@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.ArtifactStore;
 
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * Runs a pipeline's source-side capture alongside its Jet job. When a pipeline starts, its cdc capture must
@@ -13,6 +14,30 @@ import java.util.Optional;
  * so a start fills the ring before the job reads it and a stop stops the job before the capture behind it.
  */
 interface PipelineCaptureCoordinator {
+
+    /** A retained source pin may supply frozen planning observations without replacing discovery storage. */
+    default SourceModelSnapshot retainedPlanningModels(PipelineConvergencePass pass, ArtifactStore artifacts,
+            SourceModelSnapshot discovered) {
+        return discovered;
+    }
+
+    /** A scoped lifecycle captures the original run separately from its current command authority. */
+    default PipelineCaptureCoordinator forRun(io.tapstate.spi.store.PipelineIntentScope commandScope, io.tapstate.spi.store.WorkloadClaimFence command, ExecutionFence original) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
+    /** Only a scoped successful start can supply the immutable source results for its deferred DAG. */
+    default PipelineCaptureBindings captureBindings() {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+    /** Current native alias metadata only; callers separately authenticate the validation run. */
+    default ValidationCaptureRoute validationRoute(String alias,String table) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
+    /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
+    default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
+    }
 
     /**
      * Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop.
@@ -35,6 +60,11 @@ interface PipelineCaptureCoordinator {
         startCapture(pipelineId);
     }
 
+    /** Explicit model-aware adapters consume the original per-start discovery choices. */
+    default void startCapture(String pipelineId,ArtifactStore artifactSnapshot,SourceModelSnapshot sourceModels) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /**
      * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold
      * on each chain it read. {@code purgeState} additionally lets go of what the pipeline left in the
@@ -48,6 +78,15 @@ interface PipelineCaptureCoordinator {
     void stopCapture(String pipelineId, boolean purgeState);
 
     /**
+     * Whether a capture started for the pipeline is still open on this member: started, and not stopped since.
+     * The run it was opened for may be over all the same -- a job lost with a member ends with no stop -- so an
+     * open capture is not by itself a pipeline that is running. A coordinator that runs no capture holds none.
+     */
+    default boolean isCapturing(String pipelineId) {
+        return false;
+    }
+
+    /**
      * The failure a running pipeline's capture died with, or empty while it is healthy. The load and the cdc
      * stream both run on threads of their own feeding what the Jet job reads, so a read that dies leaves the
      * job running over a quiet hand-off or ring; this is how the actuator seam surfaces that death for the
@@ -55,6 +94,15 @@ interface PipelineCaptureCoordinator {
      */
     default Optional<Throwable> captureFailure(String pipelineId) {
         return Optional.empty();
+    }
+
+    default Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipelineId) {
+        return captureFailure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
+    }
+
+    /** A refused opening belongs to this start, not to a previous or replacement run. */
+    default io.tapstate.core.common.FailureFact openingFailureFact(String pipelineId, Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
     }
 
     /**
@@ -80,6 +128,14 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
+     * Records the load as landed after the exact bounded job has succeeded at every sink. False while
+     * its capture is still finishing, or when this member cannot account for the whole load.
+     */
+    default boolean confirmBoundedLoad(String pipelineId) {
+        return true;
+    }
+
+    /**
      * How far each of the pipeline's tables got through its initial load, keyed by table, with the moment
      * that load began; nothing when no capture is running for it. A coordinator that runs no capture
      * reports nothing.
@@ -94,6 +150,12 @@ interface PipelineCaptureCoordinator {
      */
     default SnapshotReading snapshotProgress(String pipelineId) {
         return SnapshotReading.NONE;
+    }
+
+    /** A current-run display projection, absent when the capture or its binding is unavailable. */
+    default io.tapstate.core.lifecycle.InitialLoad initialLoad(String pipelineId,
+            io.tapstate.core.lifecycle.ExecutionPlan plan, java.time.Instant at) {
+        return null;
     }
 
     /** The rows this run itself read during its bounded snapshot, without earlier completed loads. */

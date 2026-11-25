@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -12,13 +14,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ControlApiSchemaTest {
 
     private static final Set<String> MCP_OPERATIONS = Set.of(
-            "system.version",
+            "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+            "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
             "connector.list", "connector.get",
             "source.draft", "source.list",
             "connection.test", "connection.test-result", "connection.discover-schema", "connection.schema",
             "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-            "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
-            "pipeline.status", "pipeline.metrics",
+            "pipeline.list", "pipeline.start", "pipeline.start-checks", "pipeline.stop", "pipeline.pause",
+            "pipeline.resume", "pipeline.status", "pipeline.metrics",
             "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
             "data-browser.collections", "data-browser.find", "data-browser.stats");
 
@@ -156,7 +159,7 @@ class ControlApiSchemaTest {
         assertThat(request.get("required")).isEqualTo(java.util.List.of("id", "connector", "config"));
         assertThat(properties.keySet().stream().map(String::valueOf).toList()).containsExactlyInAnyOrder(
                 "id", "metadata", "connector", "config", "mode", "tables",
-                "options", "srs", "experimental", "clearSecrets");
+                "options", "srs", "execution", "experimental", "clearSecrets");
         assertThat(config.get("type")).isEqualTo("object");
         assertThat(config.get("additionalProperties")).isEqualTo(true);
         assertThat(definitions.get("SourceDraftResult")).isEqualTo(Map.of(
@@ -166,6 +169,33 @@ class ControlApiSchemaTest {
                         "description", "Canonical tapstate/v1 Source YAML")),
                 "additionalProperties", false,
                 "required", java.util.List.of("yaml")));
+    }
+
+    /**
+     * A Source request carries the execution block a Source draft binds - the batch its source reads in - with the
+     * bounds the draft is held to, for creating a Source as for drafting one: a caller that checks its request
+     * against this schema would otherwise be told never to send the field at all.
+     */
+    @Test
+    void sourceRequestsDescribeTheExecutionBlockASourceDraftBinds() {
+        Map<?, ?> definitions = (Map<?, ?>) ControlApiSchema.document().get("$defs");
+        for (String stem : java.util.List.of("SourceCreateRequest", "SourceDraftRequest")) {
+            Map<?, ?> execution = (Map<?, ?>) ((Map<?, ?>) ((Map<?, ?>) definitions.get(stem)).get("properties"))
+                    .get("execution");
+            assertThat(execution).as(stem).isNotNull();
+            assertThat(execution.get("additionalProperties")).as(stem).isEqualTo(false);
+            Map<?, ?> properties = (Map<?, ?>) execution.get("properties");
+            Map<?, ?> parallelism = (Map<?, ?>) properties.get("parallelism");
+            assertThat(parallelism.get("minimum")).as(stem).isEqualTo(1);
+            assertThat(parallelism.get("maximum")).as(stem).isEqualTo(ExecutionSpec.MAX_PARALLELISM);
+            Map<?, ?> batch = (Map<?, ?>) properties.get("batch");
+            assertThat(batch.get("additionalProperties")).as(stem).isEqualTo(false);
+            Map<?, ?> limits = (Map<?, ?>) batch.get("properties");
+            assertThat(((Map<?, ?>) limits.get("maxRecords")).get("maximum")).as(stem)
+                    .isEqualTo(BatchSpec.MAX_RECORDS_LIMIT);
+            assertThat(((Map<?, ?>) limits.get("maxWait")).get("pattern")).as(stem)
+                    .isEqualTo(BatchSpec.MAX_WAIT_PATTERN);
+        }
     }
 
     @Test

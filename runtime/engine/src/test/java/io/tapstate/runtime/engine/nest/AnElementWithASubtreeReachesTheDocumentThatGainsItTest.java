@@ -147,6 +147,25 @@ class AnElementWithASubtreeReachesTheDocumentThatGainsItTest {
                 .isZero();
     }
 
+    @Test
+    void aDelayedParentRecreationIncludesTheNewerChildInTheRenderedDocument() throws Exception {
+        ResolverProcessor policies = policies();
+        AssemblerProcessor assembler = assembler();
+        root(assembler, "C1");
+        upward(assembler, through(policies, OWN_ROWS, policy(io.tapstate.core.event.SourceOrder.SNAPSHOT_SEQ, "P1", "C1")));
+        upward(assembler, through(policies, CLAIMS, Envelope.insert(0, "claim",
+                row("claim_id", "K1", "policy_id", "P1", "value", 0), null)
+                .withOrder(at(io.tapstate.core.event.SourceOrder.SNAPSHOT_SEQ))));
+        upward(assembler, through(policies, OWN_ROWS, Envelope.delete(1, "policy",
+                row("policy_id", "P1", "customer_id", "C1", "policy_no", "PN-P1"), null).withOrder(at(1))));
+        upward(assembler, through(policies, CLAIMS, Envelope.insert(3, "claim",
+                row("claim_id", "K1", "policy_id", "P1", "value", 1), null).withOrder(at(3))));
+        upward(assembler, through(policies, OWN_ROWS, policy(2, "P1", "C1")));
+        assertThat(policiesOf("C1")).hasSize(1);
+        assertThat(claimsUnder(policiesOf("C1").getFirst())).singleElement().satisfies(claim ->
+                assertThat(claim).containsEntry("value", 1));
+    }
+
     private ResolverProcessor policies() throws Exception {
         ResolverProcessor processor = new ResolverProcessor(TOPOLOGY.vertexAt(List.of("policies")),
                 new HeapNestStore<>(), (from, released) -> { });

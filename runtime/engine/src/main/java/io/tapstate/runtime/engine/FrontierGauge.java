@@ -38,6 +38,16 @@ interface FrontierGauge {
     void pinned(Map<String, Long> millisByChain);
 
     /**
+     * Whether this gauge can only take a reading from a thread of the running job it belongs to. A sink
+     * driven by hand, outside any job, swaps such a gauge for one nothing reads - there is no job and no
+     * statistics to write into, and asking for a handle there fails outright. A sink that could not be driven
+     * by hand would be a sink whose behaviour nothing could pin.
+     */
+    default boolean readableOnlyOnAJobThread() {
+        return false;
+    }
+
+    /**
      * A gauge nothing reads. This is for a sink whose readings have nowhere to go - one driven outside a
      * running job - and never a way to opt a real sink out: a reading no one takes is the state this whole
      * seam exists to end.

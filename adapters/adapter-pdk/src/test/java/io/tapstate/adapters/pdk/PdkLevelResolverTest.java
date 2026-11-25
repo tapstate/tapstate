@@ -31,7 +31,7 @@ class PdkLevelResolverTest {
     void compatibleWhenDeclaredByFrozenBaselineVersion() {
         LevelResolution r = PdkLevelResolver.resolve("2.0.8", null);
         assertThat(r.outcome()).isEqualTo(LevelOutcome.COMPATIBLE);
-        assertThat(r.requiredLevel()).isEqualTo(ENGINE);
+        assertThat(r.requiredLevel()).isEqualTo(1);
     }
 
     @Test
@@ -95,7 +95,7 @@ class PdkLevelResolverTest {
         for (String version : new String[] {"2.0.5", "2.0.5-SNAPSHOT", "2.0.7", "2.0.7-SNAPSHOT"}) {
             LevelResolution r = PdkLevelResolver.resolve(version, null);
             assertThat(r.outcome()).as(version).isEqualTo(LevelOutcome.COMPATIBLE);
-            assertThat(r.requiredLevel()).as(version).isEqualTo(ENGINE);
+            assertThat(r.requiredLevel()).as(version).isEqualTo(1);
         }
     }
 
@@ -104,9 +104,21 @@ class PdkLevelResolverTest {
         for (String version : new String[] {"2.0.9", "2.0.9-SNAPSHOT", "2.0.9-20260902.031425-5"}) {
             LevelResolution result = PdkLevelResolver.resolve(version, null);
             assertThat(result.outcome()).as(version).isEqualTo(LevelOutcome.COMPATIBLE);
-            assertThat(result.requiredLevel()).as(version).isEqualTo(ENGINE);
+            assertThat(result.requiredLevel()).as(version).isEqualTo(1);
         }
         assertThat(PdkLevelResolver.resolve("2.0.10", null).outcome()).isEqualTo(LevelOutcome.UNKNOWN_VERSION);
+    }
+
+    @Test
+    void theDb2ForIBuildLineResolvesToTheBaselineLevel() {
+        // The Db2 for i connector declares 2.0.6. Every public and protected member of the 2.0.6 PDK API
+        // is present in the baseline, which only adds the alter-table-TTL function on top, so a
+        // connector built against it links against the baseline unchanged.
+        for (String version : new String[] {"2.0.6", "2.0.6-SNAPSHOT", "2.0.6-20260721.071057-17"}) {
+            LevelResolution result = PdkLevelResolver.resolve(version, null);
+            assertThat(result.outcome()).as(version).isEqualTo(LevelOutcome.COMPATIBLE);
+            assertThat(result.requiredLevel()).as(version).isEqualTo(1);
+        }
     }
 
     // ---- an unrecognized declared version is a verdict (UNKNOWN_VERSION), not a bare crash ----
@@ -126,7 +138,7 @@ class PdkLevelResolverTest {
     @Test
     void theNonThrowingLookupReportsTheGapRatherThanThrowing() {
         assertThat(PdkApiLevels.levelOf("9.9.9")).isEmpty();
-        assertThat(PdkApiLevels.levelOf("2.0.8")).hasValue(ENGINE);
+        assertThat(PdkApiLevels.levelOf("2.0.8")).hasValue(1);
     }
 
     // ---- malformed input and the bridge's own baseline stay bare-crash programmer/build errors ----

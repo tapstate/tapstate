@@ -4,15 +4,12 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.SerializerConfig;
-import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.Test;
 
-import java.net.ServerSocket;
 import java.time.Duration;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -22,18 +19,18 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import static io.tapstate.runtime.srs.SrsClusterTestSupport.startMember;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class SrsRingBackupAcrossMembersTest {
 
     @Test
     void abruptOwnerLossLeavesThePerChainPerTableRingOnItsSynchronousBackup() throws Exception {
-        int[] ports = twoFreePorts();
         String cluster = "srs-backup-" + System.nanoTime();
-        HazelcastInstance first = Hazelcast.newHazelcastInstance(config(cluster, ports[0], ports));
-        HazelcastInstance second = Hazelcast.newHazelcastInstance(config(cluster, ports[1], ports));
-        HazelcastInstance survivor = null;
+        HazelcastInstance first = startMember(config(cluster));
+        HazelcastInstance second = null;
         try {
+            second = startMember(config(cluster), first);
             awaitMembers(first, 2, Duration.ofSeconds(10));
             String ringName = SrsRingbuffer.ringName("chain-a", "orders");
             long sequence = first.<SrsItem>getRingbuffer(ringName).add(new SrsItem(
@@ -42,36 +39,25 @@ class SrsRingBackupAcrossMembersTest {
 
             UUID owner = first.getPartitionService().getPartition(ringName).getOwner().getUuid();
             HazelcastInstance failed = first.getCluster().getLocalMember().getUuid().equals(owner) ? first : second;
-            survivor = failed == first ? second : first;
+            HazelcastInstance survivor = failed == first ? second : first;
             failed.getLifecycleService().terminate();
 
             awaitMembers(survivor, 1, Duration.ofSeconds(10));
             SrsItem recovered = awaitRead(survivor, ringName, sequence, Duration.ofSeconds(10));
             assertThat(recovered.srcPos()).isEqualTo(new SourcePosition("binlog:12"));
         } finally {
-            if (survivor != null && survivor.getLifecycleService().isRunning()) {
-                survivor.shutdown();
-            }
             if (first.getLifecycleService().isRunning()) {
                 first.shutdown();
             }
-            if (second.getLifecycleService().isRunning()) {
+            if (second != null && second.getLifecycleService().isRunning()) {
                 second.shutdown();
             }
         }
     }
 
-    private static Config config(String cluster, int port, int[] ports) {
+    private static Config config(String cluster) {
         Config config = new Config();
         config.setClusterName(cluster);
-        config.setProperty("hazelcast.phone.home.enabled", "false");
-        config.setProperty("hazelcast.shutdownhook.enabled", "false");
-        config.getNetworkConfig().setPort(port).setPortAutoIncrement(false);
-        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
-        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true).setMembers(List.of(
-                "127.0.0.1:" + ports[0], "127.0.0.1:" + ports[1]));
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(SrsItem.class)
                 .setImplementation(new SrsItemSerializer()));
@@ -81,12 +67,6 @@ class SrsRingBackupAcrossMembersTest {
                 .setTimeToLiveSeconds(0)
                 .setBackupCount(1));
         return config;
-    }
-
-    private static int[] twoFreePorts() throws Exception {
-        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
-            return new int[] {first.getLocalPort(), second.getLocalPort()};
-        }
     }
 
     private static void awaitMembers(HazelcastInstance member, int expected, Duration timeout) throws Exception {

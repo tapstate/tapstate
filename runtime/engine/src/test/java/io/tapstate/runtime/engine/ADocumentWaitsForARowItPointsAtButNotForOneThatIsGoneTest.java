@@ -26,6 +26,7 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.nest.NestBinding;
+import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -133,6 +134,17 @@ class ADocumentWaitsForARowItPointsAtButNotForOneThatIsGoneTest {
                 .allSatisfy(document -> assertThat(document).doesNotContainKey("customer"));
     }
 
+    @Test
+    @DisplayName("a bounded preview sends roots whose referenced rows are absent from its complete sample")
+    void finitePreviewSettlesReferencesMissingFromItsSample() {
+        member.getJet().newJob(orders("p-preview-missing", Duration.ZERO, List.of(), true)).join();
+
+        Map<Object, Map<String, Object>> preview = latestPerOrder();
+        assertThat(preview.values())
+                .hasSize(ORDERS)
+                .allSatisfy(document -> assertThat(document).doesNotContainKey("customer"));
+    }
+
     /** Every document written, in the order the sink saw them. */
     private static List<Map<String, Object>> documentsWritten() {
         List<Map<String, Object>> documents = new ArrayList<>();
@@ -157,6 +169,11 @@ class ADocumentWaitsForARowItPointsAtButNotForOneThatIsGoneTest {
 
     /** Orders all pointing at one customer, whose own stream is given by {@code customers}. */
     private static DAG orders(String pipelineId, Duration ordersAfter, List<Timed> customers) {
+        return orders(pipelineId, ordersAfter, customers, false);
+    }
+
+    private static DAG orders(String pipelineId, Duration ordersAfter, List<Timed> customers,
+            boolean settleMissingReferencesOnComplete) {
         List<Map<String, Object>> rows = new ArrayList<>(ORDERS);
         for (int i = 1; i <= ORDERS; i++) {
             rows.add(row("order_id", i, "cust_ref", SHARED_CUSTOMER));
@@ -191,7 +208,8 @@ class ADocumentWaitsForARowItPointsAtButNotForOneThatIsGoneTest {
                 s -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
                 syncElement -> (SupplierEx<SinkWriter>) CollectingSinkWriter::new,
                 ref -> List.of(((FromRef.Literal) ref).ref()),
-                new NestBinding(tables::get, NestBinding.onMap(), (from, released) -> { }));
+                new NestBinding(tables::get, NestBinding.onMap(), (from, released) -> { },
+                        NestSettings.defaults(), settleMissingReferencesOnComplete));
 
         return PipelineDagBuilder.build(pipeline, bindings);
     }

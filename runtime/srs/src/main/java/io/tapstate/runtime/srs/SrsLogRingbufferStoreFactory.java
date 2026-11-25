@@ -27,6 +27,11 @@ public final class SrsLogRingbufferStoreFactory implements RingbufferStoreFactor
         this.log = Objects.requireNonNull(log, "log");
     }
 
+    /** The capture checkpoint and the ring must use the same member-local durable backend. */
+    boolean backs(SrsLogStore store) {
+        return log == store;
+    }
+
     @Override
     public RingbufferStore<Object> newRingbufferStore(String name, Properties properties) {
         return new SrsLogRingbufferStore(log, name);

@@ -40,7 +40,13 @@ public record SrsItem(
         Map<String, Object> before,
         Map<String, Object> after,
         long schemaVer,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        long epoch) {
+
+    public SrsItem(SourcePosition srcPos, Op op, long ts, Map<String, Object> before,
+            Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence) {
+        this(srcPos, op, ts, before, after, schemaVer, captureFence, 0L);
+    }
 
     public SrsItem(
             SourcePosition srcPos,
@@ -59,6 +65,9 @@ public record SrsItem(
         }
         if (schemaVer < 0) {
             throw new IllegalArgumentException("schemaVer must be non-negative");
+        }
+        if (epoch < 0) {
+            throw new IllegalArgumentException("capture epoch must not be negative");
         }
         before = copyOrNull(before);
         after = copyOrNull(after);

@@ -4,6 +4,10 @@ import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineLogs;
 import io.tapstate.core.logging.LogCursor;
 import io.tapstate.core.logging.PipelineLogLevel;
+import io.tapstate.core.logging.LogLine;
+import io.tapstate.messages.MessageCatalog;
+import jakarta.servlet.http.HttpServletRequest;
+
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -25,7 +29,10 @@ class PipelineLogsController {
 
     private final PipelineLogQueryService logs;
 
-    PipelineLogsController(PipelineLogQueryService logs) {
+    private final MessageCatalog catalog;
+
+    PipelineLogsController(PipelineLogQueryService logs, MessageCatalog catalog) {
+        this.catalog = catalog;
         this.logs = logs;
     }
 
@@ -34,7 +41,7 @@ class PipelineLogsController {
     PipelineLogs logs(
             @PathVariable("id") String id,
             @RequestParam(value = "limit", required = false) Integer limit,
-            @RequestParam(value = "after", required = false) String after) {
+            @RequestParam(value = "after", required = false) String after, HttpServletRequest request) {
         if (limit != null && limit < 1) {
             throw MalformedRequest.rejecting("limit must be positive", null);
         }
@@ -44,7 +51,11 @@ class PipelineLogsController {
         } catch (IllegalArgumentException invalidCursor) {
             throw MalformedRequest.rejecting("after must be a log cursor", invalidCursor);
         }
-        return logs.logs(id, cursor, limit == null ? Integer.MAX_VALUE : limit);
+        var result = logs.logs(id, cursor, limit == null ? Integer.MAX_VALUE : limit);
+        var locale = ApiExceptionHandler.localeFor(request);
+        return new PipelineLogs(id, result.lines().stream().map(line -> new LogLine(line.timestampMillis(),
+                line.level(), line.message(), ApiError.localizeDiagnostic(line.diagnostic(), catalog, locale))).toList(),
+                result.nextCursor(), result.truncated());
     }
 
     @Verb("pipeline.log-level")
@@ -65,5 +76,6 @@ class PipelineLogsController {
     @GetMapping("/pipelines/{id}:log-level")
     PipelineLogLevel level(@PathVariable("id") String id) {
         return logs.level(id);
+
     }
 }

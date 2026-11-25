@@ -2,7 +2,6 @@ package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.MapConfig;
-import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.config.EdgeConfig;
 import io.tapstate.core.common.TapstateType;
@@ -572,17 +571,8 @@ class JoinBenchRun {
                 return;
             }
             this.tier = tier;
-            Config config = new Config();
-            config.setClusterName("joinbench-" + scenario + "-" + System.nanoTime());
-            String partitions = System.getProperty(Knob.PARTITIONS);
-            if (partitions != null) {
-                config.setProperty("hazelcast.partition.count", partitions);
-            }
-            config.getJetConfig().setEnabled(false);
-            config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
-            config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
-            config.addMapConfig(mapConfigFor(tier));
-            this.member = Hazelcast.newHazelcastInstance(config);
+            this.member = StandaloneJoinMember.start(memberConfig(scenario, tier),
+                    "JoinBenchRun/" + scenario + "/" + tier);
             JoinStateMapStoreFactory.bindTo(member, cold);
             this.stores = new CountingJoinStores(new ImapJoinStores(member, PIPELINE, STEP));
             this.executor = new BuiltinJoinExecutor(List.of("id"), OUT, stores);
@@ -736,6 +726,21 @@ class JoinBenchRun {
                 member.shutdown();
             }
         }
+    }
+
+    static Config memberConfig(String scenario, String tier) {
+        Config config = new Config();
+        config.setClusterName("joinbench-" + scenario + "-" + System.nanoTime());
+        String partitions = System.getProperty(Knob.PARTITIONS);
+        if (partitions != null) {
+            config.setProperty("hazelcast.partition.count", partitions);
+        }
+        config.getJetConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
+        config.addMapConfig(mapConfigFor(tier));
+        return config;
     }
 
     /**

@@ -56,6 +56,8 @@ git rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1 || {
 }
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/_pr-read.sh
+. "$here/_pr-read.sh"
 # shellcheck source=.github/scripts/_pr-section.sh
 . "$here/_pr-section.sh"
 
@@ -67,9 +69,7 @@ numbers="$(git log --format='%s' "${base}..${sha}" 2>/dev/null \
 
 news=""; fixes=""; other=""
 for n in $numbers; do
-  # A number in a subject is not always a pull request in this repository: it can be an issue, or
-  # another repository's. Asking and being refused is the answer, not a failure.
-  body="$(gh pr view "$n" --json body --jq '.body' 2>/dev/null)" || continue
+  body="$(read_pr "$n" --json body --jq '.body')" || exit 1
   [ -n "$body" ] || continue
   note="$(section_body "Release note" "###")"
   [ -n "$note" ] || continue
@@ -107,7 +107,7 @@ group() {   # <heading> <entries>
 grouped="$(group "What's new" "$news"; group "Fixes" "$fixes"; group "Other changes" "$other")"
 
 cat <<EOF
-Preview build — single-node, in-memory runtime, not for production.
+Preview build — not for production. Runs as a single member by default; cluster mode is an opt-in preview.
 
 <!-- Breaking changes: what somebody upgrading has to DO, not what we changed. Delete this
      section if this release breaks nothing. A rolling 0.x minor is allowed to break
@@ -129,6 +129,9 @@ concerns a change the connector never reads, which no delivery guarantee can cov
 * **Changes lost while the change stream positions itself.** The position is recorded before
   the snapshot runs and is not handed to the connector's stream read until afterwards, so a
   change written to the source inside that window can be missed.
+
+* **Cluster members talk over an unauthenticated port.** The member protocol has no
+  authentication or TLS; expose it only on a private network.
 
 * **Join does not produce fan-out.** Keep each dimension unique on its complete join key.
   Duplicate dimension keys replace the earlier match with the later-arriving row; there is no

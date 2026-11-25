@@ -1,5 +1,9 @@
 package io.tapstate.spi.capture;
 
+import io.tapstate.core.common.TapstateException;
+
+import java.util.Optional;
+
 /**
  * The read side of a connector: bounded snapshot reads, an unbounded CDC stream, a connection test
  * and schema discovery. A pure interface over the standard event envelope; it depends on the core
@@ -18,8 +22,9 @@ package io.tapstate.spi.capture;
  * <p>How the two reads compose is driven by the pipeline read mode, read as a {@link CapturePlan}:
  * {@code snapshot_and_cdc} runs {@link #snapshot} then {@link #cdc} resuming at the batch's seam,
  * {@code cdc_only} runs {@link #cdc} alone from wherever its caller starts it, {@code snapshot_only}
- * runs {@link #snapshot} alone and its seam goes unused. The two {@link CapturePhase}s classify each
- * yielded event by its op; the caller persists the positions it is handed.
+ * runs a bounded read alone, using {@link SnapshotOnlyCapture} where offered to avoid sampling an unused
+ * seam. The two {@link CapturePhase}s classify each yielded event by its op; the caller persists the
+ * positions it is handed.
  */
 public interface CapturePort {
 
@@ -43,4 +48,20 @@ public interface CapturePort {
 
     /** Discovers the streams and fields the source exposes. */
     DiscoveredSchema discoverSchema(CaptureConfig config);
+
+    /**
+     * Lets go of what the connector set up on the source to read changes through {@code config}'s notes -- a
+     * replication slot, say. Called once nothing reads through those notes any more and the state they belong
+     * to is being cleared: a resource left behind there is one nobody confirms again, and a source keeps its
+     * whole change log for it.
+     *
+     * <p>A source that refuses, or cannot be reached, keeps what it had. That is answered rather than thrown,
+     * as a coded refusal naming what is left there for somebody to remove by hand, because it must not stop
+     * the state being cleared. The notes are left as they are: they are the only record of what was set up,
+     * so dropping them is the caller's, after this returns. A port or connector with nothing to let go of
+     * answers empty, which is the default.
+     */
+    default Optional<TapstateException> release(CaptureConfig config) {
+        return Optional.empty();
+    }
 }

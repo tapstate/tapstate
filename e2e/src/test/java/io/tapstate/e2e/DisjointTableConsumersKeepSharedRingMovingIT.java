@@ -4,12 +4,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import org.bson.Document;
@@ -48,10 +48,10 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
         files.seed(sourceAddress, JOIN_TABLE, SeedRows.generated(1));
         files.seed(sourceAddress, NEST_TABLE, SeedRows.generated(1));
 
-        String store = SharedMongo.replicaSetUrl("disjoint_ring_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(workspace(source, joinTarget, nestTarget));
@@ -62,16 +62,19 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
             Await.until("both disjoint pipelines to consume one mining chain", Duration.ofMinutes(2),
                     () -> documents.miningChainIds().size() == 1
                             && documents.consumersOf(documents.miningChainIds().iterator().next())
-                                    .equals(Set.of(JOIN, NEST))
+                                    .equals(Set.of(SrsConsumerId.of(JOIN, SOURCE).value(),
+                                            SrsConsumerId.of(NEST, SOURCE).value()))
                             && files.count(joinAddress, JOIN_TABLE) == 1
                             && files.count(nestAddress, NEST_TABLE) == 1,
                     () -> "chains=" + documents.miningChainIds() + ", join=" + control.state(JOIN)
                             + ", nest=" + control.state(NEST) + ", logs=" + control.logs(NEST));
             String chain = documents.miningChainIds().iterator().next();
-            Document joinCursor = documents.consumerOffset(chain, JOIN).get("perTableSeq", Document.class);
-            Document nestCursor = documents.consumerOffset(chain, NEST).get("perTableSeq", Document.class);
-            assertThat(joinCursor.keySet()).containsExactly(JOIN_TABLE);
-            assertThat(nestCursor.keySet()).containsExactly(NEST_TABLE);
+            var joinCursor = documents.consumerOffset(chain, SrsConsumerId.of(JOIN, SOURCE).value())
+                    .get("progress", Document.class).getList("perTableSeq", Document.class);
+            var nestCursor = documents.consumerOffset(chain, SrsConsumerId.of(NEST, SOURCE).value())
+                    .get("progress", Document.class).getList("perTableSeq", Document.class);
+            assertThat(joinCursor).extracting(row -> row.getString("table")).containsExactly(JOIN_TABLE);
+            assertThat(nestCursor).extracting(row -> row.getString("table")).containsExactly(NEST_TABLE);
 
             for (int batch = 1; batch <= BATCHES; batch++) {
                 files.cdc(sourceAddress, NEST_TABLE, CdcOp.INSERT, BATCH_SIZE);
@@ -80,7 +83,8 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
                         () -> files.count(nestAddress, NEST_TABLE) == expected,
                         () -> "nest rows=" + files.count(nestAddress, NEST_TABLE)
                                 + ", expected=" + expected
-                                + ", cursor=" + documents.consumerReadSeq(chain, NEST, NEST_TABLE)
+                                + ", cursor=" + documents.consumerReadSeq(
+                                        chain, SrsConsumerId.of(NEST, SOURCE).value(), NEST_TABLE)
                                 + ", join=" + control.state(JOIN) + ", nest=" + control.state(NEST)
                                 + ", logs=" + control.logs(NEST));
             }

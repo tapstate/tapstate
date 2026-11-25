@@ -16,11 +16,20 @@ final class JsPort implements TransformPort {
     private final RowScript script;
 
     JsPort(String source) {
-        this.script = new RowScript(source);
+        this(source, null);
+    }
+
+    JsPort(String source, String previewExecutionId) {
+        this.script = new RowScript(source, previewExecutionId);
     }
 
     @Override
     public List<Envelope> transform(Envelope event) {
         return script.run(event);
+    }
+
+    @Override
+    public void close() {
+        script.close();
     }
 }

@@ -10,7 +10,7 @@ class LifecycleErrorTest {
     @Test
     void everyCodeIsInTheLifecycleDomainAndErrorSeverity() {
         for (LifecycleError e : LifecycleError.values()) {
-            assertThat(e.code()).startsWith("lifecycle.");
+            assertThat(e.code()).matches("TS028(?!0000)[0-9]{4}");
             assertThat(e.severity()).isEqualTo(Severity.ERROR);
         }
     }
@@ -18,15 +18,20 @@ class LifecycleErrorTest {
     @Test
     void carriesTheLifecycleVocabularyCodes() {
         assertThat(LifecycleError.values()).extracting(LifecycleError::code).containsExactlyInAnyOrder(
-                "lifecycle.illegal-transition",
+                "TS0280001",
                 // start/resume refused because the pipeline's revision is not the latest applied one
-                "lifecycle.incompatible-revision",
+                "TS0280002",
                 // a stop that did not say whether to clear what the pipeline has accumulated
-                "lifecycle.purge-state-not-stated",
+                "TS0280003",
                 // a start or resume named a draft without an executable source-to-output path
-                "lifecycle.pipeline-not-runnable",
+                "TS0280004",
                 // a lifecycle verb named a pipeline that was never applied
-                "lifecycle.unknown-pipeline");
+                "TS0280005",
+                // a start its start checks stopped: to ask a question, or to refuse it outright
+                "TS0280006",
+                "TS0280007",
+                // a start whose answer names something its start checks do not offer
+                "TS0280008");
     }
 
     @Test

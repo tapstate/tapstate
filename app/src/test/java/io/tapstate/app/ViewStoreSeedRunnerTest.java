@@ -1,11 +1,21 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.withSettings;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.internal.dns.DefaultDnsResolver;
+import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
@@ -28,6 +38,23 @@ class ViewStoreSeedRunnerTest {
         // settings is refused as an authored source, so seeding one would break the deployment it serves.
         assertThat(source.mode()).as("no read mode").isNull();
         assertThat(source.tables()).as("no tables to read").isNull();
+    }
+
+    @Test
+    void cloudAssemblyDoesNotSeedAManagedViewStore() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        MongoProperties mongo = new MongoProperties();
+        CloudProperties properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example");
+        properties.setToken("sentinel-token");
+        properties.setAtlasUri("mongodb+srv://user:sentinel-password@atlas.example/metadata");
+        properties.setClusterId("managed-view-cluster");
+
+        new ControlPlaneConfiguration()
+                .viewStoreSeedRunner(store.artifacts(), mongo, CloudRuntimeSettings.resolve(properties))
+                .seed();
+
+        assertThat(store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID)).isEmpty();
     }
 
     @Test
@@ -83,6 +110,36 @@ class ViewStoreSeedRunnerTest {
     }
 
     @Test
+    void deriving_a_views_uri_preserves_the_authentication_source_from_srv_txt() {
+        String metadataUri = "mongodb+srv://state:sentinel-password@cluster.example.test/onprem_metadata"
+                + "?tls=true&retryWrites=true";
+        DefaultDnsResolver dns = new DefaultDnsResolver((name, type) -> {
+            assertThat(name).isEqualTo("cluster.example.test");
+            assertThat(type).isEqualTo("TXT");
+            return List.of("authSource=admin");
+        });
+
+        // Keep DNS deterministic for both the witness and any lookups made by the production helper.
+        // The real driver still merges TXT settings with each URI and constructs its credentials.
+        try (var ignored = mockConstruction(DefaultDnsResolver.class,
+                withSettings().defaultAnswer(delegatesTo(dns)))) {
+            ConnectionString metadata = new ConnectionString(metadataUri);
+            assertThat(metadata.getDatabase()).isEqualTo("onprem_metadata");
+            assertThat(metadata.getCredential()).isNotNull();
+            assertThat(metadata.getCredential().getSource()).isEqualTo("admin");
+
+            ConnectionString views = new ConnectionString(
+                    ViewStoreSeedRunner.viewsUri(metadataUri, "assigned_views"));
+
+            assertThat(views.getDatabase()).isEqualTo("assigned_views");
+            assertThat(views.getCredential()).isNotNull();
+            assertThat(views.getCredential().getSource())
+                    .as("the derived views connection must retain the metadata connection's TXT authentication source")
+                    .isEqualTo(metadata.getCredential().getSource());
+        }
+    }
+
+    @Test
     void a_uri_that_names_no_database_still_had_somewhere_it_authenticated() {
         // The spec's fallback is admin, and it is a fallback the derived URI does not inherit: the
         // original named no database, the derived one names views, so leaving it implicit moves
@@ -93,6 +150,72 @@ class ViewStoreSeedRunnerTest {
         assertThat(ViewStoreSeedRunner.viewsUri("mongodb://user:pw@mongo:27017?replicaSet=rs0"))
                 .as("no database, but options")
                 .isEqualTo("mongodb://user:pw@mongo:27017/views?replicaSet=rs0&authSource=admin");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "authSource=admin, metadata, admin",
+            "authSource=other_login, metadata, other_login",
+            "authSource=auth%26db%2Bname, metadata, auth%26db%2Bname",
+            "'', metadata, metadata",
+            "'', '', admin"
+    })
+    void srv_derivation_keeps_txt_or_fallback_authentication_and_uri_options(
+            String txt, String database, String encodedSource) {
+        String authority = "mongodb+srv://state:pa%40ss@cluster.example.test/";
+        String options = "?tls=true&retryWrites=true&appName=views%20probe";
+        String metadataUri = authority + database + options;
+        DefaultDnsResolver dns = new DefaultDnsResolver((name, type) -> {
+            assertThat(name).isEqualTo("cluster.example.test");
+            assertThat(type).isEqualTo("TXT");
+            return txt.isEmpty() ? List.of() : List.of(txt);
+        });
+
+        try (var ignored = mockConstruction(DefaultDnsResolver.class,
+                withSettings().defaultAnswer(delegatesTo(dns)))) {
+            String derived = ViewStoreSeedRunner.viewsUri(metadataUri, "assigned_views");
+
+            assertThat(derived).isEqualTo(authority + "assigned_views" + options + "&authSource=" + encodedSource);
+            assertThat(new ConnectionString(derived).getCredential())
+                    .isEqualTo(new ConnectionString(metadataUri).getCredential());
+        }
+    }
+
+    @Test
+    void an_explicit_srv_authentication_source_needs_no_dns_lookup() {
+        String metadataUri = "mongodb+srv://state:pa%40ss@cluster.example.test/metadata"
+                + "?tls=true&authsource=other%2Blogin";
+        try (var dns = mockConstruction(DefaultDnsResolver.class)) {
+            assertThat(ViewStoreSeedRunner.viewsUri(metadataUri, "assigned_views"))
+                    .isEqualTo("mongodb+srv://state:pa%40ss@cluster.example.test/assigned_views"
+                            + "?tls=true&authsource=other%2Blogin");
+            assertThat(dns.constructed()).isEmpty();
+        }
+    }
+
+    @Test
+    void a_seeded_views_connection_is_registered_with_the_pipeline_log_redactor() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        SecretRedactor redactor = new SecretRedactor();
+        SecretTrackingArtifactStore tracked = new SecretTrackingArtifactStore(
+                store.artifacts(), TapstateCatalog::load, redactor);
+        DefaultDnsResolver dns = new DefaultDnsResolver((name, type) -> {
+            assertThat(name).isEqualTo("cluster.example");
+            assertThat(type).isEqualTo("TXT");
+            return List.of();
+        });
+        try (var ignored = mockConstruction(DefaultDnsResolver.class,
+                withSettings().defaultAnswer(delegatesTo(dns)))) {
+            new ViewStoreSeedRunner(tracked,
+                    "mongodb+srv://state:pa%40ss@cluster.example/metadata?retryWrites=true", null).seed();
+        }
+
+        SourceResource seeded = (SourceResource) store.artifacts()
+                .get(ViewTargetResolver.STATE_STORE_SOURCE_ID).orElseThrow();
+        String derivedUri = (String) seeded.config().get("uri");
+        assertThat(redactor.redact(derivedUri + " decoded=pa@ss"))
+                .isEqualTo("mongodb+srv://********@cluster.example/views"
+                        + "?retryWrites=true&authSource=metadata decoded=********");
     }
 
     @Test

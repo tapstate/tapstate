@@ -5,7 +5,10 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkSinkPort;
+import io.tapstate.adapters.pdk.SharedSinkConnectors;
+import io.tapstate.adapters.pdk.TargetIdentityPlan;
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.DdlPolicy;
 import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkConfig;
@@ -32,8 +35,13 @@ import java.util.Set;
  * <p>The provisioner is expected under {@link #CONNECTOR_PROVISIONER_USER_CONTEXT_KEY}; a member with none
  * bound is not sink-capable and the open fails rather than silently dropping writes. Binding the provisioner
  * into the member user context is the assembly root's job when it makes the member sink-capable.
+ *
+ * <p>The tables its writers write are prepared once for each execution, by {@link #prepareTargets} on the member
+ * coordinating it, before any writer opens; each writer then only checks they were. A sink running several
+ * writers would otherwise prepare each table once per writer, and a table cleared for a full load by one writer
+ * after another had started writing into it would lose the other's rows.
  */
-final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
+final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSinkWriterFactory, PreparesTargets {
 
     private static final long serialVersionUID = 1L;
 
@@ -53,6 +61,13 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
      */
     static final String CONNECTOR_STATE_STORE_USER_CONTEXT_KEY = "tapstate.pdk.connector-state-store";
 
+    /**
+     * The member user-context key under which the member's table of shared sink connectors is bound: where an
+     * artifact is certified for it, the writers of one sink on the member share one connector through it. A
+     * member with none bound opens one connector per writer, whatever the artifact.
+     */
+    static final String SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY = "tapstate.pdk.shared-sink-connectors";
+
     private final String connectorId;
     private final Map<String, Object> settings;
     private final WriteMode writeMode;
@@ -61,6 +76,9 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     private final boolean fullLoad;
     private final Map<String, TargetTable> targets;
     private final PipelineNode node;
+    private final PipelineNode.Purpose purpose;
+    private final ConfiguredSinkRun configured;
+    private final Map<String,TargetIdentityPlan> identities;
 
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target,
@@ -78,6 +96,25 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+        this(connectorId, settings, writeMode, ddl, targets, node, onFullLoad, fullLoad, PipelineNode.Purpose.SYNC);
+    }
+
+    PdkSinkWriterFactory(
+            String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad,
+            PipelineNode.Purpose purpose) {
+        this(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,null,null);
+    }
+
+    private PdkSinkWriterFactory(String connectorId,Map<String,Object> settings,WriteMode writeMode,DdlPolicy ddl,
+            Map<String,TargetTable> targets,PipelineNode node,OnFullLoad onFullLoad,boolean fullLoad,
+            PipelineNode.Purpose purpose,ConfiguredSinkRun configured,Map<String,TargetIdentityPlan> identities) {
+        this.configured=configured;
+        this.identities=identities==null?null:Map.copyOf(identities);
+        if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
+            throw new IllegalArgumentException("sink purpose must be view or sync");
+        }
+        this.purpose = purpose;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
         this.connectorId = connectorId;
@@ -86,6 +123,31 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
         this.ddl = ddl;
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.node = node;
+    }
+
+    PdkSinkWriterFactory forRun(ConfiguredSinkRun run) {
+        if(targets.values().stream().anyMatch(target -> target.unwindIdentity()!=null))
+            throw new IllegalStateException("configured unwind targets require a frozen identity assessment");
+        var unchanged=new io.tapstate.adapters.pdk.PdkTargetIdentityPlanner(id -> {
+            throw new IllegalStateException("ordinary targets require no identity connector");
+        }).assess(config(),targets);
+        return forRun(run,unchanged);
+    }
+    boolean guardsWritesFor(ExecutionFence fence) {
+        return configured != null && configured.original().equals(fence);
+    }
+
+    PdkSinkWriterFactory withTargets(Map<String,TargetTable> restored) {
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,restored,node,onFullLoad,fullLoad,purpose,null,null);
+    }
+    PdkSinkWriterFactory forRun(ConfiguredSinkRun run,Map<String,TargetIdentityPlan> identities) {
+        if(!node.equals(run.node()) || purpose!=run.purpose())throw new IllegalArgumentException("configured sink run belongs to another node");
+        if(!targets.keySet().equals(identities.keySet()))throw new IllegalArgumentException("frozen identities must cover every input stream");
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,run,identities);
+    }
+    java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> preparationInputs(io.tapstate.spi.store.PipelineIntentScope scope) {
+        var physical=identities==null?targets.values():identities.values().stream().map(TargetIdentityPlan::target).toList();
+        return physical.stream().map(target -> io.tapstate.adapters.pdk.PdkSinkPreparations.input(scope,node,purpose,onFullLoad,fullLoad,target)).distinct().toList();
     }
 
     /** The write-side models this factory will hand the sink, keyed by the stream each answers for. */
@@ -98,15 +160,45 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter> {
         return node;
     }
 
+    PipelineNode.Purpose purpose() { return purpose; }
+
     OnFullLoad onFullLoad() { return onFullLoad; }
 
     boolean fullLoad() { return fullLoad; }
 
     @Override
-    public SinkWriter getEx() {
+    public SinkWriter getEx() {return forWriter(0,0);}
+    @Override public SinkWriter forWriter(int memberIndex,int localIndex) {
+        return forWriter(memberIndex, localIndex, new ScopedSinkStateProvider.WriterStartup());
+    }
+    @Override public Opening opening() {
+        var startup = new ScopedSinkStateProvider.WriterStartup();
+        return (member, local) -> forWriter(member, local, startup);
+    }
+    private SinkWriter forWriter(int memberIndex,int localIndex,ScopedSinkStateProvider.WriterStartup startup) {
+        if(memberIndex<0 || localIndex<0)throw new IllegalArgumentException("invalid writer coordinates");
         HazelcastInstance member = localMember();
-        return new PdkSinkPort(provisioner(member), stateStore(member))
-                .open(new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad), targets);
+        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member),"writer:"+memberIndex+":"+localIndex,startup)
+                .withTargetIdentities(identities).openPrepared(config(),targets);
+        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), purpose)
+                .openPrepared(config(), targets);
+    }
+
+    /** The member's table of shared sink connectors, or null where none is bound. */
+    private static SharedSinkConnectors sharing(HazelcastInstance member) {
+        Object bound = member.getUserContext().get(SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY);
+        return bound instanceof SharedSinkConnectors sharing ? sharing : null;
+    }
+
+    @Override
+    public void prepareTargets(HazelcastInstance coordinator) {
+        if(configured!=null){ScopedSinkStateProvider.of(coordinator).open(coordinator,configured,config(),provisioner(coordinator),null,"preparation")
+                .withTargetIdentities(identities).prepare(config(),targets);return;}
+        new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose).prepare(config(), targets);
+    }
+
+    SinkConfig config() {
+        return new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad);
     }
 
     /**

@@ -24,6 +24,11 @@ public interface LogSink {
     /** Records one log line against a pipeline. */
     void append(String pipelineId, LogLine line);
 
+    /** Records a line carrying the physical state generation captured by its producer. */
+    default void append(String pipelineId, long generation, LogLine line) {
+        append(pipelineId, line);
+    }
+
     /**
      * Returns the most recent buffered lines for a pipeline, oldest to newest, as an immutable
      * snapshot. Empty when the pipeline has logged nothing (or is unknown to this node).
@@ -54,4 +59,14 @@ public interface LogSink {
         LogCursor next = to == 0 ? after : new LogCursor(generation, to);
         return new LogPage(lines.subList(from, to), next, truncated);
     }
+    /** Returns only lines in the verified lifetime window; an unscoped sink cannot answer this read. */
+    default List<LogLine> tail(String pipelineId, long firstGeneration, long lastGeneration) {
+        return List.of();
+    }
+
+    /** Reads a cursor page restricted to the current physical lifetime. */
+    default LogPage page(String pipelineId, LogCursor after, int limit, long firstGeneration, long lastGeneration) {
+        return new LogPage(List.of(), null, after != null);
+    }
+
 }

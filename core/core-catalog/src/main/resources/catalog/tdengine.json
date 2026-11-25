@@ -323,7 +323,7 @@
   ],
   "provenance": {
     "specPath": "connectors/tdengine-connector/src/main/resources/tdengine-spec.json",
-    "specContentHash": "c334d878e8bf6262",
+    "specContentHash": "544117838cdb12d8",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

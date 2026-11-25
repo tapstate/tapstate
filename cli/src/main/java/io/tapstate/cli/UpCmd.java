@@ -44,9 +44,10 @@ final class UpCmd implements Callable<Integer> {
                     + "On one that is: reach this server for this run instead, leaving the binding alone.")
     String server;
 
-    @Option(names = {"-y", "--yes"},
+    @Option(names = {"-y", "--yes", "--non-interactive"},
             description = "Never prompt. The workspace must already be bound, or --server must name a "
-                    + "server; the local development stack is never started without --start-local.")
+                    + "server; the local development stack is never started without --start-local. Every "
+                    + "start check question is answered by going ahead as configured.")
     boolean yes;
 
     @Option(names = "--start-local",

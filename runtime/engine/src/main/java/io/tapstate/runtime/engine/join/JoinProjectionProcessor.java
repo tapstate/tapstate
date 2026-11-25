@@ -7,6 +7,7 @@ import com.hazelcast.jet.core.Inbox;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.SettledPositions;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -22,10 +23,21 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged 
     }
     private final JoinProjection projection;
     private final Deque<Envelope> pending = new ArrayDeque<>();
-    private boolean taken;
+    private int taken;
 
     JoinProjectionProcessor(JoinProjection projection) {
         this.projection = projection;
+    }
+
+    /**
+     * Like every other vertex that reaches the state layer, and for the same reason: every call into the
+     * join's state is a call into the cluster, and one the cluster refuses while a member joining catches up
+     * is waited out where it was made. A call that waits on a cooperative thread stops every other vertex
+     * sharing that thread rather than only this one.
+     */
+    @Override
+    public boolean isCooperative() {
+        return false;
     }
 
     // Times each drain of arrivals, which is this stage's unit of work.
@@ -47,21 +59,36 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged 
     }
 
     private void processTimed(Inbox inbox) {
-        if (!taken) {
-            List<JoinUpdate> arrivals = new ArrayList<>(inbox.size());
-            for (Object item : inbox) {
-                arrivals.add((JoinUpdate) item);
+        while (!inbox.isEmpty()) {
+            if (inbox.peek() instanceof SettledPositions) {
+                if (!tryEmit(inbox.peek())) {
+                    return;
+                }
+                inbox.poll();
+                continue;
             }
-            pending.addAll(projection.refresh(arrivals));
-            taken = true;
-        }
-        while (!pending.isEmpty()) {
-            if (!tryEmit(pending.peek())) {
-                return;
+            if (taken == 0) {
+                List<JoinUpdate> arrivals = new ArrayList<>(inbox.size());
+                // A marker follows all output from the rows before it, including a refused emission.
+                for (Object item : inbox) {
+                    if (item instanceof SettledPositions) {
+                        break;
+                    }
+                    arrivals.add((JoinUpdate) item);
+                }
+                pending.addAll(projection.refresh(arrivals));
+                taken = arrivals.size();
             }
-            pending.remove();
+            while (!pending.isEmpty()) {
+                if (!tryEmit(pending.peek())) {
+                    return;
+                }
+                pending.remove();
+            }
+            for (int i = 0; i < taken; i++) {
+                inbox.poll();
+            }
+            taken = 0;
         }
-        inbox.clear();
-        taken = false;
     }
 }

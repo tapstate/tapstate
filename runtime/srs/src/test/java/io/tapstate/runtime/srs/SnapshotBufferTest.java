@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.RowValueError;
+import io.tapstate.core.common.TapstateException;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -30,6 +32,25 @@ import org.junit.jupiter.api.Test;
 class SnapshotBufferTest {
 
     private static final String PIPELINE = "orders_pipeline";
+
+    @Test
+    void rejectsInvalidKeysBeforeDirectOrBoundSnapshotAdmission() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.invalidkeys";
+        Envelope invalid = Envelope.read(0, "orders", Map.of("dict", Map.of(7, "value")), null);
+        assertThatThrownBy(() -> buffer.append(PIPELINE, ring, invalid))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsEntry("path", "$/after/dict");
+                });
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+        CaptureHandoff handoff = buffer.handoff(PIPELINE, ring);
+        assertThatThrownBy(() -> handoff.accept(invalid)).isInstanceOf(TapstateException.class);
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+        Envelope valid = row("orders", 1);
+        handoff.accept(valid);
+        assertThat(buffer.drain(PIPELINE, ring)).containsExactly(valid);
+    }
 
     @Test
     @SuppressWarnings("unchecked")
@@ -224,6 +245,48 @@ class SnapshotBufferTest {
     }
 
     // ---- a declared load ----------------------------------------------------------------------------
+
+    @Test
+    void aReleasedHandoffCannotRecreateItsQueueOrWriteIntoALaterLoad() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.orders";
+        buffer.declareSnapshot(PIPELINE, ring);
+        CaptureHandoff stopped = buffer.handoff(PIPELINE, ring);
+
+        buffer.release(PIPELINE);
+        stopped.accept(row("orders", 1));
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+
+        buffer.declareSnapshot(PIPELINE, ring);
+        CaptureHandoff restarted = buffer.handoff(PIPELINE, ring);
+        stopped.accept(row("orders", 2));
+        stopped.loaded("orders");
+        assertThat(buffer.snapshotState(PIPELINE, ring))
+                .as("an old callback cannot finish the new run's snapshot")
+                .isEqualTo(new SnapshotBuffer.SnapshotState(true, false, false));
+        restarted.accept(row("orders", 3));
+        restarted.loaded("orders");
+        assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(3L);
+        assertThat(buffer.snapshotState(PIPELINE, ring).handedOver()).isTrue();
+    }
+
+    @Test
+    void anUndeclaredTailHandoffIsUnboundedButCannotAppendAfterRelease() {
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        String ring = "srs.chain.orders";
+        CaptureHandoff tail = buffer.handoff(PIPELINE, ring);
+        tail.accept(row("orders", 1));
+        tail.accept(row("orders", 2));
+        assertThat(buffer.snapshotState(PIPELINE, ring)).isEqualTo(SnapshotBuffer.SnapshotState.UNDECLARED);
+        assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(1L, 2L);
+
+        buffer.release(PIPELINE);
+        tail.accept(row("orders", 3));
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+        buffer.handoff(PIPELINE, ring).accept(row("orders", 4));
+        tail.accept(row("orders", 5));
+        assertThat(buffer.drain(PIPELINE, ring)).extracting(e -> e.after().get("id")).containsExactly(4L);
+    }
 
     /**
      * The bound that keeps a load of any size to a few thousand rows on the heap: once a declared load has

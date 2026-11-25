@@ -67,6 +67,10 @@
     {
       "word": "cdc",
       "description": "Produces changes against a seeded table while the pipeline runs."
+    },
+    {
+      "word": "start_refused",
+      "description": "Requires an HTTP 409 start admission refusal carrying the named code."
     }
   ],
   "cdcOperations": [
@@ -100,6 +104,7 @@
   ],
   "setupKeys": [
     "databases",
+    "managed_target",
     "connectors",
     "apply",
     "discover"

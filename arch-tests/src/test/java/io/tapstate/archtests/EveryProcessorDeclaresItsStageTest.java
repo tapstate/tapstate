@@ -4,11 +4,10 @@ import com.hazelcast.jet.core.Processor;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaModifier;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.StageTimer;
+import io.tapstate.runtime.engine.TransparentProcessor;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -33,19 +32,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 class EveryProcessorDeclaresItsStageTest {
 
     /**
-     * The one vertex that runs no processing of its own. A union, and the merge that gives a nest one edge
-     * per stream, are topology: the vertex exists so ordinals downstream stay unique, and nothing is spent
-     * in it that a reader would want to see on its own.
+     * The vertices that run no processing of their own. A union, and the merge that gives a nest one edge
+     * per stream, are topology: the vertex exists so ordinals downstream stay unique. The router in front of
+     * a sink that runs several writers is topology too: all it does is pick which of two edges into those
+     * writers a row takes. Nothing is spent in either that a reader would want to see on its own, and a
+     * router timed under the sink's stage would fill it with units of next to nothing - the shape that hides
+     * a slow writer. The processor that takes a step's input in the batches its author asked for only decides
+     * when the processor it wraps is handed its rows; that one times its own stage, and timing the wrapper too
+     * would count the same work twice. And a vertex that runs one processor for the whole cluster keeps a stand-in
+     * on every other member that takes no rows and only passes the vertex's bounds on: the processor it stands in
+     * for times the stage, on the one member where the work is done.
      */
-    private static final String PASSTHROUGH = "io.tapstate.runtime.engine.PassthroughProcessor";
+    private static final Set<String> TOPOLOGY = Set.of(
+            "io.tapstate.runtime.engine.PassthroughProcessor",
+            "io.tapstate.runtime.engine.SinkRouter",
+            "io.tapstate.runtime.engine.InputBatches",
+            "io.tapstate.runtime.engine.TotalOne$BoundsStandIn");
 
     private static JavaClasses tapstateClasses;
 
     @BeforeAll
     static void importTapstateClasses() {
-        tapstateClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        tapstateClasses = ProductionClassImports.packages("io.tapstate");
     }
 
     /** Every concrete processor the product wires into a graph. */
@@ -58,19 +66,48 @@ class EveryProcessorDeclaresItsStageTest {
     }
 
     @Test
-    @DisplayName("every processor family the engine wires declares its stage, except the passthrough")
+    @DisplayName("every processor family the engine wires declares its stage, except the ones that are topology")
     void everyProcessorDeclaresItsStage() {
         List<JavaClass> processors = processors();
 
-        assertThat(processors).extracting(JavaClass::getName).contains(PASSTHROUGH);
+        assertThat(processors).extracting(JavaClass::getName).containsAll(TOPOLOGY);
         assertThat(processors)
-                .filteredOn(processor -> !processor.getName().equals(PASSTHROUGH))
+                .filteredOn(processor -> !TOPOLOGY.contains(processor.getName())
+                        && !processor.isAssignableTo(TransparentProcessor.class))
                 .allSatisfy(processor -> assertThat(processor.isAssignableTo(Staged.class))
                         .as("%s declares the stage its time is measured under", processor.getName())
                         .isTrue());
-        assertThat(tapstateClasses.get(PASSTHROUGH).isAssignableTo(Staged.class))
-                .as("a passthrough spends no time a reader would want to see on its own")
-                .isFalse();
+        for (String topology : TOPOLOGY) {
+            assertThat(tapstateClasses.get(topology).isAssignableTo(Staged.class))
+                    .as("%s spends no time a reader would want to see on its own", topology)
+                    .isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("transparent envelopes privately delegate every processing callback and own no timing")
+    void transparentEnvelopesHaveOnePrivateDelegateAndNoTimingOrDelegateEscape() {
+        Set<String> callbacks = Set.of("init", "process", "tryProcessWatermark", "tryProcess",
+                "completeEdge", "complete", "isCooperative", "closeIsCooperative", "close");
+        var envelopes = processors().stream().filter(type -> type.isAssignableTo(TransparentProcessor.class)).toList();
+        assertThat(envelopes).isNotEmpty();
+        for (var envelope : envelopes) {
+            assertThat(envelope.isAssignableTo(Staged.class)).as(envelope.getName()).isFalse();
+            var delegates = envelope.getFields().stream().filter(field -> field.getRawType().isAssignableTo(Processor.class)).toList();
+            assertThat(delegates).singleElement().satisfies(field ->
+                    assertThat(field.getModifiers()).contains(JavaModifier.PRIVATE, JavaModifier.FINAL));
+            assertThat(envelope.getFields()).noneMatch(field -> field.getRawType().isEquivalentTo(StageTimer.class));
+            assertThat(stageTimerCallsFrom(envelope)).isEmpty();
+            assertThat(envelope.getMethods()).noneMatch(method -> method.getRawReturnType().isAssignableTo(Processor.class));
+            var methods = envelope.getMethods().stream().filter(method -> callbacks.contains(method.getName())).toList();
+            assertThat(methods).extracting(method -> method.getName()).containsAll(callbacks);
+            for (var method : methods) {
+                assertThat(method.getMethodCallsFromSelf()).anySatisfy(call -> {
+                    assertThat(call.getTargetOwner().isEquivalentTo(Processor.class)).isTrue();
+                    assertThat(call.getTarget().getName()).isEqualTo(method.getName());
+                });
+            }
+        }
     }
 
     @Test

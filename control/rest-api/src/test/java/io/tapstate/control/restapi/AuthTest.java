@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.PlanAdvisories;
@@ -23,11 +24,14 @@ import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.CreatedToken;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DataBrowserService;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
@@ -37,12 +41,18 @@ import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
+import io.tapstate.control.core.SampleSourceService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.SourceProjectionService;
+import io.tapstate.control.core.SourceRepresentation;
+import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
+import io.tapstate.control.core.ViewCatalogService;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -64,6 +74,9 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.spi.store.SessionRecord;
@@ -87,14 +100,20 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.web.client.RestClient;
 
 import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.time.Clock;
@@ -106,6 +125,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -114,7 +134,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * The authentication and authorization matrix over the {@code /api} verb surface, exercised end to end
  * through a real embedded server (booted programmatically so the module stays on the reactor's JUnit
  * line). It proves Spring Security guards every verb, the two credential mechanisms both authenticate,
- * the grade check refuses an under-scoped caller, and the two pre-authentication entry points (login and
+ * the grade check refuses an under-scoped caller, and the pre-authentication entry points (login and
  * the zero-user bootstrap) live outside the guard and self-guard. The stores and the crypto are in-memory
  * fakes; the control-core services and the wiring are real.
  */
@@ -134,7 +154,10 @@ class AuthTest {
 
     @BeforeAll
     static void startServer() {
-        context = new SpringApplicationBuilder(TestApp.class).properties("server.port=0").run();
+        context = new SpringApplicationBuilder(TestApp.class)
+                .properties("server.port=0", "tapstate.browser-auth.trusted-proxies=127.0.0.1",
+                        "tapstate.browser-auth.public-origins=https://console.example,https://localhost",
+                        "tapstate.browser-auth.allow-insecure-loopback=true").run();
         port = ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
@@ -163,6 +186,226 @@ class AuthTest {
         return context.getBean(TokenService.class).create(scope);
     }
 
+    @Test void storageRoutesKeepAuthenticationSeparateFromUnassembledDependencies() {
+        var anonymous = client().post().uri("/api/storage/status").contentType(MediaType.APPLICATION_JSON).body(Map.of())
+                .exchange((request,response) -> { assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED); return response.bodyTo(ApiError.class); });
+        assertThat(anonymous.code()).isEqualTo(ControlError.UNAUTHENTICATED.code());
+        var admin = client().post().uri("/api/storage/status").header(HttpHeaders.AUTHORIZATION,"Bearer " + machineToken(Scope.ADMIN))
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of()).exchange((request,response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE); return response.bodyTo(ApiError.class);
+                });
+        assertThat(admin.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE.code());
+        client().post().uri("/api/storage/setup/commit").header(HttpHeaders.AUTHORIZATION,"Bearer " + machineToken(Scope.READ))
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of()).exchange((request,response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN); return null;
+                });
+    }
+
+    @Test
+    void browserSessionRestoresIndependentTabsWithoutExposingTheLongCredential() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String cookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE);
+        assertThat(cookie).contains("tapstate-op-session=tss_", "HttpOnly", "SameSite=Lax", "Path=/");
+        assertThat(login.getHeaders().getCacheControl()).isEqualTo("no-store");
+        assertThat(login.getBody()).contains("\"principal\":\"alice\"", "accessExpiresAt", "sessionId")
+                .doesNotContain("sessionToken", "tss_");
+        String credentialCookie = cookie.split(";", 2)[0];
+        for (int tab = 0; tab < 2; tab++) {
+            ResponseEntity<String> resumed = client().post().uri(AuthWire.BROWSER_SESSION_PATH)
+                    .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                    .header(HttpHeaders.COOKIE, credentialCookie).retrieve().toEntity(String.class);
+            assertThat(resumed.getBody()).contains("\"principal\":\"alice\"");
+            assertThat(resumed.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        }
+        assertThat((int) client().get().uri("/api/artifacts").header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+        client().post().uri(AuthWire.BROWSER_LOGOUT_PATH).header("Origin", origin)
+                .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
+                .retrieve().toBodilessEntity();
+        assertThat((int) client().post().uri(AuthWire.BROWSER_SESSION_PATH).header("Origin", origin)
+                .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+    }
+
+    @Test
+    void trustedHttpsProxyRestoresThePublicOriginAndIssuesASecureCookie() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", "https://console.example")
+                .header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https")
+                .header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .exchange((request, response) -> new ResponseEntity<>(response.bodyTo(String.class),
+                        response.getHeaders(), response.getStatusCode()));
+
+        assertThat(login.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE))
+                .contains("__Host-tapstate-op-session=tss_", "Secure", "HttpOnly", "Path=/");
+    }
+
+    @Test
+    void trustedProxyCannotAuthorizeAnUnlistedPublicOrigin() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", "https://internal.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "internal.example")
+                .header("X-Forwarded-Port", "443").contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+        assertThat(login.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+    }
+
+    @Test
+    void trustedProxyRejectsMalformedForwardedAuthoritiesAndPorts() {
+        seedUser("alice", "s3cret", "admin");
+        for (String[] headers : List.of(
+                new String[] {"ftp", "console.example", "443"},
+                new String[] {"https", "user@console.example", "443"},
+                new String[] {"https", "console.example?query", "443"},
+                new String[] {"https", "console.example#fragment", "443"},
+                new String[] {"https", "console.example:8443", "443"},
+                new String[] {"https", "console.example", "not-a-port"})) {
+            ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                    .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                    .header("X-Forwarded-Proto", headers[0]).header("X-Forwarded-Host", headers[1])
+                    .header("X-Forwarded-Port", headers[2]).contentType(MediaType.APPLICATION_JSON)
+                    .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                    .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+            assertThat(login.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        }
+    }
+
+    @Test
+    void secureSessionIgnoresAnObsoleteLoopbackCookieAlias() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443").contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String secureCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        ResponseEntity<String> resumed = client().post().uri(AuthWire.BROWSER_SESSION_PATH)
+                .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .header(HttpHeaders.COOKIE, secureCookie + "; tapstate-op-session=tss_old.secret")
+                .exchange((request, response) -> new ResponseEntity<>(response.bodyTo(String.class),
+                        response.getHeaders(), response.getStatusCode()));
+        assertThat(resumed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(resumed.getBody()).contains("\"principal\":\"alice\"");
+        assertThat(resumed.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        ResponseEntity<String> logout = client().post().uri(AuthWire.BROWSER_LOGOUT_PATH)
+                .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .header(HttpHeaders.COOKIE, secureCookie + "; tapstate-op-session=tss_old.secret")
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    @Test
+    void browserLogoutDoesNotClearACookieForAnActiveSessionFromAnotherIssuer() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String credentialCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        String session = credentialCookie.substring(credentialCookie.indexOf('=') + 1);
+        String sessionId = session.substring(4, session.indexOf('.'));
+        context.getBean(FakeSessionStore.class).replaceIssuer(sessionId, "urn:other-cluster");
+
+        ResponseEntity<String> logout = client().post().uri(AuthWire.BROWSER_LOGOUT_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(logout.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+    }
+
+    @Test
+    void browserLogoutClearsACookieForAnExpiredMatchingSession() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String credentialCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        String session = credentialCookie.substring(credentialCookie.indexOf('=') + 1);
+        String sessionId = session.substring(4, session.indexOf('.'));
+        context.getBean(FakeSessionStore.class).expire(sessionId);
+
+        ResponseEntity<String> logout = client().post().uri(AuthWire.BROWSER_LOGOUT_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(logout.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).contains("Max-Age=0");
+    }
+
+    @Test
+    void secureLoginClearsAnEarlierLoopbackCookieAlias() {
+        seedUser("alice", "s3cret", "admin");
+        var request = new org.springframework.mock.web.MockHttpServletRequest("POST", AuthWire.BROWSER_LOGIN_PATH);
+        request.setSecure(true);
+        request.setScheme("https");
+        request.setServerName("localhost");
+        request.setServerPort(443);
+        request.addHeader("Origin", "https://localhost");
+        request.addHeader("X-Tapstate-Browser-Request", "1");
+        request.setCookies(new jakarta.servlet.http.Cookie("tapstate-op-session", "tss_old.secret"));
+        var response = context.getBean(BrowserAuthController.class).login(request, new LoginRequest("alice", "s3cret"));
+        assertThat(response.getHeaders().get(HttpHeaders.SET_COOKIE)).hasSize(2)
+                .anySatisfy(value -> assertThat(value).contains("tapstate-op-session=", "Max-Age=0"));
+    }
+
+    @Test
+    void browserAuthenticationRejectsCsrfAndNeverClearsCookiesOnExchangeFailure() {
+        for (String path : List.of(AuthWire.BROWSER_LOGIN_PATH, AuthWire.BROWSER_SESSION_PATH, AuthWire.BROWSER_LOGOUT_PATH)) {
+            for (String origin : List.of("null", "https://evil.example", "http://127.0.0.1:" + port + "/bad")) {
+                ResponseEntity<String> denied = client().post().uri(path)
+                        .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                        .contentType(MediaType.APPLICATION_JSON).body("{}")
+                        .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+                assertThat(denied.getStatusCode().value()).isEqualTo(401);
+                assertThat(denied.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+            }
+            assertThat((int) client().post().uri(path)
+                    .contentType(MediaType.APPLICATION_JSON).body("{}")
+                    .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+        }
+    }
+
+    @Test
+    void apiSecurityHeadersArePresentBeforeTheHandlerCanStartStreaming() throws Exception {
+        var api = context.getBean("apiSecurityFilterChain", SecurityFilterChain.class);
+        var headers = api.getFilters().stream().filter(HeaderWriterFilter.class::isInstance).findFirst().orElseThrow();
+        var request = new MockHttpServletRequest("POST", "/api/pipelines/orders/draft:assistant");
+        var response = new MockHttpServletResponse();
+        headers.doFilter(request, response, (req, res) -> {
+            assertThat(response.getHeader("X-Content-Type-Options")).isEqualTo("nosniff");
+            assertThat(response.isCommitted()).isFalse();
+        });
+    }
+
     // ---- an unauthenticated caller cannot reach a verb ----
 
     @Test
@@ -174,9 +417,34 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
         // The refusal echoes nothing back, so it cannot be used to probe which credentials exist.
         assertThat(body.params()).isEmpty();
+    }
+
+    @Test
+    void sampleCatalogAndAsyncInstallationUseTheSharedAuthenticationAndScopeBoundary() {
+        for (String route : List.of("/api/sample-sources/catalog", "/api/sample-sources/installations/unknown")) {
+            ApiError anonymous = client().get().uri(route).exchange((request, response) -> {
+                assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                return response.bodyTo(ApiError.class);
+            });
+            assertThat(anonymous.code()).isEqualTo("TS0210003");
+        }
+        String reader = machineToken(Scope.READ);
+        ResponseEntity<String> catalog = client().get().uri("/api/sample-sources/catalog")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + reader).retrieve().toEntity(String.class);
+        assertThat(catalog.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(catalog.getBody()).doesNotContain("password", "token", "config");
+
+        ApiError refused = client().post().uri("/api/sample-sources/installations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + reader).contentType(MediaType.APPLICATION_JSON)
+                .body("{\"ids\":[\"sample_core_banking\"]}").exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(refused.code()).isEqualTo("TS0210004");
+        assertThat(refused.params()).containsEntry("op", "sample-source.install");
     }
 
     @Test
@@ -188,7 +456,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -200,7 +468,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
         assertThat(body.params()).isEmpty();
     }
 
@@ -219,7 +487,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "artifact.apply").containsEntry("required", "write");
     }
 
@@ -241,6 +509,25 @@ class AuthTest {
                 .exchange((request, response) -> response.getStatusCode());
 
         assertThat(status).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    void onPremConnectorRefreshAndDownloadRequireAdmin() {
+        String writer = machineToken(Scope.WRITE);
+        String admin = machineToken(Scope.ADMIN);
+        for (String path : List.of("/api/connector-center:refresh", "/api/connector-center/mongodb:download")) {
+            ApiError denied = client().post().uri(path).header(HttpHeaders.AUTHORIZATION, "Bearer " + writer)
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                        return response.bodyTo(ApiError.class);
+                    });
+            assertThat(denied.code()).isEqualTo(ControlError.FORBIDDEN.code());
+            assertThat(denied.params()).containsEntry("required", "admin");
+
+            ApiError admitted = client().post().uri(path).header(HttpHeaders.AUTHORIZATION, "Bearer " + admin)
+                    .exchange((request, response) -> response.bodyTo(ApiError.class));
+            assertThat(admitted.code()).isEqualTo(ControlError.UNREACHABLE.code());
+        }
     }
 
     @Test
@@ -298,7 +585,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(malformed.code()).isEqualTo("control.malformed-request");
+        assertThat(malformed.code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -328,8 +615,8 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(malformed.code()).isEqualTo("control.unauthenticated");
-        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+        assertThat(malformed.code()).isEqualTo("TS0210003");
+        assertThat(duplicate.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -343,7 +630,7 @@ class AuthTest {
                 });
 
         assertThat(unknownApi).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(unknownRoot.code()).isEqualTo("control.unauthenticated");
+        assertThat(unknownRoot.code()).isEqualTo("TS0210003");
 
         HttpStatusCode wrongMethod = client().put().uri("/api/sources")
                 .header("Authorization", "Bearer " + machineToken(Scope.ADMIN))
@@ -352,16 +639,54 @@ class AuthTest {
     }
 
     @Test
-    void theControlFaceUsesTwoStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
-        assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(2);
+    void theControlFaceKeepsInstallationTrafficSeparateFromPublicSecurityChains() {
+        assertThat(context.getBeansOfType(SecurityFilterChain.class)).containsOnlyKeys(
+                "installationSecurityFilterChain", "apiSecurityFilterChain", "rootSecurityFilterChain");
+        var publicRequest = new org.springframework.mock.web.MockHttpServletRequest("POST", "/api/storage/setup/commit");
+        publicRequest.setLocalAddr("127.0.0.1");
+        publicRequest.addHeader("X-Forwarded-For", "127.0.0.1");
+        assertThat(context.getBean("installationSecurityFilterChain", SecurityFilterChain.class).matches(publicRequest)).isFalse();
     }
 
     @Test
-    void securityConfigurationRefusesToStartWithoutTheHumanCredentialVerifier() {
+    void publicBrandingAssetsReachStaticResourceHandlingWithoutAuthentication() {
+        for (String path : List.of("/favicon.ico", "/tapstate-mark.svg", "/tapstate-mark-light.svg")) {
+            HttpStatusCode status = client().get().uri(path)
+                    .accept(MediaType.IMAGE_PNG, MediaType.parseMediaType("image/svg+xml"), MediaType.ALL)
+                    .exchange((request, response) -> response.getStatusCode());
+
+            assertThat(status).as("anonymous GET %s should reach static resource handling", path)
+                    .isEqualTo(HttpStatus.NOT_FOUND);
+        }
+    }
+
+    @Test
+    void packagedRootImagesArePublicWithoutIndividualAllowlistEntries() {
+        HttpStatusCode status = client().get().uri("/tapstate-lockup-dark.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(status).isEqualTo(HttpStatus.OK);
+        HttpStatusCode head = client().head().uri("/tapstate-lockup-dark.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(head).isEqualTo(HttpStatus.OK);
+        HttpStatusCode post = client().post().uri("/tapstate-lockup-dark.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(post).isEqualTo(HttpStatus.UNAUTHORIZED);
+        HttpStatusCode missing = client().get().uri("/unpackaged-image.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(missing).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void theControlFaceUsesThreeStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
+        assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(3);
+    }
+
+    @Test
+    void securityConfigurationRefusesToStartWithoutTheSelectedCredentialVerifier() {
         assertThatThrownBy(() -> new SpringApplicationBuilder(MissingHumanVerifierApp.class)
                 .properties("server.port=0")
                 .run())
-                .hasStackTraceContaining("TokenSigner");
+                .hasStackTraceContaining("CredentialAuthenticator");
     }
 
     // ---- login is a pre-authentication entry point that issues a working credential ----
@@ -450,7 +775,7 @@ class AuthTest {
 
         assertThat(logout).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(logoutAgain).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(afterLogout.code()).isEqualTo("control.unauthenticated");
+        assertThat(afterLogout.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -468,7 +793,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(bearer.code()).isEqualTo("control.unauthenticated");
+        assertThat(bearer.code()).isEqualTo("TS0210003");
 
         ApiError sessionAsApiBearer = client().get().uri("/api/artifacts")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + login.sessionToken())
@@ -476,7 +801,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(sessionAsApiBearer.code()).isEqualTo("control.unauthenticated");
+        assertThat(sessionAsApiBearer.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -501,7 +826,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+        assertThat(duplicate.code()).isEqualTo("TS0210003");
 
         context.getBean(FakeSessionStore.class).replaceIssuer("tok-1", "urn:other");
         assertSessionUnauthorized(AuthWire.SESSION_PATH, AuthWire.sessionAuthorization(login.sessionToken()));
@@ -515,7 +840,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(error.code()).isEqualTo("control.unauthenticated");
+        assertThat(error.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -549,14 +874,14 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.auth-failed");
+        assertThat(body.code()).isEqualTo("TS0210002");
         assertThat(body.params()).as("the login failure reveals nothing about which half was wrong").isEmpty();
     }
 
     @Test
     void loginWithABlankCredentialIsABadRequestWithACodedBody() {
         // A missing / blank credential field is a malformed request — the client omitted a required value —
-        // refused at the boundary with a coded control.malformed-request (400). This is distinct from a
+        // refused at the boundary with a coded TS0210001 (400). This is distinct from a
         // present-but-wrong credential (the auth-failed 401), and it never reaches the login service's bare
         // argument crash.
         ApiError body = client().post().uri("/auth/login")
@@ -567,7 +892,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
     }
 
@@ -602,13 +927,13 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.bootstrap-closed");
+        assertThat(body.code()).isEqualTo("TS0210018");
     }
 
     @Test
     void bootstrapWithABlankCredentialIsABadRequestWithACodedBody() {
         // The test client is on loopback and the store is empty, so the bootstrap channel is open. A blank
-        // password is still refused at the boundary with a coded control.malformed-request (400) — it would
+        // password is still refused at the boundary with a coded TS0210001 (400) — it would
         // otherwise be hashed into a non-blank hash and silently create an admin with an empty password.
         ApiError body = client().post().uri("/auth/bootstrap")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -618,7 +943,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
     }
 
@@ -660,13 +985,156 @@ class AuthTest {
         assertThat(authenticated).isEqualTo(HttpStatus.OK);
     }
 
+    @Test
+    void authenticatedOptionsOnClusterMembersReturnsAllowedMethods() {
+        client().options().uri("/api/cluster/members")
+                .headers(headers -> headers.setBearerAuth(machineToken(Scope.ADMIN)))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).as("OPTIONS /api/cluster/members").isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getAllow())
+                            .containsExactlyInAnyOrder(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS);
+                    return null;
+                });
+    }
+
+    @Test
+    void optionsRequiresACredentialForAMappedRoute() {
+        for (String authorization : List.of("", "Bearer not-a-real-token")) {
+            ApiError body = client().options().uri("/api/cluster/members")
+                    .headers(headers -> {
+                        if (!authorization.isEmpty()) headers.set(HttpHeaders.AUTHORIZATION, authorization);
+                    })
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                        assertThat(response.getHeaders().getAllow()).isEmpty();
+                        return response.bodyTo(ApiError.class);
+                    });
+            assertThat(body.code()).isEqualTo("TS0210003");
+        }
+    }
+
+    @Test
+    void optionsRequiresEveryScopeRepresentedInAllow() {
+        String read = machineToken(Scope.READ);
+        client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(read))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getAllow())
+                            .containsExactlyInAnyOrder(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS);
+                    return null;
+                });
+
+        String draft = "/api/pipelines/orders/draft";
+        ApiError refused = client().options().uri(draft).headers(headers -> headers.setBearerAuth(read))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    assertThat(response.getHeaders().getAllow()).isEmpty();
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(refused.code()).isEqualTo("TS0210004");
+        assertThat(refused.params()).containsEntry("op", "pipeline-draft.create").containsEntry("required", "write");
+
+        client().options().uri(draft).headers(headers -> headers.setBearerAuth(machineToken(Scope.WRITE)))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getAllow()).containsExactlyInAnyOrder(
+                            HttpMethod.GET, HttpMethod.HEAD, HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE, HttpMethod.OPTIONS);
+                    return null;
+                });
+    }
+
+    @Test
+    void optionsLeavesUnknownPathsAndCorsPreflightToMvc() {
+        client().options().uri("/api/runtime-image-smoke-missing").exchange((request, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+            return null;
+        });
+        client().options().uri("/api/cluster/members")
+                .header(HttpHeaders.ORIGIN, "https://other.example")
+                .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getFirst(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN)).isNull();
+                    return null;
+                });
+    }
+
+    @Test
+    void anExplicitOptionsHandlerRequiresItsOwnScope() throws NoSuchMethodException {
+        var mapping = context.getBean(RequestMappingHandlerMapping.class);
+        var explicit = RequestMappingInfo.paths("/api/cluster/members").methods(RequestMethod.OPTIONS)
+                .options(mapping.getBuilderConfiguration()).build();
+        var controller = new OptionsTestHandler();
+        mapping.registerMapping(explicit, controller, OptionsTestHandler.class.getDeclaredMethod("explicit"));
+        try {
+            client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(machineToken(Scope.READ)))
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                        assertThat(response.bodyTo(ApiError.class).params()).containsEntry("op", "pipeline-draft.replace");
+                        return null;
+                    });
+            assertThat(controller.invoked).isFalse();
+            client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(machineToken(Scope.WRITE)))
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                        assertThat(response.getHeaders().getAllow()).containsExactly(HttpMethod.OPTIONS);
+                        return null;
+                    });
+            assertThat(controller.invoked).isTrue();
+        } finally {
+            mapping.unregisterMapping(explicit);
+        }
+    }
+
+    @Test
+    void optionsCannotDiscoverHandlersWithoutRegisteredVerbs() throws NoSuchMethodException {
+        var mapping = context.getBean(RequestMappingHandlerMapping.class);
+        var put = RequestMappingInfo.paths("/api/cluster/members").methods(RequestMethod.PUT)
+                .options(mapping.getBuilderConfiguration()).build();
+        var controller = new OptionsTestHandler();
+        String admin = machineToken(Scope.ADMIN);
+        for (String method : List.of("unannotated", "unregistered")) {
+            mapping.registerMapping(put, controller, OptionsTestHandler.class.getDeclaredMethod(method));
+            try {
+                client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(admin))
+                        .exchange((request, response) -> {
+                            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+                            assertThat(response.getHeaders().getAllow()).isEmpty();
+                            return null;
+                        });
+                assertThat(controller.invoked).isFalse();
+            } finally {
+                mapping.unregisterMapping(put);
+            }
+        }
+    }
+
+    static class OptionsTestHandler {
+        private final AtomicBoolean invoked = new AtomicBoolean();
+
+        @Verb("pipeline-draft.replace")
+        ResponseEntity<Void> explicit() {
+            invoked.set(true);
+            return ResponseEntity.ok().allow(HttpMethod.OPTIONS).build();
+        }
+
+        void unannotated() {
+            invoked.set(true);
+        }
+
+        @Verb("test.unregistered")
+        void unregistered() {
+            invoked.set(true);
+        }
+    }
+
     // ---- the unauthenticated surface is a closed allow-list (root-exit convergence) ----
 
     @Test
     void theOnlyEndpointsOutsideTheApiPrefixAreTheProbeAndThePreAuthEntryPoints() {
         // /api is the authenticated boundary (the API security chain guards /api/**). Everything reachable
         // anonymously must therefore be an intentional carve-out: the liveness probe, version and issuer
-        // discovery, the two pre-auth entry points, and the framework's own error endpoint (which renders only the
+        // discovery, the pre-authentication entry points, and the framework's own error endpoint (which renders only the
         // current request's error, no application data). A future plain @Controller added at the root would
         // escape both the verb-derivation gate and the interceptor — this pins the anonymous surface to
         // exactly that set.
@@ -675,8 +1143,11 @@ class AuthTest {
                 "/version",
                 AuthWire.DISCOVERY_PATH,
                 "/auth/login",
+                AuthWire.BROWSER_LOGIN_PATH, AuthWire.BROWSER_SESSION_PATH, AuthWire.BROWSER_LOGOUT_PATH,
                 AuthWire.SESSION_PATH,
                 AuthWire.LOGOUT_PATH,
+                CloudAuthController.EXCHANGE_PATH,
+                CloudAuthController.INVALIDATE_PATH,
                 "/auth/bootstrap",
                 "/connector-icons/{id}",
                 "/error");
@@ -701,7 +1172,7 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe, pre-auth entry points, and the anonymous connector icon asset "
+                .as("only the liveness probe, self-guarded local/managed auth entry points, and connector icon asset "
                         + "surface may live outside /api; every other endpoint is a registry verb under the "
                         + "authenticated /api prefix")
                 .isEmpty();
@@ -737,7 +1208,8 @@ class AuthTest {
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             ClusterTopologyTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, AggregateStepChecksTestConfiguration.class, ObservabilityTestConfiguration.class,
+            StartChecksTestConfiguration.class, PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -868,6 +1340,41 @@ class AuthTest {
         }
 
         @Bean
+        PipelineDraftStore pipelineDraftStore() {
+            return new PipelineDraftStore() {
+                @Override public Optional<PipelineDraft> get(String pipelineId) { return Optional.empty(); }
+                @Override public List<PipelineDraft> list() { return List.of(); }
+                @Override public PipelineDraftMutation create(PipelineDraft draft) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+                @Override public PipelineDraftMutation replace(
+                        String pipelineId, long expectedRevision, PipelineDraft replacement) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+                @Override public PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+                @Override public PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+            };
+        }
+
+        @Bean
+        PipelineDraftService pipelineDraftService(PipelineDraftStore drafts) {
+            return new PipelineDraftService(drafts);
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(
+                ArtifactQueryService artifacts,
+                PipelineDraftService drafts,
+                DesiredStore desired,
+                PipelineObservationQueryService observations) {
+            return new PipelineCatalogService(artifacts, drafts, desired, observations);
+        }
+
+        @Bean
         PipelineProjectionService pipelineProjectionService(
                 ApplyService applyService,
                 ArtifactQueryService artifactQueryService,
@@ -929,7 +1436,8 @@ class AuthTest {
                     return Optional.empty();
                 }
             };
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         // The read-back controller is bundled too, so its query service must be present for the context to
@@ -965,7 +1473,8 @@ class AuthTest {
                 public Optional<DiscoveredSourceModel> get(String connectionId) {
                     return Optional.empty();
                 }
-            }, auditGate, Clock.systemUTC());
+            }, auditGate, Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
@@ -985,6 +1494,33 @@ class AuthTest {
         @Bean
         SourceSchemaQueryService sourceSchemaQueryService(InMemoryArtifactStore store) {
             return new SourceSchemaQueryService(store, new EmptySchemaStore());
+        }
+
+        @Bean
+        ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+                PipelineObservationQueryService observations, DataBrowserService browser,
+                SourceSchemaQueryService schemas, Clock clock) {
+            return new ViewCatalogService(artifacts, observations, browser, pipeline -> List.of(), clock);
+        }
+
+        @Bean
+        SampleSourceService sampleSourceService(SourceProjectionService sources,
+                SchemaDiscoveryService discovery, ConnectionTestService connections,
+                ConnectorCatalogView connectors) {
+            return new SampleSourceService(sources, discovery, connections, connectors,
+                    new SampleSourceCredentialsProvider() {
+                        @Override public boolean available() { return false; }
+                        @Override public Credentials fetch() {
+                            throw new IllegalStateException("Sample credentials are not configured in this fixture");
+                        }
+                    });
+        }
+
+        @Bean
+        StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+                SourceRepresentation representation, ConnectionTestService connections) {
+            return new StateStoreSetupService(apply, artifacts, representation,
+                    DeploymentProfile.ON_PREM, connections);
         }
 
         // The three data-browser controller methods are bundled too, so their service must be present for
@@ -1192,6 +1728,13 @@ class AuthTest {
                     record.idleExpiresAt(), record.absoluteExpiresAt()));
         }
 
+        synchronized void expire(String id) {
+            SessionRecord record = byId.get(id);
+            byId.put(id, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                    record.scope(), record.issuer(), record.revoked(), record.createdAt(), record.lastUsedAt(),
+                    NOW.minusSeconds(1), record.absoluteExpiresAt()));
+        }
+
         @Override
         public synchronized void save(SessionRecord record) {
             byId.put(record.sessionId(), record);
@@ -1226,6 +1769,16 @@ class AuthTest {
             byId.put(sessionId, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
                     record.scope(), record.issuer(), true, record.createdAt(), record.lastUsedAt(),
                     record.idleExpiresAt(), record.absoluteExpiresAt()));
+            return true;
+        }
+
+        @Override
+        public synchronized boolean revokeBrowserSession(String sessionId, String secretHash, String issuer) {
+            SessionRecord current = byId.get(sessionId);
+            if (current == null || !current.secretHash().equals(secretHash) || !current.issuer().equals(issuer)) return false;
+            byId.put(sessionId, new SessionRecord(current.sessionId(), current.secretHash(), current.principal(),
+                    current.scope(), current.issuer(), true, current.createdAt(), current.lastUsedAt(),
+                    current.idleExpiresAt(), current.absoluteExpiresAt()));
             return true;
         }
 

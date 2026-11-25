@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -31,6 +32,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -84,9 +86,11 @@ class UpsertOverlapIdempotencyTest {
     private static final String TABLE = "orders";
 
     private HazelcastInstance member;
+    private InMemorySrsLogStore log;
 
     @BeforeEach
     void startMember() {
+        log = new InMemorySrsLogStore();
         Config config = new Config();
         config.setClusterName("upsert-overlap-test-" + System.nanoTime());
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -99,7 +103,9 @@ class UpsertOverlapIdempotencyTest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -127,7 +133,9 @@ class UpsertOverlapIdempotencyTest {
 
         actuator.start(PIPELINE);
         try {
-            awaitKeyPresent("5");
+            // Every write landed, not only the last key's: the sink runs several writers, each landing its own
+            // keys, so one key having arrived says nothing of a key another writer holds.
+            awaitTotalAtLeast(6);
         } finally {
             actuator.stop(PIPELINE, true);
         }
@@ -177,7 +185,7 @@ class UpsertOverlapIdempotencyTest {
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
-        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
                 new SourceTable(TABLE,
                         List.of(new SourceField("id", "INT"), new SourceField("amount", "STRING")),
@@ -189,6 +197,7 @@ class UpsertOverlapIdempotencyTest {
     private void makeMemberCapable(InMemoryStorePort store) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         ConnectorProvisioner provisioner = connectorId -> {
             throw new UnsupportedOperationException("not resolved by this idempotency test");
         };
@@ -207,11 +216,6 @@ class UpsertOverlapIdempotencyTest {
         DagSource dagSource = new StoreBackedDagSource(store, upsertSink);
         return new EngineLifecycleActuator(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
-    }
-
-    private void awaitKeyPresent(String key) {
-        awaitCondition(() -> UpsertSink.keys().contains(key),
-                () -> "timed out waiting for key " + key + " at the sink, have " + UpsertSink.keys());
     }
 
     private void awaitTotalAtLeast(int total) {

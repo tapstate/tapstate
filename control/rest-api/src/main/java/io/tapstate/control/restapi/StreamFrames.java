@@ -12,7 +12,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.Locale;
 
 /**
  * Renders a streamed status or logs frame to the same compact JSON the one-shot {@code GET} read faces
@@ -49,12 +49,7 @@ final class StreamFrames {
         if (failure == null) {
             return null;
         }
-        Map<String, Object> params = new TreeMap<>(failure.params());
-        Map<String, Object> encoded = new LinkedHashMap<>();
-        encoded.put("code", failure.code());
-        encoded.put("params", params);
-        encoded.put("message", catalog.render(failure.code(), params).message());
-        return encoded;
+        return ApiError.from(failure, catalog, Locale.ENGLISH).fields();
     }
 
     /** A logs frame with a resumable cursor and any retention-truncation indication. */
@@ -65,6 +60,7 @@ final class StreamFrames {
             encoded.put("timestampMillis", line.timestampMillis());
             encoded.put("level", line.level());
             encoded.put("message", line.message());
+            if (!line.diagnostic().isEmpty()) encoded.put("diagnostic", line.diagnostic());
             lines.add(encoded);
         }
         Map<String, Object> frame = new LinkedHashMap<>();

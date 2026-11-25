@@ -32,6 +32,33 @@ class E2eExecutorTest {
 
     private final RecordingBinding binding = new RecordingBinding();
 
+    @Test
+    void aRefusedStartIsCheckedAsAdmissionRatherThanAnAcceptedFailedRun() {
+        execute("""
+                name: refused
+                pipeline: p.tap.yml
+                steps:
+                  - start_refused: TS0360004
+                """);
+        assertThat(binding.calls).containsExactly("apply:[p.tap.yml]",
+                "start_refused:" + PIPELINE_ID + ":TS0360004");
+    }
+
+    @Test
+    void theManagedInstallationTargetIsReadButNeverArtifactApplied() {
+        execute("""
+                name: managed
+                setup:
+                  managed_target: views.tap.yml
+                  connectors: [mongodb]
+                  apply: [src.tap.yml]
+                pipeline: p.tap.yml
+                steps: [start]
+                """);
+        assertThat(binding.calls).containsExactly("register:mongodb", "read:[views.tap.yml]",
+                "read:[src.tap.yml]", "apply:[src.tap.yml, p.tap.yml]", "drive:START");
+    }
+
     /**
      * The dependency order, and the seed is part of it. A connector must be registered before a resource
      * naming it can be applied, and a resource must exist before its model can be discovered - but a model
@@ -205,21 +232,57 @@ class E2eExecutorTest {
     void awaitsTheFailureCodeOfThePipelineResolvedFromTheEnvelope() {
         // A dead pipeline is already assertable as a state and a count; neither says what killed it, and a
         // regression that swaps the reason for another would pass both. The code is the assertable identity.
-        binding.failureCodesUnobservedThen("engine.job-failed");
+        binding.failureCodesUnobservedThen("TS0440008");
 
-        execute(minimal("steps:\n  - await: { failure_code: engine.job-failed }\n"));
+        execute(minimal("steps:\n  - await: { failure_code: TS0440008 }\n"));
 
         assertThat(binding.failureCodedPipelineIds).containsOnly(PIPELINE_ID);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"a-sync-start-before-source-discovery-is-refused",
+            "a-view-over-a-literal-table-is-refused-without-discovery"})
+    void publishedDiscoveryRefusalsWaitForTheDiagnosisAfterTheFailedState(String example) {
+        var specification = Examples.specifications().stream()
+                .filter(path -> path.getParent().getFileName().toString().equals(example))
+                .findFirst().orElseThrow();
+        binding.states(PipelineState.FAILED);
+        binding.failureCodesUnobservedThen("TS0360004");
+
+        execute(Examples.read(specification));
+
+        assertThat(binding.failureCodeReads).isGreaterThanOrEqualTo(3);
+        assertThat(binding.readTables).contains(new TableAlias(
+                example.startsWith("a-sync") ? "tgt_file" : "views",
+                example.startsWith("a-sync") ? "orders" : "order_state"));
+    }
+
+    @Test
+    void publishedUnreachableViewStoreWaitsForTheDiagnosisAfterTheFailedState() {
+        var workspace = Examples.ROOT.resolve("a-view-whose-store-cannot-be-reached-fails-with-a-named-code");
+        binding.states(PipelineState.FAILED);
+        // The checkpoint exposes FAILED before the observation publishes its diagnosis.
+        binding.failureCodesUnobservedThen("TS0360023");
+        var target = new TableAlias("tgt_file", "orders");
+        binding.countsOverTime(target, 0L);
+
+        new E2eExecutor(binding, new FilePipelineLoader(workspace),
+                Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml"))));
+
+        assertThat(binding.failureCodedPipelineIds).containsOnly("e2e_pipeline");
+        assertThat(binding.failureCodeReads).isGreaterThanOrEqualTo(2);
+        assertThat(binding.readTables).contains(target);
+    }
+
     @Test
     void reportsTheFailureCodeMismatchAgainstTheResolvedPipeline() {
-        binding.failureCodes("io.store-unauthorized");
+        binding.failureCodes("TS0480003");
 
         assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { failure_code: engine.job-failed }\n")))
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("mongo2mongo expected failure code engine.job-failed")
-                .hasMessageContaining("io.store-unauthorized");
+                .hasMessageContaining("TS0480003");
     }
 
     @Test
@@ -685,6 +748,68 @@ class E2eExecutorTest {
                 .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
     }
 
+    @Test
+    void customerAndPaymentExampleWaitsForEveryInitialPayment() {
+        java.nio.file.Path workspace = Examples.ROOT.resolve(
+                "an-order-row-is-widened-by-its-customer-and-its-payment");
+        Envelope published = EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml")));
+        List<Step> snapshot = published.steps().stream().takeWhile(step -> !(step instanceof Step.Cdc)).toList();
+        TableAlias target = new TableAlias("views", "order_state");
+        binding.countsOverTime(target, 3L);
+        AtomicInteger paymentReads = new AtomicInteger();
+        binding.documentReader = (table, where) -> {
+            assertThat(table).isEqualTo(target);
+            int id = ((Number) where.get("order_id")).intValue();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("order_id", id);
+            row.put("qty", switch (id) {
+                case 10 -> 2;
+                case 11 -> 5;
+                case 12 -> 7;
+                default -> throw new AssertionError("unexpected order " + id);
+            });
+            row.put("customer_name", id == 11 ? "bo" : "ada");
+            // Three rows and order 10's payment can arrive before order 11's enrichment. The next
+            // reading has the payment, as the failure scene did after the immediate assertion failed.
+            row.put("payment_method", switch (id) {
+                case 10 -> "card";
+                case 11 -> paymentReads.incrementAndGet() == 1 ? null : "transfer";
+                default -> null;
+            });
+            return Optional.of(row);
+        };
+
+        // Run the published snapshot's checks unchanged: no replacement of an assertion with an await.
+        new E2eExecutor(binding, new FilePipelineLoader(workspace), Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
+        assertThat(paymentReads.get()).as("order 11's payment must be read after it arrives").isGreaterThanOrEqualTo(2);
+    }
+
+    @Test
+    void heldStreamExampleWaitsForSecondOrdersInitialShipments() {
+        java.nio.file.Path workspace = Examples.ROOT.resolve("holding-one-stream-does-not-stop-the-other");
+        Envelope published = EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml")));
+        List<Step> snapshot = published.steps().stream()
+                .takeWhile(step -> !(step instanceof Step.StreamLifecycle)).toList();
+        TableAlias target = new TableAlias("views", "order_state");
+        binding.countsOverTime(target, 5L);
+        AtomicInteger secondOrderReads = new AtomicInteger();
+        binding.documentReader = (table, where) -> {
+            assertThat(table).isEqualTo(target);
+            int id = ((Number) where.get("id")).intValue();
+            assertThat(id).isIn(1, 2);
+            // Order 1's partition is complete while order 2's shipments arrive on its next read.
+            int children = id == 2 && secondOrderReads.incrementAndGet() == 1 ? 0 : 2;
+            return Optional.of(Map.of("id", id, "customer", id == 1 ? "alice" : "bob",
+                    "shipments", java.util.Collections.nCopies(children, Map.of("id", 1))));
+        };
+
+        // Run the published initial checks unchanged, stopping before the first stream hold.
+        new E2eExecutor(binding, new FilePipelineLoader(workspace), Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
+        assertThat(secondOrderReads.get()).as("order 2 must be read after its shipments arrive").isGreaterThanOrEqualTo(2);
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
@@ -848,6 +973,11 @@ class E2eExecutorTest {
         public void drive(String pipelineId, LifecycleVerb verb) {
             drivenPipelineIds.add(pipelineId);
             calls.add("drive:" + verb);
+        }
+
+        @Override
+        public void startRefused(String pipelineId, String expectedCode) {
+            calls.add("start_refused:" + pipelineId + ":" + expectedCode);
         }
 
         @Override

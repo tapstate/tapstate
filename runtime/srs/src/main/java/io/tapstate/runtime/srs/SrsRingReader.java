@@ -1,6 +1,14 @@
 package io.tapstate.runtime.srs;
 
+import com.hazelcast.ringbuffer.StaleSequenceException;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.SrsLogBatch;
+import io.tapstate.spi.store.SrsLogBounds;
+import io.tapstate.spi.store.SrsLogRecord;
+import io.tapstate.spi.store.SrsLogStore;
 
 import java.time.Instant;
 import java.util.Map;
@@ -21,15 +29,17 @@ import java.util.function.ObjLongConsumer;
  * source rather than having its unread changes overwritten. A reader with no sink (the bare constructor)
  * simply does not report.
  *
- * <p>The cursor is run-local and deliberately not fault-tolerant: it is never written into a Jet
- * snapshot, so the source's position never lives in execution state. On an L1 restart the volatile ring
- * is gone; recovery re-mines the ring from the durable source read offset and this reader replays it from
- * the start. The offset truth stays in the durable coordination store, never in Jet.
+ * <p>The cursor is run-local and never written into a Jet snapshot. A durable reader resumes at the
+ * consumer's separately confirmed position and reads the recoverable log below the hot ring's head.
+ * Reading a batch publishes only read progress; it does not confirm downstream effects. The overloads
+ * without a log retain the volatile-ring behavior for callers that do not use durable shared capture.
  */
 public final class SrsRingReader {
 
     private final SrsRingbuffer ring;
     private final LongConsumer onAdvance;
+    private final String ringName;
+    private final SrsLogStore log;
     private long cursor;
 
     /**
@@ -45,10 +55,20 @@ public final class SrsRingReader {
      * last sequence it read, published once after each non-empty fill.
      */
     public SrsRingReader(SrsRingbuffer ring, long startSeq, LongConsumer onAdvance) {
+        this(ring, startSeq, onAdvance, null, null);
+    }
+
+    private SrsRingReader(SrsRingbuffer ring, long startSeq, LongConsumer onAdvance,
+            String ringName, SrsLogStore log) {
         this.ring = Objects.requireNonNull(ring, "ring");
         this.onAdvance = Objects.requireNonNull(onAdvance, "onAdvance");
+        this.ringName = ringName;
+        this.log = log;
         this.cursor = startSeq;
     }
+
+    /** The run-local next read position, used only to save an initial arrival before any fill; it is not an ACK. */
+    public long nextReadSequence() { return cursor; }
 
     /**
      * A reader positioned by a {@code start} point resolved against the ring: {@code earliest} at the head
@@ -86,20 +106,157 @@ public final class SrsRingReader {
      * it is not the head: a ring outlives the runs that read it, so its head can sit far below what this
      * consumer already landed, and starting there hands the target every change it has again.
      *
-     * <p>A ring numbers on across rebuilds rather than reusing sequences, so an acknowledged sequence still
-     * names the change it named. Two readings fall back to the head, and both replay rather than skip: a
-     * sequence below the head, because the ring was rebuilt past it and what it holds was mined again from
-     * the chain's durable read offset -- which no confirmation outruns; and a sequence beyond the tail,
-     * because a ring that never reached it is not the ring it was confirmed from, and trusting it there
-     * would pass over changes nobody confirmed.
+     * <p>A next sequence below the volatile ring's head is missing history, even if another consumer
+     * kept this same ring alive. Refuse it rather than skipping read-but-unconfirmed changes. A
+     * confirmed sequence beyond the tail still falls back to the head of a rebuilt ring. Durable shared
+     * capture uses the log-backed overload to recover history below the hot head.
      */
     public static SrsRingReader resumingAfter(SrsRingbuffer ring, long ackedSeq, LongConsumer onAdvance) {
         Objects.requireNonNull(ring, "ring");
         long head = ring.headSequence();
         long tail = ring.tailSequence();
         long next = ackedSeq + 1;
-        long start = next < head || next > tail + 1 ? head : next;
+        if (next < head) {
+            throw new TapstateException(CaptureError.RECOVERY_LOG_GAP, Map.of(
+                    "ring", ring.name(), "sequence", next,
+                    "reason", "the hot ring no longer retains the next change after this consumer's confirmed progress"
+                            + ": head=" + head + ", tail=" + tail), null);
+        }
+        long start = next > tail + 1 ? head : next;
         return new SrsRingReader(ring, start, onAdvance);
+    }
+
+    /**
+     * Opens a durable reader at the requested point in the retained log rather than at the hot buffer's
+     * head. A start instant searches bounded batches; a hole or a record without its original generation
+     * is an explicit recovery failure, never a reason to substitute a newer start.
+     */
+    public static SrsRingReader from(SrsRingbuffer ring, StartFrom start, LongConsumer onAdvance,
+            String retention, String ringName, SrsLogStore log) {
+        Objects.requireNonNull(start, "start");
+        Objects.requireNonNull(ringName, "ringName");
+        Objects.requireNonNull(log, "log");
+        SrsRingReader reader = new SrsRingReader(ring, 0L, onAdvance, ringName, log);
+        SrsLogBounds bounds = log.bounds(ringName);
+        reader.cursor = switch (start) {
+            case StartFrom.Earliest ignored -> nextSequence(bounds.trimmedThrough());
+            case StartFrom.Latest ignored -> nextSequence(bounds.largestSequence());
+            case StartFrom.At at -> reader.firstDurableSeqAtOrAfter(at, retention, bounds);
+        };
+        return reader;
+    }
+
+    /**
+     * Resumes exactly after this consumer's confirmed sequence or explicit first-arrival marker. The
+     * optional actual confirmation validates the retained record's original generation and token; a
+     * marker has no such claim. A trimmed confirmed record needs no replay, but every sequence after it
+     * must still be retained. In particular, neither a new hot head nor a later read cursor can advance
+     * this recovery boundary.
+     */
+    public static SrsRingReader resumingAfter(SrsRingbuffer ring, long ackedSeq,
+            ChainPosition confirmed, LongConsumer onAdvance, String ringName, SrsLogStore log) {
+        Objects.requireNonNull(ringName, "ringName");
+        Objects.requireNonNull(log, "log");
+        SrsRingReader reader = new SrsRingReader(ring, 0L, onAdvance, ringName, log);
+        SrsLogBounds bounds = log.bounds(ringName);
+        if (confirmed != null && confirmed.order() != null && confirmed.order().seq() >= 0
+                && confirmed.order().seq() > ackedSeq) {
+            // A confirmation that advanced after graph assembly still proves those effects landed.
+            ackedSeq = confirmed.order().seq();
+        }
+        if (ackedSeq < -1L || ackedSeq > bounds.largestSequence()) {
+            throw reader.gap(ackedSeq, "the recovery cursor does not belong to this retained log: tail="
+                    + bounds.largestSequence() + ", trimmedThrough=" + bounds.trimmedThrough());
+        }
+        reader.cursor = nextSequence(ackedSeq);
+        reader.requireRetained(reader.cursor, bounds);
+        if (confirmed != null && confirmed.order() == null) {
+            throw reader.gap(ackedSeq, "the confirmed position has no verified original capture order");
+        }
+        if (confirmed != null && confirmed.order() != null
+                && confirmed.order().seq() != SourceOrder.SNAPSHOT_SEQ) {
+            SourceOrder order = confirmed.order();
+            if (order.seq() != ackedSeq || order.epoch() < 1L) {
+                throw reader.gap(ackedSeq, "the confirmed position does not prove this table's recovery cursor");
+            }
+            if (ackedSeq > bounds.trimmedThrough()) {
+                reader.verifyConfirmation(ackedSeq, confirmed);
+            }
+        }
+        return reader;
+    }
+
+    private static long nextSequence(long sequence) {
+        return Math.addExact(sequence, 1L);
+    }
+
+    private void verifyConfirmation(long sequence, ChainPosition confirmed) {
+        SrsLogBatch batch = log.readBatch(ringName, sequence, 1);
+        // Compaction may retire this confirmed record during the lookup; the unread suffix must remain.
+        requireRetained(cursor, batch.bounds());
+        if (sequence <= batch.bounds().trimmedThrough()) return;
+        SrsLogRecord record = batch.records().get(sequence);
+        if (record == null) throw gap(sequence, "the retained log has no record at the required sequence");
+        if (record.epoch() < 1L) throw gap(sequence, "the retained record has no verified original capture generation");
+        if (record.epoch() != confirmed.order().epoch() || !Objects.equals(record.srcToken(), confirmed.token())) {
+            throw gap(sequence, "the confirmed position differs from the retained record's generation or token");
+        }
+    }
+
+    private long firstDurableSeqAtOrAfter(StartFrom.At at, String retention, SrsLogBounds bounds) {
+        long first = nextSequence(bounds.trimmedThrough());
+        boolean oldest = true;
+        while (first <= bounds.largestSequence()) {
+            int size = (int) Math.min(256L, bounds.largestSequence() - first + 1L);
+            SrsLogBatch batch = readDurable(first, size);
+            for (Map.Entry<Long, SrsLogRecord> entry : batch.records().entrySet()) {
+                if (oldest && entry.getValue().ts() > at.epochMilli()) {
+                    throw new TapstateException(CaptureError.START_FROM_OUTSIDE_WINDOW, Map.of(
+                            "requested", at.instant().toString(),
+                            "earliest", Instant.ofEpochMilli(entry.getValue().ts()).toString(),
+                            "retention", retention == null ? "unset" : retention), null);
+                }
+                oldest = false;
+                if (entry.getValue().ts() >= at.epochMilli()) {
+                    return entry.getKey();
+                }
+            }
+            first += size;
+        }
+        return nextSequence(bounds.largestSequence());
+    }
+
+    private void requireRetained(long sequence, SrsLogBounds bounds) {
+        if (sequence <= bounds.trimmedThrough()) {
+            throw gap(sequence, "the retained log was trimmed beyond this consumer's confirmed progress");
+        }
+    }
+
+    private SrsLogBatch readDurable(long first, int size) {
+        SrsLogBatch batch = log.readBatch(ringName, first, size);
+        requireRetained(first, batch.bounds());
+        for (int i = 0; i < size; i++) {
+            long sequence = first + i;
+            SrsLogRecord record = batch.records().get(sequence);
+            if (record == null) {
+                throw gap(sequence, "the retained log has no record at the required sequence");
+            }
+            if (record.epoch() < 1L) {
+                throw gap(sequence, "the retained record has no verified original capture generation");
+            }
+        }
+        return batch;
+    }
+
+    private TapstateException gap(long sequence, String reason) {
+        return new TapstateException(CaptureError.RECOVERY_LOG_GAP,
+                Map.of("ring", ringName, "sequence", sequence, "reason", reason), null);
+    }
+
+    private static SrsItem itemOf(SrsLogRecord record) {
+        return new SrsItem(record.srcToken() == null ? null : new SourcePosition(record.srcToken()),
+                record.op(), record.ts(), record.before(), record.after(), record.schemaVer(),
+                record.captureFence(), record.epoch());
     }
 
     private static long resolveStartSeq(SrsRingbuffer ring, StartFrom start, String retention) {
@@ -164,15 +321,66 @@ public final class SrsRingReader {
      */
     public int fill(ObjLongConsumer<SrsItem> out, int max) {
         Objects.requireNonNull(out, "out");
-        long tail = ring.tailSequence();
-        int emitted = 0;
-        while (cursor <= tail && emitted < max) {
-            out.accept(ring.readOne(cursor), cursor);
+        int emitted = drain((item, sequence) -> {
+            out.accept(item, sequence);
             cursor++;
-            emitted++;
+        }, max, ring.tailSequence());
+        if (emitted > 0) onAdvance.accept(cursor - 1);
+        return emitted;
+    }
+
+    int fill(SrsEventModelVerifier verifier, ObjLongConsumer<SrsItem> out, int max) {
+        if (!(verifier instanceof SrsEventModelVerifier.Batch batch)) {
+            return fill((item, sequence) -> {
+                verifier.verify(item, sequence);
+                out.accept(item, sequence);
+            }, max);
         }
-        if (emitted > 0) {
-            onAdvance.accept(cursor - 1);
+        long tail = ring.tailSequence();
+        if (cursor > tail || max < 1) return 0;
+        var items = new java.util.ArrayList<SrsItem>();
+        int emitted = drain((item, sequence) -> items.add(item), max, tail);
+        batch.verifyBatch(items, cursor);
+        for (SrsItem item : items) {
+            out.accept(item, cursor);
+            cursor++;
+        }
+        onAdvance.accept(cursor - 1);
+        return emitted;
+    }
+
+    private int drain(ObjLongConsumer<SrsItem> out, int max, long tail) {
+        long sequence = cursor;
+        long head = log == null || sequence > tail || max < 1 ? 0L : ring.headSequence();
+        int emitted = 0;
+        while (sequence <= tail && emitted < max) {
+            if (log != null && sequence < head) {
+                int size = (int) Math.min((long) max - emitted, Math.min(tail - sequence + 1L,
+                        head - sequence));
+                SrsLogBatch batch = readDurable(sequence, size);
+                for (int i = 0; i < size; i++) {
+                    out.accept(itemOf(batch.records().get(sequence)), sequence);
+                    sequence++;
+                    emitted++;
+                }
+            } else {
+                SrsItem item;
+                try {
+                    item = ring.readOne(sequence);
+                } catch (StaleSequenceException missing) {
+                    if (log == null) {
+                        throw missing;
+                    }
+                    throw gap(sequence, "the hot ring lost the required record and the durable log could not serve it");
+                }
+                if (log != null && (item == null || item.epoch() < 1L)) {
+                    throw gap(sequence, item == null ? "the required ring record is missing"
+                            : "the retained record has no verified original capture generation");
+                }
+                out.accept(item, sequence);
+                sequence++;
+                emitted++;
+            }
         }
         return emitted;
     }

@@ -64,6 +64,6 @@ public final class PipelineLayoutService {
     }
 
     private void requirePipeline(String pipelineId) {
-        pipelines.get(pipelineId);
+        pipelines.requireDefinition(pipelineId);
     }
 }

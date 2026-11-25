@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.messages.MessageCatalog;
@@ -15,6 +16,8 @@ import org.springframework.web.socket.config.annotation.EnableWebSocket;
 import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 
 import java.time.Duration;
+import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * Mounts the two thin streaming read channels on the same HTTP face as the one-shot verbs: a status
@@ -36,9 +39,16 @@ import java.time.Duration;
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @EnableWebSocket
 public class PipelineStreamConfiguration {
+    static final String STATUS_WATCH_PATH = "/api/pipelines/*/status/watch";
+    static final String LOGS_FOLLOW_PATH = "/api/pipelines/*/logs/follow";
 
     /** The poll cadence for both stream channels, ISO-8601 duration; a working single-node default. */
     private static final String DEFAULT_POLL_INTERVAL = "PT1S";
+
+    static Predicate<String> knownPipeline(PipelineCatalogService pipelines) {
+        Objects.requireNonNull(pipelines, "pipelines");
+        return pipelines::containsDefinition;
+    }
 
     /**
      * A small dedicated scheduler for the stream poll loops, kept off the request-serving threads. Managed
@@ -58,6 +68,7 @@ public class PipelineStreamConfiguration {
     WebSocketConfigurer pipelineStreamEndpoints(
             TaskScheduler pipelineStreamScheduler,
             PipelineObservationQueryService observations,
+            PipelineCatalogService pipelines,
             PipelineLogQueryService logs,
             CredentialAuthenticator credentials,
             MessageCatalog catalog,
@@ -65,13 +76,15 @@ public class PipelineStreamConfiguration {
         return registry -> {
             registry.addHandler(
                             new PipelineStatusWatchHandler(
-                                    observations, catalog, pipelineStreamScheduler, pollInterval),
-                            "/api/pipelines/*/status/watch")
+                                    observations,
+                                    knownPipeline(pipelines),
+                                    catalog, pipelineStreamScheduler, pollInterval),
+                            STATUS_WATCH_PATH)
                     .addInterceptors(new PipelineStreamHandshakeInterceptor(
                             credentials, ControlOperations.PIPELINE_STATUS));
             registry.addHandler(
                             new PipelineLogsFollowHandler(logs, pipelineStreamScheduler, pollInterval),
-                            "/api/pipelines/*/logs/follow")
+                            LOGS_FOLLOW_PATH)
                     .addInterceptors(new PipelineStreamHandshakeInterceptor(
                             credentials, ControlOperations.PIPELINE_LOGS));
         };

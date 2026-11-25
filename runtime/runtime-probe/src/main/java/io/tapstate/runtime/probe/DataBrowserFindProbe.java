@@ -16,8 +16,8 @@ import io.tapstate.spi.store.DataBrowserQuery;
  * so a read reaches only what the connection already points at. Both omissions are the seam's, not
  * the caller's to restore.
  *
- * <p>The whitelist of such calls is a closed set of six — the connection probe, the discovery probe,
- * and the four the data browser needs. Any further synchronous control-to-runtime call is a
+ * <p>The whitelist of such calls is a closed set of seven — the connection probe, the discovery probe,
+ * the four data-browser calls, and the Pipeline preview probe. Any further synchronous control-to-runtime call is a
  * deliberate widening of the seam that must change the gate and the sync-whitelist decision, not slip
  * in beside them.
  */

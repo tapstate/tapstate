@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import java.util.List;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.networknt.schema.JsonSchema;
 import com.networknt.schema.JsonSchemaFactory;
@@ -35,6 +37,54 @@ class SpecSchemaAgreesWithParserTest {
     private static final JsonSchema SCHEMA = JsonSchemaFactory
             .getInstance(SpecVersion.VersionFlag.V202012)
             .getSchema(SpecGenerator.schema());
+
+    @Test
+    void aStartRefusalNamesOneCanonicalCode() {
+        String specification = """
+                name: refused
+                pipeline: p.tap.yml
+                steps:
+                  - start_refused: TS0360004
+                """;
+        assertThat(EnvelopeParser.parse(specification).steps()).containsExactly(new Step.StartRefused("TS0360004"));
+        assertThat(validate(specification)).isEmpty();
+        String invalid = specification.replace("TS0360004", "not-a-code");
+        assertThat(catchThrowable(() -> EnvelopeParser.parse(invalid))).isInstanceOf(EnvelopeException.class);
+        assertThat(validate(invalid)).isNotEmpty();
+    }
+
+    @Test
+    void productFailureCodesAndHistoricalCodesAgreeOnBothDeclarationSurfaces() {
+        for (String code : List.of("TS0360004", "actuation.source-schema-not-discovered")) {
+            String specification = "name: code\npipeline: p.tap.yml\nsteps:\n  - start_refused: " + code
+                    + "\n  - assert:\n      failure_code: " + code + "\n";
+            assertThat(EnvelopeParser.parse(specification)).isNotNull();
+            assertThat(validate(specification)).isEmpty();
+        }
+        for (String code : List.of("TS0000001", "TS0360000", "TS03600040", "ts0360004", " TS0360004")) {
+            for (String declaration : List.of("  - start_refused: ", "  - assert:\n      failure_code: ")) {
+                String specification = "name: code\npipeline: p.tap.yml\nsteps:\n" + declaration + "\"" + code + "\"\n";
+                assertThat(catchThrowable(() -> EnvelopeParser.parse(specification))).isInstanceOf(EnvelopeException.class);
+                assertThat(validate(specification)).isNotEmpty();
+            }
+        }
+    }
+
+    @Test
+    void aManagedTargetIsOneInstallationFileRatherThanAnApplyList() {
+        String specification = """
+                name: managed
+                setup:
+                  managed_target: views.tap.yml
+                pipeline: p.tap.yml
+                steps: [start]
+                """;
+        assertThat(catchThrowable(() -> EnvelopeParser.parse(specification))).isNull();
+        assertThat(validate(specification)).isEmpty();
+        String array = specification.replace("managed_target: views.tap.yml", "managed_target: [views.tap.yml]");
+        assertThat(catchThrowable(() -> EnvelopeParser.parse(array))).isInstanceOf(EnvelopeException.class);
+        assertThat(validate(array)).isNotEmpty();
+    }
 
     @Test
     void theSchemaAcceptsEverySpecificationTheParserAccepts() {

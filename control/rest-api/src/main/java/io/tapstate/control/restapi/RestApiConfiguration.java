@@ -1,17 +1,25 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.PipelinePreviewService;
+import io.tapstate.control.core.AiProviderClient;
+import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.messages.MessageCatalog;
+import org.springframework.boot.webmvc.autoconfigure.WebMvcRegistrations;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.method.HandlerTypePredicate;
+import org.springframework.web.servlet.config.annotation.AsyncSupportConfigurer;
 import org.springframework.web.servlet.config.annotation.PathMatchConfigurer;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
+
+import java.time.Duration;
 
 /**
  * The HTTP presentation configuration: the single Spring context's Web MVC face over the control
- * core. It is imported into the one service context (there is no second application context and no
- * second port); the control verbs are projected onto HTTP here.
+ * core. The control verbs are projected here in the one service context. The assembly may supply a
+ * dedicated installation connector with its own channel and capability checks.
  *
  * <p>Every {@code @RestController} handler is mounted under the single {@code /api} prefix, so the
  * verb surface lives at one route root. A plain {@code @Controller} (not annotated
@@ -26,12 +34,35 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 @Configuration
 public class RestApiConfiguration {
 
+    private static final Duration ASYNC_RESPONSE_BUFFER = Duration.ofSeconds(15);
+
+    static long asyncRequestTimeoutMillis() {
+        long previewBudget = PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        long assistantBudget = OpenAiCompatibleClient.maximumProposalDuration().plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        return Math.max(Math.max(previewBudget, assistantBudget), 105000L);
+    }
+
+    @Bean
+    WebMvcRegistrations operationWebMvcRegistrations() {
+        return new WebMvcRegistrations() {
+            @Override
+            public RequestMappingHandlerMapping getRequestMappingHandlerMapping() {
+                return new OperationRequestMappingHandlerMapping();
+            }
+        };
+    }
+
     @Bean
     WebMvcConfigurer apiWebMvc() {
         return new WebMvcConfigurer() {
             @Override
             public void configurePathMatch(PathMatchConfigurer configurer) {
                 configurer.addPathPrefix("/api", HandlerTypePredicate.forAnnotation(RestController.class));
+            }
+
+            @Override
+            public void configureAsyncSupport(AsyncSupportConfigurer configurer) {
+                configurer.setDefaultTimeout(asyncRequestTimeoutMillis());
             }
         };
     }
@@ -44,5 +75,10 @@ public class RestApiConfiguration {
     @Bean
     MessageCatalog messageCatalog() {
         return MessageCatalog.bundled();
+    }
+
+    @Bean
+    AiProviderClient aiProviderClient() {
+        return new OpenAiCompatibleClient();
     }
 }

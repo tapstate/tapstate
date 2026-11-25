@@ -4,10 +4,15 @@ import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
+import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.WriteModel;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import org.bson.BsonMaximumSizeExceededException;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.bson.types.MaxKey;
@@ -77,6 +82,8 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
     /** The most bytes one Java character can become in UTF-8. Deliberately the bound, not the average. */
     private static final int WORST_CASE_BYTES_PER_CHAR = 3;
 
+    private static final String NAMESPACE_ARGUMENT = "namespace";
+
     private final MongoCollection<Document> collection;
 
     public MongoKeyedStateStore(MongoCollection<Document> collection) {
@@ -111,7 +118,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
      */
     @Override
     public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         Map<String, byte[]> loaded = new LinkedHashMap<>();
         List<Document> batch = new ArrayList<>();
         int idBytes = 0;
@@ -131,10 +138,41 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
 
     @Override
     public void save(String namespace, String key, byte[] state) {
-        Objects.requireNonNull(state, "state");
+        Objects.requireNonNull(state, STATE);
         Document document = new Document("_id", id(namespace, key)).append(STATE, new Binary(state));
         StoreIo.run(() -> collection.replaceOne(byId(namespace, key), document,
                 new ReplaceOptions().upsert(true)));
+    }
+
+    @Override
+    public void saveAll(String namespace, Map<String, byte[]> states) {
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
+        List<WriteModel<Document>> batch = new ArrayList<>();
+        long bytes = 0;
+        for (Map.Entry<String, byte[]> entry : states.entrySet()) {
+            byte[] value = Objects.requireNonNull(entry.getValue(), STATE);
+            long weight = ID_OVERHEAD_BYTES
+                    + (long) WORST_CASE_BYTES_PER_CHAR * (namespace.length() + entry.getKey().length())
+                    + value.length;
+            if (!batch.isEmpty() && (batch.size() >= MAX_KEYS_PER_READ
+                    || weight > MAX_ID_BYTES_PER_READ - bytes)) {
+                writeBatch(batch);
+                batch.clear();
+                bytes = 0;
+            }
+            Document document = new Document("_id", id(namespace, entry.getKey()))
+                    .append(STATE, new Binary(value));
+            batch.add(new ReplaceOneModel<>(byId(namespace, entry.getKey()), document,
+                    new ReplaceOptions().upsert(true)));
+            bytes += weight;
+        }
+        writeBatch(batch);
+    }
+
+    private void writeBatch(List<WriteModel<Document>> batch) {
+        if (!batch.isEmpty()) {
+            StoreIo.run(() -> collection.bulkWrite(batch, new BulkWriteOptions().ordered(true)));
+        }
     }
 
     /**
@@ -150,19 +188,19 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
      */
     @Override
     public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
-        Objects.requireNonNull(state, "state");
+        Objects.requireNonNull(state, STATE);
         Document onInsert = new Document("$setOnInsert", new Document(STATE, new Binary(state)));
         FindOneAndUpdateOptions asItWas = new FindOneAndUpdateOptions()
                 .upsert(true)
                 .returnDocument(ReturnDocument.BEFORE);
         Document before;
         try {
-            before = StoreIo.call(
-                    () -> collection.findOneAndUpdate(byId(namespace, key), onInsert, asItWas));
-        } catch (TapstateException e) {
-            if (!(e.getCause() instanceof MongoException mongo)
-                    || ErrorCategory.fromErrorCode(mongo.getCode()) != ErrorCategory.DUPLICATE_KEY) {
-                throw e;
+            before = collection.findOneAndUpdate(byId(namespace, key), onInsert, asItWas);
+        } catch (BsonMaximumSizeExceededException tooLarge) {
+            throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", "unknown"), null);
+        } catch (MongoException failure) {
+            if (ErrorCategory.fromErrorCode(failure.getCode()) != ErrorCategory.DUPLICATE_KEY) {
+                throw StoreIo.coded(failure);
             }
             // findAndModify reports duplicate keys as command failures, not write failures.
             // Lost the race: somebody else inserted between the check and the write. Their value is the
@@ -183,7 +221,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
 
     @Override
     public void dropNamespace(String namespace) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         StoreIo.run(() -> collection.deleteMany(new Document("_id." + NAMESPACE, namespace)));
     }
 
@@ -200,7 +238,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
      */
     @Override
     public long count(String namespace) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         Document lower = new Document(NAMESPACE, namespace).append(KEY, new MinKey());
         Document upper = new Document(NAMESPACE, namespace).append(KEY, new MaxKey());
         Document withinNamespace = new Document("_id",
@@ -233,7 +271,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
     }
 
     private static Document id(String namespace, String key) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         Objects.requireNonNull(key, "key");
         return new Document(NAMESPACE, namespace).append(KEY, key);
     }

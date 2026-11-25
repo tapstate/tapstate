@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -7,6 +8,7 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
@@ -19,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -76,6 +79,8 @@ public final class SnapshotPhase {
      * <p>One seam covers the whole round, taken from the first read and never replaced. A port may keep one
      * connector across the table reads or open one for each. Any later seam remains a check, not a new
      * start: moving the tail past a table already read would lose intervening deletes without a warning.
+     * A partial load with no recorded snapshot generation retains the prior checkpoint or consumer seam,
+     * because its unread, confirmed tables still need every change since that position.
      *
      * <p>Seeding the chain's meta record is a separate lifecycle step; recording the cdc-start position on
      * an unseeded chain is a caller ordering error surfaced by the store.
@@ -133,18 +138,18 @@ public final class SnapshotPhase {
         if (owed.isEmpty()) {
             return new Load(null, miningChainId, tables, owed, order, null, null, false);
         }
-        // A resume reuses the pair it read back. Both halves come from the same record and the same
-        // question, so one of them moving on its own is the state that has no meaning: rows pinned to a
-        // generation whose seam is somewhere else.
-        String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition).orElse(null);
+        // A known generation keeps its recorded seam. A legacy partial load must also replay changes
+        // for confirmed tables it leaves unread, so retain their start before recording a new epoch.
+        String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition)
+                .orElseGet(() -> owed.size() < tables.size() ? recordedTailStart(record, pipelineId) : null);
         SnapshotSession session = SnapshotSession.open(port, readOf(config, owed));
         CaptureBatch first = null;
         try {
             first = session.read(owed.getFirst());
             SourcePosition seam = seamOf(first, miningChainId);
             String tailSeam = resumedStart != null ? resumedStart : seam.token();
-            // A resume writes back the pair it read, unchanged; a new load writes the pair it sampled. Both
-            // are scoped to this pipeline, so neither can move another pipeline's tail or generation.
+            // Persist the replay anchor with the row generation. A partial legacy load can anchor before
+            // its sampled seam, so a restart also preserves changes for the tables left unread.
             meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
             return new Load(session, miningChainId, tables, owed, order, tailSeam, first, false);
         } catch (RuntimeException | Error failure) {
@@ -154,6 +159,108 @@ public final class SnapshotPhase {
             session.close();
             throw failure;
         }
+    }
+
+    /** Opens only a host-prepared session; its original model-pin receipt must exist before a load may proceed. */
+    public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation) {
+        return openPrepared(port,config,preparation,java.util.function.UnaryOperator.identity());
+    }
+    // The returned Load owns the session wrapper; failure paths close the first batch and session.
+    @SuppressWarnings("java:S2095")
+    public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation,
+            java.util.function.UnaryOperator<SnapshotSession> owner) {
+        Objects.requireNonNull(port,"port"); Objects.requireNonNull(config,"config"); Objects.requireNonNull(preparation,"preparation");
+        var run = preparation.run(); var owed = preparation.stillOwed(); var tables = preparation.tables();
+        var order = SourceOrder.snapshotRow(preparation.request().snapshotEpoch());
+        preparation.beginRead(); SnapshotSession session = null; CaptureBatch first = null;
+        try {
+            if (owed.isEmpty()) { preparation.close(); return new Load(null,run.miningChainId(),tables,owed,order,null,null,false); }
+            var opened = owner.apply(SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
+                    new TapstateException(io.tapstate.spi.store.IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",run.miningChainId()),null)));
+            session = new SnapshotSession() {
+                @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return opened.failureFact(failure); }
+                @Override public CaptureBatch read(String table) {
+                    preparation.requireReading();
+                    var batch = opened.read(table);
+                    try { preparation.requireReading(); return guardedBatch(batch,preparation); }
+                    catch (RuntimeException | Error failure) { closing(failure,batch::close); throw failure; }
+                }
+                @Override public void close() { preparation.close(); opened.close(); }
+            };
+            first = session.read(owed.getFirst());
+            seamOf(first,run.miningChainId());
+            var pin = preparation.accepted();
+            return new Load(session,run.miningChainId(),tables,owed,order,pin.sourcePosition(),first,false);
+        } catch (RuntimeException | Error failure) {
+            preparation.close();
+            if (first != null) closing(failure,first::close);
+            if (session != null) closing(failure,session::close);
+            throw failure;
+        }
+    }
+
+    /** A private load pins only its own existing channel and never creates an SRS consumer or model. */
+    public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation) {
+        return openDirectPrepared(port,config,preparation,java.util.function.UnaryOperator.identity());
+    }
+    // The returned Load owns the session wrapper; failure paths close the first batch and session.
+    @SuppressWarnings("java:S2095")
+    public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation,
+            java.util.function.UnaryOperator<SnapshotSession> owner) {
+        Objects.requireNonNull(port,"port");Objects.requireNonNull(config,"config");Objects.requireNonNull(preparation,"preparation");
+        var owed=preparation.stillOwed();var tables=preparation.tables();var order=SourceOrder.snapshotRow(preparation.request().snapshotEpoch());
+        preparation.beginRead();SnapshotSession session=null;CaptureBatch first=null;
+        try {
+            if(owed.isEmpty()) {
+                preparation.prepareRetained();String seam=preparation.accepted().token();preparation.close();
+                return new Load(null,preparation.channel(),tables,owed,order,seam,null,false);
+            }
+            var opened=owner.apply(SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
+                    new TapstateException(io.tapstate.spi.store.IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",preparation.channel()),null)));
+            session=new SnapshotSession() {
+                @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return opened.failureFact(failure); }
+                @Override public CaptureBatch read(String table) {
+                    preparation.requireReading();var batch=opened.read(table);
+                    try {preparation.requireReading();return guardedBatch(batch,preparation::requireReading);}
+                    catch(RuntimeException|Error failure){closing(failure,batch::close);throw failure;}
+                }
+                @Override public void close(){preparation.close();opened.close();}
+            };
+            first=session.read(owed.getFirst());seamOf(first,preparation.channel());String anchor=preparation.accepted().token();
+            return new Load(session,preparation.channel(),tables,owed,order,anchor,first,false);
+        } catch(RuntimeException|Error failure) {
+            preparation.close();if(first!=null)closing(failure,first::close);if(session!=null)closing(failure,session::close);throw failure;
+        }
+    }
+
+    private static CaptureBatch guardedBatch(CaptureBatch original,SrsSnapshotPreparation preparation) {
+        return guardedBatch(original,preparation::requireReading);
+    }
+    private static CaptureBatch guardedBatch(CaptureBatch original,Runnable requireReading) {
+        return new CaptureBatch() {
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) { return original.failureFact(failure); }
+            private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+            @Override public Optional<SourcePosition> seam() { requireReading.run(); return original.seam(); }
+            @Override public boolean hasNext() { requireReading.run(); return original.hasNext(); }
+            @Override public Envelope next() { requireReading.run(); return original.next(); }
+            @Override public synchronized void close() { if (!closed.get()) {original.close();closed.set(true);} }
+        };
+    }
+
+    private static Throwable closing(Throwable primary,Runnable close) {
+        try { close.run(); }
+        catch (RuntimeException | Error cleanup) {
+            if (primary == null) return cleanup;
+            if (cleanup != primary) primary.addSuppressed(cleanup);
+        }
+        return primary;
+    }
+
+    private static String recordedTailStart(Optional<SrsMeta> record, String pipelineId) {
+        return record.map(stored -> stored.sourceReadOffset() != null
+                        ? stored.sourceReadOffset()
+                        : stored.consumerOffset(pipelineId).map(ConsumerOffset::cdcStartPosition).orElse(null))
+                .orElse(null);
     }
 
     /**
@@ -173,8 +280,8 @@ public final class SnapshotPhase {
      * samples no seam and starts no snapshot the tail has to cover.
      *
      * <p>The seam is handed back rather than left to be read off the chain's record, and that is the whole
-     * point of it being here. It is the seam sampled by this invocation, so the tail can start without a
-     * second store read and without racing a later update to the same pipeline's durable record.
+     * point of it being here. It is the replay anchor settled by this invocation, so the tail can start
+     * without a second store read or racing a later update to the same pipeline's durable record.
      */
     public record Outcome(long rows, String tailSeam) {
     }
@@ -209,7 +316,7 @@ public final class SnapshotPhase {
      * narrows each bounded read to one table when that read opens.
      */
     private static CaptureConfig readOf(CaptureConfig config, List<String> tables) {
-        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node());
+        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node(), config.sharedNotes(), config.nodeConfig());
     }
 
     /**
@@ -276,6 +383,10 @@ public final class SnapshotPhase {
      * through -- one read covers them all, so no table is through before the last row of the batch is.
      */
     public static Load openChainless(CapturePort port, CaptureConfig config, long snapshotEpoch) {
+        return openChainless(port,config,snapshotEpoch,java.util.function.UnaryOperator.identity());
+    }
+    public static Load openChainless(CapturePort port,CaptureConfig config,long snapshotEpoch,
+            java.util.function.UnaryOperator<CaptureBatch> owner) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         if (snapshotEpoch < 1) {
@@ -283,8 +394,10 @@ public final class SnapshotPhase {
                     "a chainless snapshot generation must be positive, got " + snapshotEpoch);
         }
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
-        CaptureBatch batch = port.snapshot(config);
-        return new Load(null, null, config.streams(), config.streams(), order, null, batch, true);
+        // Construct the owner before opening a source read that it must release.
+        Load load = new Load(null, null, config.streams(), config.streams(), order, null, null, true);
+        load.open = owner.apply(SnapshotOnlyCapture.open(port, config));
+        return load;
     }
 
     /**
@@ -307,7 +420,14 @@ public final class SnapshotPhase {
         private final String tailSeam;
         private final boolean oneBatch;
         private CaptureBatch open;
+        private final AtomicReference<FailureFact> capturedFailure = new AtomicReference<>();
+
+        public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+            var captured = capturedFailure.get();
+            return captured != null && captured.cause() == failure ? captured : new io.tapstate.core.common.FailureFact(failure);
+        }
         private boolean closed;
+        private boolean disposed;
 
         private Load(SnapshotSession session, String miningChainId, List<String> tables,
                 List<String> owed, SourceOrder order, String tailSeam, CaptureBatch open, boolean oneBatch) {
@@ -369,19 +489,16 @@ public final class SnapshotPhase {
         public void close() {
             CaptureBatch batch;
             synchronized (this) {
+                if (disposed) return;
                 closed = true;
                 batch = open;
-                open = null;
             }
-            try {
-                if (session != null) {
-                    session.close();
-                }
-            } finally {
-                if (batch != null) {
-                    batch.close();
-                }
-            }
+            Throwable failure = null;
+            if (session != null) failure = closing(failure,session::close);
+            if (batch != null) failure = closing(failure,batch::close);
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
+            synchronized (this) { if (open == batch) open = null; disposed = true; }
         }
 
         private long readOpenBatch(Consumer<Envelope> sink) {
@@ -396,15 +513,42 @@ public final class SnapshotPhase {
                     sink.accept(batch.next().withOrder(order));
                     count++;
                 }
-            } finally {
-                synchronized (this) {
-                    if (open == batch) {
-                        open = null;
-                    }
+            } catch (RuntimeException | Error failure) {
+                try {
+                    recordReadFailure(batch, failure);
+                } finally {
+                    closeReadBatch(batch, failure);
                 }
-                batch.close();
+                throw failure;
             }
+            closeReadBatch(batch, null);
             return count;
+        }
+
+        private void recordReadFailure(CaptureBatch batch, Throwable failure) {
+            try {
+                capturedFailure.set(batch.failureFact(failure));
+            } catch (RuntimeException | LinkageError unavailable) {
+                capturedFailure.set(FailureFact.unavailable(failure));
+            }
+        }
+
+        private void closeReadBatch(CaptureBatch batch, Throwable primary) {
+            try {
+                batch.close();
+            } catch (RuntimeException | Error cleanup) {
+                if (primary == null) throw cleanup;
+                if (!(primary instanceof VirtualMachineError)
+                        && (cleanup instanceof Error || primary instanceof CancellationException)) {
+                    if (cleanup != primary) cleanup.addSuppressed(primary);
+                    throw cleanup;
+                }
+                if (cleanup != primary) primary.addSuppressed(cleanup);
+                return;
+            }
+            synchronized (this) {
+                if (open == batch) open = null;
+            }
         }
 
         /**
@@ -417,7 +561,13 @@ public final class SnapshotPhase {
          */
         private void openBatchOf(String table) {
             requireOpen();
-            CaptureBatch batch = session.read(table);
+            CaptureBatch batch;
+            try { batch = session.read(table); }
+            catch (RuntimeException | Error failure) {
+                try { capturedFailure.set(session.failureFact(failure)); }
+                catch (RuntimeException | LinkageError unavailable) { capturedFailure.set(FailureFact.unavailable(failure)); }
+                throw failure;
+            }
             try {
                 seamOf(batch, miningChainId);
             } catch (RuntimeException | Error failure) {

@@ -63,7 +63,8 @@ final class Vocabulary {
     static final List<String> TOP_LEVEL_KEYS = componentsOf(Envelope.class);
 
     /** The provisioning facet's keys, in dependency order - which is the order they are declared. */
-    static final List<String> SETUP_KEYS = componentsOf(Setup.class);
+    static final List<String> SETUP_KEYS = componentsOf(Setup.class).stream()
+            .map(key -> key.equals("managedTarget") ? "managed_target" : key).toList();
 
     /** Store kinds the harness can provide, as a specification spells them. */
     static final SortedSet<String> DATABASE_KINDS = sorted(DatabaseKind.values(), DatabaseKind::word);

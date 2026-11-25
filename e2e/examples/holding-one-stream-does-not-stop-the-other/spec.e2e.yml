@@ -37,7 +37,8 @@ setup:
     fulfillment: { kind: postgres }
     store: { kind: mongo }
   connectors: [mysql, postgres, mongodb]
-  apply: [orders_db.tap.yml, fulfillment_db.tap.yml, views.tap.yml, order_pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [orders_db.tap.yml, fulfillment_db.tap.yml, order_pipeline.tap.yml]
   discover: [orders_db, fulfillment_db]
 pipeline: order_pipeline.tap.yml
 seed:
@@ -60,7 +61,7 @@ steps:
   - start
   - await: { count: { views.order_state: 5 } }
   - await: { doc: { views.order_state: { where: { id: 1 }, expect: { customer: alice }, size: { shipments: 2 } } } }
-  - assert: { doc: { views.order_state: { where: { id: 2 }, expect: { customer: bob }, size: { shipments: 2 } } } }
+  - await: { doc: { views.order_state: { where: { id: 2 }, expect: { customer: bob }, size: { shipments: 2 } } } }
 
   # Hold the second engine's stream. The database keeps accepting writes; they just cannot cross.
   - pause: fulfillment_db

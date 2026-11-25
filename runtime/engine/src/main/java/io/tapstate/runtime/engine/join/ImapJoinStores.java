@@ -3,7 +3,10 @@ package io.tapstate.runtime.engine.join;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.ReadOnly;
 import com.hazelcast.map.EntryProcessor;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.ProtectedMap;
+import io.tapstate.runtime.engine.OperatorRunManifest;
+import io.tapstate.runtime.engine.OperatorStepMaps;
+import io.tapstate.spi.store.OperatorPlacement;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -58,12 +61,18 @@ public final class ImapJoinStores implements JoinStores {
     private final String pipelineId;
     private final String stepId;
     private final int pageSize;
+    private final OperatorStepMaps names;
 
     public ImapJoinStores(HazelcastInstance member, String pipelineId, String stepId) {
         this(member, pipelineId, stepId, ReverseIndex.DEFAULT_PAGE_SIZE);
     }
 
-    public ImapJoinStores(HazelcastInstance member, String pipelineId, String stepId, int pageSize) {
+    public ImapJoinStores(HazelcastInstance member, String pipelineId, String stepId, int pageSize) { this(member,pipelineId,stepId,pageSize,null); }
+    public ImapJoinStores(HazelcastInstance member,String pipelineId,String stepId,OperatorRunManifest original) {
+        this(member,pipelineId,stepId,ReverseIndex.DEFAULT_PAGE_SIZE,Objects.requireNonNull(original,"original"));
+    }
+    private ImapJoinStores(HazelcastInstance member,String pipelineId,String stepId,int pageSize,OperatorRunManifest original) {
+        this.names = original == null ? null : original.forStep(pipelineId,stepId);
         this.member = Objects.requireNonNull(member, "member");
         this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
         this.stepId = Objects.requireNonNull(stepId, "stepId");
@@ -123,7 +132,7 @@ public final class ImapJoinStores implements JoinStores {
 
     @Override
     public int indexPageCount(String source, String dimensionKey) {
-        IMap<ReverseBucket.At, ReverseBucket> pages = index(source);
+        ProtectedMap<ReverseBucket.At, ReverseBucket> pages = index(source);
         ReverseBucket head = pages.get(new ReverseBucket.At(dimensionKey, 0));
         return head == null ? 0 : lastPage(pages, dimensionKey, head) + 1;
     }
@@ -173,7 +182,7 @@ public final class ImapJoinStores implements JoinStores {
      */
     @Override
     public void indexAdd(String source, String dimensionKey, String factKey) {
-        IMap<ReverseBucket.At, ReverseBucket> pages = index(source);
+        ProtectedMap<ReverseBucket.At, ReverseBucket> pages = index(source);
         ReverseBucket head = pages.get(new ReverseBucket.At(dimensionKey, 0));
         int page = head == null ? 0 : head.furtherPages();
         while (!Boolean.TRUE.equals(
@@ -189,7 +198,7 @@ public final class ImapJoinStores implements JoinStores {
 
     @Override
     public void indexRemove(String source, String dimensionKey, String factKey) {
-        IMap<ReverseBucket.At, ReverseBucket> pages = index(source);
+        ProtectedMap<ReverseBucket.At, ReverseBucket> pages = index(source);
         ReverseBucket head = pages.get(new ReverseBucket.At(dimensionKey, 0));
         if (head == null) {
             return;
@@ -229,7 +238,7 @@ public final class ImapJoinStores implements JoinStores {
      * the same place. Nothing between the two opens a page, and were something to, this would start
      * below the end and trim less - which the next removal's trim does instead.
      */
-    private void trim(IMap<ReverseBucket.At, ReverseBucket> pages, String dimensionKey, int end) {
+    private void trim(ProtectedMap<ReverseBucket.At, ReverseBucket> pages, String dimensionKey, int end) {
         int page = end;
         // Read-then-delete would be a page emptied by this thread and refilled by another between the
         // two, so the emptiness is decided where the entry lives and the delete happens there or not
@@ -255,7 +264,7 @@ public final class ImapJoinStores implements JoinStores {
     }
 
     /** The last page of this bucket: the hint, then upwards while a further page is there. */
-    private static int lastPage(IMap<ReverseBucket.At, ReverseBucket> pages, String dimensionKey,
+    private static int lastPage(ProtectedMap<ReverseBucket.At, ReverseBucket> pages, String dimensionKey,
             ReverseBucket head) {
         int page = head.furtherPages();
         while (pages.containsKey(new ReverseBucket.At(dimensionKey, page + 1))) {
@@ -264,20 +273,27 @@ public final class ImapJoinStores implements JoinStores {
         return page;
     }
 
-    private IMap<String, Map<String, Object>> facts() {
-        return member.getMap(JoinMaps.factMirror(pipelineId, stepId));
+    // Every map this store reaches waits out the cluster refusing an operation on it, one operation at a time:
+    // a member joining takes parts of this state over before its protection verdict has caught up.
+
+    private ProtectedMap<String, Map<String, Object>> facts() {
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_FACTS,null,JoinMaps.factMirror(pipelineId,stepId))));
     }
 
-    private IMap<String, Map<String, Object>> dimension(String source) {
-        return member.getMap(JoinMaps.dimensionMirror(pipelineId, stepId, source));
+    private ProtectedMap<String, Map<String, Object>> dimension(String source) {
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_DIMENSIONS,source,JoinMaps.dimensionMirror(pipelineId,stepId,source))));
     }
 
-    private IMap<ReverseBucket.At, ReverseBucket> index(String source) {
-        return member.getMap(JoinMaps.reverseIndex(pipelineId, stepId, source));
+    private ProtectedMap<ReverseBucket.At, ReverseBucket> index(String source) {
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_INDEXES,source,JoinMaps.reverseIndex(pipelineId,stepId,source))));
     }
 
-    private IMap<String, Long> writers() {
-        return member.getMap(JoinMaps.writers(pipelineId, stepId));
+    private ProtectedMap<String, Long> writers() {
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_WRITERS,null,JoinMaps.writers(pipelineId,stepId))));
+    }
+
+    private String name(OperatorPlacement.Resource kind,String alias,String legacy) {
+        return names == null ? legacy : names.join(kind,alias).mapName();
     }
 
     /** Appends one fact key to a page, or says the page is full. Runs where the entry lives. */

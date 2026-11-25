@@ -1,6 +1,9 @@
 package io.tapstate.control.core;
 
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.ConnectorErrorDefinitions;
+import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
@@ -33,17 +36,6 @@ public final class SchemaDiscoveryService {
     private final SourceConnectionResolver sourceConnections;
 
     public SchemaDiscoveryService(
-            SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock) {
-        this(probe, schemaStore, auditGate, clock, null);
-    }
-
-    public SchemaDiscoveryService(
-            SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
-            ConnectorConfigValidator configValidator) {
-        this(probe, schemaStore, auditGate, clock, configValidator, null);
-    }
-
-    public SchemaDiscoveryService(
             SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
         this.probe = Objects.requireNonNull(probe, "probe");
@@ -51,7 +43,7 @@ public final class SchemaDiscoveryService {
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.configValidator = configValidator;
-        this.sourceConnections = sourceConnections;
+        this.sourceConnections = Objects.requireNonNull(sourceConnections, "sourceConnections");
     }
 
     /**
@@ -65,21 +57,44 @@ public final class SchemaDiscoveryService {
      */
     public SchemaReport discover(
             String connectionId, String connectorId, Map<String, Object> settings, String principal) {
-        ConnectionConfig config = sourceConnections == null
-                ? new ConnectionConfig(connectionId, connectorId, settings)
-                : sourceConnections.resolve(connectionId, connectorId, settings);
-        if (configValidator != null) {
-            configValidator.validate(config.connectorId(), config.settings());
+        SourceConnectionResolver.ResolvedConnection resolved =
+                sourceConnections.resolveWithSecrets(connectionId, connectorId, settings);
+        ConnectionConfig config = resolved.config();
+        try {
+            if (configValidator != null) {
+                configValidator.validate(config.connectorId(), config.settings(), resolved.catalogSnapshot());
+            }
+            return auditGate.dispatch(
+                    ControlOperations.CONNECTION_DISCOVER_SCHEMA,
+                    new AuditContext(principal, config.id()),
+                    () -> {
+                        SourceModel model = probe.discover(config);
+                        DiscoveredSourceModel discovered =
+                                new DiscoveredSourceModel(config.id(), config.connectorId(), clock.millis(), model);
+                        schemaStore.save(discovered);
+                        return SchemaReport.from(discovered);
+                    });
+        } catch (TapstateException failure) {
+            TapstateException safe = ConnectionTestResultRedactor.redact(failure, resolved.secretValues());
+            String code = safe.code().code();
+            if (code.equals(ConnectorErrorDefinitions.DISCOVERY_AUTHENTICATION_REJECTED.code())
+                    || code.equals(ConnectorErrorDefinitions.DISCOVERY_CONNECTION_TIMEOUT.code())
+                    || code.equals(ConnectorErrorDefinitions.DISCOVER_FAILED.code())) {
+                Object detail = safe.args().get("detail");
+                Throwable cause = failure.getCause();
+                String raw = detail instanceof String text ? text : null;
+                if (raw == null && cause != null && cause.getMessage() != null) {
+                    raw = SecretRedactor.redactConnectionDiagnostic(
+                            cause.getClass().getSimpleName() + ": " + cause.getMessage(), resolved.secretValues());
+                }
+                if (raw != null && !raw.isBlank()) {
+                    Map<String, Object> diagnostic = raw.length() <= 4096
+                            ? Map.of("code", code, "codeSource", "tapstate-standard", "rawMessage", raw)
+                            : Map.of("code", code, "codeSource", "tapstate-standard", "rawMessage", raw.substring(0, 4096), "truncated", true);
+                    throw new ConnectionDiagnosticRefusal(safe, diagnostic);
+                }
+            }
+            throw safe;
         }
-        return auditGate.dispatch(
-                ControlOperations.CONNECTION_DISCOVER_SCHEMA,
-                new AuditContext(principal, config.id()),
-                () -> {
-                    SourceModel model = probe.discover(config);
-                    DiscoveredSourceModel discovered =
-                            new DiscoveredSourceModel(config.id(), config.connectorId(), clock.millis(), model);
-                    schemaStore.save(discovered);
-                    return SchemaReport.from(discovered);
-                });
     }
 }

@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The handle a {@link CaptureRunUnit#start started} source run hands back — what the assembly did and the
@@ -48,6 +49,7 @@ public final class CaptureRun implements AutoCloseable {
     private final Optional<StreamSource<SrsItem>> ringSource;
     private final Optional<Subscription> cdcSubscription;
     private final CaptureHealth health;
+    private final AtomicReference<Runnable> widening = new AtomicReference<>(() -> { });
 
     /** The load still being read behind this run; null for a run handed back with its load already over. */
     private final BackgroundLoad load;
@@ -126,6 +128,17 @@ public final class CaptureRun implements AutoCloseable {
 
     public CaptureHealth health() {
         return health;
+    }
+
+    /** Registers how this shared reader takes on tables requested after it opened. */
+    public CaptureRun withWidening(Runnable handler) {
+        widening.set(Objects.requireNonNull(handler, "handler"));
+        return this;
+    }
+
+    /** Takes on pending table requests; runs without a shared reader have nothing to widen. */
+    public void widen() {
+        widening.get().run();
     }
 
     /** Whether this run is still reading its load, or opening the tail that follows it. */

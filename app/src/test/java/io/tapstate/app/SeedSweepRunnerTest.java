@@ -41,9 +41,13 @@ import org.springframework.boot.DefaultApplicationArguments;
 class SeedSweepRunnerTest {
 
     private final ListAppender<ILoggingEvent> logLines = new ListAppender<>();
+    private Level previousLevel;
 
     @BeforeEach
     void captureRunnerLog() {
+        previousLevel = runnerLogger().getLevel();
+        // Other application-context tests may leave the root logger at ERROR.
+        runnerLogger().setLevel(Level.INFO);
         logLines.start();
         runnerLogger().addAppender(logLines);
     }
@@ -52,6 +56,7 @@ class SeedSweepRunnerTest {
     void releaseRunnerLog() {
         runnerLogger().detachAppender(logLines);
         logLines.stop();
+        runnerLogger().setLevel(previousLevel);
     }
 
     @Test

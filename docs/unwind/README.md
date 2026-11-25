@@ -36,7 +36,7 @@ If both locator options are present, `element_key` supplies identity and
 `element_key` and use `include_array_index`; the key becomes `(id, item_no)`.
 At least one locator is required. Generated column names must differ from parent
 column names, the array path, and each other. Assembly refuses a known collision with
-`dsl.unwind-column-already-exists` before the job runs. If an extra field absent from
+`TS0010027` before the job runs. If an extra field absent from
 the discovered model appears in a row, the same check stops expansion before that
 row can overwrite it. Choose another generated name or rename the parent field in
 an earlier `map`.
@@ -47,12 +47,147 @@ an earlier `map`.
 | `element_key` | Identity field inside each element. Also creates a top-level column of the same name. |
 | `include_array_index` | Adds a zero-based ordinal column. Supplies element identity when `element_key` is absent. |
 | `preserve_null_and_empty_arrays` | Defaults to `false`: null, missing and empty arrays produce no rows. `true` retains one row with the expanded field and locator columns set to null. |
+| `source_id_field` | Optional top-level name for a preserved parent identity when the target requires an independent generated identity. Defaults to `_unwind_source_id`. It adds no field when automatic separation is unnecessary. |
 | `element_type` | Optional declared type of the expanded column, such as `json` for objects. Without it the type is unresolved and the connector infers it. It does not convert values. |
 
 A non-array value is treated as one element. This includes a string containing
 JSON text: decode text into an array before expansion. Output order is not
 guaranteed; use the ordinal column when order matters. A second unwind inherits
 the first expansion's key and adds its own locator.
+
+## Target identity checks
+
+The logical key of an expanded row combines the parent key and the element
+locator. Some targets also enforce an independent identity constraint. For example,
+MongoDB requires `_id` alone to be unique, even when a unique compound index exists
+on `(_id, item_no)`. Copying the same parent `_id` into two expanded documents then
+fails with a duplicate-key error. MongoDB's native `$unwind` preserves `_id`; it does
+not resolve that target constraint.
+
+Tapstate checks each destination separately before preview and START. Automatic
+separation applies only when all of the following hold:
+
+- An unwind expanded the row key, and the target's mandatory identity is inherited
+  from the repeated parent key.
+- The target can generate an independent identity when that field is omitted.
+- The original identity can be preserved without overwriting an existing field.
+- The complete expanded logical key can reliably match updates, deletes and
+  replayed events, backed by a full unique index.
+- Other target unique constraints remain compatible with every expanded row.
+
+For an eligible MongoDB target, a logical row such as
+`{"_id":"order-1","items":"a","item_no":0}` is written as
+`{"_unwind_source_id":"order-1","items":"a","item_no":0}`. MongoDB generates a
+new `_id`. Matching uses `(_unwind_source_id, item_no)`, so replay updates the same
+row instead of creating another one. The original value and type are preserved,
+including BSON ObjectId values. The same projection applies to before images,
+after images, deletes and the target model.
+
+This decision is based on constraints, not just a database name. An ordinary
+composite-key target keeps its fields unchanged. An existing PostgreSQL or MySQL
+table with an independently generated identity can also qualify, provided its
+schema already contains the preserved field and a non-null, complete unique
+matching key. Automatic relational mapping currently requires signed 64-bit
+integer source keys and ordinary writable signed BIGINT target columns for every
+matching component. Every before/after key value is also checked at write time:
+strings, floating-point values, decimals, nulls and values outside the signed
+64-bit range are rejected before any row in that batch reaches the connector.
+Sampled integer metadata therefore cannot silently authorize later CDC type drift.
+Other representations, including string-to-number coercion, decimal rounding and
+unknown widths, are refused until lossless equality can be established. Tapstate does not add missing columns to an existing relational
+table, remove business constraints, or rename unrelated unique fields to make a
+write succeed. For relational targets, partial, expression, prefix or
+non-simple-collation unique indexes do not establish the required guarantee and
+block automatic separation.
+MySQL character-collated unique keys are conservatively refused, including binary
+collations with unproven padding semantics. PostgreSQL nondeterministic collations
+are refused. A compatible
+composite primary key does not exempt conflicting secondary business indexes.
+Existing targets whose connectors cannot expose exact constraint metadata are
+refused until that metadata can be verified.
+
+For MongoDB, index inspection uses the connector's existing index-query capability,
+which reads `listIndexes`. Matching unique or primary indexes are accepted using
+the portable PDK index declaration. MongoDB-specific options such as sparse,
+partial filters and collation are not represented by that declaration and are not
+validated by this check. The destination owner must ensure those options are
+suitable for the rows and key comparisons used by the pipeline. This check does
+not require `$indexStats` or the `indexStats` privilege.
+
+If index querying is unavailable, fails or returns malformed metadata, START is
+blocked with `TS0060003`. A required logical index
+may be prepared for a new or empty collection, or when the existing full-load
+policy explicitly clears the collection. Preparation is followed by another
+index query before writes begin. A populated collection without the matching
+index requires an explicit migration or a new destination.
+
+MongoDB automatic matching accepts canonical scalar keys: strings, booleans,
+signed 64-bit integers, ObjectIds, binary values with preserved subtype, and dates
+with millisecond precision. Arrays, objects, null or missing key components,
+floating-point/decimal values and sub-millisecond dates are refused. This applies
+to every component of every before and after key; `preserve_null_and_empty_arrays`
+cannot produce a null locator for an automatically separated target. Use a stable
+scalar element key or an ordinal locator for these targets. Integer input is
+normalized by source capture; manually generated keys must use that canonical
+representation. ObjectId and its hexadecimal string share a logical source key;
+they are not independent element identifiers. A CDC update that changes only a
+key's BSON representation (for example ObjectId to the same hexadecimal string)
+is refused before writing, because its previous native predicate would not remain
+replayable. Keep each logical key's representation stable.
+
+Before any connector write in a batch, Tapstate also reads the target records that
+its before/after keys could match and checks their actual BSON key types. A full
+unique index alone does not rule out MongoDB multikey matching: scalar `"a"` can
+match an existing `["a"]`. Such a row blocks the batch before an update or delete
+can affect it. The checks use bounded groups of complete key predicates through
+the connector's read-only aggregate command; the target must permit these reads.
+Unavailable or incomplete checks fail closed. Only matching records are examined;
+this is not a complete audit of existing data. Keep the target key/index contract
+stable while the pipeline runs and explicitly migrate incompatible existing data.
+
+### Configuration and preview
+
+The Wizard's unwind advanced options expose **Source identity field**, initialized
+to the effective upstream name or `_unwind_source_id`. Restore default explicitly
+sets `_unwind_source_id`, overriding an inherited custom name. For example:
+
+```yaml
+- id: lines
+  from: [orders]
+  type: unwind
+  path: items
+  include_array_index: item_no
+  source_id_field: original_order_id
+```
+
+Use a nonblank top-level name without dots, a leading `$`, or a NUL character.
+A collision with a source field is shown beside the setting and blocks START;
+a collision detected only in a runtime row also fails before overwriting data.
+With successive unwinds, an omitted setting inherits the upstream choice; an explicit setting overrides
+it for downstream targets. The full matching key includes every locator.
+Different source streams may keep different settings when they reach independent
+targets, or when their target needs no automatic separation. If branches reaching
+one target actually require automatic separation, the chosen name and complete
+matching key must agree; otherwise the target panel reports **Action required**.
+START identifies each contributing source stream in its diagnostics, including
+multiple streams routed through the same sync element. A conflicting mapping
+blocks the start before desired state or an audit operation is written.
+Resolve that target's conflicting settings or send the streams to separate targets.
+An unused difference never adds fields or blocks an ordinary compatible target.
+
+The target panel reports **No change needed**, **Automatic**, or **Action required**
+for each destination. An automatic result shows the original and preserved field,
+the complete matching key, and which physical field is generated on write. The
+**Logical operator result** preview retains the original logical fields; **Target
+write result** shows the projected fields. A generated physical identity is
+annotated as generated on write and is not fabricated in preview.
+
+Changing the candidate invalidates the previous check. START performs fresh checks
+against the saved configuration and current target metadata. Automatic handling
+requires no confirmation dialog or additional mapping step. Do not change
+`source_id_field` for a populated destination as a hot migration: existing rows are
+not rewritten, and an incompatible existing matching index blocks the new mapping.
+Use a new destination or explicitly migrate and validate existing data first.
 
 ## Changes and deletion
 
@@ -64,20 +199,20 @@ or removal of an element from the middle of an indexed array.
 The source must provide a complete previous image for updates and deletes. The
 runtime requires every parent key column and at least one other column. A missing,
 empty or key-only previous image stops with
-`transform.unwind-needs-a-complete-before-image`. For MySQL CDC, configure full
+`TS0450007`. For MySQL CDC, configure full
 binlog row images. For MongoDB CDC, enable source collection pre-images.
 A full document without the optional array field is allowed when it has another
 non-key field. A document consisting only of its key cannot be distinguished from
 a partial image and is refused.
 
 Duplicate element keys still emit all rows. The log reports
-`transform.unwind-rows-share-a-key` at WARNING severity, and the target may keep
+`TS0450008` at WARNING severity, and the target may keep
 only the last row for that key. The warning is not an `error_count` increment.
 Choose element keys unique within each parent.
 
 A declaration with neither locator fails validation with
-`dsl.unwind-needs-an-element-key`. An append target fails validation with
-`dsl.unwind-needs-an-upsert-target`: appending a delete would add a row instead of
+`TS0010024`. An append target fails validation with
+`TS0010025`: appending a delete would add a row instead of
 removing the old one. One-time expansion into an append target is also unsupported.
 
 A `map` before or after `unwind` can rename parent key columns; their identity follows

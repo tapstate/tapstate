@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ARequiredFieldLeftOutIsRefusedAtApplyIT {
 
-    private static final String MISSING_FIELD = "dsl.missing-field";
+    private static final String MISSING_FIELD = "TS0010004";
 
     /** Complete but for the one field the join type requires; everything else is well formed. */
     private static final String JOIN_WITHOUT_SQL = """
@@ -44,9 +44,9 @@ class ARequiredFieldLeftOutIsRefusedAtApplyIT {
 
     @Test
     void aJoinWithoutItsSqlIsRefusedByTheFieldItLeftOutAndNoneOfTheBatchIsFiled() {
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_required_field"))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             ControlPlane.Refusal refusal =
                     control.applyExpectingRefusal(Map.of("orders_wide.tap.yml", JOIN_WITHOUT_SQL));

@@ -1,71 +1,119 @@
 package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineStatus;
-import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.control.core.ConnectorUsageQuery;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.TreeMap;
 
 /**
- * The wire shape of a pipeline's status: its lifecycle state, plus why its run died when it did. A failed
- * state that cannot say what failed is only half an answer, and sending the reader to the logs for the rest
- * is what the coded reason exists to avoid.
- *
- * <p>The failure is omitted while the pipeline is healthy rather than serialized as null, so a client tells
- * "nothing wrong" from "something wrong" by presence alone.
- *
- * <p>{@code observedAt} says when the projection behind this answer was taken and {@code observedAgeMillis}
- * how long ago that was, measured here rather than by the caller: the caller's wall clock is its own, and a
- * client minutes out of step with the server would report a fresh pipeline as stale or the reverse. Both are
- * omitted together when the time is not known, so a reader tells "this is how old it is" from "nobody can
- * say how old this is" by presence alone — the absent case is an answer, not a gap to fill in locally.
- *
- * <p>The age is floored at zero, because the two clocks in it are not always the same one: a cluster
- * publishes an observation on whichever node converges and serves this read from whichever node was
- * dialled, so a node running milliseconds ahead of its peer yields a negative difference. Rendered, that
- * reaches a reader as an age before the present. Floored rather than dropped: the reading is still an age
- * and still says the observation is recent, and the direction is the safe one — a floor can only make a
- * reading look fresher, never stale, so nothing is ever reported as a stopped publisher by clock skew.
+ * The wire shape of a Pipeline status read. {@code state}, failure, and observation time describe runtime
+ * facts. A current, fenced engine job can supply state before monitoring publishes; observation fields
+ * remain absent until an observation exists. An unproved transition does not invent a runtime state.
+ * {@code desiredState} and {@code displayState} separately describe lifecycle intent and its UI projection.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure, Instant observedAt,
-        Long observedAgeMillis) {
-
-    /**
-     * A coded failure as a client reads it: the canonical code string (the stable identity — the enum never
-     * leaves the process), its named arguments sorted for a stable machine contract, and the message
-     * rendered from both through the shared catalog, so every face prints one wording.
-     */
-    record Failure(String code, Map<String, Object> params, String message) {
-    }
+record PipelineStatusResponse(
+        String pipelineId,
+        PipelineState state,
+        PipelineCatalogItem.UiState displayState,
+        ApiError failure,
+        Instant observedAt,
+        Long observedAgeMillis,
+        PipelineState desiredState,
+        PipelineState observedState,
+        boolean hasArtifact,
+        ExecutionPlanResponse plan,
+        List<String> awaitingRebalance,
+        ApiError intentReadFailure,
+        List<ConnectorUsageQuery.Version> connectorVersions) {
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
-        return of(status, catalog, Clock.systemUTC());
+        return of(status, catalog, Clock.systemUTC(), Locale.ENGLISH);
     }
 
-    /**
-     * The same projection reading now from {@code clock}, so the age can be witnessed at a known instant
-     * rather than by waiting for real time to pass.
-     */
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
-        Instant observedAt = status.observedAt();
-        return new PipelineStatusResponse(status.pipelineId(), status.state(),
-                failure(status.failure(), catalog), observedAt,
-                observedAt == null ? null
-                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()));
+        return of(status, catalog, clock, Locale.ENGLISH);
     }
 
-    private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
-        if (failure == null) {
-            return null;
+    static PipelineStatusResponse of(
+            PipelineStatus status, MessageCatalog catalog, Clock clock, Locale locale) {
+        Instant observedAt = status.observedAt();
+        return new PipelineStatusResponse(status.pipelineId(), status.state(), null,
+                ApiError.from(status.failure(), catalog, locale), observedAt,
+                observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
+                null, status.observedState(), false, ExecutionPlanResponse.of(status.plan()),
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null, null);
+    }
+
+    static PipelineStatusResponse of(
+            PipelineCatalogItem item, MessageCatalog catalog, PipelineStatus runtime) {
+        return of(item, catalog, runtime, Locale.ENGLISH);
+    }
+
+    static PipelineStatusResponse of(
+            PipelineCatalogItem item, MessageCatalog catalog, PipelineStatus runtime, Locale locale) {
+        PipelineCatalogItem.Status status = item.status();
+        Instant observedAt = runtime.observedAt();
+        return new PipelineStatusResponse(item.id(), runtime.state(), status.displayState(),
+                ApiError.from(runtime.failure(), catalog, locale),
+                observedAt, observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
+                status.desiredState(), runtime.observedState(), item.hasArtifact(),
+                ExecutionPlanResponse.of(runtime.plan()),
+                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(),
+                ApiError.from(status.intentReadFailure(), catalog, locale), null);
+    }
+
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
+        return of(item, catalog, Clock.systemUTC(), Locale.ENGLISH);
+    }
+
+    /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
+    static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
+        return of(item, catalog, clock, Locale.ENGLISH);
+    }
+
+    static PipelineStatusResponse of(
+            PipelineCatalogItem item, MessageCatalog catalog, Clock clock, Locale locale) {
+        PipelineCatalogItem.Status status = item.status();
+        PipelineState state = status.observedState();
+        if (state == null && status.state() != null) {
+            state = switch (status.state()) {
+                case NEW, RUNNING, PAUSED, STOPPED, COMPLETED, FAILED -> PipelineState.valueOf(status.state().name());
+                default -> null;
+            };
         }
-        Map<String, Object> params = new TreeMap<>(failure.params());
-        return new Failure(failure.code(), params, catalog.render(failure.code(), params).message());
+        if (state == null && item.hasArtifact() && !knownTransition(status.displayState())) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", item.id(), "field", "checkpoint"), null);
+        }
+        Instant observedAt = status.observedAt();
+        return new PipelineStatusResponse(item.id(), state, status.displayState(),
+                ApiError.from(status.failure(), catalog, locale), observedAt, observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
+                status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
+                ApiError.from(status.intentReadFailure(), catalog, locale), null);
+    }
+
+    PipelineStatusResponse withConnectorVersions(List<ConnectorUsageQuery.Version> versions) {
+        return new PipelineStatusResponse(pipelineId, state, displayState, failure, observedAt, observedAgeMillis,
+                desiredState, observedState, hasArtifact, plan, awaitingRebalance, intentReadFailure, List.copyOf(versions));
+    }
+
+    private static boolean knownTransition(PipelineCatalogItem.UiState state) {
+        return state != null && switch (state) {
+            case STARTING, STOPPING, PAUSING, RESUMING, RECOVERY_REQUIRED -> true;
+            default -> false;
+        };
     }
 }

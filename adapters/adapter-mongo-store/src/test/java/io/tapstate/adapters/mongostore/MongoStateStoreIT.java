@@ -3,24 +3,33 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.ConnectionString;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.EpochCas;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -36,12 +45,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoStateStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
     private static final String PIPELINE = "orders-sync";
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoStateStoreIT.class);
 
     @Test
     void createSeedsEpochZeroAndReadReturnsIt() {
@@ -225,6 +234,94 @@ class MongoStateStoreIT {
         });
     }
 
+    @Test
+    void anOldExecutionCannotCompleteTheUnchangedCheckpointOfItsReplacement() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("fenced_completion"));
+            database.drop();
+            var claimsCollection = database.getCollection("claims");
+            var claims = new MongoWorkloadClaimStore(claimsCollection);
+            var state = new MongoStateStore(client, database.getCollection("states"), claimsCollection);
+            var key = new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+            var acquired = claims.acquire(key, new WorkloadOwner("node", "boot"), 1L, Duration.ofMinutes(1)).claim();
+            var first = claims.advanceExecution(acquired, 1L, Set.of("node")).orElseThrow();
+            state.create(PIPELINE, "RUNNING", T0);
+            var second = claims.advanceExecution(first, 1L, Set.of("node")).orElseThrow();
+
+            assertThat(state.compareAndSwap(PIPELINE, 0L, "COMPLETED", T0, WorkloadClaimFence.from(first)))
+                    .isInstanceOf(CasOutcome.Fenced.class);
+            assertThat(state.read(PIPELINE).orElseThrow().epoch()).isZero();
+            assertThat(state.read(PIPELINE).orElseThrow().stateJson()).isEqualTo("RUNNING");
+            assertThat(state.compareAndSwap(PIPELINE, 0L, "COMPLETED", T0, WorkloadClaimFence.from(second)))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            assertThat(claims.release(second)).isTrue();
+            assertThat(state.compareAndSwap(PIPELINE, 1L, "RUNNING", T0, WorkloadClaimFence.from(second)))
+                    .as("an expired lease is not authority even with matching generations and epoch")
+                    .isInstanceOf(CasOutcome.Fenced.class);
+        }
+    }
+
+    @Test
+    void provingTheClaimAndWritingCompletionCannotBeSeparatedByAReplacement() throws Exception {
+        CountDownLatch beforeCheckpoint = new CountDownLatch(1);
+        CountDownLatch releaseCheckpoint = new CountDownLatch(1);
+        AtomicBoolean held = new AtomicBoolean();
+        CommandListener gate = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("findAndModify")
+                        && event.getCommand().getString("findAndModify").getValue().equals("states")
+                        && held.compareAndSet(false, true)) {
+                    beforeCheckpoint.countDown();
+                    try {
+                        if (!releaseCheckpoint.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("checkpoint write was never released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(interrupted);
+                    }
+                }
+            }
+        };
+        String databaseName = REPLICA_SET.database("atomic_completion");
+        var settings = MongoClientSettings.builder().applyConnectionString(
+                new ConnectionString(REPLICA_SET.getReplicaSetUrl())).addCommandListener(gate).build();
+        try (MongoClient completingClient = MongoClients.create(settings);
+                MongoClient replacingClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
+                ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            var database = completingClient.getDatabase(databaseName);
+            database.drop();
+            var claims = new MongoWorkloadClaimStore(replacingClient.getDatabase(databaseName).getCollection("claims"));
+            var state = new MongoStateStore(completingClient, database.getCollection("states"), database.getCollection("claims"));
+            var key = new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+            var acquired = claims.acquire(key, new WorkloadOwner("node", "boot"), 1L, Duration.ofMinutes(1)).claim();
+            var first = claims.advanceExecution(acquired, 1L, Set.of("node")).orElseThrow();
+            state.create(PIPELINE, "RUNNING", T0);
+            Future<CasOutcome> completion = pool.submit(() -> state.compareAndSwap(
+                    PIPELINE, 0L, "COMPLETED", T0, WorkloadClaimFence.from(first)));
+            try {
+                assertThat(beforeCheckpoint.await(10, TimeUnit.SECONDS)).isTrue();
+                CountDownLatch replacing = new CountDownLatch(1);
+                var replacement = pool.submit(() -> {
+                    replacing.countDown();
+                    return claims.advanceExecution(first, 1L, Set.of("node"));
+                });
+                assertThat(replacing.await(10, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> replacement.get(300, TimeUnit.MILLISECONDS))
+                        .as("the claim remains locked until its checkpoint transaction commits")
+                        .isInstanceOf(java.util.concurrent.TimeoutException.class);
+                releaseCheckpoint.countDown();
+                assertThat(completion.get(10, TimeUnit.SECONDS)).isInstanceOf(CasOutcome.Applied.class);
+                assertThat(replacement.get(10, TimeUnit.SECONDS)).isPresent();
+                assertThat(state.compareAndSwap(PIPELINE, 1L, "COMPLETED", T0, WorkloadClaimFence.from(first)))
+                        .isInstanceOf(CasOutcome.Fenced.class);
+            } finally {
+                releaseCheckpoint.countDown();
+            }
+        }
+    }
+
     private static Callable<CasOutcome> racingSwap(MongoStateStore store, CountDownLatch startLine, String next) {
         return () -> {
             startLine.await();
@@ -239,7 +336,7 @@ class MongoStateStoreIT {
     /** Runs a test body against a fresh state store over a clean checkpoints collection on the replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("checkpoints");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("checkpoints");
             collection.drop();
             test.run(new MongoStateStore(collection));
         } catch (Exception e) {

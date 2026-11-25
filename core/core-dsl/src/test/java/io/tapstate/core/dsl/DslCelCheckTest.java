@@ -39,7 +39,7 @@ class DslCelCheckTest {
 
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException ex = (DslException) thrown;
-        assertThat(ex.code().code()).isEqualTo("dsl.illegal-expression");
+        assertThat(ex.code().code()).isEqualTo("TS0010010");
         assertThat(ex.path()).isEqualTo("transforms[0].expr");
     }
 
@@ -99,7 +99,7 @@ class DslCelCheckTest {
         Throwable thrown = catchThrowable(() -> parser.parse(pipeline));
 
         assertThat(thrown).isInstanceOf(DslException.class);
-        assertThat(((DslException) thrown).code().code()).isEqualTo("dsl.illegal-expression");
+        assertThat(((DslException) thrown).code().code()).isEqualTo("TS0010010");
         assertThat(((DslException) thrown).path()).isEqualTo("transforms[0].expr");
     }
 
@@ -127,7 +127,7 @@ class DslCelCheckTest {
         Throwable thrown = catchThrowable(() -> parser.parse(pipeline));
 
         assertThat(thrown).isInstanceOf(DslException.class);
-        assertThat(((DslException) thrown).code().code()).isEqualTo("dsl.illegal-expression");
+        assertThat(((DslException) thrown).code().code()).isEqualTo("TS0010010");
         assertThat(((DslException) thrown).path()).isEqualTo("transforms[0].expr");
     }
 
@@ -149,7 +149,7 @@ class DslCelCheckTest {
         Throwable thrown = catchThrowable(() -> parser.parse(pipeline));
 
         assertThat(thrown).isInstanceOf(DslException.class);
-        assertThat(((DslException) thrown).code().code()).isEqualTo("dsl.illegal-expression");
+        assertThat(((DslException) thrown).code().code()).isEqualTo("TS0010010");
         assertThat(((DslException) thrown).path()).isEqualTo("transforms[0].fields.tag");
     }
 
@@ -189,7 +189,7 @@ class DslCelCheckTest {
         Throwable thrown = catchThrowable(() -> parser.parse(pipeline));
 
         assertThat(thrown).isInstanceOf(DslException.class);
-        assertThat(((DslException) thrown).code().code()).isEqualTo("dsl.illegal-expression");
+        assertThat(((DslException) thrown).code().code()).isEqualTo("TS0010010");
         assertThat(((DslException) thrown).path()).isEqualTo("serve.push[0].format");
     }
 
@@ -211,7 +211,7 @@ class DslCelCheckTest {
         Throwable thrown = catchThrowable(() -> parser.parse(pipeline));
 
         assertThat(thrown).isInstanceOf(DslException.class);
-        assertThat(((DslException) thrown).code().code()).isEqualTo("dsl.illegal-expression");
+        assertThat(((DslException) thrown).code().code()).isEqualTo("TS0010010");
         assertThat(((DslException) thrown).path()).isEqualTo("serve.push[0].format.tag");
     }
 

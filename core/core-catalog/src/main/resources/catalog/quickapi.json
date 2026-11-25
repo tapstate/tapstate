@@ -70,7 +70,7 @@
   ],
   "provenance": {
     "specPath": "connectors/quickapi-connector/src/main/resources/spec.json",
-    "specContentHash": "88a4cce7065308ba",
+    "specContentHash": "a0f1a05789315255",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

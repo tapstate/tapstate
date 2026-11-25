@@ -3,6 +3,9 @@ package io.tapstate.app;
 import java.util.OptionalLong;
 import java.time.Instant;
 import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.core.lifecycle.ExecutionPlans;
+import org.springframework.beans.factory.ObjectProvider;
+import java.util.List;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.runtime.engine.Engine;
@@ -58,14 +61,26 @@ class RuntimeConvergenceConfiguration {
     @Bean
     PipelineConverger pipelineConverger(
             StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock,
-            RebuildAdmission rebuildAdmission) {
+            RebuildAdmission rebuildAdmission, ObservationPublisher observationPublisher) {
         return new PipelineConverger(
-                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission);
+                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission,
+                observationPublisher::publish);
     }
 
-    @Bean
-    ObservationPublisher observationPublisher(
-            StorePort storePort, Engine engine, PipelineCaptureCoordinator captureCoordinator) {
+    @Bean(name = "observationPublisher")
+    ObservationPublisher plannedObservationPublisher(StorePort storePort, Engine engine,
+            PipelineCaptureCoordinator captureCoordinator, ObjectProvider<ExecutionPlans> executionPlans) {
+        return observationPublisher(storePort, engine, captureCoordinator,
+                executionPlans.getIfAvailable(() -> ExecutionPlans.NONE));
+    }
+
+    ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
+            PipelineCaptureCoordinator captureCoordinator) {
+        return observationPublisher(storePort, engine, captureCoordinator, ExecutionPlans.NONE);
+    }
+
+    ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
+            PipelineCaptureCoordinator captureCoordinator, ExecutionPlans executionPlans) {
         // The publisher's four run-statistic sources: recordCount and the per-chain frontier readings ride
         // from the engine's live Jet job, the per-table sink-acked positions from the store, and the
         // per-table initial load from the capture coordinator. All are ports, so the scheduler stays clear
@@ -107,7 +122,14 @@ class RuntimeConvergenceConfiguration {
                 // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
                 engine::stageDurations,
                 captureCoordinator::runSnapshotProgress,
-                Clock.systemUTC());
+                id -> captureCoordinator.initialLoad(id,
+                        executionPlans.current(List.of(id)).get(id),
+                        Instant.now()),
+                Clock.systemUTC())
+                // What each aggregate step holds and what it could not apply or give exactly. A group
+                // held at its last good values is marked in its own row, but only a reader of that row
+                // sees the mark; this is where the pipeline says it has any.
+                .withAggregateReadings(engine::aggregateReadings);
     }
 
     /**
@@ -140,9 +162,13 @@ class RuntimeConvergenceConfiguration {
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,
-            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership,
+            ClusterProperties cluster, NodeSessionLease nodeSession) {
         return new ConvergenceDriver(
                 pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
-                membershipGate::businessEligible, pipelineActuationOwnership);
+                // A stopped single member must still report its held engine failure while the original
+                // node proof is live. New claims and execution generations retain the business gate.
+                cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                        ? nodeSession::active : membershipGate::businessEligible, pipelineActuationOwnership);
     }
 }

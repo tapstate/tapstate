@@ -1,0 +1,358 @@
+package io.tapstate.adapters.mongostore;
+
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Witnesses draft CAS and publication preconditions against a real Mongo replica-set. */
+@RequiresDocker
+class MongoPipelineDraftStoreIT {
+
+
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoPipelineDraftStoreIT.class);
+
+    @Test
+    void publishesArtifactAndMarkersTogetherAndRejectsAStaleArtifact() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        try (MongoClient client = MongoClients.create(uri)) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            PipelineDraft initial = draft("orders", 1, PipelineDraft.Mode.DAG);
+            assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
+
+            Resource artifact = artifact("orders");
+            String artifactHash = CanonicalHash.of(artifact);
+            assertThat(store.publish(new PipelineDraft.Publication("orders", 1, null, artifact, artifactHash,
+                    Instant.parse("2026-09-21T01:00:00Z"), "publisher")))
+                    .isEqualTo(PipelineDraftMutation.PUBLISHED);
+
+            Document storedArtifact = artifacts.find(new Document("_id", "orders")).first();
+            assertThat(storedArtifact).isNotNull();
+            assertThat(storedArtifact.getString("contentHash")).isEqualTo(artifactHash);
+            assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isEqualTo(1L);
+
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    artifactHash, 1L, artifactHash)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(store.publish(new PipelineDraft.Publication("orders", 2, "stale-hash", artifact,
+                    artifactHash, Instant.parse("2026-09-21T02:00:00Z"), "publisher")))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(artifacts.countDocuments()).isEqualTo(1);
+            assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isEqualTo(1L);
+        }
+    }
+
+    @Test
+    void createListReplaceAndDeleteUseRevisionAndModePreconditions() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+
+            PipelineDraft initial = draft("orders", 1, PipelineDraft.Mode.DAG);
+            assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.ALREADY_EXISTS);
+            assertThat(store.create(draft("customers", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.get("missing")).isEmpty();
+            assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("customers", "orders");
+
+            assertThat(store.replace("missing", 1, draft("missing", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.NOT_FOUND);
+            assertThat(store.replace("orders", 2, draft("orders", 3, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.WIZARD)))
+                    .isEqualTo(PipelineDraftMutation.MODE_CONFLICT);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    null, null, null)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(2);
+
+            assertThat(store.delete("orders", 1)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.DELETED);
+            assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.NOT_FOUND);
+            assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("customers");
+
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(3);
+            assertThat(store.replace("orders", 2, draft("orders", 3, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            Resource ordersArtifact = artifact("orders");
+            assertThat(store.publish(new PipelineDraft.Publication("orders", 2, null, ordersArtifact,
+                    CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T03:00:00Z"), "stale-publisher")))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        }
+    }
+
+    @Test
+    void rebaseChangesOnlyThePublicationBaseWithThePriorBaseAsPrecondition() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_rebase_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG,
+                    "old-hash", 1L, "published-hash"))).isEqualTo(PipelineDraftMutation.CREATED);
+
+            PipelineDraft rebased = draft("orders", 2, PipelineDraft.Mode.DAG,
+                    "new-hash", 1L, "published-hash");
+            assertThat(store.replace("orders", 1, rebased)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.rebase("orders", 1, "wrong-hash", rebased))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.rebase("orders", 1, "old-hash", rebased))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(store.get("orders").orElseThrow().baseArtifactHash()).isEqualTo("new-hash");
+            assertThat(store.get("orders").orElseThrow().publishedArtifactHash()).isEqualTo("published-hash");
+            assertThat(store.rebase("orders", 1, "old-hash", rebased))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        }
+    }
+
+    @Test
+    void publishDistinguishesMissingAndStaleDraftRevisions() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            Resource missingArtifact = artifact("missing");
+            PipelineDraft.Publication missing = new PipelineDraft.Publication("missing", 1, null, missingArtifact,
+                    CanonicalHash.of(missingArtifact), Instant.parse("2026-09-21T01:00:00Z"), "publisher");
+            assertThat(store.publish(missing)).isEqualTo(PipelineDraftMutation.NOT_FOUND);
+
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            Resource ordersArtifact = artifact("orders");
+            PipelineDraft.Publication stale = new PipelineDraft.Publication("orders", 2, null, ordersArtifact,
+                    CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T01:00:00Z"), "publisher");
+            assertThat(store.publish(stale)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(artifacts.countDocuments()).isZero();
+        }
+    }
+
+    @Test
+    void publishRejectsDependenciesThatChangedAfterValidation() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            artifacts.insertOne(new Document("_id", "crm").append("contentHash", "new-source-hash"));
+
+            Resource ordersArtifact = artifact("orders");
+            PipelineDraft.Publication staleDependency = new PipelineDraft.Publication("orders", 1, null,
+                    ordersArtifact, CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T04:00:00Z"),
+                    "publisher", Map.of("crm", "hash-used-during-validation"));
+
+            assertThat(store.publish(staleDependency)).isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(artifacts.find(new Document("_id", "orders")).first()).isNull();
+            assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isNull();
+        }
+    }
+
+    @Test
+    void refusesToReplaceAnArtifactOfAnotherKind() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            assertThat(store.create(draft("mysql", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            artifacts.insertOne(new Document("_id", "mysql").append("kind", "source")
+                    .append("contentHash", "source-hash"));
+            Resource pipeline = artifact("mysql");
+
+            assertThat(store.publish(new PipelineDraft.Publication("mysql", 1, null, pipeline,
+                    CanonicalHash.of(pipeline), Instant.parse("2026-09-21T01:00:00Z"), "publisher")))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(artifacts.find(new Document("_id", "mysql")).first().getString("kind"))
+                    .isEqualTo("source");
+        }
+    }
+
+    @Test
+    void replacesAStoredDraftAfterComparingItsMigratedModeAndSkipsUnreadableRowsInLists() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(REPLICA_SET.database("tapstate_pipeline_draft_it"));
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            drafts.insertOne(new Document("_id", "legacy").append("revision", 1L)
+                    .append("name", "Legacy").append("updatedBy", "migration"));
+            assertThat(store.replace("legacy", 1, draft("legacy", 2, PipelineDraft.Mode.DAG,
+                    null, null, null)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+
+            drafts.insertOne(new Document("_id", "corrupt").append("schemaVersion", 99)
+                    .append("revision", 1L).append("mode", "unknown"));
+            assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("legacy");
+            assertThat(store.listSummaries()).extracting(summary -> summary.pipelineId()).containsExactly("legacy");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> store.get("corrupt"))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(error -> ((TapstateException) error).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+        }
+    }
+
+    @Test
+    void changesTheDefinitionAndTheDraftBasedOnItInOneTransaction() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            Fixture fixture = fixture(client, "tapstate_definition_change_it");
+            String before = fixture.published("orders");
+            Resource changed = changedArtifact("orders");
+            String after = CanonicalHash.of(changed);
+
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", before, changed,
+                    after, Map.of(), draft -> renamed(draft, after))))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+
+            assertThat(fixture.artifacts.find(new Document("_id", "orders")).first().getString("contentHash"))
+                    .isEqualTo(after);
+            PipelineDraft synced = fixture.store.get("orders").orElseThrow();
+            assertThat(synced.revision()).isEqualTo(2);
+            assertThat(synced.baseArtifactHash()).isEqualTo(after);
+            assertThat(synced.name()).isEqualTo("changed with the definition");
+        }
+    }
+
+    @Test
+    void leavesADraftBasedOnAnotherDefinitionAsItIs() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            Fixture fixture = fixture(client, "tapstate_definition_change_behind_it");
+            String before = fixture.published("orders");
+            assertThat(fixture.store.rebase("orders", 1, before, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    "an-older-definition", 1L, before))).isEqualTo(PipelineDraftMutation.REPLACED);
+            PipelineDraft behind = fixture.store.get("orders").orElseThrow();
+            Resource changed = changedArtifact("orders");
+
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", before, changed,
+                    CanonicalHash.of(changed), Map.of(), draft -> renamed(draft, CanonicalHash.of(changed)))))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+
+            assertThat(fixture.store.get("orders")).contains(behind);
+        }
+    }
+
+    @Test
+    void refusesADefinitionThatMovedOrADependencyThatMovedAndWritesNothing() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            Fixture fixture = fixture(client, "tapstate_definition_change_conflict_it");
+            String before = fixture.published("orders");
+            PipelineDraft draft = fixture.store.get("orders").orElseThrow();
+            Resource changed = changedArtifact("orders");
+            String after = CanonicalHash.of(changed);
+
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", "a-moved-definition",
+                    changed, after, Map.of(), current -> renamed(current, after))))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", before, changed,
+                    after, Map.of("crm", "a-moved-dependency"), current -> renamed(current, after))))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+
+            assertThat(fixture.artifacts.find(new Document("_id", "orders")).first().getString("contentHash"))
+                    .isEqualTo(before);
+            assertThat(fixture.store.get("orders")).contains(draft);
+        }
+    }
+
+    private static Fixture fixture(MongoClient client, String databaseName) {
+        var database = client.getDatabase(REPLICA_SET.database(databaseName));
+        var drafts = database.getCollection("pipeline_drafts");
+        var artifacts = database.getCollection("artifacts");
+        drafts.drop();
+        artifacts.drop();
+        return new Fixture(new MongoPipelineDraftStore(client, drafts, artifacts), artifacts);
+    }
+
+    private record Fixture(MongoPipelineDraftStore store, com.mongodb.client.MongoCollection<Document> artifacts) {
+
+        /** A draft created and published, so draft and definition are in step; answers the definition's hash. */
+        String published(String id) {
+            assertThat(store.create(draft(id, 1, PipelineDraft.Mode.DAG))).isEqualTo(PipelineDraftMutation.CREATED);
+            Resource artifact = artifact(id);
+            String hash = CanonicalHash.of(artifact);
+            assertThat(store.publish(new PipelineDraft.Publication(id, 1, null, artifact, hash,
+                    Instant.parse("2026-09-21T01:00:00Z"), "publisher"))).isEqualTo(PipelineDraftMutation.PUBLISHED);
+            return hash;
+        }
+    }
+
+    private static Resource changedArtifact(String id) {
+        return new PipelineResource(id, new io.tapstate.core.model.Metadata(Map.of(), "changed"),
+                List.of(SourceRef.bare("crm")), List.of(), null, null, null, Map.of());
+    }
+
+    private static PipelineDraft renamed(PipelineDraft draft, String base) {
+        return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), draft.revision() + 1, draft.mode(),
+                "changed with the definition", draft.description(), draft.graph(), draft.wizard(), base,
+                draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(), draft.updatedAt(),
+                draft.updatedBy());
+    }
+
+    private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode) {
+        return draft(id, revision, mode, revision == 1 ? null : "artifact-hash", null, null);
+    }
+
+    private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode,
+            String baseArtifactHash, Long publishedDraftRevision, String publishedArtifactHash) {
+        Instant now = Instant.parse("2026-09-21T00:00:00Z");
+        boolean dag = mode == PipelineDraft.Mode.DAG;
+        PipelineDraft.Graph graph = dag
+                ? new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)) : null;
+        PipelineDraft.Wizard wizard = dag ? null : new PipelineDraft.Wizard(
+                new PipelineDraft.Root(id, "crm", "orders", List.of(), List.of()), List.of(), List.of(), null);
+        return new PipelineDraft(id, 1, revision, mode, id, "", graph, wizard,
+                baseArtifactHash, publishedDraftRevision, publishedArtifactHash, now, now, "author");
+    }
+
+    private static Resource artifact(String id) {
+        return new PipelineResource(id, null, List.of(SourceRef.bare("crm")), List.of(), null, null, null,
+                Map.of());
+    }
+}

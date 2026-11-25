@@ -37,8 +37,8 @@ class AnIndependentFailureStaysFailedAfterItsDriverLeavesIT {
 
         try (FileEndpoints files = new FileEndpoints()) {
             files.seed(EndpointAddress.uri(source.toString()), TABLE, SeedRows.generated(3));
-            String store = SharedMongo.replicaSetUrl("e2e_independent_failure_handover");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-independent-failure")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -48,14 +48,15 @@ class AnIndependentFailureStaysFailedAfterItsDriverLeavesIT {
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
 
                 Await.until("the sink's own failure to be recorded", Duration.ofMinutes(1),
-                        () -> control.state(PIPELINE).filter(PipelineState.FAILED::equals).isPresent(),
-                        () -> "state = " + control.state(PIPELINE));
+                        () -> control.state(PIPELINE).filter(PipelineState.FAILED::equals).isPresent()
+                                && control.failureCode(PIPELINE).isPresent(),
+                        () -> "state = " + control.state(PIPELINE) + ", failure = " + control.failureCode(PIPELINE));
                 // Status can report the coded sink failure or its Jet wrapper. The member log
                 // identifies the sink failure; the handover assertions below guard the behavior.
                 assertThat(control.failureCode(PIPELINE)).isPresent();
                 String driver = control.pipelineControllerOf(PIPELINE).orElseThrow();
                 assertThat(Files.readString(cluster.processCarrying(driver).output()))
-                        .contains("connector.write-failed");
+                        .contains("TS0060027");
                 long failedExecution = control.executionGenerationOf(PIPELINE).orElseThrow();
                 String newHolder = TwoMemberCluster.NODE_A.equals(driver)
                         ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;

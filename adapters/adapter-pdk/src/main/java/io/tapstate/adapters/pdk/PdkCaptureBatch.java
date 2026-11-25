@@ -16,6 +16,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -74,6 +75,8 @@ final class PdkCaptureBatch implements CaptureBatch {
     private Iterator<Envelope> current = Collections.emptyIterator();
     private boolean over;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean cleanupStarted = new AtomicBoolean();
+    private final CompletableFuture<Void> cleanup = new CompletableFuture<>();
 
     private PdkCaptureBatch(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
         this.connector = connector;
@@ -93,23 +96,45 @@ final class PdkCaptureBatch implements CaptureBatch {
     /** A batch whose enclosing snapshot session keeps the connector for the next table. */
     static PdkCaptureBatch start(
             PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
-        PdkCaptureBatch batch = new PdkCaptureBatch(connector, read, threadName, ownsConnector);
-        batch.reader.start();
+        PdkCaptureBatch batch = unstarted(connector, read, threadName, ownsConnector);
+        batch.startReader();
+        return batch.awaitSeam();
+    }
+
+    /** Registers a session-owned worker before it starts, so closing can interrupt preparation too. */
+    static PdkCaptureBatch unstarted(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
+        return new PdkCaptureBatch(connector, read, threadName, ownsConnector);
+    }
+    void startReader() { reader.start(); }
+    boolean isClosed() { return closed.get(); }
+    boolean isReading() { return reader.isAlive(); }
+
+    private final AtomicReference<io.tapstate.core.common.FailureFact> readerFailure = new AtomicReference<>();
+    private final AtomicReference<io.tapstate.core.common.FailureFact> decodeFailure = new AtomicReference<>();
+
+    @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        var decoded = decodeFailure.get();
+        if (decoded != null && decoded.cause() == failure) return decoded;
+        var read = readerFailure.get();
+        return read != null && read.cause() == failure ? read : new io.tapstate.core.common.FailureFact(failure);
+    }
+
+    PdkCaptureBatch awaitSeam() {
         try {
-            batch.seam.get();
+            seam.get();
         } catch (InterruptedException interrupted) {
-            batch.close();
+            if (ownsConnector) close(); else requestClose();
             Thread.currentThread().interrupt();
             throw new CancellationException("the snapshot read was interrupted before its seam was taken");
         } catch (ExecutionException failed) {
-            batch.close();
+            if (ownsConnector) close(); else requestClose();
             throw unchecked(failed.getCause());
         } catch (CancellationException abandoned) {
             // A read abandoned before its seam ends the wait with that as itself, not wrapped as a failure is.
-            batch.close();
+            if (ownsConnector) close(); else requestClose();
             throw abandoned;
         }
-        return batch;
+        return this;
     }
 
     /** The connector this batch was read from, and the state scope it was opened under. */
@@ -125,6 +150,7 @@ final class PdkCaptureBatch implements CaptureBatch {
     /** Refuses further rows and wakes the reader; {@link #close()} still joins it. */
     boolean requestClose() {
         boolean first = closed.compareAndSet(false, true);
+        if (first) seam.completeExceptionally(new CancellationException("the snapshot read closed before preparation completed"));
         reader.interrupt();
         return first;
     }
@@ -160,6 +186,7 @@ final class PdkCaptureBatch implements CaptureBatch {
                 // A batch that cannot be taken ends the read as a failure of the read does: what would come
                 // after it is not the rest of the table.
                 over = true;
+                if (!(refused instanceof VirtualMachineError)) decodeFailure.set(connector.failureFact(refused));
                 throw refused;
             }
         }
@@ -181,21 +208,38 @@ final class PdkCaptureBatch implements CaptureBatch {
 
     @Override
     public void close() {
-        boolean first = requestClose();
-        // A session-owned batch releases only its worker. The session stops and closes the connector
-        // after the table read, or on abandonment before this worker is joined.
-        if (first && ownsConnector) {
-            connector.stopQuietly();
+        requestClose();
+        if (ownsConnector) {
+            if (cleanupStarted.compareAndSet(false,true)) {
+                var owner = new Thread(() -> {
+                    try {connector.stopQuietly(); awaitReader(); ahead.clear(); connector.close(); cleanup.complete(null);}
+                    catch(RuntimeException|Error failure){cleanup.completeExceptionally(failure);}
+                }, "tapstate-snapshot-ending-" + connector.connectorId());
+                owner.setDaemon(true); owner.start();
+            }
+            try { cleanup.get(JOIN_MILLIS,TimeUnit.MILLISECONDS); }
+            catch (InterruptedException stopping) {Thread.currentThread().interrupt();throw stillEnding(stopping);}
+            catch (ExecutionException failed) {throw unchecked(failed.getCause());}
+            catch (java.util.concurrent.TimeoutException stopping) {throw stillEnding(stopping);}
+            return;
         }
-        try {
-            reader.join(JOIN_MILLIS);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-        }
+        try { reader.join(JOIN_MILLIS); }
+        catch (InterruptedException stopping) {Thread.currentThread().interrupt();}
+        if (reader.isAlive()) throw stillEnding(null);
         ahead.clear();
-        if (first && ownsConnector) {
-            connector.close();
-        }
+    }
+
+    /** Only the original cleanup owner waits without a caller budget, retaining its own reader reference. */
+    // The cleanup owner waits for termination, then restores every deferred interrupt.
+    @SuppressWarnings("java:S2142")
+    void awaitReader() {
+        boolean interrupted=false;
+        while(reader.isAlive())try {reader.join();}catch(InterruptedException stopping){interrupted=true;}
+        if(interrupted)Thread.currentThread().interrupt();
+    }
+    private io.tapstate.core.common.TapstateException stillEnding(Throwable cause) {
+        return new io.tapstate.core.common.TapstateException(ConnectorError.CAPTURE_FAILED,
+                java.util.Map.of("connector",connector.connectorId(),"detail","the original snapshot reader is still ending; retry its close"),cause);
     }
 
     private void readAll(Read read) {
@@ -207,6 +251,7 @@ final class PdkCaptureBatch implements CaptureBatch {
         } catch (CancellationException abandoned) {
             seam.completeExceptionally(abandoned);
         } catch (Throwable failure) {
+            if (!closed.get() && !(failure instanceof VirtualMachineError)) readerFailure.set(connector.failureFact(failure));
             if (!seam.completeExceptionally(failure) && !closed.get()) {
                 put(new Failure(failure));
             }

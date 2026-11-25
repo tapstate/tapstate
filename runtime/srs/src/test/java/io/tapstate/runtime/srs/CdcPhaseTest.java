@@ -15,6 +15,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.RowValueError;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -40,6 +41,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,6 +50,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -73,6 +76,20 @@ class CdcPhaseTest {
     /** Orders the mock positions {@code w1 < w2 < w3 < ...} by their numeric suffix; a source position is never ordered lexically. */
     /** The generation the ring under test is running under; every order on it carries this first. */
     private static final long RING_GENERATION = 1L;
+
+    @Test
+    void invalidKeysDoNotAdvanceTheSourceReadOffset() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.invalidkeys"));
+        RecordingMeta meta = new RecordingMeta();
+        CdcChain chain = new CdcChain(new SrsWriteGate(ring), meta, "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(List.of(
+                Envelope.insert(1, "orders", Map.of("dict", Map.of(7, "value")), Map.of())));
+        assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, List::of, new CaptureHealth()))
+                .isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY));
+        assertThat(meta.advances).isEmpty();
+        assertThat(ring.tailSequence()).isEqualTo(-1L);
+    }
 
     @BeforeAll
     static void startMember() {
@@ -104,6 +121,31 @@ class CdcPhaseTest {
 
     private static CaptureConfig config() {
         return new CaptureConfig("mysql", Map.of(), List.of("orders"));
+    }
+
+    @Test
+    void aLateDurableCallbackRetainsItsOwnSelectionAfterTheRoutesAreWidened() {
+        RecordingMeta meta = new RecordingMeta();
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.late-selection")));
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+        Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
+        routes.put("orders", new CdcPhase.TableRoute(chain, List::of, ignored -> { }));
+        AtomicReference<CaptureListener> callback = new AtomicReference<>();
+        FakeCdcPort source = new FakeCdcPort(List.of()) {
+            @Override
+            public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                callback.set(listener);
+                return () -> { };
+            }
+        };
+        CdcPhase.runDurable(source, config(), CaptureStart.present(), routes, new CaptureHealth(), new AtomicLong());
+
+        routes.put("customers", new CdcPhase.TableRoute(chain, List::of, ignored -> { }));
+        callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())),
+                Optional.of(new SourcePosition("late-narrow-batch")));
+
+        assertThat(meta.captureSelections).containsExactly(List.of("orders"));
+        assertThat(meta.advances).containsExactly("late-narrow-batch");
     }
 
     /**
@@ -638,6 +680,43 @@ class CdcPhaseTest {
         }
     }
 
+    @Test
+    void aBackpressuredCdcWriteStopsWhenItsThreadIsInterrupted() throws Exception {
+        Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.interrupted-park");
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(raw));
+        for (int i = 0; i < 8; i++) {
+            assertThat(gate.append(cdcItem("f" + i), -1L)).isPresent();
+        }
+        AtomicBoolean freed = new AtomicBoolean(false);
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", Map.of("orders", freed.get() ? 0L : -1L), null));
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(
+                List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
+        Thread writer = new Thread(
+                () -> CdcPhase.run(port, config(), chain, minRead, new CaptureHealth()),
+                "interrupted-cdc-writer");
+        writer.setDaemon(true);
+
+        try {
+            writer.start();
+            assertThat(awaitState(writer, Thread.State.TIMED_WAITING, Duration.ofSeconds(2)))
+                    .as("the writer reached the headroom park before teardown interrupted it")
+                    .isTrue();
+
+            writer.interrupt();
+            writer.join(2_000);
+
+            assertThat(writer.isAlive())
+                    .as("an interrupted backpressured writer stops within the subscription close join")
+                    .isFalse();
+        } finally {
+            freed.set(true);
+            writer.interrupt();
+            writer.join(2_000);
+        }
+    }
+
     /**
      * A cluster that refuses the write for a moment pauses it; it does not end the capture.
      *
@@ -828,7 +907,7 @@ class CdcPhaseTest {
      * A cdc port that drives a fixed list of change events into the listener when the stream starts,
      * stating a position for each one the way a source does.
      */
-    private static final class FakeCdcPort implements CapturePort {
+    private static class FakeCdcPort implements CapturePort {
         private final List<Envelope> events;
         private final Throwable error;
         private final Supplier<SourcePosition> positions = sourceStatedPositions();
@@ -1027,6 +1106,14 @@ class CdcPhaseTest {
         }
 
         final List<String> advances = new ArrayList<>();
+        final List<List<String>> captureSelections = new ArrayList<>();
+
+        @Override
+        public void advanceCaptureCheckpoint(
+                String miningChainId, ChainPosition position, List<String> servedTables) {
+            captureSelections.add(servedTables);
+            advances.add(position.token());
+        }
 
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {

@@ -26,7 +26,9 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
@@ -50,6 +52,8 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -255,7 +259,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     .isInstanceOf(TapstateException.class)
                     .satisfies(e -> {
                         TapstateException refused = (TapstateException) e;
-                        assertThat(refused.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(refused.code().code()).isEqualTo("TS0350010");
                         assertThat(refused.args()).containsEntry("value", binlogCoordinate);
                     });
         }
@@ -440,10 +444,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SrsCoordinator srsCoordinator = new SrsCoordinator(new InMemorySrsMetaStore());
         java.util.Iterator<CaptureHealth> next = healths.iterator();
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(
                     spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
                     Optional.of(() -> { }), next.next());
         };
@@ -465,12 +469,23 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chainId = SourceCaptureResolution.of(source).chainId().value();
         store.meta().create(chainId, null);
-        store.meta().rewindSourceReadOffset(chainId, "before-backlog");
+        long snapshotEpoch = store.meta().openEpoch(chainId);
+        ChainPosition baseline = new ChainPosition(SourceOrder.snapshotRow(snapshotEpoch), "before-backlog");
+        store.meta().advanceCaptureCheckpoint(chainId, baseline);
+        Map<String, Long> initialReads = new java.util.LinkedHashMap<>();
+        Map<String, ChainPosition> confirmedSnapshots = new java.util.LinkedHashMap<>();
+        tableNames.forEach(table -> {
+            initialReads.put(table, -1L);
+            confirmedSnapshots.put(table, baseline);
+        });
         for (int index = 0; index < 15; index++) {
             String pipelineId = "pipeline_" + index;
             artifacts.save(pipelineWithReadMode(pipelineId, source.id(), ReadMode.SNAPSHOT_AND_CDC));
+            String consumerId = SrsConsumerId.of(pipelineId, source.id()).value();
+            store.meta().upsertConsumerOffset(chainId, new ConsumerOffset(consumerId, initialReads, baseline,
+                    tableNames, "before-backlog", snapshotEpoch, confirmedSnapshots, ConsumerProgressKind.SRS));
             for (String table : tableNames) {
-                store.meta().markSnapshotComplete(chainId, pipelineId, table);
+                store.meta().startRingAfter(chainId, consumerId, table, -1L);
             }
         }
 
@@ -501,8 +516,20 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             }
         };
         HazelcastInstance member = mock(HazelcastInstance.class);
-        when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
-        when(member.getRingbuffer(any())).thenReturn(mock(com.hazelcast.ringbuffer.Ringbuffer.class));
+        var context = new java.util.concurrent.ConcurrentHashMap<String, Object>();
+        context.put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
+        when(member.getUserContext()).thenReturn(context);
+        var config = new com.hazelcast.config.Config();
+        config.addRingBufferConfig(new com.hazelcast.config.RingbufferConfig("srs.*")
+                .setInMemoryFormat(com.hazelcast.config.InMemoryFormat.OBJECT)
+                .setRingbufferStoreConfig(new com.hazelcast.config.RingbufferStoreConfig()
+                        .setEnabled(true)
+                        .setFactoryImplementation(new io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory(
+                                store.srsLog()))));
+        when(member.getConfig()).thenReturn(config);
+        var ring = mock(com.hazelcast.ringbuffer.Ringbuffer.class);
+        when(ring.tailSequence()).thenReturn(-1L);
+        when(member.getRingbuffer(any())).thenReturn(ring);
         SrsCoordinator chains = new SrsCoordinator(store.meta());
         CaptureRunUnit runs = new CaptureRunUnit(port, chains, store.meta(), member);
         StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
@@ -534,9 +561,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         // and attach the consumer -- and hands back a run whose subscription records that it was closed.
         CaptureStarter starter = (spec, passthrough) -> {
             startedSpec.set(spec);
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             Subscription subscription = () -> subscriptionClosed.set(true);
             return new CaptureRun(
                     Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(subscription), new CaptureHealth());
@@ -547,14 +574,14 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.startCapture("p");
 
         MiningChainId chainId = MiningChainId.resolve(startedSpec.get().config(), startedSpec.get().srsKey());
-        assertThat(coordinator.isActive("p")).as("start retains a live handle for the pipeline").isTrue();
+        assertThat(coordinator.isCapturing("p")).as("start retains a live handle for the pipeline").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).isTrue();
 
         coordinator.stopCapture("p", true);
 
         assertThat(subscriptionClosed).as("stop closes the capture subscription, stopping the daemon").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).as("stop tears the source chain down").isFalse();
-        assertThat(coordinator.isActive("p")).as("stop drops the handle").isFalse();
+        assertThat(coordinator.isCapturing("p")).as("stop drops the handle").isFalse();
     }
 
     @Test
@@ -590,9 +617,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         }
 
         private CaptureRun start(CaptureRunSpec spec, java.util.function.Consumer<Envelope> passthrough) {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
             }), new CaptureHealth());
         }
@@ -764,10 +791,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
                 .isInstanceOfSatisfying(TapstateException.class, exception -> {
-                    assertThat(exception.code().code()).isEqualTo("capture.event-table-not-selected");
+                    assertThat(exception.code().code()).isEqualTo("TS0350012");
                     assertThat(exception.args()).containsEntry("table", "customers");
                 });
-        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     @Test
@@ -821,6 +848,15 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(buffer.snapshotState("p", ring).declared()).as("declared before the job is assembled").isTrue();
         assertThat(buffer.snapshotState("p", ring).handedOver()).isFalse();
         assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+        var at = java.time.Instant.now();
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+        assertThat(port.atRest.await(10, TimeUnit.SECONDS)).isTrue();
+        var live = coordinator.initialLoad("p", plan, at);
+        assertThat(live.tables().get("orders").rowsRead()).isEqualTo(1L);
+        assertThat(live.tables()).containsKey("orders");
+        assertThat(live.tables().get("orders").stage())
+                .isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.READING);
+        assertThat(live.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.SNAPSHOTTING);
 
         rest.countDown();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
@@ -998,6 +1034,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     private static final class HeldSource implements CapturePort {
         private final int rows;
         private final CountDownLatch rest;
+        private final CountDownLatch atRest = new CountDownLatch(1);
         volatile boolean closed;
 
         HeldSource(int rows, CountDownLatch rest) {
@@ -1036,6 +1073,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         }
 
         private void awaitRest() {
+            atRest.countDown();
             try {
                 while (!rest.await(20, TimeUnit.MILLISECONDS)) {
                     if (closed) {
@@ -1087,6 +1125,15 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .containsOnly(entry("orders", new TableSnapshot(500L, null, null)));
         // A total without what it accumulates from cannot be read, so the load says when it opened.
         assertThat(coordinator.snapshotProgress("p").start()).isPresent();
+        var at = java.time.Instant.now();
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+        var display = coordinator.initialLoad("p", plan, at);
+        assertThat(display.tables().get("orders").stage())
+                .isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDING);
+        assertThat(display.tables().get("orders").rowsTotalEstimate()).isNull();
+        var replacement = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 3L, 3L, List.of(), List.of(), at);
+        assertThat(coordinator.initialLoad("p", replacement, at)).isNull();
+
     }
 
     @Test
@@ -1125,12 +1172,12 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         for (int member = 0; member < 2; member++) {
             SrsCoordinator srs = new SrsCoordinator(store.meta());
             CaptureStarter starter = (spec, passthrough) -> {
-                MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+                MiningChainId chainId = spec.miningChainId();
                 chain.set(chainId);
                 long epoch = srs.provisionSource(
                         spec.sourceId(), chainId, spec.config().streams(), spec.retention()).epoch();
-                srs.attachConsumer(chainId, spec.pipelineId());
-                long rows = SnapshotPhase.run(source, spec.config(), chainId.value(), spec.pipelineId(),
+                srs.attachConsumer(chainId, spec.consumerId());
+                long rows = SnapshotPhase.run(source, spec.config(), chainId.value(), spec.consumerId(),
                         spec.config().streams(), epoch, store.meta(), passthrough).rows();
                 return new CaptureRun(Optional.of(chainId), false, rows, Map.of("orders", rows),
                         Optional.empty(), Optional.empty(), new CaptureHealth());
@@ -1141,15 +1188,20 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
             if (member == 0) {
                 assertThat(coordinator.snapshotProgress("p").byTable())
-                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
-                store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+                        .as("read through and not yet confirmed by the target: landing")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, false)));
+                store.meta().markSnapshotComplete(
+                        chain.get().value(), SrsConsumerId.of("p", "orders_src").value(), "orders");
                 assertThat(coordinator.loadDelivered("p")).isTrue();
+                assertThat(coordinator.snapshotProgress("p").byTable())
+                        .as("the target's durable mark is what lands it")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             } else {
                 verify(source, times(1)).snapshot(any());
                 assertThat(coordinator.loadDelivered("p")).isTrue();
                 assertThat(coordinator.snapshotProgress("p").byTable())
-                        .as("a replacement that skips the confirmed load still reports its five rows")
-                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+                        .as("a replacement that skips the confirmed load still reports its five rows, landed")
+                        .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             }
         }
     }
@@ -1195,7 +1247,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(first.captureFailure("p")).isEmpty();
         assertThat(first.snapshotProgress("p").byTable().get("orders").rowsDone()).isEqualTo(5L);
         MiningChainId chain = latest.get().chainId().orElseThrow();
-        store.meta().markSnapshotComplete(chain.value(), "p", "orders");
+        store.meta().markSnapshotComplete(chain.value(), SrsConsumerId.of("p", "orders_src").value(), "orders");
         first.stopCapture("p", false);
 
         StoreBackedPipelineCaptureCoordinator replacement = new StoreBackedPipelineCaptureCoordinator(
@@ -1205,9 +1257,19 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             assertThat(secondCustomerRead.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(replacement.runSnapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
             assertThat(replacement.snapshotProgress("p").byTable())
-                    .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100)));
+                    .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             verify(source, times(1)).snapshot(org.mockito.ArgumentMatchers.argThat(
                     config -> config.streams().equals(List.of("orders"))));
+            store.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(SrsConsumerId.of("p", "orders_src").value()));
+            assertThat(replacement.snapshotProgress("p").byTable()).isEmpty();
+            var at = java.time.Instant.now();
+            var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+            var load = replacement.initialLoad("p", plan, at);
+            assertThat(load.tables().get("orders").stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDED);
+            assertThat(load.tables().get("orders").rowsRead()).isNull();
+            assertThat(load.landedTables()).isEqualTo(1);
+            assertThat(load.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.MIXED);
+
         } finally {
             releaseSecondRead.countDown();
             replacement.stopCapture("p", false);
@@ -1296,12 +1358,12 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SrsCoordinator srs = new SrsCoordinator(store.meta());
         AtomicReference<MiningChainId> chain = new AtomicReference<>();
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             chain.set(chainId);
             srs.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srs.attachConsumer(chainId, spec.pipelineId());
+            srs.attachConsumer(chainId, spec.consumerId());
             long rows = SnapshotPhase.stillOwed(
-                    store.meta().read(chainId.value()), spec.pipelineId(), spec.config().streams())
+                    store.meta().read(chainId.value()), spec.consumerId(), spec.config().streams())
                     .isEmpty() ? 0L : 8L;
             return new CaptureRun(Optional.of(chainId), false, rows, Map.of("orders", rows),
                     Optional.empty(), Optional.empty(), new CaptureHealth());
@@ -1312,15 +1374,43 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.startCapture("p");
         Map<String, TableSnapshot> first = coordinator.snapshotProgress("p").byTable();
         assertThat(first).containsOnly(entry("orders", new TableSnapshot(8L, 5L, 100)));
-        store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+        store.meta().markSnapshotComplete(chain.get().value(), SrsConsumerId.of("p", "orders_src").value(), "orders");
         coordinator.stopCapture("p", false);
         coordinator.startCapture("p");
 
         assertThat(coordinator.snapshotProgress("p").byTable())
-                .containsOnly(entry("orders", new TableSnapshot(8L, 8L, 100)));
+                .containsOnly(entry("orders", new TableSnapshot(8L, 8L, 100, true)));
 
         coordinator.stopCapture("p", true);
-        assertThat(store.keyedState().count(SnapshotLoadCounts.namespaceOf("p"))).isZero();
+        assertThat(store.keyedState().count(SnapshotLoadCounts.namespaceOf(SrsConsumerId.of("p", "orders_src").value()))).isZero();
+    }
+
+    @Test
+    void aConfirmedLoadNothingCountedStillReadsAsLanded() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        // Discovered by a connector that cannot count, and confirmed before this run began by a server that kept
+        // no count of its own: the run reads the table through at nought rows and saves no count for it, so there
+        // is no number to report it as complete with.
+        InMemoryStorePort store = discoveredAs(artifacts, "orders", null);
+        SrsCoordinator srs = new SrsCoordinator(store.meta());
+        CaptureStarter starter = (spec, passthrough) -> {
+            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            srs.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
+            srs.attachConsumer(chainId, spec.consumerId());
+            store.meta().markSnapshotComplete(chainId.value(), spec.consumerId(), "orders");
+            return new CaptureRun(Optional.of(chainId), false, 0L, Map.of("orders", 0L),
+                    Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srs, new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        assertThat(coordinator.snapshotProgress("p").byTable())
+                .as("its reading stands as read, and the target's mark lands it all the same")
+                .containsOnly(entry("orders", new TableSnapshot(0L, null, null, true)));
     }
 
     @Test
@@ -1463,7 +1553,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.stopCapture("never-started", true);
 
-        assertThat(coordinator.isActive("never-started")).isFalse();
+        assertThat(coordinator.isCapturing("never-started")).isFalse();
     }
 
     @Test
@@ -1478,9 +1568,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         // the run started, exactly as a real stream failing on its daemon thread would.
         CaptureHealth health = new CaptureHealth();
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             return new CaptureRun(
                     Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
             }), health);
@@ -1522,9 +1612,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         CaptureHealth healthA = new CaptureHealth();
         CaptureHealth healthB = new CaptureHealth();
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             CaptureHealth health = spec.sourceId().equals("src_b") ? healthB : healthA;
             return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
             }), health);
@@ -1558,9 +1648,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 throw wouldNotOpen;
             }
             firstSpec.set(spec);
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
                     Optional.of(() -> firstSubscriptionClosed.set(true)), new CaptureHealth());
         };
@@ -1572,7 +1662,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         MiningChainId firstChain = MiningChainId.resolve(firstSpec.get().config(), firstSpec.get().srsKey());
         assertThat(firstSubscriptionClosed).isTrue();
         assertThat(srsCoordinator.isProvisioned(firstChain)).isFalse();
-        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     /**
@@ -1599,9 +1689,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
                 .isInstanceOfSatisfying(TapstateException.class, refused -> assertThat(refused.code().code())
-                        .isEqualTo("actuation.source-schema-not-discovered"));
+                        .isEqualTo("TS0360004"));
         assertThat(opened).isEmpty();
-        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     @Test
@@ -1625,9 +1715,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             if (starts[0] == 3) {
                 throw wouldNotOpen;
             }
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             if (starts[0] == 1) {
                 firstSpec.set(spec);
                 return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
@@ -1666,9 +1756,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
         AtomicReference<MiningChainId> chain = new AtomicReference<>();
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             chain.set(chainId);
             return new CaptureRun(Optional.of(chainId), false, 2L, Map.of("orders", 1L, "customers", 1L),
                     Optional.empty(), Optional.of(() -> {
@@ -1684,10 +1774,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         // ... and the target has confirmed none of it, which is where a hold part way through a load lands.
         assertThat(coordinator.loadDelivered("p")).as("read but not written is not delivered").isFalse();
 
-        store.meta().markSnapshotComplete(chain.get().value(), "p", "orders");
+        store.meta().markSnapshotComplete(chain.get().value(), SrsConsumerId.of("p", "orders_src").value(), "orders");
         assertThat(coordinator.loadDelivered("p")).as("one table of two is not the load").isFalse();
 
-        store.meta().markSnapshotComplete(chain.get().value(), "p", "customers");
+        store.meta().markSnapshotComplete(chain.get().value(), SrsConsumerId.of("p", "orders_src").value(), "customers");
         assertThat(coordinator.loadDelivered("p")).as("every table confirmed").isTrue();
     }
 
@@ -1705,9 +1795,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
         AtomicReference<MiningChainId> chain = new AtomicReference<>();
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             chain.set(chainId);
             return new CaptureRun(Optional.of(chainId), false, 1L, Map.of("orders", 1L),
                     Optional.empty(), Optional.of(() -> {
@@ -1735,9 +1825,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
             }), new CaptureHealth());
         };
@@ -1763,9 +1853,9 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         SrsCoordinator srsCoordinator = new SrsCoordinator(store.meta());
         CaptureStarter starter = (spec, passthrough) -> {
-            MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-            srsCoordinator.attachConsumer(chainId, spec.pipelineId());
+            srsCoordinator.attachConsumer(chainId, spec.consumerId());
             return new CaptureRun(Optional.of(chainId), false, 1L, Map.of("orders", 1L),
                     Optional.empty(), Optional.of(() -> {
                     }), new CaptureHealth());
@@ -1779,6 +1869,29 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.stopCapture("p", false);
 
         assertThat(coordinator.loadDelivered("p")).isTrue();
+    }
+
+    @Test void captureUsesTheModelSnapshotChosenBeforeALaterDiscoveryExpandsTheSelection() {
+        var source = new SourceResource("orders_src",null,"mysql",Map.of("host","h"),SourceMode.CDC,
+                List.of(TableRef.regex(".*")),null,null);
+        var artifacts = new InMemoryArtifactStore(); artifacts.save(source); artifacts.save(pipeline("p","orders_src"));
+        var store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel(source.id(),"mysql",1,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of())))));
+        var snapshot = ReadOnlyArtifactSnapshot.capture(artifacts); var models = SourceModelSnapshot.capture("p",List.of(source),store.schemas());
+        store.schemas().save(new DiscoveredSourceModel(source.id(),"mysql",2,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of()),
+                new SourceTable("new_orders",List.of(),List.of(),List.of())))));
+        var srs = new SrsCoordinator(store.meta()); var opened = new AtomicReference<CaptureRunSpec>();
+        CaptureStarter starter = (spec,passthrough) -> {
+            opened.set(spec); var chain = spec.miningChainId();
+            srs.provisionSource(spec.sourceId(),chain,spec.config().streams(),spec.retention()); srs.attachConsumer(chain,spec.consumerId());
+            return new CaptureRun(Optional.of(chain),false,0L,Optional.empty(),Optional.of(() -> {}),new CaptureHealth());
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store,starter,srs,new SnapshotBuffer());
+        assertThatThrownBy(() -> coordinator.startCapture("foreign",snapshot,models)).isInstanceOf(TapstateException.class); assertThat(opened.get()).isNull();
+        coordinator.startCapture("p",snapshot,models);
+        assertThat(opened.get().config().streams()).containsExactly("orders");
+        assertThat(store.schemas().get(source.id()).orElseThrow().model().tables()).hasSize(2);
+        coordinator.stopCapture("p",false);
     }
 
     // ---- fixtures --------------------------------------------------------------------------------

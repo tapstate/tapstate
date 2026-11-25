@@ -8,7 +8,10 @@ import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
@@ -19,6 +22,7 @@ import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
@@ -36,6 +40,10 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -61,6 +69,101 @@ import org.junit.jupiter.api.Test;
  * - the leaves (SRS source vertex, transform port, sink writer) are built but never opened here.
  */
 class StoreBackedDagSourceTest {
+
+    @Test
+    void aKeepStateRestartDoesNotAnnounceANewSnapshotBoundBeforeOlderPendingChanges() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of("support_case"), "before-batch", 1L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+        store.meta().openEpoch("crm");
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(1L);
+        assertThat(store.meta().read("crm").orElseThrow().epoch()).isEqualTo(2L);
+    }
+
+    @Test
+    void cdcOnlyRestartUsesItsTablesConfirmedEpochWithoutBorrowingAnotherTable() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L, "emailmessage", 1_000L), null, List.of(), null, 0L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low"),
+                        "emailmessage", new ChainPosition(new SourceOrder(2, 1_000), "mail")),
+                ConsumerProgressKind.SRS));
+
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        assertThat(source.sourceContextEpoch("crm", consumer, "support_case")).isEqualTo(1L);
+        assertThat(source.sourceContextEpoch("crm", consumer, "emailmessage")).isEqualTo(2L);
+    }
+
+    @Test
+    void aFullReloadUsesItsNewSnapshotEpochOverRetainedOlderChanges() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of(), "fresh-seam", 2L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(2L);
+    }
+
+    @Test
+    void aResumedTableUsesItsNewerConfirmedGenerationAfterTheSnapshot() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of("support_case"), "old-seam", 1L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(2, 1), "high")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(2L);
+    }
+
+    @Test
+    void exposesPreviewSourcesReachableThroughInlineTransformsWithoutOpeningConnectors() {
+        FakeStorePort store = new FakeStorePort();
+        SourceResource sourceResource = cdcSource("orders_src", "orders");
+        store.artifacts().save(sourceResource);
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+        Step.Inline filter = Step.inline("filter", FromClause.list(FromRef.literal("orders_src.orders")),
+                new TransformBody.Filter("true"), null);
+        PipelineResource pipeline = new PipelineResource("preview_pipeline", null,
+                List.of(new SourceRef.Spec("orders_src", true, Map.of("preImage", false))), List.of(filter),
+                new ViewBlock.Inline("orders_view", FromRef.literal("filter"), "id", null),
+                null, null, null);
+        StoreBackedDagSource dagSource = new StoreBackedDagSource(store, io.tapstate.runtime.engine.nest.NestSettings
+                .defaults(), store.artifacts());
+
+        assertThat(dagSource.previewSourceTables(pipeline)).singleElement().satisfies(table -> {
+            assertThat(table.sourceKey()).isEqualTo("orders_src");
+            assertThat(table.settings()).containsEntry("preImage", false);
+            assertThat(table.schema().fields()).extracting(io.tapstate.spi.capture.FieldSchema::name)
+                    .containsExactly("id");
+        });
+        assertThat(dagSource.previewInputSourceKeys(pipeline)).containsExactly("orders_src");
+        assertThat(dagSource.previewCompiledJoins(pipeline)).isEmpty();
+        assertThat(dagSource.previewStateMapNames(pipeline)).isEmpty();
+    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"qualified", "source", "multiple", "regex"})
@@ -107,11 +210,113 @@ class StoreBackedDagSourceTest {
             assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(
                     io.tapstate.core.event.Op.DELETE, 1L, stream, Map.of(key, 1L), null, null)))
                     .isInstanceOf(TapstateException.class)
-                    .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                    .hasMessageContaining("TS0450007");
             var output = port.transform(event);
             assertThat(output).as("%s via %s", stream, from)
                     .extracting(io.tapstate.core.event.Envelope::op)
                     .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+        "absent, false", "present, true", "generated, true", "dropped, false"
+    })
+    void aRenameOverwritesTheUnwindParentKeyOnlyWhenItsSourceCanReachIt(
+            String region, boolean overwritten) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        List<SourceField> fields = new ArrayList<>(List.of(
+                new SourceField("o_id", "bigint", TapstateType.INT64),
+                new SourceField("items", "array", TapstateType.ARRAY)));
+        if (region.equals("present") || region.equals("dropped")) {
+            fields.add(new SourceField("o_region", "varchar", TapstateType.STRING));
+        }
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", fields, List.of("o_id"), List.of())))));
+        List<Step> steps = new ArrayList<>();
+        String upstream = "orders";
+        if (region.equals("generated") || region.equals("dropped")) {
+            FieldRule rule = region.equals("generated") ? FieldRule.literal("east") : FieldRule.drop();
+            steps.add(Step.inline("prepare", FromClause.list(FromRef.literal(upstream)),
+                    new TransformBody.MapProjection(Map.of("o_region", rule)), null));
+            upstream = "prepare";
+        }
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal(upstream)),
+                new TransformBody.MapProjection(Map.of("o_id", FieldRule.rename("o_region"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", null, false, "sku", null), null);
+        steps.add(rename);
+        steps.add(expand);
+        var pipeline = new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                steps, null, null, null, null);
+        var source = new StoreBackedDagSource(store);
+        if (overwritten) {
+            assertThatThrownBy(() -> source.transformBinding(pipeline, expand))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("TS0360008");
+        } else {
+            List<Map<String, String>> items = List.of(Map.of("sku", "same"));
+            Map<String, Object> before = new LinkedHashMap<>(Map.of("o_id", 1L, "items", items));
+            Map<String, Object> after = new LinkedHashMap<>(Map.of("o_id", 2L, "items", items));
+            if (region.equals("dropped")) {
+                before.put("o_region", "east");
+                after.put("o_region", "east");
+            }
+            var event = new io.tapstate.core.event.Envelope(io.tapstate.core.event.Op.UPDATE, 1L, "orders",
+                    before, after, null);
+            for (Step projection : steps.subList(0, steps.size() - 1)) {
+                event = source.transformBinding(pipeline, projection).get().transform(event).getFirst();
+            }
+            assertThat(source.transformBinding(pipeline, expand).get().transform(event))
+                    .extracting(io.tapstate.core.event.Envelope::op)
+                    .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"absent,false", "before,false", "after,false", "after,true"})
+    void aRenameAfterJavaScriptChecksActualParentKeyOverwrites(String replacementImage, boolean stableAlias) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("o_id", "bigint", TapstateType.INT64),
+                        new SourceField("items", "array", TapstateType.ARRAY)), List.of("o_id"), List.of())))));
+        String mutation = replacementImage.equals("absent") ? "" : "r." + replacementImage + ".o_region = 'east';";
+        Step.Inline script = Step.inline("script", FromClause.list(FromRef.literal("orders")),
+                new TransformBody.Js("function process(r, ctx) { " + mutation + " return r; }"), null);
+        Map<String, FieldRule> relayRules = new LinkedHashMap<>(Map.of("region", FieldRule.rename("o_region")));
+        if (stableAlias) relayRules.put("order_key", FieldRule.computed("after.o_id"));
+        Step.Inline relay = Step.inline("relay", FromClause.list(FromRef.literal("script")),
+                new TransformBody.MapProjection(relayRules), null);
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal("relay")),
+                new TransformBody.MapProjection(Map.of("o_id", FieldRule.rename("region"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", null, false, "sku", null), null);
+        var pipeline = new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                List.of(script, relay, rename, expand), null, null, null, null);
+        var source = new StoreBackedDagSource(store);
+        var items = List.of(Map.of("sku", "same"));
+        var update = new io.tapstate.core.event.Envelope(io.tapstate.core.event.Op.UPDATE, 1L, "orders",
+                Map.of("o_id", 1L, "items", items), Map.of("o_id", 2L, "items", items), null);
+        try (var scriptPort = source.transformBinding(pipeline, script).get();
+             var relayPort = source.transformBinding(pipeline, relay).get();
+             var renamePort = source.transformBinding(pipeline, rename).get();
+             var expandPort = source.transformBinding(pipeline, expand).get()) {
+            var relayed = relayPort.transform(scriptPort.transform(update).getFirst()).getFirst();
+            if (replacementImage.equals("absent") || stableAlias) {
+                String key = stableAlias ? "order_key" : "o_id";
+                var events = expandPort.transform(renamePort.transform(relayed).getFirst());
+                assertThat(events).extracting(io.tapstate.core.event.Envelope::op)
+                        .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+                assertThat(events.getFirst().before()).containsEntry(key, 1L);
+                assertThat(events.getLast().after()).containsEntry(key, 2L);
+            } else {
+                assertThatThrownBy(() -> renamePort.transform(relayed))
+                        .isInstanceOf(TapstateException.class)
+                        .hasMessageContaining("TS0360008");
+            }
         }
     }
 
@@ -140,7 +345,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
                 Map.of("id", 1L), op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                .hasMessageContaining("TS0450007");
         assertThat(port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
                 Map.of("id", 1L, "customer", "ada"),
                 op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L, "customer", "ada") : null,
@@ -188,14 +393,14 @@ class StoreBackedDagSourceTest {
                 op, 1L, "orders", Map.of("id", 1L),
                 op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                .hasMessageContaining("TS0450007");
         Step.Inline mixed = Step.inline("add", FromClause.list(FromRef.literal("drop"), FromRef.literal("orders")),
                 add.body(), null);
         PipelineResource mixedPipeline = new PipelineResource("mixed", null,
                 List.of(SourceRef.spec("orders_src", true)), List.of(drop, mixed, expand), null, null, null, null);
         assertThatThrownBy(() -> source.transformBinding(mixedPipeline, mixed))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                .hasMessageContaining("TS0360008");
     }
 
     @Test
@@ -414,8 +619,10 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
-        assertThat(edges(dag)).containsExactly(edge("orders_src", "view.order_state"));
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("view.order_state",
+                edge("orders_src", "route.view.order_state")));
     }
 
     @Test
@@ -451,7 +658,22 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-store-not-configured"));
+                        .isEqualTo("TS0360022"));
+    }
+
+    @Test
+    void aBoundDefaultTargetCannotBeRedirectedByAnAuthoredStoreLabel() {
+        for (String bound : List.of("views", "atlas-store")) {
+            FakeStorePort store = seededViewPipeline();
+            store.artifacts.managedDefault = bound;
+            store.artifacts().save(connectionSupplier(bound));
+            store.artifacts().save(new SourceResource("forged", new io.tapstate.core.model.Metadata(Map.of("store", "true"), null),
+                    "mongodb", Map.of("uri", "mongodb://forged/other"), null, null, null, null));
+            List<String> reached = new ArrayList<>();
+            var source = new StoreBackedDagSource(store, (id, connector, settings) -> reached.add(id));
+            source.dagFor("p");
+            assertThat(reached).containsExactly(bound);
+        }
     }
 
     @Test
@@ -470,8 +692,10 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
-        assertThat(edges(dag)).containsExactly(edge("orders_src", "view.order_state"));
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("view.order_state",
+                edge("orders_src", "route.view.order_state")));
     }
 
     @Test
@@ -484,7 +708,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store, refusing("connection refused")).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-store-unreachable"));
+                        .isEqualTo("TS0360023"));
     }
 
     @Test
@@ -592,7 +816,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> {
                     TapstateException coded = (TapstateException) e;
-                    assertThat(coded.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(coded.code().code()).isEqualTo("TS0360023");
                     assertThat(String.valueOf(coded.args().get("reason")))
                             .as("what the connector said, carried through to the operator")
                             .contains("connection refused by mongo:27017");
@@ -610,7 +834,8 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(
                 store, StoreReachability.probing(passing, Duration.ofSeconds(5))).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
     }
 
     @Test
@@ -633,7 +858,7 @@ class StoreBackedDagSourceTest {
                 store, StoreReachability.bounded(neverAnswers, Duration.ofMillis(200))).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-store-unreachable"));
+                        .isEqualTo("TS0360023"));
         assertThat(Duration.ofNanos(System.nanoTime() - startedAt))
                 .as("the start gave up on its own rather than waiting for the probe")
                 .isLessThan(Duration.ofMinutes(1));
@@ -673,7 +898,8 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store, StoreReachability.assumingReachable()).dagFor("p");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "route.view.order_state",
+                "view.order_state");
     }
 
     /** A pipeline whose only instruction is a view, with the managed store registered and plain. */
@@ -718,6 +944,127 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
+    void refuses_legacy_aggregate_progress_before_a_multi_sink_dag_can_run() {
+        FakeStorePort store = new FakeStorePort();
+        SourceResource source = cdcSource("orders_src", "orders");
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                null,
+                null,
+                serve(
+                        FromRef.literal("orders_src"),
+                        sync("fast", "fast_dest"),
+                        sync("slow", "slow_dest")),
+                null, null);
+        store.artifacts().save(source);
+        store.artifacts().save(connectionSupplier("fast_dest"));
+        store.artifacts().save(connectionSupplier("slow_dest"));
+        store.artifacts().save(pipeline);
+        discovered(store, "orders_src", "orders");
+        String chain = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chain, null);
+        store.meta().advanceSinkAcked(
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+        assertThat(store.meta().ringDoneThrough(chain, SOURCE_NODE))
+                .containsEntry("orders", 100L);
+    }
+
+    @Test
+    void a_multi_sink_pipeline_cleared_of_its_legacy_progress_can_run_again() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().advanceSinkAcked(
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class);
+
+        // Clearing what the pipeline holds on the chain is the store's half of loading it all again.
+        store.meta().detachConsumer(chain, "p");
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_single_sink_resumes_from_progress_it_alone_can_have_made() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "only");
+        store.meta().advanceSinkAcked(
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_position_at_the_loads_seam_is_no_progress_that_two_sinks_could_disagree_on() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        // Where a direct channel's capture records the load's seam before any run of its sinks has begun.
+        store.meta().advanceSinkAcked(chain, SOURCE_NODE, new ChainPosition(SourceOrder.snapshotRow(1), "seam"));
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_ring_cursor_alone_is_no_progress_that_two_sinks_could_disagree_on() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().startRingAfter(chain, SOURCE_NODE, "orders", 40);
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_load_marked_finished_for_every_sink_at_once_is_refused_like_a_position() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().markSnapshotComplete(chain, SOURCE_NODE, "orders");
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+    }
+
+    @Test
+    void progress_kept_writer_by_writer_is_not_mistaken_for_legacy_progress() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().advanceSinkAcked(
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+        store.meta().beginWriterRun(
+                chain, SOURCE_NODE, "g1", Map.of("orders", List.of("serve.fast#0", "serve.slow#0")));
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    /** Where pipeline {@code p} keeps what it read from orders_src: under that source node's own name. */
+    private static final String SOURCE_NODE = SrsConsumerId.of("p", "orders_src").value();
+
+    /** Pipeline {@code p} reading orders_src into one serve sink per name, its chain created; answers the chain. */
+    private static String servedBy(FakeStorePort store, String... sinks) {
+        SourceResource source = cdcSource("orders_src", "orders");
+        SyncElement[] elements = new SyncElement[sinks.length];
+        for (int i = 0; i < sinks.length; i++) {
+            elements[i] = sync(sinks[i], sinks[i] + "_dest");
+            store.artifacts().save(connectionSupplier(sinks[i] + "_dest"));
+        }
+        store.artifacts().save(source);
+        store.artifacts().save(new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null, null,
+                serve(FromRef.literal("orders_src"), elements), null, null));
+        discovered(store, "orders_src", "orders");
+        String chain = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chain, null);
+        return chain;
+    }
+
+    @Test
     void expands_a_multi_table_source_into_one_source_vertex_per_table() {
         FakeStorePort store = new FakeStorePort();
         store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
@@ -731,10 +1078,48 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("multi");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "multi_src.orders", "multi_src.customers", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("multi_src.orders", "serve.sync_1"),
-                "multi_src.customers->serve.sync_1#0,1");
+                "multi_src.orders", "multi_src.customers", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("multi_src.orders", "route.serve.sync_1"),
+                "multi_src.customers->route.serve.sync_1#0,1"));
+    }
+
+    @Test
+    void two_keyless_tables_renamed_into_one_target_table_are_written_by_one_writer() {
+        // Written into one table, two keyless tables leave nothing to tell that table's rows apart by, so one
+        // writer writes them all. Written into two - as in the case above - each table's rows go to a writer of
+        // their own and the sink runs wide. What decides it is the table a stream lands in, not the stream.
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("multi_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders_eu"), TableRef.literal("orders_us")), null, null));
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        RenameSpec intoOne = new RenameSpec(Map.of("orders_eu", "orders", "orders_us", "orders"), null, null, null);
+        store.artifacts().save(new PipelineResource(
+                "merged", null, List.of(SourceRef.spec("multi_src", true)), null, null,
+                serve(FromRef.literal("multi_src"), new SyncElement("sync_1", "orders_dest", null, intoOne, null)),
+                null, null));
+        discovered(store, "multi_src", "orders_eu", "orders_us");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("merged");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "multi_src.orders_eu", "multi_src.orders_us", "serve.sync_1");
+    }
+
+    @Test
+    void a_view_asking_for_one_writer_runs_it_with_no_router() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(connectionSupplier(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+        store.artifacts().save(new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null,
+                        new ExecutionSpec(1, null)),
+                null, null, null));
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("p");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "view.order_state");
     }
 
     @Test
@@ -757,10 +1142,10 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("multi_subset");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "multi_src.orders", "multi_src.customers", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("multi_src.orders", "serve.sync_1"),
-                "multi_src.customers->serve.sync_1#0,1");
+                "multi_src.orders", "multi_src.customers", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("multi_src.orders", "route.serve.sync_1"),
+                "multi_src.customers->route.serve.sync_1#0,1"));
     }
 
     @Test
@@ -778,10 +1163,11 @@ class StoreBackedDagSourceTest {
 
         DAG dag = new StoreBackedDagSource(store).dagFor("all");
 
-        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("all_src.orders", "all_src.customers", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("all_src.orders", "serve.sync_1"),
-                "all_src.customers->serve.sync_1#0,1");
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
+                "all_src.orders", "all_src.customers", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("all_src.orders", "route.serve.sync_1"),
+                "all_src.customers->route.serve.sync_1#0,1"));
     }
 
     @Test
@@ -799,10 +1185,10 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("players");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "players_src.Player", "players_src.PlayerCard", "serve.sync_1");
-        assertThat(edges(dag)).containsExactlyInAnyOrder(
-                edge("players_src.Player", "serve.sync_1"),
-                "players_src.PlayerCard->serve.sync_1#0,1");
+                "players_src.Player", "players_src.PlayerCard", "route.serve.sync_1", "serve.sync_1");
+        assertThat(edges(dag)).containsExactlyInAnyOrderElementsOf(routed("serve.sync_1",
+                edge("players_src.Player", "route.serve.sync_1"),
+                "players_src.PlayerCard->route.serve.sync_1#0,1"));
     }
 
     @Test
@@ -852,7 +1238,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.source-table-ambiguous"));
+                        .isEqualTo("TS0360009"));
     }
 
     @Test
@@ -868,7 +1254,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("actuation.source-table-not-discovered");
+                    assertThat(coded.code().code()).isEqualTo("TS0360005");
                     assertThat(coded.args()).containsEntry("source", "src_a");
                     assertThat(coded.args()).containsEntry("table", "customers");
                 });
@@ -882,7 +1268,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("actuation.pipeline-not-found");
+                    assertThat(coded.code().code()).isEqualTo("TS0360002");
                     assertThat(coded.args()).containsEntry("pipeline", "ghost");
                 });
     }
@@ -896,10 +1282,92 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("actuation.not-a-pipeline");
+                    assertThat(coded.code().code()).isEqualTo("TS0360003");
                     assertThat(coded.args()).containsEntry("pipeline", "orders_src");
                     assertThat(coded.args()).containsEntry("kind", "source");
                 });
+    }
+
+    /**
+     * The connectors a pipeline's sinks open are what every member a run takes part on must be able to load: each
+     * sync element's target source's, and the managed store's a view materializes into. The source it reads from
+     * is not among them - its connector is opened by the capture, on one member only - and a start carries the
+     * same set it was worked out from, taken from the artifacts the start froze.
+     */
+    @Test
+    void the_connectors_a_start_needs_on_every_member_are_its_sync_targets_and_its_views_store() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        store.artifacts().save(new SourceResource("orders_dest", null, "postgres", Map.of("host", "d"),
+                null, null, null, null));
+        store.artifacts().save(new SourceResource("orders_copy", null, "oracle", Map.of("host", "e"),
+                null, null, null, null));
+        store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null, "mongodb",
+                Map.of("uri", "m"), null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
+                serve(FromRef.literal("order_state"), sync("sync_1", "orders_dest"), sync("sync_2", "orders_copy")),
+                null, null));
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+
+        Map<String, String> bySink = Map.of(
+                "view.order_state", "mongodb", "serve.sync_1", "postgres", "serve.sync_2", "oracle");
+        assertThat(source.sinkConnectors("p")).containsExactlyInAnyOrderEntriesOf(bySink);
+        assertThat(source.prepareStart("p", "tapstate").sinkConnectors()).isEqualTo(bySink);
+    }
+
+    /**
+     * How wide a run is worked out when its start is planned, which a start does before it opens anything for the
+     * run: a width it cannot honour is refused there, and nothing is left to build. Refused only while building the
+     * topology, it would already have opened the capture the topology reads from.
+     */
+    @Test
+    void aWidthTheRunCannotHonourIsRefusedWhenItsStartIsPlanned() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src", "orders"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource("too_wide", null, List.of(SourceRef.spec("src", true)),
+                List.of(Step.inline("w", FromClause.list(FromRef.literal("orders")), new TransformBody.Filter("true"),
+                        new ExecutionSpec(1000, null), null)),
+                null, serve(FromRef.literal("w"), sync("sync_1", "dest")), null, null));
+        // Keyed, so the rows reaching the step could be spread by key: what is refused is the width alone.
+        store.schemas.save(new DiscoveredSourceModel("src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+
+        DagSource.StartPreparation prepared = new StoreBackedDagSource(store).prepareStart("too_wide", "tapstate");
+
+        assertThatThrownBy(prepared::plan)
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM);
+                    assertThat(refused.args()).containsEntry("node", "w").containsEntry("requested", 1000);
+                });
+    }
+
+    @Test
+    void operatorPreparationAndTheDeferredTopologyKeepTheSameOriginalMembers() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src", "orders")); store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("src", true)), null,
+                null, serve(FromRef.literal("src"), sync("sync", "dest")), null, null));
+        store.schemas.save(new DiscoveredSourceModel("src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(new SourceField("id", "bigint", TapstateType.INT64)),
+                        List.of("id"), List.of())))));
+        var members = new java.util.ArrayList<>(List.of("node-a", "node-b"));
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var source = new StoreBackedDagSource(store, io.tapstate.runtime.engine.nest.NestSettings.defaults(),
+                StoreReachability.assumingReachable(), io.tapstate.runtime.srs.SourcePlacement.anyMember(),
+                () -> { reads.incrementAndGet(); return members; }, io.tapstate.core.lifecycle.ParallelismBudget.DEFAULTS);
+        var planned = source.prepareStart("p", "tapstate").plan();
+        assertThat(planned.members()).containsExactly("node-a", "node-b");
+        members.clear(); members.add("replacement");
+        assertThat(planned.build(null).planned().members()).containsExactly("node-a", "node-b");
+        assertThat(planned.members()).containsExactly("node-a", "node-b"); assertThat(reads.get()).isOne();
     }
 
     // ---- fixtures ----------------------------------------------------------------------
@@ -959,8 +1427,22 @@ class StoreBackedDagSourceTest {
         return src + "->" + dest + "#0,0";
     }
 
+    /**
+     * {@code into} - the edges reaching the router in front of {@code sink} - and the two edges from that router
+     * into the sink: a sink running several writers reads through a router of its own, which spreads a keyed
+     * table's snapshot rows over the writers and sends everything else to the writer its key belongs to.
+     */
+    private static List<String> routed(String sink, String... into) {
+        List<String> all = new ArrayList<>(List.of(into));
+        all.add(edge("route." + sink, sink));
+        all.add("route." + sink + "->" + sink + "#1,1");
+        return all;
+    }
+
     /** In-memory artifact store keyed by top-level id; the other sub-stores are not exercised. */
     private static final class FakeArtifactStore implements ArtifactStore {
+        private String managedDefault;
+        @Override public Optional<String> managedDefaultSourceId() { return Optional.ofNullable(managedDefault); }
 
         private final Map<String, Resource> byId = new LinkedHashMap<>();
 

@@ -275,10 +275,12 @@ class NestOperatorCostTest {
         // Out of memory but not out of the store, so the reads that follow are the cold path exactly.
         member.getMap(referenced).evictAll();
         Snapshot before = snapshot(root, referenced, index);
+        var rootKeysBefore = NestStateStats.of(member).keyAccess(root);
 
         feed("orders", rootsPointingAtRows());
         quiesce();
         Report report = report(before, snapshot(root, referenced, index), ROOTS);
+        var rootKeysAfter = NestStateStats.of(member).keyAccess(root);
 
         job.cancel();
         print("N:1 - a document fetching the row it points at", report);
@@ -294,17 +296,23 @@ class NestOperatorCostTest {
                         + "cold numbers below are about a path nothing walked")
                 .isPositive();
 
-        assertOneRowPerEvent(report, root, 1);
-        // The reading this whole shape exists to pin. A pointed-at row is fetched once because it is one
-        // row, not once per document that points at it: REFERENCED_ROWS rows were asked for by ROOTS
-        // documents, and it is the first number that decides the trips. Were it the second, every reading
-        // above would be unchanged and every document would still render - the count is the only trace.
+        assertThat(report.emitted()).as("emitted root documents").isEqualTo(ROOTS);
+        assertThat(rootKeysAfter.reads() - rootKeysBefore.reads()).as("root keys read").isEqualTo(ROOTS);
+        assertThat(rootKeysAfter.writes() - rootKeysBefore.writes()).as("root keys written").isEqualTo(ROOTS);
+        Counters rootWork = report.namespaces().get(root);
+        // Guarded reference wakes may read several root keys in one access.
+        assertThat(rootWork.accesses()).as("root state accesses").isLessThanOrEqualTo(2L * ROOTS);
+        assertThat(rootWork.coldSaves()).as("root cold writes").isEqualTo(ROOTS);
+        assertThat(rootKeysAfter.coldLoads() - rootKeysBefore.coldLoads()).as("root cold keys read").isEqualTo(ROOTS);
+        assertThat(rootWork.coldLoads()).as("root cold read calls").isPositive().isLessThanOrEqualTo(ROOTS);
+        // Every cold key is still fetched exactly once. Concurrent partition loads can now share a
+        // backend request, so call count is a ceiling, while the key count below remains exact.
         assertThat(batches.coldLoads())
-                .describedAs("%d documents pointing at %d rows cost %d reads behind the map. It has to be "
-                        + "the row count: a fetch driven by the documents asking would grow with them and "
-                        + "leave every other number, and every document, exactly as they are",
+                .describedAs("%d documents pointing at %d rows cost %d reads behind the map. Coalescing "
+                        + "can reduce backend calls, but reading per document instead of per distinct "
+                        + "key still exceeds this ceiling",
                         ROOTS, REFERENCED_ROWS, batches.coldLoads())
-                .isEqualTo(REFERENCED_ROWS);
+                .isPositive().isLessThanOrEqualTo(REFERENCED_ROWS);
         assertThat(batches.coldBatchedKeys())
                 .describedAs("the batches asked for %d keys to fetch %d distinct rows, so a key was asked "
                         + "for more than once - the batch is being formed per document rather than per "

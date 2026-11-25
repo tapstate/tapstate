@@ -22,6 +22,10 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
     private final List<ConnectorRegistration> registrations = new ArrayList<>();
     private final Map<String, byte[]> bytesByHash = new LinkedHashMap<>();
     int artifactCalls;
+    /** Certifications that one instance may serve several writers, by content hash. */
+    final Map<String, String> shareSafe = new java.util.HashMap<>();
+    /** Runs on every {@link #artifact} fetch before the bytes are returned; a test sets it to act mid-fetch. */
+    Runnable onArtifactFetch = () -> { };
 
     @Override
     public RegistrationOutcome register(
@@ -46,8 +50,14 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
     @Override
     public Optional<byte[]> artifact(String contentHash) {
         artifactCalls++;
+        onArtifactFetch.run();
         byte[] bytes = bytesByHash.get(contentHash);
         return bytes == null ? Optional.empty() : Optional.of(bytes.clone());
+    }
+
+    @Override
+    public Optional<String> shareSafeCertification(String connectorId, String contentHash) {
+        return Optional.ofNullable(shareSafe.get(contentHash));
     }
 
     @Override
@@ -59,5 +69,10 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
     void addDanglingRegistration(String connectorId, String contentHash, String pdkApiVersion) {
         registrations.add(new ConnectorRegistration(
                 connectorId, contentHash, pdkApiVersion, RegistrationSource.REGISTER));
+    }
+
+    /** Changes stored bytes without changing their registration, modeling a damaged artifact store. */
+    void replaceArtifact(String contentHash, byte[] artifact) {
+        bytesByHash.put(contentHash, artifact.clone());
     }
 }

@@ -37,7 +37,10 @@ cat > "$scratch/bin/gh" <<'STUB'
 case "$1" in
   pr)
     for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
-    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    if [ ! -f "$SMOKE_SCRATCH/pr/$n" ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of $n. (repository.pullRequest)" >&2
+      exit 1
+    fi
     cat "$SMOKE_SCRATCH/pr/$n" ;;
   issue)
     for a in "$@"; do case "$a" in *"/pull/"*) u="${a##*/pull/}" ;; esac; done
@@ -209,7 +212,10 @@ cat > "$scratch/bin/gh" <<'STUB'
 case "$1" in
   pr)
     for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
-    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    if [ ! -f "$SMOKE_SCRATCH/pr/$n" ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of $n. (repository.pullRequest)" >&2
+      exit 1
+    fi
     cat "$SMOKE_SCRATCH/pr/$n" ;;
   issue) echo "HTTP 404: Not Found" >&2; exit 1 ;;
   *) exit 1 ;;
@@ -227,7 +233,10 @@ cat > "$scratch/bin/gh" <<'STUB'
 case "$1" in
   pr)
     for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
-    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    if [ ! -f "$SMOKE_SCRATCH/pr/$n" ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of $n. (repository.pullRequest)" >&2
+      exit 1
+    fi
     cat "$SMOKE_SCRATCH/pr/$n" ;;
   issue)
     for a in "$@"; do case "$a" in *"/pull/"*) u="${a##*/pull/}" ;; esac; done
@@ -304,6 +313,16 @@ refuses "--report-only needs somewhere to write it" "--list-open" \
   --base v0.3.0 --sha HEAD --report-only
 
 expect "an unknown bump is a usage error"          sideways 2 "--bump"
+
+# The post-publication scan must carry the frozen range into the final documentation request.
+if python3 "$here/docs-refresh-shallow-test.py" \
+    DocumentationRefreshShallowTest.test_satellite_refresh_carries_followups_from_shallow_release_checkout; then
+  printf '  ok    %s\n' "satellite refresh retains followups from a shallow checkout"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n' "satellite refresh retains followups from a shallow checkout"
+  failed=$((failed + 1))
+fi
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
@@ -54,10 +55,17 @@ public final class LivePipelines {
 
     /** Whether the pipeline is at rest right now: not executing, and not headed back up. */
     public boolean isAtRest(String pipelineId) {
-        return isAtRest(actualStateOf(pipelineId), intentOf(pipelineId));
+        return isAtRest(state.read(pipelineId).orElse(null), desired.read(pipelineId).orElse(null));
     }
 
-    /** Whether those two readings together mean at rest -- the one definition every caller shares. */
+    /** A completion consumes an old run intent, while an accepted new start remains live. */
+    public static boolean isAtRest(CheckpointDoc actual, DesiredState intent) {
+        PipelineState current = actual == null ? PipelineState.NEW : StateJson.parse(actual.stateJson());
+        PipelineState target = intent == null ? PipelineState.NEW : intent.targetStateAt(actual);
+        return isAtRest(current, target);
+    }
+
+    /** Conservative state-only reading: without epochs, a RUNNING intent cannot be known to be consumed. */
     public static boolean isAtRest(PipelineState actual, PipelineState intent) {
         return RESTING.contains(actual) && !HEADED_UP.contains(intent);
     }
@@ -83,9 +91,9 @@ public final class LivePipelines {
      * wave through the one pipeline that is about to raise a held job onto the change.
      */
     public boolean changeWouldGoUnreported(String pipelineId) {
-        PipelineState actual = actualStateOf(pipelineId);
-        PipelineState intent = intentOf(pipelineId);
-        return !isAtRest(actual, intent) && intent != PipelineState.PAUSED;
+        CheckpointDoc actual = state.read(pipelineId).orElse(null);
+        DesiredState intent = desired.read(pipelineId).orElse(null);
+        return !isAtRest(actual, intent) && (intent == null || intent.targetState() != PipelineState.PAUSED);
     }
 
     /** What the pipeline is doing. A pipeline with no checkpoint has never run. */
@@ -120,6 +128,12 @@ public final class LivePipelines {
         if (stored == null || !changeWouldGoUnreported(replacement.id())) {
             return;
         }
+        if (!nodeConfigs(stored).equals(nodeConfigs(replacement))) {
+            String id = replacement.id();
+            throw new TapstateException(ArtifactError.PIPELINE_NOT_STOPPED,
+                    Map.of("id", id, "actual", actualStateOf(id).name(), "desired", intentOf(id).name()),
+                    null);
+        }
         Map<String, Boolean> before = recordedSwitches(stored);
         List<String> moved = new ArrayList<>();
         for (Map.Entry<String, Boolean> after : recordedSwitches(replacement).entrySet()) {
@@ -132,17 +146,27 @@ public final class LivePipelines {
             Collections.sort(moved);
             throw new TapstateException(
                     SourceError.SRS_CHANGE_WHILE_RUNNING,
-                    Map.of("id", moved.get(0), "pipelines", List.of(replacement.id())),
+                    Map.of("id", replacement.sourceReference(moved.get(0)).id(), "pipelines", List.of(replacement.id())),
                     null);
         }
     }
 
-    /** The switches this pipeline has recorded, by source id; references carrying none are absent. */
+    private static Map<String, Map<String, Object>> nodeConfigs(PipelineResource pipeline) {
+        Map<String, Map<String, Object>> configs = new LinkedHashMap<>();
+        for (SourceRef ref : pipeline.sources()) {
+            if (!ref.nodeConfig().isEmpty()) {
+                configs.put(ref.binding(), ref.nodeConfig());
+            }
+        }
+        return configs;
+    }
+
+    /** The switches this pipeline has recorded for each input binding. */
     private static Map<String, Boolean> recordedSwitches(PipelineResource pipeline) {
         Map<String, Boolean> switches = new LinkedHashMap<>();
         for (SourceRef ref : pipeline.sources()) {
             if (ref instanceof SourceRef.Spec spec) {
-                switches.put(spec.id(), spec.srs());
+                switches.put(spec.binding(), spec.srs());
             }
         }
         return switches;

@@ -30,12 +30,54 @@ class SecretRedactorTest {
     }
 
     @Test
+    void retainedOperationsKeepOriginalSecretsAfterSourceReplacementAndDeletion(){
+        var original=new SecretRedactor();original.replace("source",List.of("old-secret"));original.replace("unrelated",List.of("other-secret"));var retained=original.fork(List.of("source"));
+        original.replace("source",List.of("new-secret"));original.remove("source");
+        assertThat(retained.redact("old-secret")).isEqualTo("********");
+        assertThat(retained.redact("other-secret")).isEqualTo("other-secret");
+        assertThat(original.redact("old-secret")).isEqualTo("old-secret");
+        retained.replace("retained-inputs",List.of("saved-secret"));
+        assertThat(original.redact("saved-secret")).isEqualTo("saved-secret");
+    }
+
+    @Test
     void ignoresEmptyValuesAndLeavesNullTextNull() {
         SecretRedactor redactor = new SecretRedactor();
         redactor.replace("source", List.of("", "  "));
 
         assertThat(redactor.redact("ordinary line")).isEqualTo("ordinary line");
         assertThat(redactor.redact(null)).isNull();
+    }
+
+    @Test
+    void redactsShortCredentialsAsTokensAndLeavesDiagnosticsAndMarkersIntact() {
+        SecretRedactor redactor = new SecretRedactor();
+        redactor.replace("source", List.of("ed", "pass"));
+
+        assertThat(redactor.redact("authentication <redacted>; password; ed; passphrase; pass"))
+                .isEqualTo("authentication <redacted>; password; ********; passphrase; ********");
+    }
+
+    @Test
+    void repeatedRedactionDoesNotRewriteExistingMarkers() {
+        SecretRedactor redactor = new SecretRedactor();
+        redactor.replace("source", List.of("ed"));
+
+        String once = redactor.redact("private key ed");
+
+        assertThat(redactor.redact(once)).isEqualTo(once);
+        assertThat(redactor.redact("already <redacted>")).isEqualTo("already <redacted>");
+    }
+
+    @Test
+    void hidesCompleteCredentialsThatContainAnExistingMarkerSpelling() {
+        var values = List.of("fixture<redacted>-account", "fixture********-password", "redacted");
+        String text = "account fixture<redacted>-account, password fixture********-password, existing <redacted>";
+
+        var safe = SecretRedactor.redactConnectionDiagnostic(text, values);
+
+        assertThat(safe).isEqualTo("account <redacted>, password <redacted>, existing <redacted>");
+        assertThat(SecretRedactor.redactConnectionDiagnostic(safe, values)).isEqualTo(safe);
     }
 
     @Test

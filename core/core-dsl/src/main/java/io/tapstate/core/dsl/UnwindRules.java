@@ -68,10 +68,32 @@ public final class UnwindRules {
             byId.put(r.id(), r);
         }
         for (Resource r : batch) {
+            if (r instanceof TransformResource transform && transform.body() instanceof TransformBody.Unwind unwind) {
+                validateSourceIdField(unwind.sourceIdField());
+            }
             if (r instanceof PipelineResource p) {
                 validatePipeline(p, byId);
             }
         }
+    }
+
+    public static void validateSourceIdField(String field) {
+        if (field != null && (field.isBlank() || field.contains(".") || field.startsWith("$") || field.indexOf('\0') >= 0)) {
+            throw new DslException(DslError.ILLEGAL_VALUE, "source_id_field", 0, 0, null,
+                    Map.of("value", field, "expected", "a nonblank top-level field name without dots or a dollar prefix"));
+        }
+    }
+
+    /** Whether a resolved unwind contributes rows to an external sync target, without reading schemas. */
+    public static boolean reachesSyncTarget(PipelineResource pipeline, Map<String, Resource> resources) {
+        if (pipeline.serve() == null || pipeline.transforms() == null
+                || syncElements(pipeline.serve(), resources).isEmpty()) return false;
+        Set<String> reaching = new Wiring(pipeline, resources).nodesReaching(switch (pipeline.serve()) {
+            case ServeBlock.Inline inline -> inline.from();
+            case ServeBlock.Use use -> use.from();
+        });
+        return pipeline.transforms().stream().anyMatch(step -> reaching.contains(step.id())
+                && bodyOf(step, resources) instanceof TransformBody.Unwind);
     }
 
     private static void validatePipeline(PipelineResource p, Map<String, Resource> byId) {
@@ -82,6 +104,7 @@ public final class UnwindRules {
             if (!(bodyOf(step, byId) instanceof TransformBody.Unwind unwind)) {
                 continue;
             }
+            validateSourceIdField(unwind.sourceIdField());
             unwinds.add(step.id());
             // Judged wherever it is declared, read or not. What the step says about its own rows is
             // a property of the declaration, and an author who has written one that cannot key its

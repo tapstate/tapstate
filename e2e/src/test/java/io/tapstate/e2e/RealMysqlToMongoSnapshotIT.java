@@ -92,13 +92,12 @@ class RealMysqlToMongoSnapshotIT {
             // One store and one target per tier: sharing them would let a later tier read the rows an
             // earlier one already landed and pass on the first poll without the connector writing a thing.
             String suffix = tier.name().toLowerCase(Locale.ROOT);
-            String storeUri = SharedMongo.replicaSetUrl("real_mysql_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("real_mysql_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));

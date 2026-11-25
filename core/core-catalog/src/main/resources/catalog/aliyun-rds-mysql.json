@@ -268,7 +268,7 @@
   ],
   "provenance": {
     "specPath": "connectors/aliyun-rds-mysql-connector/src/main/resources/aliyun-rds-mysql-spec.json",
-    "specContentHash": "fc76c9c034ceb30a",
+    "specContentHash": "8591475250ecb714",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

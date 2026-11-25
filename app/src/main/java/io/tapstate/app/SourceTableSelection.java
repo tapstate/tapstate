@@ -16,6 +16,24 @@ final class SourceTableSelection {
 
     private SourceTableSelection() {}
 
+    /** Other literal names need no invented discovery facts when checking one already observed table. */
+    static boolean selectsKnownTable(SourceResource source, SourceTable knownTable) {
+        return selectsTableName(source,knownTable.name());
+    }
+    /** Declaration membership only; a requested name does not prove that a native table exists. */
+    static boolean selectsTableName(SourceResource source,String table) {
+        if (source.tables() == null) return true;
+        var selected = new LinkedHashSet<String>();
+        for (var selector : source.tables()) {
+            switch (selector) {
+                case TableRef.Literal literal -> addLiteral(source, null, selected, literal.name());
+                case TableRef.Spec spec -> addSpec(source, null, selected, spec);
+                case TableRef.Regex regex -> {if(tablePattern(source,regex.pattern()).matcher(table).matches())selected.add(table);}
+            }
+        }
+        return selected.contains(table);
+    }
+
     static List<String> resolve(SourceResource source, SourceModel discovered) {
         List<TableRef> selectors = source.tables();
         if (selectors == null) {
@@ -32,16 +50,50 @@ final class SourceTableSelection {
 
         LinkedHashSet<String> selected = new LinkedHashSet<>();
         for (TableRef selector : selectors) {
-            switch (selector) {
-                case TableRef.Literal literal -> addLiteral(source, discovered, selected, literal.name());
-                case TableRef.Spec spec -> addSpec(source, discovered, selected, spec);
-                case TableRef.Regex regex -> addRegex(source, discovered, selected, regex.pattern());
-            }
+            select(source, discovered, selected, selector);
         }
         if (selected.isEmpty()) {
             throw emptySelection(source);
         }
         return List.copyOf(selected);
+    }
+
+    /** Known selection members and unresolved selectors for read-only output naming. */
+    record Names(List<String> tables, List<TapstateException> unresolved) {
+        Names {
+            tables = List.copyOf(tables);
+            unresolved = List.copyOf(unresolved);
+        }
+    }
+
+    static Names forOutputNames(SourceResource source, SourceModel discovered) {
+        if (source.tables() == null || source.tables().isEmpty()) {
+            try {
+                return new Names(resolve(source, discovered), List.of());
+            } catch (TapstateException unavailable) {
+                return new Names(List.of(), List.of(unavailable));
+            }
+        }
+        LinkedHashSet<String> selected = new LinkedHashSet<>();
+        List<TapstateException> unresolved = new ArrayList<>();
+        for (TableRef selector : source.tables()) {
+            try {
+                select(source, discovered, selected, selector);
+            } catch (TapstateException unavailable) {
+                unresolved.add(unavailable);
+            }
+        }
+        if (selected.isEmpty() && unresolved.isEmpty()) unresolved.add(emptySelection(source));
+        return new Names(List.copyOf(selected), unresolved);
+    }
+
+    private static void select(SourceResource source, SourceModel discovered,
+            LinkedHashSet<String> selected, TableRef selector) {
+        switch (selector) {
+            case TableRef.Literal literal -> addLiteral(source, discovered, selected, literal.name());
+            case TableRef.Spec spec -> addSpec(source, discovered, selected, spec);
+            case TableRef.Regex regex -> addRegex(source, discovered, selected, regex.pattern());
+        }
     }
 
     private static void addLiteral(
@@ -82,19 +134,17 @@ final class SourceTableSelection {
     private static void addRegex(
             SourceResource source, SourceModel discovered, LinkedHashSet<String> selected, String expression) {
         requireDiscovery(source, discovered);
-        final Pattern pattern;
-        try {
-            pattern = Pattern.compile(expression);
-        } catch (PatternSyntaxException exception) {
-            throw new TapstateException(
-                    ActuationError.SOURCE_TABLE_REGEX_INVALID,
-                    Map.of("source", source.id(), "regex", expression),
-                    exception);
-        }
+        final Pattern pattern=tablePattern(source,expression);
         discovered.tables().stream()
                 .map(SourceTable::name)
                 .filter(name -> pattern.matcher(name).matches())
                 .forEach(selected::add);
+    }
+
+    private static Pattern tablePattern(SourceResource source,String expression){
+        try{return Pattern.compile(expression);}
+        catch(PatternSyntaxException failed){throw new TapstateException(ActuationError.SOURCE_TABLE_REGEX_INVALID,
+                Map.of("source",source.id(),"regex",expression),failed);}
     }
 
     private static void requireDiscovery(SourceResource source, SourceModel discovered) {

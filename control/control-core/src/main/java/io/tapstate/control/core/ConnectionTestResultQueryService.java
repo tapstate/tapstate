@@ -11,16 +11,21 @@ import java.util.Optional;
  * surface {@link ConnectionTestReport}, or empty when the connection has never been tested. A read of derived
  * observation data, not the config truth layer, so it carries no audit gate.
  *
- * <p>The store is the truth layer; this only projects the storage-port result onto the control-ring report,
- * so the faces render a control-ring type and never reach into the storage ports (the same split the artifact
- * read side keeps between {@link ArtifactQueryService} and {@link ApplyService}).
+ * <p>The store is the truth layer; this projects the storage-port result onto the control-ring report and hides
+ * diagnostic text from legacy rows without a safety marker. New results are redacted before they are stored.
+ * The faces render a control-ring type and never reach into the storage ports (the same split the artifact read
+ * side keeps between {@link ArtifactQueryService} and {@link ApplyService}).
  */
 public final class ConnectionTestResultQueryService {
 
     private final ConnectionTestResultStore store;
+    private final java.util.function.Predicate<String> readable;
 
     public ConnectionTestResultQueryService(ConnectionTestResultStore store) {
-        this.store = Objects.requireNonNull(store, "store");
+        this(store, ignored -> true);
+    }
+    public ConnectionTestResultQueryService(ConnectionTestResultStore store, java.util.function.Predicate<String> readable) {
+        this.store = Objects.requireNonNull(store, "store"); this.readable = Objects.requireNonNull(readable);
     }
 
     /**
@@ -29,6 +34,9 @@ public final class ConnectionTestResultQueryService {
      */
     public Optional<ConnectionTestReport> find(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
-        return store.find(connectionId).map(ConnectionTestReport::from);
+        if (!readable.test(connectionId)) return Optional.empty();
+        return store.find(connectionId)
+                .map(ConnectionTestResultRedactor::hideUntrustedDiagnostics)
+                .map(ConnectionTestReport::from);
     }
 }

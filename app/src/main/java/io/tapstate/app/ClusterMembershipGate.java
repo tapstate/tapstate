@@ -1,11 +1,16 @@
 package io.tapstate.app;
 
 import com.hazelcast.cluster.Member;
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.splitbrainprotection.SplitBrainProtectionFunction;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -23,10 +28,26 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     private final int bootstrapMinMembers;
     private final AtomicReference<ClusterMembership> committed = new AtomicReference<>();
     private final AtomicReference<VisibleSnapshot> visible =
-            new AtomicReference<>(new VisibleSnapshot(0, Set.of()));
+            new AtomicReference<>(new VisibleSnapshot(0, Set.of(), false));
 
     /** A publication changes the revision even when the visible members have not changed. */
-    record VisibleSnapshot(long revision, Set<String> nodeIds) {}
+    record VisibleSnapshot(long revision, Set<String> nodeIds, boolean originalSingleVisible) {}
+    // The single member bootstrap publishes one immutable owner identity.
+    @SuppressWarnings("java:S3077")
+    private volatile WorkloadOwner singleOwner;
+    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> false);
+
+    /** A fixed deployment predicate, not a persisted majority decision or recovery epoch. */
+    void bindSingle(WorkloadClaim original) {
+        if (profile != ClusterProperties.Profile.SINGLE || singleOwner != null || original.key().type() != WorkloadClaimType.NODE_SESSION
+                || !original.key().clusterId().equals(original.owner().nodeId()) || !original.key().resourceId().equals(original.owner().nodeId())) {
+            throw new IllegalArgumentException("invalid single-node admission");
+        }
+        nodeSession.set(() -> false);
+        singleOwner = original.owner();
+        committed.set(new ClusterMembership(original.key().clusterId(), 1, Set.of(original.owner().nodeId())));
+    }
+
 
     /**
      * The data plane's own answer to this same predicate. Until a member binds one, nothing is asked -
@@ -34,14 +55,52 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
      */
     private final AtomicReference<BooleanSupplier> dataPlane = new AtomicReference<>(() -> true);
 
+
     ClusterMembershipGate(ClusterProperties properties) {
         this.profile = properties.getProfile();
         this.bootstrapMinMembers = properties.getBootstrapMinMembers();
     }
 
+    /** A member by the stable id it joined under, or by its engine identity where it names none. */
+    static String stableIdOf(Member member) {
+        String nodeId = member.getAttribute(NODE_ID_ATTRIBUTE);
+        return nodeId != null ? nodeId : member.getUuid().toString();
+    }
+
+    /**
+     * The members of {@code member}'s cluster a run submitted now would take part on, by stable id and in order:
+     * every member that holds data, which in this product is every member - none joins as a lite member.
+     */
+    static List<String> dataMembers(HazelcastInstance member) {
+        return member.getCluster().getMembers().stream()
+                .filter(candidate -> !candidate.isLiteMember())
+                .map(ClusterMembershipGate::stableIdOf)
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * {@link #dataMembers}, or none while {@code member}'s engine cannot be asked - down, or its cluster changing under
+     * the read. For the read faces, which leave out what only a running engine knows rather than failing the part of
+     * their answer the store holds; a run being planned asks {@link #dataMembers}, and fails with it.
+     */
+    static List<String> dataMembersIfReadable(HazelcastInstance member) {
+        try {
+            return dataMembers(member);
+        } catch (RuntimeException failed) {
+            if (!HazelcastLivePipelineRuns.theClusterIsChanging(failed)) {
+                throw failed;
+            }
+            return List.of();
+        }
+    }
+
     @Override
     public boolean apply(Collection<Member> members) {
-        return eligible(rememberVisible(nodeIds(members)));
+        WorkloadOwner original = singleOwner;
+        boolean matches = original != null && members.size() == 1 && members.stream().allMatch(member -> !member.isLiteMember()
+                && original.nodeId().equals(member.getAttribute(NODE_ID_ATTRIBUTE)) && original.bootId().equals(member.getAttribute(BOOT_ID_ATTRIBUTE)));
+        return eligible(rememberVisible(nodeIds(members), matches));
     }
 
     /**
@@ -61,7 +120,18 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
      * pause, and disagreeing by admitting is a dead run.
      */
     boolean businessEligible() {
-        return eligible(visibleNodeIds()) && dataPlane.get().getAsBoolean();
+        return eligible(visible.get()) && dataPlane.get().getAsBoolean();
+    }
+
+    /** Only the original single process may keep an already-held lifecycle claim for failure reporting. */
+    boolean singleControlEligible(WorkloadClaim expected) {
+        ClusterMembership fixed = committed.get();
+        WorkloadOwner original = singleOwner;
+        return profile == ClusterProperties.Profile.SINGLE && original != null && fixed != null
+                && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                && expected.owner().equals(original) && expected.key().clusterId().equals(fixed.clusterId())
+                && fixed.activeNodeIds().equals(Set.of(original.nodeId())) && fixed.revision() == 1
+                && expected.topologyRevision() == fixed.revision() && nodeSession.get().getAsBoolean();
     }
 
     /**
@@ -74,11 +144,17 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         dataPlane.set(Objects.requireNonNull(admits, "admits"));
     }
 
+    /** The pre-join identity must remain proved while the member is starting or carrying work. */
+    void observeNodeSession(BooleanSupplier current) {
+        nodeSession.set(Objects.requireNonNull(current, "current"));
+    }
+
     boolean canCommit(Set<String> visibleNodeIds) {
         rememberVisible(visibleNodeIds);
+        if (!nodeSession.get().getAsBoolean()) return false;
         ClusterMembership current = committed.get();
         if (profile == ClusterProperties.Profile.SINGLE) {
-            return true;
+            return singleOwner == null;
         }
         if (current == null) {
             return visibleNodeIds.size() >= bootstrapMinMembers;
@@ -93,7 +169,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     }
 
     void failClosed() {
-        if (profile != ClusterProperties.Profile.SINGLE) {
+        if (profile != ClusterProperties.Profile.SINGLE || singleOwner != null) {
             committed.set(null);
         }
     }
@@ -135,9 +211,11 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         return Set.copyOf(ids);
     }
 
-    private boolean eligible(Set<String> visibleNodeIds) {
+    private boolean eligible(VisibleSnapshot snapshot) {
+        Set<String> visibleNodeIds = snapshot.nodeIds();
+        if (!nodeSession.get().getAsBoolean()) return false;
         if (profile == ClusterProperties.Profile.SINGLE) {
-            return true;
+            return singleOwner == null || singleEligible(snapshot);
         }
         ClusterMembership current = committed.get();
         if (current == null) {
@@ -149,10 +227,14 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
                 : present >= 1;
     }
 
-    private Set<String> rememberVisible(Set<String> visibleNodeIds) {
+    private boolean singleEligible(VisibleSnapshot snapshot) {
+        ClusterMembership fixed = committed.get();
+        return fixed != null && snapshot.originalSingleVisible() && snapshot.nodeIds().equals(fixed.activeNodeIds()) && nodeSession.get().getAsBoolean();
+    }
+    private VisibleSnapshot rememberVisible(Set<String> visibleNodeIds) { return rememberVisible(visibleNodeIds, false); }
+    private VisibleSnapshot rememberVisible(Set<String> visibleNodeIds, boolean originalSingleVisible) {
         Set<String> snapshot = Set.copyOf(visibleNodeIds);
-        visible.updateAndGet(previous -> new VisibleSnapshot(previous.revision() + 1, snapshot));
-        return snapshot;
+        return visible.updateAndGet(previous -> new VisibleSnapshot(previous.revision() + 1, snapshot, originalSingleVisible));
     }
 
     private static int overlap(Set<String> committed, Set<String> visible) {

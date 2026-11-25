@@ -201,16 +201,36 @@ public final class HistoryAggregator {
         return before != null && after != null && after < before;
     }
 
-    private static CounterInterval counter(RateSample left, RateSample right, String name, Duration elapsed) {
+    /**
+     * How much {@code name} grew from {@code left} to {@code right}, or {@code null} when the pair gives no
+     * rate: a total missing on one side, totals counted from different starts, or a total that fell.
+     *
+     * <p>Two samples taken before the run counted anything at all — no counting start and no total on
+     * either side — moved nothing between them, and that is a measurement of zero, not the absence of one.
+     * The engine publishes a total only once the first row crosses, so without this a running pipeline
+     * with nothing to deliver would read as unmeasured for as long as it stayed idle.
+     */
+    static Long growth(RateSample left, RateSample right, String name) {
         Long before = left.counters().get(name);
         Long after = right.counters().get(name);
-        if (elapsed.isZero() || before == null || after == null
+        if (before == null && after == null && left.countingSince() == null && right.countingSince() == null) {
+            return 0L;
+        }
+        if (before == null || after == null
                 || left.countingSince() == null || !left.countingSince().equals(right.countingSince())
                 || after < before) {
             return null;
         }
+        return after - before;
+    }
+
+    private static CounterInterval counter(RateSample left, RateSample right, String name, Duration elapsed) {
+        Long growth = growth(left, right, name);
+        if (elapsed.isZero() || growth == null) {
+            return null;
+        }
         long nanos = nanos(elapsed);
-        BigDecimal delta = BigDecimal.valueOf(after - before);
+        BigDecimal delta = BigDecimal.valueOf(growth);
         BigDecimal rate = delta.multiply(NANOS_PER_SECOND)
                 .divide(BigDecimal.valueOf(nanos), INTERNAL_SCALE, RoundingMode.HALF_EVEN);
         return new CounterInterval(delta, nanos, rate);

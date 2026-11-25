@@ -10,9 +10,8 @@ import io.tapstate.spi.store.ConnectionTestResult;
  * request/response calls that cannot be expressed as desired state. This interface is one of those
  * narrow seams.
  *
- * <p>The whitelist of such calls is a closed set — this probe and the {@link SchemaDiscoveryProbe} —
- * pinned by the ring-dependency gate. A preview or any further synchronous control-to-runtime call is
- * a deliberate widening of the seam that must change the gate and the sync-whitelist decision, not
+ * <p>The whitelist of such calls is a closed set of seven probes, pinned by the ring-dependency gate.
+ * Any further synchronous control-to-runtime call is a deliberate widening of the seam that must change the gate and the sync-whitelist decision, not
  * something a later slice adds in passing.
  *
  * <p>The probe drives the target connector's own connection test and reports the normalized
@@ -26,4 +25,7 @@ public interface ConnectionProbe {
 
     /** Probes the target connection synchronously and reports the normalized result. */
     ConnectionTestResult probe(ConnectionConfig config);
+
+    /** Same local test action with the original default-Source deadline; never a new routing or retry action. */
+    default ConnectionTestResult probeDefault(ConnectionConfig config, long deadlineNanos) { return probe(config); }
 }

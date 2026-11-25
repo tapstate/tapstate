@@ -19,8 +19,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.util.UriComponentsBuilder;
 
-import java.net.URI;
 import java.util.Map;
 import java.util.Objects;
 
@@ -42,7 +42,8 @@ class SourceController {
     @PostMapping("/sources")
     ResponseEntity<SourceView> create(@RequestBody SourceInput input) {
         SourceView created = sources.create(AuthenticatedCaller.subject(), input);
-        return ResponseEntity.created(URI.create("/api/sources/" + created.id()))
+        return ResponseEntity.created(UriComponentsBuilder.fromPath("/api/sources/{id}")
+                        .buildAndExpand(created.id()).encode().toUri())
                 .eTag(created.contentHash())
                 .body(created);
     }

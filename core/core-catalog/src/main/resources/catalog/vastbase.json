@@ -329,7 +329,7 @@
   ],
   "provenance": {
     "specPath": "connectors/vastbase-connector/src/main/resources/spec_vastbase.json",
-    "specContentHash": "d41b14a8bfa35b15",
+    "specContentHash": "df46495fda304ce4",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

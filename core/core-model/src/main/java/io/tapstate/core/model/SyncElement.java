@@ -30,10 +30,17 @@ public record SyncElement(
         DdlPolicy ddl,
         @Doc(value = "Treatment of existing target rows before a new full load; resume, recovery and CDC-only never clear rows.",
                 def = "append")
-        OnFullLoad onFullLoad) {
+        OnFullLoad onFullLoad,
+        @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+        ExecutionSpec execution) {
 
     public SyncElement(String id, String source, WriteMode writeMode, RenameSpec rename, DdlPolicy ddl) {
-        this(id, source, writeMode, rename, ddl, null);
+        this(id, source, writeMode, rename, ddl, null, null);
+    }
+
+    public SyncElement(String id, String source, WriteMode writeMode, RenameSpec rename, DdlPolicy ddl,
+            OnFullLoad onFullLoad) {
+        this(id, source, writeMode, rename, ddl, onFullLoad, null);
     }
 
     public SyncElement {

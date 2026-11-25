@@ -1,0 +1,214 @@
+package io.tapstate.spi.store;
+
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
+import org.junit.jupiter.api.Test;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class PipelineDraftStoreContractTest {
+
+    @Test
+    void onlyOneWriterCanAdvanceAnAuthoringRevision() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        PipelineDraft initial = draft(PipelineDraft.Mode.DAG, 1, graph(), null);
+
+        assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
+        PipelineDraft writerA = draft(PipelineDraft.Mode.DAG, 2, graphWithNode("a"), null);
+        PipelineDraft writerB = draft(PipelineDraft.Mode.DAG, 2, graphWithNode("b"), null);
+
+        assertThat(store.replace("orders", 1, writerA)).isEqualTo(PipelineDraftMutation.REPLACED);
+        assertThat(store.replace("orders", 1, writerB)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        assertThat(store.get("orders").orElseThrow().graph().nodes()).extracting(PipelineDraft.Node::id)
+                .containsExactly("a");
+    }
+
+    @Test
+    void modeCannotChangeAndPublishChecksBothConditionsBeforeEitherMutation() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        PipelineDraft initial = draft(PipelineDraft.Mode.DAG, 1, graph(), null);
+        store.create(initial);
+
+        PipelineDraft wizard = draft(PipelineDraft.Mode.WIZARD, 2, null, emptyWizard());
+        assertThat(store.replace("orders", 1, wizard)).isEqualTo(PipelineDraftMutation.MODE_CONFLICT);
+
+        Resource artifact = artifact("orders");
+        PipelineDraft.Publication staleArtifact = new PipelineDraft.Publication(
+                "orders", 1, "old-hash", artifact, "new-hash", Instant.parse("2026-09-21T00:00:00Z"), "test");
+        assertThat(store.publish(staleArtifact)).isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+        assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isNull();
+        assertThat(store.artifacts).isEmpty();
+    }
+
+    @Test
+    void successfulPublishAdvancesArtifactAndMarkersTogether() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null));
+        Resource artifact = artifact("orders");
+
+        assertThat(store.publish(new PipelineDraft.Publication("orders", 1, null, artifact, "hash-2",
+                Instant.parse("2026-09-21T00:00:00Z"), "test"))).isEqualTo(PipelineDraftMutation.PUBLISHED);
+        PipelineDraft saved = store.get("orders").orElseThrow();
+        assertThat(saved.baseArtifactHash()).isEqualTo("hash-2");
+        assertThat(saved.publishedDraftRevision()).isEqualTo(1L);
+        assertThat(store.artifacts).containsEntry("orders", artifact);
+    }
+
+    @Test
+    void discardUsesTheSameRevisionCasAsAutosave() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null));
+
+        assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        assertThat(store.delete("orders", 1)).isEqualTo(PipelineDraftMutation.DELETED);
+        assertThat(store.get("orders")).isEmpty();
+        assertThat(store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null)))
+                .isEqualTo(PipelineDraftMutation.CREATED);
+        assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(2);
+        assertThat(store.replace("orders", 1, draft(PipelineDraft.Mode.DAG, 2, graphWithNode("stale"), null)))
+                .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+    }
+
+    @Test
+    void defaultDraftPagesValidateBoundsAndReturnImmutableSlices() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null));
+
+        assertThat(store.listSummaries()).hasSize(1)
+                .extracting(PipelineDraftSummary::pipelineId).containsExactly("orders");
+        assertThat(store.listSummaries(0, 1)).hasSize(1);
+        assertThat(store.listSummaries(1, 1)).isEmpty();
+        assertThat(store.list(0, 1)).hasSize(1);
+        assertThat(store.list(1, 1)).isEmpty();
+        assertThatThrownBy(() -> store.listSummaries(-1, 1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("draft page offset must be non-negative and limit must be positive");
+        assertThatThrownBy(() -> store.list(0, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("draft page offset must be non-negative and limit must be positive");
+    }
+
+    private static PipelineDraft draft(PipelineDraft.Mode mode, long revision, PipelineDraft.Graph graph,
+            PipelineDraft.Wizard wizard) {
+        Instant now = Instant.parse("2026-09-21T00:00:00Z");
+        return new PipelineDraft("orders", 1, revision, mode, "Orders", "", graph, wizard, null, null, null,
+                now, now, "test");
+    }
+
+    private static PipelineDraft.Graph graph() {
+        return new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1));
+    }
+
+    private static PipelineDraft.Graph graphWithNode(String id) {
+        return new PipelineDraft.Graph(List.of(new PipelineDraft.Node(id, "source", "crm", "orders", Map.of(), Map.of())),
+                List.of(), new PipelineDraft.Viewport(0, 0, 1));
+    }
+
+    private static PipelineDraft.Wizard emptyWizard() {
+        return new PipelineDraft.Wizard(new PipelineDraft.Root("orders", "crm", "orders", List.of(), List.of()),
+                List.of(), List.of(), null);
+    }
+
+    private static Resource artifact(String id) {
+        return new PipelineResource(id, null, List.of(SourceRef.bare("crm")), null, null, null, null, Map.of());
+    }
+
+    private static final class InMemoryDraftStore implements PipelineDraftStore {
+        private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
+        private final Map<String, Resource> artifacts = new LinkedHashMap<>();
+        private final Map<String, Long> lastRevision = new LinkedHashMap<>();
+
+        @Override
+        public synchronized Optional<PipelineDraft> get(String pipelineId) {
+            return Optional.ofNullable(drafts.get(pipelineId));
+        }
+
+        @Override
+        public synchronized List<PipelineDraft> list() {
+            return new ArrayList<>(drafts.values());
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation create(PipelineDraft draft) {
+            if (drafts.containsKey(draft.pipelineId())) {
+                return PipelineDraftMutation.ALREADY_EXISTS;
+            }
+            long revision = Math.max(draft.revision(), lastRevision.getOrDefault(draft.pipelineId(), 0L) + 1);
+            drafts.put(draft.pipelineId(), withRevision(draft, revision));
+            lastRevision.put(draft.pipelineId(), revision);
+            return PipelineDraftMutation.CREATED;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation replace(String pipelineId, long expectedRevision,
+                PipelineDraft replacement) {
+            PipelineDraft current = drafts.get(pipelineId);
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.mode() != replacement.mode()) {
+                return PipelineDraftMutation.MODE_CONFLICT;
+            }
+            if (current.revision() != expectedRevision) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            if (!java.util.Objects.equals(current.baseArtifactHash(), replacement.baseArtifactHash())
+                    || !java.util.Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+                    || !java.util.Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            drafts.put(pipelineId, replacement);
+            lastRevision.put(pipelineId, replacement.revision());
+            return PipelineDraftMutation.REPLACED;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+            PipelineDraft current = drafts.get(pipelineId);
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.revision() != expectedRevision) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            drafts.remove(pipelineId);
+            return PipelineDraftMutation.DELETED;
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+            PipelineDraft current = drafts.get(publication.pipelineId());
+            if (current == null) {
+                return PipelineDraftMutation.NOT_FOUND;
+            }
+            if (current.revision() != publication.expectedDraftRevision()) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
+            if (!java.util.Objects.equals(current.baseArtifactHash(), publication.expectedArtifactHash())) {
+                return PipelineDraftMutation.ARTIFACT_CONFLICT;
+            }
+            artifacts.put(publication.pipelineId(), publication.artifact());
+            drafts.put(publication.pipelineId(), new PipelineDraft(current.pipelineId(), current.schemaVersion(),
+                    current.revision(), current.mode(), current.name(), current.description(), current.graph(), current.wizard(),
+                    publication.publishedArtifactHash(), publication.expectedDraftRevision(),
+                    publication.publishedArtifactHash(), current.createdAt(), publication.publishedAt(), publication.updatedBy()));
+            return PipelineDraftMutation.PUBLISHED;
+        }
+
+        private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
+            return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(),
+                    draft.description(), draft.graph(), draft.wizard(), draft.baseArtifactHash(),
+                    draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(),
+                    draft.updatedAt(), draft.updatedBy());
+        }
+    }
+}

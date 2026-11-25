@@ -26,7 +26,7 @@ class ConnectionTestResultQueryServiceTest {
             "conn-orders", "mongodb", Outcome.FAILED,
             List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
                     "authentication failed", "SCRAM rejected", "check the password", "11000")),
-            1_700_000_000_000L);
+            1_700_000_000_000L, true);
 
     @Test
     void findReturnsTheLatestResultProjectedOntoTheSurfaceReport() {
@@ -54,6 +54,24 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void rereadingAnEarlierPostgresReportKeepsItsOriginalPrimaryCodeAndCauseChain() {
+        var diagnostic = Map.<String, Object>of("code", "28P01", "cause",
+                Map.of("code", "10002", "cause", Map.of("code", "28P01")));
+        var stored = new ConnectionTestResult("conn-orders", "postgres", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
+                        "password authentication failed", null, null, "28P01", diagnostic)),
+                1_700_000_000_000L, true);
+        var store = new MapResultStore();
+        store.save(stored);
+
+        var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow().checks().getFirst();
+
+        assertThat(check.connectorErrorCode()).isEqualTo("28P01");
+        assertThat(check.diagnostic()).isEqualTo(diagnostic);
+        assertThat(store.find("conn-orders")).contains(stored);
+    }
+
+    @Test
     void findReturnsEmptyWhenTheConnectionWasNeverTested() {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
 
@@ -61,9 +79,118 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void hidesDiagnosticsFromLegacyResultsWithoutAStoredSafetyMarker() {
+        ConnectionTestResult legacy = new ConnectionTestResult(
+                "conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login private credential", ConnectionTestItem.Status.FAILED,
+                        "old password value", "old private key", "rotate the password", "secret-code")),
+                1_700_000_000_000L);
+        MapResultStore store = new MapResultStore();
+        store.save(legacy);
+
+        ConnectionTestReport report = new ConnectionTestResultQueryService(store)
+                .find("conn-orders").orElseThrow();
+
+        assertThat(report.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+        assertThat(report.testedAt()).isEqualTo(1_700_000_000_000L);
+        assertThat(report.checks()).singleElement().satisfies(check -> {
+            assertThat(check.name()).isEqualTo("Check 1");
+            assertThat(check.status()).isEqualTo(ConnectionTestReport.Check.Status.FAILED);
+            assertThat(check.message()).isNull();
+            assertThat(check.reason()).isNull();
+            assertThat(check.solution()).isNull();
+            assertThat(check.connectorErrorCode()).isNull();
+        });
+    }
+
+    @Test
     void requiresItsStore() {
         assertThatThrownBy(() -> new ConnectionTestResultQueryService(null))
                 .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void hidesDriverCredentialsWhenTheOldReportAlreadyHasASafetyMarker() {
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb-atlas", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "SCRAM rejected MongoCredential{userName='fixture-account', mechanismProperties=<hidden>}",
+                        null, null, null)), 1_700_000_000_000L, true));
+
+        var report = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow();
+
+        assertThat(report.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+        assertThat(report.checks().getFirst().message())
+                .contains("SCRAM rejected", "<redacted>").doesNotContain("fixture-account");
+    }
+
+    @Test
+    void leavesEndpointDescriptionsAndContactAddressesIntact() {
+        String message = "No reply from mongodb://db.example:27017 after 3 attempts; contact ops@example.org";
+        String reason = "A proxy was used; server replied {code=18}";
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        message, reason, null, null)), 1_700_000_000_000L, true));
+
+        var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst();
+
+        assertThat(check.message()).isEqualTo(message);
+        assertThat(check.reason()).isEqualTo(reason);
+    }
+
+    @Test
+    void hidesUserInfoAndProxyCredentialsInPreviouslyStoredReports() {
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Unable to connect to mongodb://fixture-user:two@parts words@db.example/data",
+                        "Refused ProxySettings{host=proxy, port=1080, username=fixture-user, password=head}tail",
+                        "Check the server address", null)), 1_700_000_000_000L, true));
+
+        var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst();
+
+        assertThat(check.message()).isEqualTo("Unable to connect to mongodb://<redacted>@db.example/data");
+        assertThat(check.reason()).isEqualTo("Refused ProxySettings<redacted>");
+        assertThat(check.solution()).isEqualTo("Check the server address");
+    }
+
+    @Test
+    void hidesAnIncompleteCredentialDumpAfterACompleteOneInStoredDiagnostics() {
+        String credentials = "MongoCredential{userName='first', mechanismProperties=<hidden>}"
+                + " then MongoCredential{userName='hidden-tail-user'";
+        String proxy = "ProxySettings{username=first, password=first-secret}"
+                + " then ProxySettings{username=hidden-tail-proxy, password=hidden-tail-secret";
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Login failed", null, null, null,
+                        Map.of("rawMessage", credentials, "stackTrace", proxy))), 1_700_000_000_000L, true));
+
+        var diagnostic = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst().diagnostic();
+        assertThat(diagnostic).containsEntry("rawMessage", "MongoCredential<redacted>")
+                .containsEntry("stackTrace", "ProxySettings<redacted>");
+    }
+
+    @Test
+    void masksHttpAuthorizationInPreviouslyStoredDiagnosticFields() {
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Login failed", null, null, null,
+                        Map.of("rawMessage", "Authorization: Bearer fixture-header-token",
+                                "stackTrace", "authentication failed\nauthorization: basic Zml4dHVyZTpwYXNz==\n"
+                                        + "\tat example.Client.connect(Client.java:42)"))),
+                1_700_000_000_000L, true));
+
+        var diagnostic = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst().diagnostic();
+        assertThat(diagnostic).containsEntry("rawMessage", "Authorization: Bearer <redacted>")
+                .containsEntry("stackTrace", "authentication failed\nauthorization: basic <redacted>\n"
+                        + "\tat example.Client.connect(Client.java:42)");
     }
 
     @Test

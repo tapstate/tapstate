@@ -1,22 +1,25 @@
 package io.tapstate.adapters.mongostore.migration;
 
+import io.tapstate.adapters.mongostore.SharedMongoCase;
+
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.ChangeSet.Fence;
+import io.tapstate.adapters.mongostore.MigrationError;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Clock;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -24,6 +27,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -44,21 +48,25 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 @RequiresDocker
 class MigrationRunnerIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Duration LOCK_TTL = Duration.ofSeconds(30);
     private static final Duration PATIENT = Duration.ofSeconds(30);
     private static final Clock CLOCK = Clock.systemUTC();
     private static final Document SCHEMA_ID = new Document("_id", "schema");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MigrationRunnerIT.class);
 
     private static MongoClient client;
 
-    @AfterAll
-    static void closeClient() {
-        if (client != null) {
-            client.close();
+    @AfterEach
+    void closeClient() {
+        try {
+            if (client != null) {
+                client.close();
+            }
+        } finally {
+            client = null;
         }
     }
 
@@ -155,13 +163,50 @@ class MigrationRunnerIT {
                 TapstateException.class);
 
         assertThat(failure).isNotNull();
-        assertThat(failure.code().code()).isEqualTo("migration.changeset-failed");
+        assertThat(failure.code().code()).isEqualTo("TS0420003");
         assertThat(failure.args()).containsEntry("cause", "disk is full");
         assertThat(installedVersion(database))
                 .as("the step that succeeded is recorded; the one that threw is not")
                 .isEqualTo(1);
 
         // And the next start resumes at the failed step rather than repeating the one before it.
+        AtomicInteger secondRan = new AtomicInteger();
+        MigrationRunner.migrate(database, List.of(counting(1, firstRan), counting(2, secondRan)),
+                LOCK_TTL, PATIENT, CLOCK);
+        assertThat(firstRan).hasValue(1);
+        assertThat(secondRan).hasValue(1);
+        assertThat(installedVersion(database)).isEqualTo(2);
+    }
+
+    @Test
+    void aDriverFailureDoesNotExposeDocumentValuesAndStillResumesAtTheFailedStep() {
+        MongoDatabase database = freshDatabase("runner_driver_failure");
+        String sentinel = "controlled-migration-secret-value";
+        database.getCollection("duplicate_proof").insertOne(new Document("_id", sentinel));
+        AtomicInteger firstRan = new AtomicInteger();
+        ChangeSet duplicateWrite = new ChangeSet() {
+            @Override public int version() { return 2; }
+            @Override public String changeSetName() { return "controlled-driver-failure"; }
+            @Override public void up(MongoDatabase target, Fence fence) {
+                fence.requireStillHeld();
+                target.getCollection("duplicate_proof").insertOne(new Document("_id", sentinel));
+            }
+        };
+        TapstateException failure = catchThrowableOfType(() -> MigrationRunner.migrate(database,
+                List.of(counting(1, firstRan), duplicateWrite), LOCK_TTL, PATIENT, CLOCK), TapstateException.class);
+        assertThat(failure).isNotNull();
+        assertThat(failure.code()).isEqualTo(MigrationError.CHANGESET_FAILED);
+        assertThat(failure.args()).containsExactlyEntriesOf(Map.of(
+                "changeset", "controlled-driver-failure", "cause", "MongoWriteException code=11000"));
+        assertThat(failure.getCause()).isNull();
+        StringWriter stack = new StringWriter();
+        failure.printStackTrace(new PrintWriter(stack));
+        assertThat(stack.toString()).doesNotContain(sentinel, "E11000", "duplicate_proof");
+        assertThat(installedVersion(database)).isEqualTo(1);
+        assertThat(schemaDocuments(database).find(SCHEMA_ID).first().get("lock", Document.class))
+                .doesNotContainKeys("owner", "since", "heartbeat");
+        assertThat(database.getCollection("duplicate_proof").countDocuments()).isEqualTo(1);
+
         AtomicInteger secondRan = new AtomicInteger();
         MigrationRunner.migrate(database, List.of(counting(1, firstRan), counting(2, secondRan)),
                 LOCK_TTL, PATIENT, CLOCK);
@@ -183,7 +228,7 @@ class MigrationRunnerIT {
                 TapstateException.class);
 
         assertThat(failure).isNotNull();
-        assertThat(failure.code().code()).isEqualTo("migration.changeset-failed");
+        assertThat(failure.code().code()).isEqualTo("TS0420003");
         assertThat(failure.args().get("cause").toString()).contains("taken over");
         assertThat(installedVersion(database)).isZero();
     }
@@ -202,7 +247,7 @@ class MigrationRunnerIT {
                 TapstateException.class);
 
         assertThat(refusal).isNotNull();
-        assertThat(refusal.code().code()).isEqualTo("migration.lock-timeout");
+        assertThat(refusal.code().code()).isEqualTo("TS0420002");
         // Naming the holder is the point of the diagnostic: the answer is on that member, not this one.
         assertThat(refusal.args()).containsEntry("holder", "member-a@host");
         assertThat(refusal.args()).containsEntry("since", heldSince.toString());
@@ -269,7 +314,7 @@ class MigrationRunnerIT {
         assertThat(failure).as("it started against a store seven versions past what it can read").isNotNull();
         assertThat(failure.getCause()).isInstanceOf(TapstateException.class);
         TapstateException refusal = (TapstateException) failure.getCause();
-        assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+        assertThat(refusal.code().code()).isEqualTo("TS0420001");
         assertThat(refusal.args()).containsEntry("installed", "7").containsEntry("supported", "1");
     }
 
@@ -305,7 +350,8 @@ class MigrationRunnerIT {
                 .containsExactly("V1BaselineIndexes", "V2StructuredArtifacts", "V3RecordedSrsSwitches",
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
-                        "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex");
+                        "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
+                        "V12EncryptSourceConfigs");
 
         MigrationRunner.migrate(database);
 
@@ -519,7 +565,7 @@ class MigrationRunnerIT {
         if (client == null) {
             client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
         }
-        MongoDatabase database = client.getDatabase(name);
+        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
         database.drop();
         return database;
     }

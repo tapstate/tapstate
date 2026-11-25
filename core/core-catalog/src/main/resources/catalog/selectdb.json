@@ -92,7 +92,7 @@
   ],
   "provenance": {
     "specPath": "connectors/selectdb-connector/src/main/resources/spec_selectdb.json",
-    "specContentHash": "461c8c5b7580c711",
+    "specContentHash": "e8d4da61f9fb6d26",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

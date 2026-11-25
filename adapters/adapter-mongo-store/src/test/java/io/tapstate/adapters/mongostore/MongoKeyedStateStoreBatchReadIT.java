@@ -12,9 +12,7 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -47,13 +45,44 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoKeyedStateStoreBatchReadIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
     private static final String NAMESPACE = "join.orders_wide.dimension.customers";
     private static final String SIBLING = "join.orders_wide.fact.orders";
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoKeyedStateStoreBatchReadIT.class);
+
+    @Test
+    void aBatchOfStateWritesUsesOneAcknowledgedCommandAndRetainsEveryKey() {
+        withCommands("update", (store, commands) -> {
+            Map<String, byte[]> states = new LinkedHashMap<>();
+            for (int i = 0; i < 200; i++) states.put("C" + i, bytes("state-" + i));
+
+            store.saveAll(NAMESPACE, states);
+
+            assertThat(commands).as("a bulk write must not loop over replaceOne").hasSize(1);
+            assertThat(store.loadAll(NAMESPACE, states.keySet())).containsExactlyInAnyOrderEntriesOf(states);
+            assertThat(store.loadAll(SIBLING, states.keySet())).isEmpty();
+        });
+    }
+
+    @Test
+    void anEmptyWriteBatchSendsNothingAndReplacingABatchRemainsIdempotent() {
+        withCommands("update", (store, commands) -> {
+            store.saveAll(NAMESPACE, Map.of());
+            assertThat(commands).isEmpty();
+            store.saveAll(NAMESPACE, Map.of("C1", bytes("old"), "C2", bytes("unchanged")));
+            Map<String, byte[]> replacement = Map.of("C1", bytes("new"), "C3", bytes("added"));
+            store.saveAll(NAMESPACE, replacement);
+            store.saveAll(NAMESPACE, replacement);
+            assertThat(store.count(NAMESPACE)).isEqualTo(3);
+            assertThat(store.loadAll(NAMESPACE, List.of("C1", "C2", "C3")))
+                    .containsEntry("C1", bytes("new"))
+                    .containsEntry("C2", bytes("unchanged"))
+                    .containsEntry("C3", bytes("added"));
+        });
+    }
 
     @Test
     void aBatchAnswersExactlyWhatTheKeyAtATimeReadsWould() {
@@ -216,7 +245,7 @@ class MongoKeyedStateStoreBatchReadIT {
 
     private static Document explain(BsonDocument filter) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            return client.getDatabase("tapstate").getCollection(MongoStorePort.OPERATOR_STATE)
+            return client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.OPERATOR_STATE)
                     .find(filter).explain(ExplainVerbosity.EXECUTION_STATS);
         }
     }
@@ -234,13 +263,17 @@ class MongoKeyedStateStoreBatchReadIT {
      * exists to report, arrived at with nothing wrong with the store at all.
      */
     private static void withStore(BiConsumer<MongoKeyedStateStore, List<BsonDocument>> test) {
+        withCommands("find", test);
+    }
+
+    private static void withCommands(String command, BiConsumer<MongoKeyedStateStore, List<BsonDocument>> test) {
         List<BsonDocument> finds = new ArrayList<>();
         MongoClientSettings settings = MongoClientSettings.builder()
                 .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
                 .addCommandListener(new CommandListener() {
                     @Override
                     public void commandStarted(CommandStartedEvent event) {
-                        if ("find".equals(event.getCommandName())) {
+                        if (command.equals(event.getCommandName())) {
                             finds.add(event.getCommand().clone());
                         }
                     }
@@ -248,7 +281,7 @@ class MongoKeyedStateStoreBatchReadIT {
                 .build();
         try (MongoClient client = MongoClients.create(settings)) {
             MongoCollection<Document> collection =
-                    client.getDatabase("tapstate").getCollection(MongoStorePort.OPERATOR_STATE);
+                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.OPERATOR_STATE);
             collection.drop();
             test.accept(new MongoKeyedStateStore(collection), finds);
         }

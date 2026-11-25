@@ -1,5 +1,6 @@
 package io.tapstate.adapters.transform;
 
+import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.List;
@@ -43,16 +44,39 @@ public final class StatelessTransforms {
     public static TransformPort requireCompleteBeforeImage(
             TransformPort delegate, String path, List<String> parentKey) {
         List<String> key = List.copyOf(parentKey);
-        return event -> {
-            if (event.op() == Op.DELETE || event.op() == Op.UPDATE) {
-                UnwindBeforeImage.require(event, path, key);
+        return new TransformPort() {
+            @Override
+            public List<Envelope> transform(Envelope event) {
+                if (event.op() == Op.DELETE || event.op() == Op.UPDATE) {
+                    UnwindBeforeImage.require(event, path, key);
+                }
+                return delegate.transform(event);
             }
-            return delegate.transform(event);
+
+            @Override
+            public void close() {
+                delegate.close();
+            }
         };
     }
 
     /** The {@code js} port for a GraalVM script captured as its source text. */
     public static TransformPort js(String script) {
         return new JsPort(script);
+    }
+
+    /** The {@code js} port scoped to one cancellable, short-lived preview execution. */
+    public static TransformPort previewJs(String script, String executionId) {
+        return new JsPort(script, executionId);
+    }
+
+    /** Interrupts guest JavaScript contexts created for the named preview execution. */
+    public static void cancelPreviewJs(String executionId) {
+        PreviewJsExecutionRegistry.cancel(executionId);
+    }
+
+    /** Closes and forgets guest JavaScript contexts after the preview job has stopped. */
+    public static void finishPreviewJs(String executionId) {
+        PreviewJsExecutionRegistry.finish(executionId);
     }
 }

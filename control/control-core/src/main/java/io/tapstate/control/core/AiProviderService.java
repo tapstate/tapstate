@@ -1,0 +1,81 @@
+package io.tapstate.control.core;
+
+import io.tapstate.spi.store.AiProviderSettingsStore;
+import io.tapstate.core.common.TapstateException;
+import java.util.Map;
+import java.util.Optional;
+
+/** Settings use a trusted workspace scope supplied by the authenticated application boundary. */
+public final class AiProviderService {
+    private static final String AUDIT_TARGET = "ai-provider-settings";
+    private final AiProviderSettingsStore store;
+    private final AuditGate audit;
+    public AiProviderService(AiProviderSettingsStore store, AuditGate audit) {
+        this.store = java.util.Objects.requireNonNull(store);
+        this.audit = java.util.Objects.requireNonNull(audit);
+    }
+    public record SavedProvider(AiProviderSettings settings, boolean managedSelected) { }
+
+    public Optional<SavedProvider> saved(String owner) {
+        return store.get(owner).map(value -> new SavedProvider(
+                new AiProviderSettings(value.providerId(), value.baseUrl(), value.model(), value.apiKey()),
+                value.managedSelected()));
+    }
+
+    public Optional<AiProviderSettings> get(String caller) { return saved(caller).map(SavedProvider::settings); }
+
+    public void select(String owner, String actor, boolean managed) {
+        audit.dispatch(ControlOperations.AI_PROVIDER_SELECT, new AuditContext(actor, AUDIT_TARGET), () -> {
+            if (!store.selectManaged(owner, managed) && !managed) throw error(ControlError.AI_NOT_CONFIGURED);
+            return null;
+        });
+    }
+    public AiProviderSettings require(String caller) {
+        return validated(get(caller).orElseThrow(() -> error(ControlError.AI_NOT_CONFIGURED)));
+    }
+    public AiProviderSettings resolve(String scope, AiProviderSettings settings) {
+        return validated(resolveKey(scope, settings));
+    }
+    public AiProviderSettings resolveModels(String scope, AiProviderSettings settings) {
+        return validated(resolveKey(scope, settings), false);
+    }
+    private AiProviderSettings resolveKey(String scope, AiProviderSettings settings) {
+        if (settings.apiKey() == null || settings.apiKey().isBlank()) {
+            AiProviderSettings saved = require(scope);
+            if (!OpenAiCompatibleEndpointPolicy.normalizedBaseUrl(settings.baseUrl()).equals(saved.baseUrl())) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "a new API key is required when changing the provider endpoint"), null);
+            }
+            return new AiProviderSettings(settings.providerId(), settings.baseUrl(), settings.model(), saved.apiKey());
+        }
+        return settings;
+    }
+    public void put(String caller, String actor, AiProviderSettings settings) {
+        AiProviderSettings checked = resolve(caller, settings);
+        audit.dispatch(ControlOperations.AI_PROVIDER_REPLACE, new AuditContext(actor, AUDIT_TARGET),
+                () -> { store.put(caller, new AiProviderSettingsStore.Settings(checked.providerId(), checked.baseUrl(), checked.model(), checked.apiKey())); return null; });
+    }
+    public void delete(String caller, String actor) {
+        audit.dispatch(ControlOperations.AI_PROVIDER_DELETE, new AuditContext(actor, AUDIT_TARGET),
+                () -> { store.delete(caller); return null; });
+    }
+    public static AiProviderSettings validated(AiProviderSettings settings) {
+        return validated(settings, true);
+    }
+    private static AiProviderSettings validated(AiProviderSettings settings, boolean requireModel) {
+        String base = OpenAiCompatibleEndpointPolicy.normalizedBaseUrl(settings.baseUrl());
+        if (!AiProviderSettingsStore.supportsProvider(settings.providerId()))
+            throw malformedSettings("a supported AI provider is required");
+        if (requireModel && (settings.model() == null || settings.model().isBlank())
+                || settings.model() != null && (settings.model().length() > 200 || settings.model().chars().anyMatch(Character::isISOControl)))
+            throw malformedSettings("a valid model is required");
+        if (settings.apiKey() == null || settings.apiKey().isBlank() || settings.apiKey().length() > 8192
+                || settings.apiKey().chars().anyMatch(c -> c < 32 || c == 127))
+            throw malformedSettings("a valid API key is required");
+        return new AiProviderSettings(settings.providerId(), base, settings.model(), settings.apiKey());
+    }
+    private static TapstateException malformedSettings(String reason) {
+        return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null);
+    }
+    public static TapstateException error(ControlError error) { return new TapstateException(error, Map.of(), null); }
+}

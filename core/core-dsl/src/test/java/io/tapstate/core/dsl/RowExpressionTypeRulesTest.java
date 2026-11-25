@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Judging a batch's row expressions against the columns their sources were discovered to hold. This
@@ -89,6 +91,52 @@ class RowExpressionTypeRulesTest {
     }
 
     @Test
+    @DisplayName("comparing an exact fixed-point column to an integer or double passes without precision loss")
+    void decimalComparisonPasses() {
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(filterPipeline("after.amount > 25")), model("amount", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(filterPipeline("after.i_name != 'cK6J3' && after.i_price > 25")),
+                model("i_name", TapstateType.STRING, "i_price", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void aValidDecimalComparisonDoesNotHideAnUnrelatedTypeError() {
+        String expression = "after.amount > 25 && after.qty > 'five'";
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(filterPipeline(expression)),
+                        model("amount", TapstateType.DECIMAL, "qty", TapstateType.INT64)));
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ILLEGAL_EXPRESSION);
+        assertThat(thrown.args()).containsEntry("expr", expression).doesNotContainKey("column");
+    }
+
+    @Test
+    void aDecimalTypeDiagnosticNamesTheOperandThatFails() {
+        String expression = "after.amount > 25 && after.fee * 2 > 0";
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(filterPipeline(expression)),
+                        model("amount", TapstateType.DECIMAL, "fee", TapstateType.DECIMAL)));
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(thrown.args()).containsEntry("column", "fee");
+    }
+
+    @Test
+    void anOpaqueColumnInAValidPresenceTestDoesNotHideInvalidDecimalArithmetic() {
+        String expression = "after.amount * 2 > 0 && has(after.created)";
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(filterPipeline(expression)),
+                        model("amount", TapstateType.DECIMAL, "created", TapstateType.DATE)));
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(thrown.args()).containsEntry("column", "amount");
+    }
+
+    @Test
     @DisplayName("a lossless numeric column passes, so the gate is not refusing numbers as a class")
     void losslessNumericPasses() {
         assertThatCode(() -> RowExpressionTypeRules.validate(
@@ -116,6 +164,189 @@ class RowExpressionTypeRulesTest {
 
         assertThatCode(() -> RowExpressionTypeRules.validate(
                 batch(pipeline), model("amount", TapstateType.DECIMAL))).doesNotThrowAnyException();
+    }
+
+    @Test
+    void aDecimalReplacedByAnIntegerBeforeAChoicePasses() {
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: numbers, from: [orders], type: map, fields: { a: 1, b: 2 } }
+                  - id: choose
+                    from: [numbers]
+                    type: map
+                    fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """;
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(batch(pipeline),
+                model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void aParallelIntegerMapDoesNotHideADecimalChoice() {
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: base, from: [orders], type: filter, expr: "op == 'i'" }
+                  - { id: numbers, from: [base], type: map, fields: { a: 1, b: 2 } }
+                  - { id: unchanged, from: [base], type: filter, expr: "op == 'i'" }
+                  - { id: merge, from: [numbers, unchanged], type: union }
+                  - id: choose
+                    from: [merge]
+                    type: map
+                    fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """;
+
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(pipeline),
+                        model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(thrown.path()).isEqualTo("transforms[4].fields.chosen");
+        assertThat(thrown.args()).containsEntry("type", "DECIMAL").containsEntry("table", "orders");
+    }
+
+    @Test
+    void reusedMapsUseTheirInputsComputedTypes() {
+        String numbers = """
+                version: tapstate/v1
+                kind: transform
+                id: integer_fields
+                type: map
+                fields: { a: "=1", b: "=2" }
+                """;
+        String choose = """
+                version: tapstate/v1
+                kind: transform
+                id: choose_integer
+                type: map
+                fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                """;
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: numbers, from: [orders], use: integer_fields }
+                  - { id: choose, from: [numbers], use: choose_integer }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """;
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(batch(numbers, choose, pipeline),
+                model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void filtersAndBothPushFormatsReadTheProjectedTypes() {
+        String expression = "has(after.a) ? after.a : after.b";
+        for (String format : List.of("\"=" + expression + "\"", "{ chosen: \"=" + expression + "\" }")) {
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: orders_out
+                    source: src_orders
+                    transforms:
+                      - { id: numbers, from: [orders], type: map, fields: { a: 1, b: 2 } }
+                      - { id: keep, from: [numbers], type: filter, expr: "after.a > 0" }
+                    serve:
+                      from: keep
+                      push: [ { id: topic_out, source: src_orders, topic: t, format: %s } ]
+                    """.formatted(format);
+
+            assertThatCode(() -> RowExpressionTypeRules.validate(batch(pipeline),
+                    model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
+                    .doesNotThrowAnyException();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            true       | after.value                   | after.value * 2 > 0
+            kept       | after.value == 'kept'          | after.value * 2 > 0
+            2147483648 | after.value > 0                | after.value && true
+            2.5        | after.value > 0.0              | after.value && true
+            """)
+    void aLiteralReplacementIsJudgedByItsOwnType(String literal, String valid, String invalid) {
+        String fields = "{ value: " + literal + " }";
+        Map<String, List<DiscoveredTable>> discovered = model("value", TapstateType.DECIMAL);
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(projectThenFilter(fields, valid)), discovered)).doesNotThrowAnyException();
+
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(projectThenFilter(fields, invalid)), discovered));
+        assertThat(thrown.code()).isEqualTo(DslError.ILLEGAL_EXPRESSION);
+        assertThat(thrown.path()).isEqualTo("transforms[1].expr");
+        assertThat(thrown.args()).containsEntry("expr", invalid);
+    }
+
+    @Test
+    void anUnresolvedLiteralReplacementIsRefusedEvenForAPresenceTest() {
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(
+                        batch(projectThenFilter("{ value: [1, 2] }", "has(after.value)")),
+                        model("value", TapstateType.INT64)));
+
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNKNOWN);
+        assertThat(thrown.args()).containsEntry("column", "value").containsEntry("table", "orders");
+        assertThat(thrown.path()).isEqualTo("transforms[1].expr");
+    }
+
+    @Test
+    void renamesKeepTypesAndConsumeTheirInputsWhileDropsRemoveFields() {
+        String fields = "{ moved: $amount, discarded: false, absent: $missing }";
+        Map<String, List<DiscoveredTable>> discovered = model(
+                "amount", TapstateType.DECIMAL, "discarded", TapstateType.DECIMAL,
+                "retained", TapstateType.UNKNOWN);
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(batch(projectThenFilter(fields,
+                "after.amount * 2 > 0 && after.discarded * 2 > 0 && after.absent * 2 > 0")), discovered))
+                .doesNotThrowAnyException();
+
+        DslException renamed = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(
+                        batch(projectThenFilter(fields, "after.moved * 2 > 0")), discovered));
+        assertThat(renamed.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(renamed.args()).containsEntry("column", "moved").containsEntry("type", "DECIMAL");
+
+        DslException retained = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(
+                        batch(projectThenFilter(fields, "after.retained > 0")), discovered));
+        assertThat(retained.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNKNOWN);
+        assertThat(retained.args()).containsEntry("column", "retained");
+    }
+
+    private static String projectThenFilter(String fields, String expr) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: project, from: [orders], type: map, fields: %s }
+                  - { id: keep, from: [project], type: filter, expr: "%s" }
+                serve:
+                  from: keep
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """.formatted(fields, expr);
     }
 
     // ---- a column whose type nothing resolved -------------------------------------------
@@ -285,6 +516,38 @@ class RowExpressionTypeRulesTest {
     }
 
     @Test
+    void aDecimalChoiceIsRefusedInBothPushFormats() {
+        String expression = "has(after.a) ? after.a : after.b";
+        Map<String, String> formats = Map.of(
+                "\"=" + expression + "\"", "serve.push[0].format",
+                "{ chosen: \"=" + expression + "\" }", "serve.push[0].format.chosen");
+        for (var format : formats.entrySet()) {
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: orders_out
+                    source: src_orders
+                    transforms:
+                      - { id: keep, from: [orders], type: filter, expr: "op == 'i'" }
+                    serve:
+                      from: keep
+                      push: [ { id: topic_out, source: src_orders, topic: t, format: %s } ]
+                    """.formatted(format.getKey());
+
+            DslException thrown = catchThrowableOfType(DslException.class,
+                    () -> RowExpressionTypeRules.validate(batch(pipeline),
+                            model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)));
+
+            assertThat(thrown).isNotNull();
+            assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+            assertThat(thrown.args()).containsEntry("expr", expression)
+                    .containsEntry("column", "a").containsEntry("type", "DECIMAL")
+                    .containsEntry("table", "orders");
+            assertThat(thrown.path()).isEqualTo(format.getValue());
+        }
+    }
+
+    @Test
     @DisplayName("an expression inside a reused transform definition is judged where the pipeline uses it")
     void reusedTransformDefinitionIsJudged() {
         String definition = """
@@ -292,7 +555,7 @@ class RowExpressionTypeRulesTest {
                 kind: transform
                 id: keep_big
                 type: filter
-                expr: "after.amount > 0"
+                expr: "after.amount * 2 > 0"
                 """;
         String pipeline = """
                 version: tapstate/v1

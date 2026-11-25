@@ -53,4 +53,12 @@ class SrsLogRecordTest {
                         + "carry none, and that absence is the record's meaning rather than a gap")
                 .isNull();
     }
+
+    @Test
+    void anUnrecordedGenerationRemainsUnknownInsteadOfBecomingTheCurrentOne() {
+        assertThat(new SrsLogRecord("tok", Op.INSERT, 1L, null, Map.of("id", 1), 3L).epoch())
+                .isZero();
+        assertThat(new SrsLogRecord("tok", Op.INSERT, 1L, null, Map.of("id", 1), 3L, 7L).epoch())
+                .isEqualTo(7L);
+    }
 }

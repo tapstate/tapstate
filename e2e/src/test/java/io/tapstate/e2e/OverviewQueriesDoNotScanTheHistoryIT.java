@@ -5,7 +5,8 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
@@ -15,6 +16,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -60,15 +64,16 @@ class OverviewQueriesDoNotScanTheHistoryIT {
     @EnumSource(Tiers.class)
     void aRoundOfOverviewReadsExaminesNoHistoryWorthOfDocuments(Tiers tier, @TempDir Path directory)
             throws Exception {
-        String storeUri = storeUri("overview_history", tier);
-        try (ServerHandle server = tier.launch(storeUri);
-                MongoClient client = MongoClients.create(storeUri)) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage);
+                MongoClient client = MongoClients.create(storage.cacheUri())) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             ControlPlane control = running.control();
             String pipelineId = running.pipelineId();
 
             Round empty = round(control, pipelineId, client);
-            layDownAFullHistory(client, storeUri, pipelineId);
+            Instant newest = layDownAFullHistory(client, storage.cacheUri(), pipelineId);
+            assertSeededHistoryReadable(server, control, pipelineId, newest);
             Round full = round(control, pipelineId, client);
 
             // The evidence line: printed, not asserted, and both rounds on purpose - a number alone does
@@ -112,17 +117,24 @@ class OverviewQueriesDoNotScanTheHistoryIT {
     }
 
     /** Fills the pipeline's history at the default cadence, newest sample a minute ago, through the product's codec. */
-    private static void layDownAFullHistory(MongoClient client, String storeUri, String pipelineId) {
+    private static Instant layDownAFullHistory(MongoClient client, String storeUri, String pipelineId) {
         MongoCollection<Document> history = client
                 .getDatabase(new ConnectionString(storeUri).getDatabase())
-                .getCollection(MongoStorePort.PIPELINE_RATE_HISTORY);
+                .getCollection(SystemCollections.CACHE_PIPELINE_RATE_HISTORY.collectionName());
+        Await.until("the running pipeline to publish an original scoped sample",
+                () -> history.find(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId)).first() != null,
+                () -> "no real rate sample was published");
+        Document scope = history.find(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId))
+                .first().get("scope", Document.class);
+        assertThat(scope).isNotNull().containsEntry("pipelineId", pipelineId);
         Instant now = Instant.now();
         Instant countingSince = now.minus(CADENCE.multipliedBy(FULL_HISTORY));
         List<Document> batch = new ArrayList<>();
         for (int i = FULL_HISTORY; i >= 1; i--) {
             long taken = FULL_HISTORY - i;
             batch.add(MongoRateHistoryStore.toDocument(new RateSample(pipelineId, now.minus(CADENCE.multipliedBy(i)),
-                    Map.of("records.out", taken, "records.in", taken), Map.of("orders", 0L), countingSince)));
+                    Map.of("records.out", taken, "records.in", taken), Map.of("orders", 0L), countingSince))
+                    .append("scope", new Document(scope)));
             if (batch.size() == 2_000) {
                 history.insertMany(batch);
                 batch.clear();
@@ -134,12 +146,28 @@ class OverviewQueriesDoNotScanTheHistoryIT {
         // At least: the running pipeline is sampling itself meanwhile, and its own samples count too.
         assertThat(history.countDocuments(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId)))
                 .as("the history laid down, before anything is read over it").isGreaterThanOrEqualTo(FULL_HISTORY);
+        return now.minus(CADENCE);
     }
 
     private record Round(long examined, long millis) {
     }
 
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
+    /** The native public reader must recognize the fixture before it can witness a missing scan. */
+    private static void assertSeededHistoryReadable(ServerHandle server, ControlPlane control,
+            String pipelineId, Instant newest) throws Exception {
+        var request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/pipelines/" + pipelineId
+                        + "/metrics/history?from=" + newest.minus(Duration.ofMinutes(4)) + "&to=" + newest
+                        + "&resolution=raw&limit=20"))
+                .timeout(Duration.ofSeconds(30)).header("Authorization", "Bearer " + control.credential()).GET().build();
+        var response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(200);
+        var result = (Map<?, ?>) JsonReader.parse(response.body());
+        assertThat(result.get("pipelineId")).isEqualTo(pipelineId);
+        var segments = (List<?>) result.get("segments");
+        assertThat(segments).isNotEmpty();
+        assertThat(segments.stream().map(Map.class::cast).flatMap(segment -> ((List<?>) segment.get("points")).stream())
+                .map(Map.class::cast).map(point -> (Map<?, ?>) point.get("recordsOut"))
+                .filter(java.util.Objects::nonNull).map(rate -> ((Number) rate.get("delta")).longValue()).toList())
+                .isNotEmpty().allMatch(delta -> delta == 1L);
     }
 }

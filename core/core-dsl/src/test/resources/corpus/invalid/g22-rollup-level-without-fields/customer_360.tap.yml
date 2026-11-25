@@ -1,0 +1,28 @@
+# Invalid: a rollup level renders nothing but its rollup fields, and this one declares none.
+version: tapstate/v1
+kind: pipeline
+id: customer_360
+source: src_ins
+transforms:
+  - id: clean
+    from: [CUSTOMERS]
+    type: map
+    fields: { customer_id: $CUST_ID, name: $CUST_NAME }
+  - id: c360
+    type: nest
+    from: { customer: clean, policy: POLICIES }
+    root:
+      from: customer
+      key: [customer_id]
+      embed:
+        - from: policy
+          on: { CUST_ID: customer_id }
+          as: rollup
+          arrayKey: [POLICY_ID]
+view:
+  id: customer_360
+  from: c360
+  primary_key: customer_id
+serve:
+  from: customer_360
+  query: [ { type: rest } ]

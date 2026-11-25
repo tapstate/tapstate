@@ -8,6 +8,10 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -41,7 +45,7 @@ import static org.assertj.core.api.Assertions.tuple;
 /**
  * The resource-type-agnostic apply pipeline. {@code plan} validates a batch (structural, reference
  * closure, connector capability matrix, batch duplicate id) and emits each resource's canonical form
- * and content hash, touching no store. {@code apply} runs a plan and then upserts each artifact by id
+ * and content hash, writing no store state. {@code apply} runs a plan and then upserts each artifact by id
  * into the store, skipping the write when the stored artifact's content hash is unchanged — the
  * idempotency key is the hash over the canonical form, so re-applying unchanged content writes
  * nothing. A validation failure aborts before any write.
@@ -82,6 +86,377 @@ class ApplyServiceTest {
             connector: mongodb
             config: { uri: "mongodb://10.30.0.11:27017/ods", auth_source: admin }
             """;
+
+    @Test
+    void managedCloudApplyPersistsServerGeneratedAttributionAndKeepsItOnReplay() {
+        ApplyService cloud = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud());
+
+        ApplyResult created = cloud.apply("cloud-user-7", List.of(draft(TGT_MG)));
+        SourceResource stored = (SourceResource) store.get("tgt_mg").orElseThrow();
+        String readBack = new ArtifactQueryService(store).get("tgt_mg").orElseThrow().canonicalForm();
+
+        assertThat(created.outcomes()).singleElement().extracting(ArtifactOutcome::change)
+                .isEqualTo(ArtifactOutcome.Change.CREATED);
+        assertThat(stored.metadata().cloud()).isTrue();
+        assertThat(stored.metadata().userId()).isEqualTo("cloud-user-7");
+        assertThat(readBack).contains("cloud: true", "user_id: cloud-user-7");
+        assertThat(cloud.apply("cloud-user-7", List.of(draft(readBack))).outcomes())
+                .singleElement().extracting(ArtifactOutcome::change)
+                .isEqualTo(ArtifactOutcome.Change.UNCHANGED);
+    }
+
+    @Test
+    void managedCloudApplyRejectsCallerChosenAttributionBeforeAnyWrite() {
+        ApplyService cloud = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud());
+        String forged = TGT_MG + "metadata: { cloud: true, user_id: forged-user }\n";
+
+        assertThatThrownBy(() -> cloud.apply("cloud-user-7", List.of(draft(forged))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThat(store.get("tgt_mg")).isEmpty();
+    }
+
+    @Test
+    void managedCloudApplyCannotReplaceAConcurrentCreatorOrWriteItsBatchSiblings() {
+        ApplyService cloud = cloudForAttribution();
+        Resource firstCreator = ResourceAttributionPolicy.managedCloud().attribute("first-cloud-user",
+                new DslParser().parse(TGT_MG), null);
+        store.concurrentWriter = () -> store.landDirectly(firstCreator);
+
+        assertThatThrownBy(() -> cloud.apply("later-cloud-user", List.of(
+                draft(TGT_MG.replace("tgt_mg", "new_sibling")), draft(TGT_MG))))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
+                    assertThat(error.args()).containsExactlyInAnyOrderEntriesOf(Map.of("id", "tgt_mg"));
+                });
+
+        assertThat(store.get("tgt_mg")).contains(firstCreator);
+        assertThat(store.get("new_sibling")).isEmpty();
+        assertThat(store.saveCount).isZero();
+    }
+
+    @Test
+    void managedCloudApplyCannotRestoreAttributionFromAReplacedResource() {
+        ApplyService cloud = cloudForAttribution();
+        String transform = """
+                version: tapstate/v1
+                kind: transform
+                id: attributed_transform
+                type: filter
+                expr: "true"
+                """;
+        cloud.apply("original-cloud-user", List.of(draft(transform)));
+        Resource replacement = ResourceAttributionPolicy.managedCloud().attribute("replacement-cloud-user",
+                new DslParser().parse(transform), null);
+        // Another request deletes and recreates the id after this request copied its old creator.
+        store.concurrentWriter = () -> store.landDirectly(replacement);
+
+        assertThatThrownBy(() -> cloud.apply("editing-cloud-user",
+                List.of(draft(transform + "metadata: { description: edited }\n"))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT));
+
+        assertThat(store.get("attributed_transform")).contains(replacement);
+    }
+
+    @Test
+    void onPremApplyKeepsItsUnconditionalCreateBehaviorDuringAConcurrentCreate() {
+        Resource earlier = new DslParser().parse(TGT_MG_EDITED);
+        store.concurrentWriter = () -> store.landDirectly(earlier);
+
+        service.apply("on-prem-user", List.of(draft(TGT_MG)));
+
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG));
+    }
+
+    private ApplyService cloudForAttribution() {
+        return new ApplyService(TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud());
+    }
+
+    @Test
+    void cloudRejectsInlineStatePlacementInValidateAndApplyBeforeAnyBatchWrite() {
+        ApplyService cloud = cloudWithStatePolicy();
+        List<ArtifactDraft> batch = nestBatch("custom_ops");
+
+        ArtifactValidationResult validation = cloud.validate(batch);
+        assertThat(validation.valid()).isFalse();
+        assertThat(validation.diagnostics()).singleElement().extracting(ValidationDiagnostic::code)
+                .isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE.code());
+        assertThatThrownBy(() -> cloud.apply("verified-cloud-user", batch))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThat(store.list()).isEmpty();
+        assertThat(auditStore.records).isEmpty();
+    }
+
+    @Test
+    void cloudAcceptsAnImplicitStateDatabaseButEvenAnExplicitDefaultIsRefused() {
+        ApplyService cloud = cloudWithStatePolicy();
+        assertThat(cloud.validate(nestBatch(null)).valid()).isTrue();
+        assertThat(cloud.apply("verified-cloud-user", nestBatch(null)).outcomes())
+                .allSatisfy(outcome -> assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
+        assertThat(cloud.validate(nestBatch("tapstate_nest")).valid()).isFalse();
+    }
+
+    @Test
+    void cloudTypedCreateAndReplaceCannotBypassTheStatePlacementGate() {
+        service.apply("local-author", nestBatch(null));
+        Resource explicit = new DslParser().parse(nestPipeline("custom_ops"));
+        ApplyService cloud = cloudWithStatePolicy();
+        String prior = stored("nested_orders");
+
+        assertThatThrownBy(() -> cloud.create("verified-cloud-user", explicit))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThatThrownBy(() -> cloud.replace("verified-cloud-user", explicit,
+                CanonicalHash.of(store.get(explicit.id()).orElseThrow())))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThat(stored("nested_orders")).isEqualTo(prior);
+    }
+
+    @Test
+    void cloudRejectsReusableNestPlacementIncludingAStoredUseDependency() {
+        String reusable = """
+                version: tapstate/v1
+                kind: transform
+                id: reusable_nest
+                type: nest
+                state: { database: custom_ops }
+                root: { from: c, key: [id] }
+                """;
+        ApplyService cloud = cloudWithStatePolicy();
+        Resource transform = new DslParser().parse(reusable);
+        assertThat(cloud.validate(List.of(draft(reusable))).valid()).isFalse();
+        assertThatThrownBy(() -> cloud.create("verified-cloud-user", transform))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        // A stored dependency must not provide an escape hatch through the typed Pipeline path.
+        service.apply("local-author", List.of(draft(NEST_SOURCE), draft(TGT_MG), draft(reusable)));
+        PipelineResource parsed = (PipelineResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: uses_nest
+                source: src_orders
+                transforms:
+                  - id: doc
+                    use: reusable_nest
+                    from: customers
+                serve:
+                  from: doc
+                  sync: [{ id: out, source: tgt_mg, write_mode: upsert }]
+                """);
+        PipelineResource referring = new PipelineResource(parsed.id(), parsed.metadata(), parsed.sources(),
+                List.of(Step.use("doc", "reusable_nest", FromClause.aliases(Map.of(
+                        "c", FromRef.literal("customers"))))),
+                parsed.view(), parsed.serve(), parsed.settings(), parsed.experimental());
+        assertThatThrownBy(() -> cloud.create("verified-cloud-user", referring))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThat(store.get("uses_nest")).isEmpty();
+    }
+
+    @Test
+    void onPremStillAcceptsAndPreservesAuthoredStatePlacement() {
+        assertThat(service.validate(nestBatch("custom_ops")).valid()).isTrue();
+        service.apply("local-author", nestBatch("custom_ops"));
+        assertThat(stored("nested_orders")).contains("database: custom_ops");
+    }
+
+    private ApplyService cloudWithStatePolicy() {
+        return new ApplyService(TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud(), StateDatabasePolicy.CLOUD);
+    }
+
+    private static final String NEST_SOURCE = """
+            version: tapstate/v1
+            kind: source
+            id: src_orders
+            connector: mysql
+            config: { host: db.example, username: test, password: test }
+            mode: cdc
+            tables: [customers, orders]
+            """;
+
+    private static List<ArtifactDraft> nestBatch(String database) {
+        return List.of(draft(NEST_SOURCE), draft(TGT_MG), draft(nestPipeline(database)));
+    }
+
+    private static String nestPipeline(String database) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: nested_orders
+                source: src_orders
+                transforms:
+                  - id: doc
+                    type: nest
+                %s    from: { c: customers, o: orders }
+                    root:
+                      from: c
+                      key: [id]
+                      embed:
+                        - from: o
+                          on: { customer_id: id }
+                          as: array
+                          path: orders
+                          arrayKey: [id]
+                serve:
+                  from: doc
+                  sync: [{ id: out, source: tgt_mg, write_mode: upsert }]
+                """.formatted(database == null ? "" : "    state: { database: " + database + " }\n");
+    }
+
+    @Test
+    void reapplyingAConfigOmittingSourceReadKeepsItsConnectionAndIsANoOp() {
+        service.apply("author", List.of(draft(TGT_MG)));
+        SourceResource original = (SourceResource) store.get("tgt_mg").orElseThrow();
+        String publicRead = new ArtifactQueryService(store).get("tgt_mg").orElseThrow().canonicalForm();
+        assertThat(publicRead).doesNotContain("config:");
+
+        ApplyResult replay = service.apply("author", List.of(draft(publicRead)));
+
+        assertThat(replay.outcomes()).singleElement().extracting(ArtifactOutcome::change)
+                .isEqualTo(ArtifactOutcome.Change.UNCHANGED);
+        assertThat(((SourceResource) store.get("tgt_mg").orElseThrow()).config())
+                .isEqualTo(original.config());
+        assertThat(CanonicalHash.of(store.get("tgt_mg").orElseThrow()))
+                .isEqualTo(CanonicalHash.of(original));
+    }
+
+    @Test
+    void configOmittingSourceReadsCanBeReappliedWithoutExposingOrChangingCredentials() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: atlas
+                connector: mongodb-atlas
+                config: { isUri: true, uri: "mongodb+srv://probe:sentinel@cluster.example/test" }
+                """;
+        service.apply("author", List.of(draft(original)));
+        String storedBefore = stored("atlas");
+        String display = new ArtifactQueryService(store).get("atlas").orElseThrow().canonicalForm();
+        assertThat(display).doesNotContain("config:", "sentinel");
+
+        ApplyResult replay = service.apply("author", List.of(draft(display), draft(TGT_MG)));
+
+        assertThat(replay.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED, ArtifactOutcome.Change.CREATED);
+        assertThat(stored("atlas")).isEqualTo(storedBefore);
+        assertThat(((SourceResource) store.get("atlas").orElseThrow()).config())
+                .containsEntry("uri", "mongodb+srv://probe:sentinel@cluster.example/test");
+
+        assertThatThrownBy(() -> service.apply("author", List.of(draft(SourceReadProjection.WITHHELD))))
+                .isInstanceOf(TapstateException.class);
+        assertThat(stored("atlas")).isEqualTo(storedBefore);
+    }
+
+    @Test
+    void omittedSourceFieldsArePreservedWhileSubmittedTopLevelFieldsChange() {
+        String initial = TGT_MG + "metadata: { labels: { team: ops }, description: original }\n"
+                + "experimental: { retained: true }\n";
+        service.apply("author", List.of(draft(initial)));
+
+        ApplyResult edit = service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mongodb
+                metadata: { description: updated }
+                """)));
+
+        assertThat(edit.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UPDATED);
+        SourceResource after = (SourceResource) store.get("tgt_mg").orElseThrow();
+        assertThat(after.config()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("uri", "mongodb://10.30.0.11:27017/ods", "auth_source", "admin"));
+        assertThat(after.metadata().description()).isEqualTo("updated");
+        assertThat(after.metadata().labels()).isEmpty();
+        assertThat(after.experimental()).containsEntry("retained", true);
+    }
+
+    @Test
+    void explicitlySubmittedSourceConfigReplacesTheWholeConfigMap() {
+        service.apply("author", List.of(draft(TGT_MG + "metadata: { description: retained }\n")));
+
+        service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mongodb
+                config: { uri: "mongodb://10.30.0.12:27017/ods" }
+                """)));
+
+        SourceResource after = (SourceResource) store.get("tgt_mg").orElseThrow();
+        assertThat(after.config()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("uri", "mongodb://10.30.0.12:27017/ods"));
+        assertThat(after.metadata().description()).isEqualTo("retained");
+    }
+
+    @Test
+    void explicitlyEmptySourceConfigClearsThePreviouslyStoredConfig() {
+        service.apply("author", List.of(draft(TGT_MG)));
+
+        service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mongodb
+                config: {}
+                """)));
+
+        assertThat(((SourceResource) store.get("tgt_mg").orElseThrow()).config()).isEmpty();
+    }
+
+    @Test
+    void changingSourceConnectorRequiresAnExplicitConfig() {
+        service.apply("author", List.of(draft(TGT_MG)));
+
+        assertThatThrownBy(() -> service.apply("author", List.of(draft("""
+                version: tapstate/v1
+                kind: source
+                id: tgt_mg
+                connector: mysql
+                """))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThat(((SourceResource) store.get("tgt_mg").orElseThrow()).connector())
+                .isEqualTo("mongodb");
+    }
+
+    @Test
+    void aRedactionOutsideSourceConfigCannotBeReapplied() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: documented-atlas
+                metadata:
+                  description: "mongodb://probe:sentinel-secret@cluster.example/test"
+                connector: mongodb-atlas
+                config: { uri: "mongodb+srv://cluster.example/test" }
+                """;
+        service.apply("author", List.of(draft(original)));
+        String storedBefore = stored("documented-atlas");
+        StoredArtifact display = new ArtifactQueryService(store).get("documented-atlas").orElseThrow();
+
+        assertThat(display.canonicalForm())
+                .contains("mongodb://<redacted>@cluster.example/test")
+                .doesNotContain("probe", "sentinel-secret");
+        assertThatThrownBy(() -> service.apply(
+                "author", List.of(draft(display.canonicalForm(), display.contentHash()))))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThat(stored("documented-atlas")).isEqualTo(storedBefore);
+    }
 
     /**
      * The refusal is reached through apply, which is the path an edit to a stored Source usually takes.
@@ -131,6 +506,73 @@ class ApplyServiceTest {
 
         assertThatThrownBy(() -> guarded.replace(
                 "author", replacement, CanonicalHash.of(store.get("orders_src").orElseThrow())))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    @Test
+    void refusesAConnectorReplacementThatInvalidatesAnExistingPipelineOverride() {
+        ApplyService configured = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, ResourceAttributionPolicy.onPrem(),
+                StateDatabasePolicy.ON_PREM, DeploymentProfile.ON_PREM,
+                id -> new ConnectorDetail(id, id, "", "database", List.of(), "", true, false, "",
+                        List.of(), SpecSource.of("hash", id.equals("postgres")
+                                ? "{}" : """
+                                        {"configOptions":{"node":{"properties":{"preImage":{"type":"boolean"}}}}}
+                                        """), true));
+        String reader = READER_PIPELINE.replace("source: orders_src",
+                "source: { id: orders_src, nodeConfig: { preImage: false } }");
+        configured.apply("author", List.of(draft(BUFFERED_SRC), draft(reader)));
+        Resource original = store.get("orders_src").orElseThrow();
+        SourceResource source = (SourceResource) original;
+        Map<String, Object> postgres = new LinkedHashMap<>(source.config());
+        postgres.put("schema", "public");
+        SourceResource replacement = new SourceResource(source.id(), source.metadata(), "postgres", postgres,
+                source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
+
+        assertThat(stored("p1")).contains("preImage: false");
+        assertThatThrownBy(() -> configured.replace("author", replacement, CanonicalHash.of(original)))
+                .isInstanceOf(TapstateException.class).hasMessageContaining("undeclared field");
+        assertThat(store.get("orders_src")).contains(original);
+    }
+
+    @Test
+    void dslConnectorReplacementFencesTheStoredPipelineItValidated() {
+        ApplyService configured = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, ResourceAttributionPolicy.onPrem(),
+                StateDatabasePolicy.ON_PREM, DeploymentProfile.ON_PREM,
+                id -> new ConnectorDetail(id, id, "", "database", List.of(), "", true, false, "",
+                        List.of(), SpecSource.of("hash", """
+                                {"configOptions":{"node":{"properties":{%s"preImage":{"type":"boolean"}}}}}
+                                """.formatted(id.equals("postgres") ? "" : "\"legacyFlag\":{}, ")), true));
+        String reader = READER_PIPELINE.replace("source: orders_src",
+                "source: { id: orders_src, nodeConfig: { preImage: false } }");
+        configured.apply("author", List.of(draft(BUFFERED_SRC), draft(reader)));
+        SourceResource original = (SourceResource) store.get("orders_src").orElseThrow();
+        Map<String, Object> postgres = new LinkedHashMap<>(original.config());
+        postgres.put("schema", "public");
+        SourceResource replacement = new SourceResource(original.id(), original.metadata(), "postgres", postgres,
+                original.mode(), original.tables(), original.srs(), original.execution(), original.experimental());
+
+        store.concurrentWriter = () -> store.landDirectly(new DslParser().parse(
+                reader.replace("preImage: false", "legacyFlag: true")));
+        assertThatThrownBy(() -> configured.apply("author", List.of(draft(new CanonicalWriter().write(replacement)))))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ArtifactError.VERSION_CONFLICT);
+                    assertThat(refused.args()).containsEntry("id", "p1");
+                });
+        assertThat(store.get("orders_src")).contains(original);
+    }
+
+    @Test
+    void draftPublicationPlanningAlsoRefusesToChangeTheLivePipelinesBufferingSwitch() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+        Resource replacement = new DslParser().parse(PINNED_OFF_PIPELINE);
+
+        assertThatThrownBy(() -> guarded.planDraftPublication(replacement))
                 .isInstanceOfSatisfying(TapstateException.class, refused ->
                         assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
     }
@@ -300,7 +742,7 @@ class ApplyServiceTest {
         return new CanonicalWriter().write(new DslParser().parse(yaml));
     }
 
-    // ---- the store-free front half: validate -> canonical -> hash ----
+    // ---- the write-free front half: validate -> canonical -> hash ----
 
     @Test
     void planCanonicalizesAndHashesAValidResource() {
@@ -346,7 +788,7 @@ class ApplyServiceTest {
         assertThat(result.valid()).isFalse();
         assertThat(result.outcomes()).isEmpty();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic -> {
-            assertThat(diagnostic.code()).isEqualTo("dsl.unknown-field");
+            assertThat(diagnostic.code()).isEqualTo("TS0010002");
             assertThat(diagnostic.params()).containsEntry("field", "bogus_field");
         });
         assertThat(store.saveCount).isZero();
@@ -606,7 +1048,7 @@ class ApplyServiceTest {
         List<String> attempted = new ArrayList<>();
         List<String> refreshed = new ArrayList<>();
         boolean[] fail = {true};
-        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ValidationDiagnostic advisory = new ValidationDiagnostic("TS0210005", Map.of());
         ApplyService deriving = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
                 (resources, discovered) -> List.of(advisory), pipeline -> {
@@ -628,7 +1070,7 @@ class ApplyServiceTest {
         assertThat(refreshed).containsExactly("second_pipeline");
         assertThat(first.warnings()).hasSize(2).contains(advisory);
         assertThat(first.warnings().get(1)).satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
                     .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
                     .containsEntry("causeParams", Map.of("id", "missing_model"));
@@ -963,7 +1405,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).extracting(ValidationDiagnostic::code)
-                .containsExactly("dsl.unknown-field");
+                .containsExactly("TS0010002");
         assertThat(result.warnings()).as("a batch that was refused carries no advisory findings").isEmpty();
         assertThat(reviewed).as("the advisory pass is not reached at all").isEmpty();
     }
@@ -1091,19 +1533,18 @@ class ApplyServiceTest {
     }
 
     @Test
-    void anApplyWithNoDeclaredVersionIsStillWrittenWhenAnotherWriterLandsFirst() {
-        // The other half of the same window: a caller that declared nothing asked for no check, and
-        // must keep overwriting exactly as it always did. Guarding an unasked-for precondition would
-        // turn every concurrent apply into a refusal.
+    void aPartialSourceApplyRefusesToOverwriteAConcurrentConnectionChange() {
+        // A partial Source edit copies omitted fields from the stored version. Even without a caller-
+        // declared hash, the copied fields must be guarded by an atomic precondition.
         service.apply("alice", List.of(draft(TGT_MG)));
         Resource alicesEdit = new DslParser().parse(TGT_MG_EDITED);
         store.concurrentWriter = () -> store.landDirectly(alicesEdit);
 
-        ApplyResult result = service.apply("bob", List.of(draft(TGT_MG_EDITED_AGAIN)));
+        assertThatThrownBy(() -> service.apply("bob", List.of(draft(TGT_MG_EDITED_AGAIN))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ArtifactError.VERSION_CONFLICT));
 
-        assertThat(result.outcomes()).extracting(ArtifactOutcome::change)
-                .containsExactly(ArtifactOutcome.Change.UPDATED);
-        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED_AGAIN));
+        assertThat(stored("tgt_mg")).isEqualTo(canonicalOf(TGT_MG_EDITED));
     }
 
     @Test
@@ -1169,7 +1610,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic ->
-                assertThat(diagnostic.code()).isEqualTo("artifact.version-conflict"));
+                assertThat(diagnostic.code()).isEqualTo("TS0240003"));
     }
 
     // ---- fixtures ----
@@ -1265,23 +1706,31 @@ class ApplyServiceTest {
                     }
                 }
             }
-            ArtifactWrite write = writes.getFirst();
-            if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
-                return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
-            }
-            if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
-                String canonical = byId.get(write.resource().id());
-                if (canonical == null) {
-                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
+            for (ArtifactWrite write : writes) {
+                if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && byId.containsKey(write.resource().id())) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
                 }
-                if (!storedHash(canonical).equals(write.expectedContentHash())) {
-                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
+                if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY) {
+                    String canonical = byId.get(write.resource().id());
+                    if (canonical == null) {
+                        return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.NOT_FOUND);
+                    }
+                    if (!storedHash(canonical).equals(write.expectedContentHash())) {
+                        return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.VERSION_CONFLICT);
+                    }
                 }
             }
-            byId.put(write.resource().id(), writer.write(write.resource()));
-            unreadable.remove(write.resource().id());
-            saveCount++;
-            saveAllBatches.add(List.of(write.resource().id()));
+            Map<String, String> staged = new LinkedHashMap<>();
+            for (ArtifactWrite write : writes) {
+                if (write.resource().id().equals(failOnId)) {
+                    throw new RuntimeException("simulated store write failure at " + failOnId);
+                }
+                staged.put(write.resource().id(), writer.write(write.resource()));
+            }
+            byId.putAll(staged);
+            unreadable.removeAll(staged.keySet());
+            saveCount += writes.size();
+            saveAllBatches.add(writes.stream().map(write -> write.resource().id()).toList());
             return ArtifactBatchWrite.applied();
         }
 

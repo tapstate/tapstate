@@ -61,7 +61,14 @@ public record Observation(
         Map<String, String> positions,
         ObservationFailure failure,
         Instant observedAt,
-        List<MetricFact> facts) {
+        List<MetricFact> facts,
+        InitialLoad initialLoad) {
+
+    public Observation(String pipelineId, PipelineState state, Map<String, Long> metrics,
+            Map<String, TableSnapshot> snapshot, Map<String, String> positions,
+            ObservationFailure failure, Instant observedAt, List<MetricFact> facts) {
+        this(pipelineId, state, metrics, snapshot, positions, failure, observedAt, facts, null);
+    }
 
     public Observation {
         Objects.requireNonNull(pipelineId, "pipelineId");

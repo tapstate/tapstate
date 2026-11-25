@@ -17,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
@@ -52,9 +53,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * made to carry a document written after the restart, and beside the claim stands a guard reading the
  * state and the run's own record count. Both have to hold, and the claim is asserted first on purpose --
  * the guard's bound is on volume, so an implementation that read the collection again would trip it on
- * the way past and the reading in question would never be looked at. The case that asserts the whole
- * collection needs no such gate: nought there would mean the run never started, so the count it asserts
- * is its own liveness.
+ * the way past and the reading in question would never be looked at. The rerun case waits for a
+ * replacement execution to enter streaming and publish its snapshot count before asserting how many
+ * documents it read.
  *
  * <p>Gated on Docker and on a directory of real connector jars
  * ({@code -Dtapstate.e2e.connectors-dir}); the real-process tier additionally needs the app module
@@ -91,12 +92,13 @@ class RestartKeepsThePositionIT {
     void thePlainRestartCarriesOnWithoutReadingTheCollectionAgain(Tiers tier) throws Exception {
         Fixture fixture = Fixture.forCase("restart_keep", tier);
 
-        try (MongoClient source = fixture.openSource();
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = fixture.openSource();
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(fixture.storeUri())) {
+                ServerHandle server = tier.launch(storage)) {
 
             fixture.seed(source);
-            ControlPlane control = fixture.start(server);
+            ControlPlane control = fixture.start(server, storage);
 
             awaitCount(mongo, fixture.target(), SEEDED_ROWS, "the full load of the seeded documents");
             // A change after the full load, so the run ends holding a recorded stream position rather
@@ -145,12 +147,13 @@ class RestartKeepsThePositionIT {
     void aRerunReadsTheWholeCollectionAgain(Tiers tier) throws Exception {
         Fixture fixture = Fixture.forCase("restart_rerun", tier);
 
-        try (MongoClient source = fixture.openSource();
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = fixture.openSource();
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(fixture.storeUri())) {
+                ServerHandle server = tier.launch(storage)) {
 
             fixture.seed(source);
-            ControlPlane control = fixture.start(server);
+            ControlPlane control = fixture.start(server, storage);
 
             awaitCount(mongo, fixture.target(), SEEDED_ROWS, "the full load of the seeded documents");
             // The same recorded position the other case carries on from. It is seeded here as well, so
@@ -160,14 +163,24 @@ class RestartKeepsThePositionIT {
             awaitName(mongo, fixture.target(), CHANGED_ID, BEFORE_RESTART,
                     "the change the first run captured");
 
-            // The pair the terminal composes for the rerun: the stop clears, so there is nothing left
-            // to carry on from.
-            control.stop(fixture.pipelineId(), true);
-            control.lifecycle(fixture.pipelineId(), LifecycleVerb.START);
+            var firstLoad = Await.answered("the original full load", TIMEOUT,
+                    () -> control.initialLoad(fixture.pipelineId())
+                            .filter(load -> "STREAMING".equals(load.get("phase"))));
+            String originalRun = (String) firstLoad.get("runKey");
+            assertThat(originalRun).isNotBlank();
 
-            // The count is its own liveness here: nought would mean the run never started, and every
-            // seeded document is the only reading that says it really read the collection again.
-            assertThat(settledRowsRead(control, fixture.pipelineId()))
+            // The pair the terminal composes for the rerun: the stop clears, so there is nothing left
+            // to carry on from. Its new full load goes into a target holding the first run's documents,
+            // so the start asks first; keeping them is the answer, because what this case reads is how
+            // much the rerun read, not what the target holds afterwards.
+            control.stop(fixture.pipelineId(), true);
+            control.startAnswering(fixture.pipelineId(), "target-not-empty", "keep");
+
+            Await.answered("the completed full load of the replacement execution", TIMEOUT,
+                    () -> control.initialLoad(fixture.pipelineId())
+                            .filter(load -> "STREAMING".equals(load.get("phase"))
+                                    && load.get("runKey") instanceof String run && !originalRun.equals(run)));
+            assertThat(control.awaitSnapshotRowsRead(fixture.pipelineId(), Set.of(COLLECTION)).get(COLLECTION))
                     .as("documents the rerun read from %s: it was told to read everything, so it reads "
                             + "every seeded document", COLLECTION)
                     .isEqualTo(SEEDED_ROWS);
@@ -182,15 +195,14 @@ class RestartKeepsThePositionIT {
      * reason -- which is the failure this file would be least able to see, both readings being what the
      * case expects.
      */
-    private record Fixture(String pipelineId, String sourceUri, String targetUri, String storeUri) {
+    private record Fixture(String pipelineId, String sourceUri, String targetUri) {
 
         static Fixture forCase(String name, Tiers tier) {
             String suffix = name + "_" + tier.name().toLowerCase(Locale.ROOT);
             return new Fixture(
                     suffix,
                     SharedMongo.replicaSetUrl(suffix + "_src"),
-                    SharedMongo.replicaSetUrl(suffix + "_tgt"),
-                    SharedMongo.replicaSetUrl(suffix + "_state"));
+                    SharedMongo.replicaSetUrl(suffix + "_tgt"));
         }
 
         String sourceDatabase() {
@@ -224,9 +236,9 @@ class RestartKeepsThePositionIT {
         }
 
         /** Everything up to and including the start, which both cases here do identically. */
-        ControlPlane start(ServerHandle server) {
+        ControlPlane start(ServerHandle server, PreparedNativeStore storage) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
             Map<String, String> resources = new LinkedHashMap<>();

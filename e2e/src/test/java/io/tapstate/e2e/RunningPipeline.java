@@ -90,7 +90,11 @@ final class RunningPipeline {
 
     /** Drives a stop and waits for the runtime to report it has reached rest. */
     void stopAndSettle() {
-        control.stop(pipelineId, true);
+        stopAndSettle(true);
+    }
+
+    void stopAndSettle(boolean purge) {
+        control.stop(pipelineId, purge);
         Await.until(
                 pipelineId + " to reach " + PipelineState.STOPPED,
                 () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
@@ -101,6 +105,17 @@ final class RunningPipeline {
     static RunningPipeline started(ServerHandle server, Path directory) throws Exception {
         ControlPlane control = new ControlPlane(server.baseUrl());
         control.bootstrapAndLogin("e2e", "e2e-password");
+        return started(control, directory);
+    }
+
+    /** Uses one explicitly prepared installation, retained by the caller across any server replacement. */
+    static RunningPipeline started(ServerHandle server, Path directory, PreparedNativeStore storage) throws Exception {
+        ControlPlane control = new ControlPlane(server.baseUrl());
+        storage.loginAndAwaitBusiness(control);
+        return started(control, directory);
+    }
+
+    private static RunningPipeline started(ControlPlane control, Path directory) throws Exception {
         control.registerConnector(
                 E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 

@@ -12,8 +12,9 @@ import java.util.Objects;
  * <p>{@code expectedContentHash} is an optional precondition: the content hash of the stored version
  * this edit was written against. Supplied, the apply is refused unless that is still the stored
  * version, so two authors editing the same resource cannot silently overwrite each other. Omitted,
- * the apply overwrites whatever is stored — the original behaviour, kept so that a caller who never
- * asked for the check is never refused by it.
+ * a full replacement keeps the original unconditional-write behavior. A partial Source draft is an
+ * exception: omitted top-level fields are copied from the stored Source and guarded by its version.
+ * Managed Cloud apply additionally fences the stored snapshot that supplies server-managed attribution.
  */
 public record ArtifactDraft(String source, String content, String expectedContentHash) {
 
@@ -21,7 +22,7 @@ public record ArtifactDraft(String source, String content, String expectedConten
         Objects.requireNonNull(content, "draft content");
     }
 
-    /** A draft submitted with no precondition, overwriting whatever is stored under its id. */
+    /** A draft submitted with no caller-declared precondition. */
     public ArtifactDraft(String source, String content) {
         this(source, content, null);
     }

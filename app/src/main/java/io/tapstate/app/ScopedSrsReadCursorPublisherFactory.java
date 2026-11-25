@@ -1,0 +1,97 @@
+package io.tapstate.app;
+
+import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.runtime.srs.SrsReadCursorPublisherFactory;
+import io.tapstate.spi.store.SrsConsumerRun;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.function.LongConsumer;
+
+/** A reader reports only its original consumer; recovery uses a retained ring floor rather than read-ahead. */
+final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublisherFactory {
+    private static final long serialVersionUID = 1L;
+    private final SrsConsumerRun run;
+    private final String table;
+    ScopedSrsReadCursorPublisherFactory(SrsConsumerRun run,String table) {
+        this.run = Objects.requireNonNull(run,"run"); this.table = Objects.requireNonNull(table,"table");
+        if (table.isBlank()) throw new IllegalArgumentException("blank original consumer table");
+    }
+    @Override public boolean requiresDurableLog() { return true; }
+    @Override public LongConsumer resolve(HazelcastInstance member) {
+        var bound = ScopedSrsConsumerAccess.bind(member,run);
+        return sequence -> {
+            bound.requireClaim(null);
+            boolean committed = bound.store().advanceReadSequence(run.context(),run.membershipRevision(),table,sequence,run.originalClaim());
+            if (!committed) throw ScopedSrsConsumerAccess.refused(run);
+        };
+    }
+    @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
+        if (ring == null || ring.isBlank()) throw new IllegalArgumentException("blank original ring");
+        var bound = ScopedSrsConsumerAccess.bind(member,run);
+        if (bound.store().supportsReadBatchVerification()) {
+            return (io.tapstate.runtime.srs.SrsEventModelVerifier.Batch) (items, firstSequence) -> {
+                bound.requireClaim(null);
+                var events = new java.util.ArrayList<io.tapstate.spi.store.SrsConsumerStore.ReadEvent>(items.size());
+                long sequence = firstSequence;
+                for (var item : items) {
+                    events.add(new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(
+                            sequence++, item.epoch(), item.schemaVer(), item.captureFence()));
+                }
+                if (!bound.store().verifyReadEvents(run, table, ring, events)) throw ScopedSrsConsumerAccess.refused(run);
+                bound.requireClaim(null);
+            };
+        }
+        if(bound.store().supportsReadEventVerification())return (item,sequence)->{
+            bound.requireClaim(null);
+            var model=bound.store().verifyReadEvent(run,table,ring,sequence,item.epoch(),item.schemaVer(),item.captureFence())
+                    .orElseThrow(()->ScopedSrsConsumerAccess.refused(run));
+            var expected=new io.tapstate.spi.store.SrsModelKey(run.miningChainId(),table,run.scope().cacheIncarnation(),item.epoch(),item.schemaVer());
+            if(!expected.equals(model.key()) || !ring.equals(model.ringName()))throw unavailable(ring,item);
+            bound.requireClaim(null);
+        };
+        var models = bound.models().guardedBy(bound.requireActive());
+        return (item,sequence) -> {
+            bound.requireClaim(null); var progress = bound.progress();
+            if (!progress.cursor().perTableSeq().containsKey(table)) throw ScopedSrsConsumerAccess.refused(run);
+            if (sequence < 0 || sequence == Long.MAX_VALUE || item.epoch() < 1 || item.epoch() == Long.MAX_VALUE
+                    || item.schemaVer() == Long.MAX_VALUE || item.captureFence() == null) throw unavailable(ring,item);
+            var expected = new io.tapstate.spi.store.SrsModelKey(run.miningChainId(),table,run.scope().cacheIncarnation(),item.epoch(),item.schemaVer());
+            var model = models.requireEvent(expected,ring,sequence,item.captureFence());
+            if (model == null || !expected.equals(model.key()) || !ring.equals(model.ringName())) throw unavailable(ring,item);
+            bound.requireClaim(null);
+        };
+    }
+    private static io.tapstate.core.common.TapstateException unavailable(String ring,io.tapstate.runtime.srs.SrsItem item) {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.SRS_EVENT_MODEL_UNAVAILABLE,
+                java.util.Map.of("ring",ring,"epoch",String.valueOf(item.epoch()),"version",String.valueOf(item.schemaVer())),null);
+    }
+    @Override public Optional<ChainPosition> confirmedPosition(HazelcastInstance member) {
+        return confirmedPosition(progress(member));
+    }
+
+    private Optional<ChainPosition> confirmedPosition(io.tapstate.spi.store.SrsConsumerProgress held) {
+        return Optional.ofNullable(held.cursor().sinkAckedByTable().get(table))
+                .filter(position -> position.order().epoch() > 0 && position.order().seq() >= 0 && position.order().seq() < Long.MAX_VALUE);
+    }
+    private io.tapstate.spi.store.SrsConsumerProgress progress(HazelcastInstance member) {
+        var held = ScopedSrsConsumerAccess.bind(member,run).progress();
+        if (!held.cursor().perTableSeq().containsKey(table) || !held.ringDoneThrough().containsKey(table)) throw ScopedSrsConsumerAccess.refused(run);
+        return held;
+    }
+    @Override public OptionalLong recoverySequence(HazelcastInstance member) {
+        return recoverySequence(progress(member));
+    }
+
+    private OptionalLong recoverySequence(io.tapstate.spi.store.SrsConsumerProgress held) {
+        var floor = held.ringDoneThrough().get(table);
+        if (floor == null) throw ScopedSrsConsumerAccess.refused(run);
+        return OptionalLong.of(floor);
+    }
+
+    @Override public RecoveryProgress recoveryProgress(HazelcastInstance member) {
+        var held = progress(member);
+        return new RecoveryProgress(recoverySequence(held), confirmedPosition(held));
+    }
+}

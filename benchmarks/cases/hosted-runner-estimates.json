@@ -1,0 +1,819 @@
+{
+  "cases": {
+    "aggregate.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 251.073,
+      "seconds": 374,
+      "workload_sha256": "96f42d04e6bb564e0b78f7ab6cbbc312919cf836624782368d21bbb779bc733f"
+    },
+    "aggregate.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "filter.live.basic.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "d68c72a75059235e956fd124d430861767dc6781a29d3d973e20712a968a50ff"
+    },
+    "aggregate.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "projection": {
+        "before_hosted_headroom_seconds": 306.073,
+        "qualification_case": "filter.snapshot.basic.large",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "join.snapshot.basic.large@1",
+        "representative_whole_case_seconds": 306.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 443,
+      "workload_sha256": "1cb36d9539786795835a0a8ad1e3933c7df8cb739d9d661b18850377abda46bb"
+    },
+    "aggregate.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 97.12,
+      "seconds": 182,
+      "workload_sha256": "f8cf392d52f7dba7698ea1535bb10052550912937b7bf43bfeb12830a252132b"
+    },
+    "aggregate.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "filter.snapshot.basic.standard",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "8f8b3021afdfbfe4935202d954dd3e6632cff3eea38436cccaae97490dfb2b9f"
+    },
+    "aggregate.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "filter.snapshot.basic.wide",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "0a6d82aa8024ac082508c07f4022f8b501e9e435940febe7f7e4e58a80ceb10c"
+    },
+    "copy.backlog.fixed-iud.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "observed_whole_case_seconds": 220.869,
+      "seconds": 337,
+      "workload_sha256": "db643bad6ddc4cffb19bd07b1b816ff408f85f6b2c215ab8aada2598a943d6f8"
+    },
+    "copy.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1156,
+        "qualification_case": "copy.live.basic.standard",
+        "qualification_estimate_seconds": 187,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "same_workload_sample": {
+        "elapsed_seconds": 1127.99,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+        "repeat_statuses": [
+          "completed",
+          "measurement-incomplete",
+          "completed"
+        ]
+      },
+      "seconds": 1505,
+      "workload_sha256": "ed9e2f90f45cab4abf4464c59305ffd8307300cf45eb09d288e4000b2cfd2763"
+    },
+    "copy.live.handoff.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "copy.live.handoff.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "790fea86c0bc287dc8b2f50c9231b38d5e0cebed5392a9a362e6c72ede0b6514"
+    },
+    "copy.live.slow-target.large@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 2386,
+        "qualification_case": "copy.live.slow-target.large",
+        "qualification_estimate_seconds": 448,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 1980
+      },
+      "seconds": 3043,
+      "workload_sha256": "58606c2cdc5861ba9a3c81dfbf55d74a5e08cc1db23ca86da84bb03c296d39dc"
+    },
+    "copy.snapshot.basic.large@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "projection": {
+        "before_hosted_headroom_seconds": 306.073,
+        "qualification_case": "copy.snapshot.basic.large",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "join.snapshot.basic.large@1",
+        "representative_whole_case_seconds": 306.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 443,
+      "workload_sha256": "9dabec1f0447c46ebf4058115664618552b22b10ff6926f366e324ea3ecfb1b7"
+    },
+    "copy.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "copy.snapshot.basic.small",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "f0b112998387818eef4477e3e5e0e112a1801ef13dea7c926616678a70ac71c4"
+    },
+    "copy.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "observed_whole_case_seconds": 98.158,
+      "seconds": 183,
+      "workload_sha256": "28a8438ce7b0f45ba347504e491c918b26ff7177a43ea6b314ccebddb1036722"
+    },
+    "copy.snapshot.basic.wide@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "copy.snapshot.basic.wide",
+        "qualification_estimate_seconds": 164,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "de1cacf261d94e3839148b5bcaf0ad7601b877136867c98a97accd3ec42db2db"
+    },
+    "copy.snapshot.dummy-baseline.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 142.178,
+      "seconds": 238,
+      "workload_sha256": "b3aa2dded550a7796d06bb13c2ec0b6d2bbd595870c7fd1c096e71d2d8ab6abe"
+    },
+    "filter.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 251.073,
+        "qualification_case": "filter.backlog.basic.standard",
+        "qualification_estimate_seconds": 200,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "aggregate.backlog.basic.standard@1",
+        "representative_whole_case_seconds": 251.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 374,
+      "workload_sha256": "fe3bf8d0d9a50a5599810cda5e3f12bd4a82d09ccc62c43d0ca260a4eef357a0"
+    },
+    "filter.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "filter.live.basic.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "dbb7734da07411a0281fa8d6e34560f7c5809b7929c3424a042021342e5d5ac2"
+    },
+    "filter.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "projection": {
+        "before_hosted_headroom_seconds": 306.073,
+        "qualification_case": "filter.snapshot.basic.large",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "join.snapshot.basic.large@1",
+        "representative_whole_case_seconds": 306.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 443,
+      "workload_sha256": "665a99e66bf423adbc1ae18fa8271772d35b8d1ab0b147fee1fd186889fb2daf"
+    },
+    "filter.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 111.359,
+      "seconds": 200,
+      "workload_sha256": "62dc55eba13eededfd8d71f0e8588a8cdf4c2a2cf79815203e08a5d2e744bb33"
+    },
+    "filter.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "filter.snapshot.basic.standard",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "191182d627213dc1220c13df962cf6b30ffd70a3edb1466afe7045cd169238b1"
+    },
+    "filter.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "filter.snapshot.basic.wide",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "8dcca32653c6112d6ac7cd14366ffcb7bc7d1829a1d729d9b58646c7a3171f30"
+    },
+    "join.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 251.073,
+        "qualification_case": "join.backlog.basic.standard",
+        "qualification_estimate_seconds": 186,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "aggregate.backlog.basic.standard@1",
+        "representative_whole_case_seconds": 251.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 374,
+      "workload_sha256": "52fdcd91aa93211a7e74509913e90fd8b0bd4893c4048508c2b5954936932171"
+    },
+    "join.lifecycle.release.standard@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 1233.695,
+      "seconds": 1603,
+      "workload_sha256": "8f2e93d5c7f2b9bab37462662c6ac74d01e416677f8e210cf91c4d758c081f52"
+    },
+    "join.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "join.live.basic.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "25e6fca26a1e8e7b880fef3997c5366aa1e2ee4390643b508028de9e6bff5771"
+    },
+    "join.live.hot-update.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 5161.545,
+        "qualification_case": "join.live.hot-update.standard",
+        "qualification_estimate_seconds": 420,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 1980
+      },
+      "seconds": 6512,
+      "single_repeat_sample": {
+        "case": "join.live.hot-update.wide@2",
+        "elapsed_seconds": 1720.515,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879500135"
+      },
+      "workload_sha256": "484ccdf0763c5a91a6a5d6605021b477d05b2d12da77266f7531221840526476"
+    },
+    "join.live.hot-update.wide@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 5161.545,
+        "qualification_case": "join.live.hot-update.wide",
+        "qualification_estimate_seconds": 724,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 1980
+      },
+      "seconds": 6512,
+      "single_repeat_sample": {
+        "case": "join.live.hot-update.wide@2",
+        "elapsed_seconds": 1720.515,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879500135"
+      },
+      "workload_sha256": "48e619bedb0d72dd07d9ae72fecfc19d198fc15400864bb78f0f1a8c68d1f6c1"
+    },
+    "join.live.steady-state.standard@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "join.live.steady-state.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "ec4092e7d87df13054b27fb2213d55e578adc5b2a1fdea94ffb91054d098450f"
+    },
+    "join.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 306.073,
+      "seconds": 443,
+      "workload_sha256": "2fb262ba2c7297145a45f7b1a052e876c4fb8a5d149e4a6ef18829a7d1a479ea"
+    },
+    "join.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "join.snapshot.basic.small",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "79a591ee9be1bc37ec833b9622f2baa7c03fc8eb1035246c381253ae04245813"
+    },
+    "join.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "join.snapshot.basic.standard",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "73b1f33290dcefe421cc4facb61c7cb984761c27ae7937869cf187741ad8e3b4"
+    },
+    "join.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "join.snapshot.basic.wide",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "be7c6ac68e7f1b831204c4fc02f2425bdb32582bcc4f9266ec50b8468450a591"
+    },
+    "js.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 251.073,
+        "qualification_case": "js.backlog.basic.standard",
+        "qualification_estimate_seconds": 200,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "aggregate.backlog.basic.standard@1",
+        "representative_whole_case_seconds": 251.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 374,
+      "workload_sha256": "a3aa69799adb072d568596dd98b5b91408597e5bbe67870d20f0f9420a730cf5"
+    },
+    "js.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1146,
+        "qualification_case": "js.live.basic.standard",
+        "qualification_estimate_seconds": 177,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1493,
+      "workload_sha256": "69304d4dbe97dab96c01eff867faf53d2ef4cec3ced9f94941f9630387a686cc"
+    },
+    "js.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 128.679,
+      "seconds": 221,
+      "workload_sha256": "8403830ecc7a0c3e588da8ad7af165a8d9bcdc9507f6c1833b2e1f8f2f74e78a"
+    },
+    "js.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 111.359,
+        "qualification_case": "js.snapshot.basic.small",
+        "qualification_estimate_seconds": 88,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 200,
+      "workload_sha256": "0330d5b63e935c71702c67b18b00caed21f318fb846c94d31aad7b4e7d282b9b"
+    },
+    "js.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 157.72,
+        "qualification_case": "js.snapshot.basic.standard",
+        "qualification_estimate_seconds": 93,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 258,
+      "workload_sha256": "01dbf45b2fed0d261cf071be29e52b5d6e3b68033e00d5183d28e8e8596e8b69"
+    },
+    "js.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "js.snapshot.basic.wide",
+        "qualification_estimate_seconds": 95,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "793ebec60b77f0323eef563560827c967a9e710ea168e9aad0c4be3a3e6763be"
+    },
+    "map.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 251.073,
+        "qualification_case": "map.backlog.basic.standard",
+        "qualification_estimate_seconds": 200,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "aggregate.backlog.basic.standard@1",
+        "representative_whole_case_seconds": 251.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 374,
+      "workload_sha256": "0cf4229104c177e52631b8c68f3433b76a514d3ff3c797eb73333bd2a0d656ef"
+    },
+    "map.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "map.live.basic.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "3649bc67787e124a4033314c8f762f0d3dc535c1155c30e5bce58c3b58732e23"
+    },
+    "map.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "projection": {
+        "before_hosted_headroom_seconds": 306.073,
+        "qualification_case": "map.snapshot.basic.large",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "join.snapshot.basic.large@1",
+        "representative_whole_case_seconds": 306.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 443,
+      "workload_sha256": "b742d9f3981f035284f0f7c562e25c82785edff0572359551570bb7a12fef942"
+    },
+    "map.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "map.snapshot.basic.small",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "bc29ecf36432bf0509f26ce2e33f0c150d84cc03bc34b834f73d46ee821b89c7"
+    },
+    "map.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 157.72,
+      "seconds": 258,
+      "workload_sha256": "30a6ddf024c330355bc782d7d4ec37ddb9817d6bb592b2c94e2cd4ba57c54ff8"
+    },
+    "map.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "map.snapshot.basic.wide",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "2ba4811aceb9ff776a1f64a6a667886f2f87dfffbe6815e3401f7fdc9e54f714"
+    },
+    "mixed.snapshot.double-map.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 157.72,
+        "qualification_case": "mixed.snapshot.double-map.standard",
+        "qualification_estimate_seconds": 95,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 258,
+      "workload_sha256": "cdfd208cbca48e636523f83f87b0763aa0a9c1db2b823b59dabd5ab0aeb6188d"
+    },
+    "nest.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 251.073,
+        "qualification_case": "nest.backlog.basic.standard",
+        "qualification_estimate_seconds": 167,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "aggregate.backlog.basic.standard@1",
+        "representative_whole_case_seconds": 251.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 374,
+      "workload_sha256": "b8aa0458899912685fcdf306c0748e941c163430b7105b45d9236624385de568"
+    },
+    "nest.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "nest.live.basic.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "07501a2566d123516bf9bdc4006e2bec9a781eb030b9811b1b047d815bd4f97e"
+    },
+    "nest.live.child-update.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 2506.65,
+        "qualification_case": "nest.live.child-update.standard",
+        "qualification_estimate_seconds": 346,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 1980
+      },
+      "seconds": 3194,
+      "single_repeat_sample": {
+        "case": "nest.live.child-update.standard@1",
+        "elapsed_seconds": 835.55,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879500135"
+      },
+      "workload_sha256": "2fca59d5acad9ea8d8647330671c3ae54519d1cbee921635e2ef21881572b4c9"
+    },
+    "nest.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "projection": {
+        "before_hosted_headroom_seconds": 306.073,
+        "qualification_case": "nest.snapshot.basic.large",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "join.snapshot.basic.large@1",
+        "representative_whole_case_seconds": 306.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 443,
+      "workload_sha256": "7d933d7f10535ea48e00a74f29f29d890f41754a741713d088ba4786cbb6171c"
+    },
+    "nest.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "nest.snapshot.basic.small",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "572b7e97123bb8c08c5a2957ab1dfa7a79ba65eda160e55d0b5d46979145e62c"
+    },
+    "nest.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "nest.snapshot.basic.standard",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "36feba5f0621406554868eaac4347c74fceefa8142f8afa1e10afd0092e22a3b"
+    },
+    "nest.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "observed_whole_case_seconds": 176.592,
+      "seconds": 281,
+      "workload_sha256": "43fce117508a6a21af151d4fb0ebc5d3a9d643a5a28cd691c0e82ecaf7147c40"
+    },
+    "nest.snapshot.fanout.wide@2": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "observed_whole_case_seconds": 353.466,
+      "seconds": 502,
+      "workload_sha256": "046fc5497df13a309bdf398bf76ac022ade7904a622d1133665e6dca966fead5"
+    },
+    "union.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 217.636,
+      "seconds": 333,
+      "workload_sha256": "56605476ae06a28d7f0f34319eee939b8909bf1c1955c5beb1953d167d0ef570"
+    },
+    "union.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1188.234,
+        "qualification_case": "union.live.basic.standard",
+        "qualification_estimate_seconds": 186,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1546,
+      "single_repeat_sample": {
+        "case": "union.live.basic.standard@1",
+        "elapsed_seconds": 396.078,
+        "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879889351"
+      },
+      "workload_sha256": "a13b5db39f70c2761dc36eb8136a4098e46f0dd0203d746a8eba6cdf0592335d"
+    },
+    "union.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "projection": {
+        "before_hosted_headroom_seconds": 306.073,
+        "qualification_case": "union.snapshot.basic.large",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "join.snapshot.basic.large@1",
+        "representative_whole_case_seconds": 306.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 443,
+      "workload_sha256": "bec53022c446eb61fd8f20ea09a3177e7fc7a2d6434818fc804224e0ed01dceb"
+    },
+    "union.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "union.snapshot.basic.small",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "528803c8ec8af208f28dd69507ab5a8b620b9cef37a876626fa22ae0f536d860"
+    },
+    "union.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "union.snapshot.basic.standard",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "29bf343e3811a23e53a000b37ad8671a39d99d1efad311a43b0870aa30a6e7cb"
+    },
+    "union.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "union.snapshot.basic.wide",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "b519c0495b9962791897b845fd8fbf72f97b36afbbd0aaa3fe6ce873b9708e08"
+    },
+    "unwind.backlog.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 251.073,
+        "qualification_case": "unwind.backlog.basic.standard",
+        "qualification_estimate_seconds": 200,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "aggregate.backlog.basic.standard@1",
+        "representative_whole_case_seconds": 251.073,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 374,
+      "workload_sha256": "bf623b3e759246402d04bad66c4c1be4370c4053027832ed00108c7cfc7ef9d8"
+    },
+    "unwind.live.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 1293,
+        "qualification_case": "unwind.live.basic.standard",
+        "qualification_estimate_seconds": 324,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "copy.live.basic.standard@1",
+        "representative_whole_case_seconds": 1127.99,
+        "scheduled_window_seconds": 990
+      },
+      "seconds": 1677,
+      "workload_sha256": "b6ab04d8b6a784e118d68924e804d43c18d36d36d94b23ed15cfe850783b83ec"
+    },
+    "unwind.snapshot.basic.large@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44876206343",
+      "observed_whole_case_seconds": 148.03,
+      "seconds": 246,
+      "workload_sha256": "eebbbc77eecc232e93fc54f1a0b5618f59eab37cbeb7c272eddd896e0b8dda16"
+    },
+    "unwind.snapshot.basic.small@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "unwind.snapshot.basic.small",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "filter.snapshot.basic.small@1",
+        "representative_whole_case_seconds": 111.359,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "79f436a3550bd8117ef288bec12c1e6b60557f6d3efd5de744d0575cf3647887"
+    },
+    "unwind.snapshot.basic.standard@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44879070030",
+      "projection": {
+        "before_hosted_headroom_seconds": 246,
+        "qualification_case": "unwind.snapshot.basic.standard",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "map.snapshot.basic.standard@1",
+        "representative_whole_case_seconds": 157.72,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 368,
+      "workload_sha256": "24e36730998e9bd0068fd3a34c421d51c5d12343ce5a593209fbb3102be2761a"
+    },
+    "unwind.snapshot.basic.wide@1": {
+      "evidence": "https://github.com/tapstate/tapstate/actions/runs/44874613768",
+      "projection": {
+        "before_hosted_headroom_seconds": 353.466,
+        "qualification_case": "unwind.snapshot.basic.wide",
+        "qualification_estimate_seconds": 246,
+        "qualification_evidence": "https://github.com/tapstate/tapstate/actions/runs/44480025319",
+        "representative_case": "nest.snapshot.fanout.wide@2",
+        "representative_whole_case_seconds": 353.466,
+        "scheduled_window_seconds": 0
+      },
+      "seconds": 502,
+      "workload_sha256": "6612f72b127e1683429b074ecce7dafc4b1d437924e70a2e2fbc78de1965aa68"
+    }
+  },
+  "environment": "ubuntu-24.04-x64-op",
+  "schema_version": 1
+}

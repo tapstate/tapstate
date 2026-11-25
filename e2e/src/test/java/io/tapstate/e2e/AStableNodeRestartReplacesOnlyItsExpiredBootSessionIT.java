@@ -89,10 +89,8 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
 
     @Test
     void aRestartedNodeIsRefusedUntilItsOwnDeadSessionExpiresAndThenReplacesIt() {
-        String store = SharedMongo.replicaSetUrl("e2e_stable_node_restart");
-
-        try (TwoMemberCluster cluster = TwoMemberCluster.start(
-                store, "e2e-stable-node-restart", NODE_SESSION)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage, NODE_SESSION)) {
             cluster.awaitBothMembers();
 
             // Asked of the member that survives all of this. The one being restarted cannot be the
@@ -136,7 +134,7 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
                 assertThat(outputOf(tooSoon))
                         .describedAs("and it says which id it was turned away over, so an operator "
                                 + "reading the restart loop can tell waiting from misconfiguration")
-                        .contains("boot.node-id-in-use")
+                        .contains("TS0310028")
                         .contains(TwoMemberCluster.NODE_A);
 
                 RealProcessServer admitted = restartUntilAdmitted(cluster, survivor, restarts);
@@ -210,6 +208,15 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
                         .describedAs("out of the same cluster identity")
                         .isEqualTo(cluster0);
             } finally {
+                // Keep every attempted boot before cleanup, including the replacement's exit status.
+                // The cluster fixture retains only the original two members' process output.
+                var logs = new java.util.LinkedHashMap<String, java.nio.file.Path>();
+                for (int attempt = 0; attempt < restarts.size(); attempt++) {
+                    RealProcessServer process = restarts.get(attempt);
+                    String status = process.isAlive() ? "running" : "exit-" + process.exitValue();
+                    logs.put("node-a-restart-" + attempt + "-" + status, process.output());
+                }
+                FailureScene.writeMemberLogs(cluster0, logs);
                 restarts.forEach(RealProcessServer::close);
             }
         }
@@ -242,7 +249,7 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
                     .describedAs("every restart that was turned away was turned away over its own id. "
                             + "Without this, a build where the node could never start again would "
                             + "produce the same patient-looking loop")
-                    .contains("boot.node-id-in-use");
+                    .contains("TS0310028");
         }
         return null;
     }
@@ -253,6 +260,10 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
         AtomicReference<String> refusal = new AtomicReference<>("it was not asked yet");
         Await.until("the readmitted member's own read face to answer", SERVING_BUDGET,
                 () -> {
+                    if (!member.isAlive()) {
+                        throw new AssertionError("the readmitted member exited with status " + member.exitValue()
+                                + " before its read face could serve; inspect the retained restart process log");
+                    }
                     try {
                         signedIn.set(cluster.signedInAt(member));
                         return true;

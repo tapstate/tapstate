@@ -22,6 +22,8 @@ class PipelineLogAppenderTest {
     /** Runs {@code body} with the appender attached to a private logger, then detaches and cleans up. */
     private void withAppender(RingBufferLogSink sink, String loggerName, java.util.function.Consumer<Logger> body) {
         Logger logger = (Logger) LoggerFactory.getLogger(loggerName);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         PipelineLogAppender appender = new PipelineLogAppender(sink, new SecretRedactor());
         appender.setContext(logger.getLoggerContext());
         appender.start();
@@ -32,6 +34,7 @@ class PipelineLogAppenderTest {
             MDC.remove(MDC_KEY);
             logger.detachAppender(appender);
             appender.stop();
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -49,6 +52,21 @@ class PipelineLogAppenderTest {
             assertThat(line.level()).isEqualTo("INFO");
             assertThat(line.timestampMillis()).isPositive();
         });
+    }
+
+    @Test
+    void capturesOnlyAValidBoundedDiagnosticAlongsideTheOriginalLine() {
+        var sink = new RingBufferLogSink(8, 8);
+        var diagnostic = java.util.Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        withAppender(sink, "test.logs.diagnostic", logger -> {
+            MDC.put(MDC_KEY, "orders");
+            logger.atWarn().addKeyValue("diagnostic", diagnostic).log("safe failure");
+            logger.atWarn().addKeyValue("diagnostic", java.util.Map.of("unsupported", "payload")).log("original line");
+        });
+        assertThat(sink.tail("orders")).hasSize(2);
+        assertThat(sink.tail("orders").getFirst().diagnostic()).isEqualTo(diagnostic);
+        assertThat(sink.tail("orders").getLast().diagnostic()).isEmpty();
+        assertThat(sink.tail("orders").getLast().message()).isEqualTo("original line");
     }
 
     @Test
@@ -92,27 +110,53 @@ class PipelineLogAppenderTest {
     }
 
     @Test
+    void preservesExceptionDetailsAfterACredentialFreeMongoUri() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+
+        withAppender(sink, "test.logs.mongo-cause", logger -> {
+            MDC.put(MDC_KEY, "pl-mongo-err");
+            logger.error("Connection failed for mongodb://db.example/data",
+                    new IllegalStateException("ops@example.com: connection refused",
+                            new IllegalArgumentException("endpoint unavailable")));
+        });
+
+        assertThat(sink.tail("pl-mongo-err")).singleElement().satisfies(line ->
+                assertThat(line.message()).contains(
+                        "Connection failed for mongodb://db.example/data",
+                        "IllegalStateException: ops@example.com: connection refused",
+                        "Caused by: java.lang.IllegalArgumentException: endpoint unavailable",
+                        "\tat io.tapstate.app.PipelineLogAppenderTest."));
+    }
+
+    @Test
     void redactsRegisteredSecretsBeforeWritingToTheSink() {
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);
         SecretRedactor redactor = new SecretRedactor();
         redactor.replace("source-orders", java.util.List.of("sentinel-password"));
         Logger logger = (Logger) LoggerFactory.getLogger("test.logs.redacted");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         PipelineLogAppender appender = new PipelineLogAppender(sink, redactor);
         appender.setContext(logger.getLoggerContext());
         appender.start();
         logger.addAppender(appender);
         try {
             MDC.put(MDC_KEY, "orders");
-            logger.warn("connector rejected {}", "sentinel-password");
+            logger.atWarn().addKeyValue("diagnostic", java.util.Map.of(
+                    "code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "sentinel-password",
+                    "cause", java.util.Map.of("rawMessage", "nested sentinel-password")))
+                    .log("connector rejected {}", "sentinel-password");
         } finally {
             MDC.remove(MDC_KEY);
             logger.detachAppender(appender);
             appender.stop();
+            logger.setLevel(previousLevel);
         }
 
-        assertThat(sink.tail("orders")).singleElement().satisfies(line ->
-                assertThat(line.message())
-                        .isEqualTo("connector rejected ********")
-                        .doesNotContain("sentinel-password"));
+        assertThat(sink.tail("orders")).singleElement().satisfies(line -> {
+            assertThat(line.message()).isEqualTo("connector rejected ********");
+            assertThat(line.diagnostic()).containsEntry("code", "28000");
+            assertThat(line.diagnostic().toString()).contains("nested ********").doesNotContain("sentinel-password");
+        });
     }
 }

@@ -124,6 +124,9 @@ class ARunningNestReportsWhatItsStateCostsTest {
         try {
             NestStateReading reading = awaitReading();
 
+            assertThat(reading.keyAccesses()).isPresent();
+            assertThat(reading.coldKeys()).isPresent();
+
             assertThat(reading.entries())
                     .describedAs("every root is being held, including the last one written - a reading left "
                             + "only on reads reports what was there before the final write and then goes "
@@ -143,6 +146,32 @@ class ARunningNestReportsWhatItsStateCostsTest {
             assertThat(reading.backfillMillis())
                     .describedAs("time spent behind the map is measured, not assumed")
                     .isNotNegative();
+        } finally {
+            engine.cancel(PIPELINE);
+        }
+    }
+
+    @Test
+    void aRunningRootReportsRenderedDocumentsAndCompleteCommitHistograms() throws InterruptedException {
+        Engine engine = new Engine(member);
+        engine.submit(PIPELINE, ordersWithItems());
+        try {
+            long stop = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            NestStateReading reading;
+            do {
+                reading = engine.nestStateReadings(PIPELINE).get(ROOT_NAMESPACE);
+                if (reading != null && reading.rootsRendered().orElse(0L) >= 3
+                        && reading.commits() != null && reading.commits().keys().sum() >= 3) break;
+                Thread.sleep(25);
+            } while (System.nanoTime() - stop < 0);
+            assertThat(reading).isNotNull();
+            assertThat(reading.rootsRendered().orElse(0L)).isGreaterThanOrEqualTo(3);
+            var commits = reading.commits();
+            assertThat(commits).isNotNull();
+            assertThat(commits.groups()).isPositive();
+            assertThat(commits.keys().count()).isEqualTo(commits.groups());
+            assertThat(commits.keys().bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(commits.groups());
+            assertThat(commits.keys().sum()).isGreaterThanOrEqualTo(3);
         } finally {
             engine.cancel(PIPELINE);
         }
@@ -240,7 +269,8 @@ class ARunningNestReportsWhatItsStateCostsTest {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (System.nanoTime() < deadline) {
             NestStateReading reading = engine.nestStateReadings(PIPELINE).get(namespace);
-            if (reading != null && reading.accesses() >= minimumAccesses) {
+            if (reading != null && reading.accesses() >= minimumAccesses
+                    && reading.keyAccesses().isPresent() && reading.coldKeys().isPresent()) {
                 return reading;
             }
             sleep();

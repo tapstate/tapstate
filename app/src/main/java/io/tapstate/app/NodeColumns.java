@@ -1,6 +1,10 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.AggregateStepRules;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
+import io.tapstate.core.dsl.aggregate.ValueType;
+import io.tapstate.core.model.RollupFunction;
 import io.tapstate.core.common.NumericType;
 import io.tapstate.core.common.StringType;
 import io.tapstate.core.dsl.RowExpressions;
@@ -95,12 +99,26 @@ import java.util.Set;
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
  * @param origins       surviving source identity, output column to its original name; replacement
  *                      values have no origin even if their output name matches a source column
- * @param expanded      whether rows passed through an expansion; only these outputs use source
- *                      identity through renames when publishing their parent key
+ * @param expanded      whether rows passed through an expansion, repeating parent values and
+ *                      invalidating source uniqueness
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
         Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
-        Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields,
+        List<Set<String>> keyCandidates) {
+
+    NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+            Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
+            Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields) {
+        this(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, stringTypes,
+                unwindSourceIdFields, key.stream().map(Set::of).toList());
+    }
+
+    NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+            Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
+            Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        this(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, stringTypes, List.of());
+    }
 
     NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
             Map<String, String> origins, boolean expanded) {
@@ -122,15 +140,15 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     }
 
     NodeColumns withStringTypes(Map<String, StringType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types, unwindSourceIdFields, keyCandidates);
     }
 
     NodeColumns withUnchangedFields(Set<String> fields) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes, unwindSourceIdFields, keyCandidates);
     }
 
     NodeColumns withNumericTypes(Map<String, NumericType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes, unwindSourceIdFields, keyCandidates);
     }
 
     NodeColumns {
@@ -138,6 +156,8 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         key = List.copyOf(key);
+        keyCandidates = keyCandidates.stream().map(names -> Collections.unmodifiableSet(new LinkedHashSet<>(names))).toList();
+        unwindSourceIdFields = List.copyOf(unwindSourceIdFields);
         origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
         numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
         stringTypes = Collections.unmodifiableMap(new LinkedHashMap<>(stringTypes));
@@ -176,7 +196,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
 
     /**
      * What a transform step produces, given what reaches it and, where it has one, what it compiled to.
-     * Seven kinds, and the switch is exhaustive over all of them: an eighth cannot be added to the
+     * Eight kinds, and the switch is exhaustive over all of them: a ninth cannot be added to the
      * grammar without this stopping the build.
      *
      * <p><b>A script is the one kind that cannot be answered for, and the answer is final rather than
@@ -190,11 +210,17 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * and nothing here may work a row's shape out from one of those.
      */
     static NodeColumns of(TransformBody body, Map<String, NodeColumns> inputs, JoinPlan compiledJoin) {
+        return of(null, body, inputs, compiledJoin);
+    }
+
+    /** The same, for a caller that can say which step this is, so a refusal can name it. */
+    static NodeColumns of(String step, TransformBody body, Map<String, NodeColumns> inputs,
+            JoinPlan compiledJoin) {
         return switch (body) {
             case TransformBody.Js ignored ->
                     unknown("js: a script settles its own columns while it runs, not before");
             case TransformBody.MapProjection projection ->
-                    project(projection.fields(), merged(inputs.values()));
+                    project(projection.outputFields(), merged(inputs.values()));
             // A predicate decides which rows travel on, never which columns they carry. Handing what
             // reached it back unchanged is the whole of it - including when that answer is an unknown,
             // which then keeps naming the step that actually went dark.
@@ -205,9 +231,51 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             // not to touch a column, so folding them together would make a later change to one of
             // them silently a change to the other.
             case TransformBody.Union ignored -> merged(inputs.values());
+            case TransformBody.Aggregate aggregate ->
+                    grouped(step == null ? "aggregate" : step, aggregate, merged(inputs.values()));
             case TransformBody.Nest nest -> rootOf(nest, inputs);
             case TransformBody.Join ignored -> published(compiledJoin);
         };
+    }
+
+    /**
+     * What a grouped step produces: the group names, then the fields, each typed by its function. None
+     * of the input's columns travels on, and the rows are told apart by the group names alone.
+     *
+     * <p>Every expression is checked against the input here, so a group expression or a field that does
+     * not hold is refused with the step's code when the pipeline is applied. A group value may be null,
+     * as in SQL, and so may every field but a count: a group whose rows all carry null has no sum.
+     */
+    /** A node's columns as the types an aggregate step's expressions are checked against. */
+    static Map<String, ValueType> valueTypes(NodeColumns upstream) {
+        Map<String, ValueType> input = new LinkedHashMap<>();
+        upstream.columns().forEach((name, declared) -> {
+            TapstateType type = JoinSchemaDrift.typeOf(declared);
+            NumericType numeric = upstream.numericTypes().get(name);
+            input.put(name, type == TapstateType.DECIMAL
+                    ? ValueType.decimal(numeric == null ? null : numeric.scale()) : ValueType.of(type));
+        });
+        return input;
+    }
+
+    private static NodeColumns grouped(String step, TransformBody.Aggregate aggregate, NodeColumns upstream) {
+        if (!upstream.known()) {
+            return upstream;
+        }
+        AggregateStepSpec spec = AggregateStepRules.shape(step, aggregate, valueTypes(upstream), true);
+        Map<String, String> columns = new LinkedHashMap<>();
+        Map<String, NumericType> numbers = new LinkedHashMap<>();
+        spec.outputColumns().forEach((name, type) -> {
+            boolean count = spec.fields().stream().anyMatch(field -> field.field().equals(name)
+                    && (field.function() == RollupFunction.COUNT
+                            || field.function() == RollupFunction.COUNT_DISTINCT));
+            columns.put(name, JoinSchemaDrift.declaredType(type.type(), !count));
+            if (type.type() == TapstateType.DECIMAL && type.scale() != null) {
+                numbers.put(name, new NumericType(null, null, null, null, null, null, 38, type.scale()));
+            }
+        });
+        return new NodeColumns(columns, spec.outputKey(), null, identityOrigins(columns), false,
+                numbers, Set.of(), Map.of());
     }
 
     /**
@@ -255,42 +323,57 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         seen.forEach((name, declared) -> out.put(name, carriedBy.get(name) == inputs.size()
                 ? declared
                 : JoinSchemaDrift.declaredType(JoinSchemaDrift.typeOf(declared), true)));
-        // An added key column is a claim about every row leaving this node, and a merge forwards
-        // rows from each input as they arrive. So the claim survives only where every input makes
-        // the same one: one branch that expanded a list and one that did not produce rows told apart
-        // by different things, and keying on either branch's answer describes the other's wrongly.
         NodeColumns first = inputs.iterator().next();
-        List<String> agreed = first.key();
         Map<String, String> origins = new LinkedHashMap<>(first.origins());
         boolean expanded = false;
         for (NodeColumns input : inputs) {
-            if (!input.key().equals(agreed)) {
-                agreed = List.of();
-            }
             origins.entrySet().removeIf(entry ->
                     !entry.getValue().equals(input.origins().get(entry.getKey())));
             expanded |= input.expanded();
         }
-        Map<String, NumericType> numbers = new LinkedHashMap<>();
-        Map<String, StringType> strings = new LinkedHashMap<>();
-        for (String column : out.keySet()) {
-            NumericType candidate = inputs.iterator().next().numericTypes().get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, input.numericTypes().get(column)))) {
-                numbers.put(column, candidate);
-            }
-        }
-        for (String column : out.keySet()) {
-            StringType candidate = inputs.iterator().next().stringTypes().get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, input.stringTypes().get(column)))) {
-                strings.put(column, candidate);
-            }
-        }
+        Map<String, NumericType> numbers = commonDescriptors(inputs, out.keySet(), NodeColumns::numericTypes);
+        Map<String, StringType> strings = commonDescriptors(inputs, out.keySet(), NodeColumns::stringTypes);
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
-        return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
-                origins, expanded, numbers, unchanged, strings);
+        List<Set<String>> mergedCandidates = mergedKeyCandidates(inputs);
+        List<String> mergedKey = mergedCandidates.stream().filter(names -> !names.isEmpty())
+                .map(names -> names.iterator().next()).toList();
+        return new NodeColumns(out, mergedKey, null,
+                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs), mergedCandidates);
+    }
+
+    /** An added key component needs a common alias on every input. */
+    private static List<Set<String>> mergedKeyCandidates(Collection<NodeColumns> inputs) {
+        if (inputs.stream().flatMap(input -> input.keyCandidates().stream()).anyMatch(Set::isEmpty)) {
+            return List.of(Set.of());
+        }
+        List<Set<String>> shared = inputs.iterator().next().keyCandidates();
+        for (NodeColumns input : inputs) {
+            shared = KeyProjection.sharedCandidates(shared, input.keyCandidates(), input.columns()::containsKey)
+                    .orElseGet(List::of);
+            if (shared.isEmpty()) return shared;
+        }
+        return shared;
+    }
+
+    private static <T> Map<String, T> commonDescriptors(Collection<NodeColumns> inputs, Set<String> columns,
+            java.util.function.Function<NodeColumns, Map<String, T>> descriptors) {
+        Map<String, T> result = new LinkedHashMap<>();
+        Map<String, T> first = descriptors.apply(inputs.iterator().next());
+        for (String column : columns) {
+            T candidate = first.get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, descriptors.apply(input).get(column)))) result.put(column, candidate);
+        }
+        return result;
+    }
+
+    private static List<String> mergedSourceIdentityFields(Collection<NodeColumns> inputs) {
+        return inputs.stream().flatMap(input -> input.unwindSourceIdFields().stream()).distinct().toList();
+    }
+
+    String unwindSourceIdField() {
+        return unwindSourceIdFields.size() == 1 ? unwindSourceIdFields.getFirst() : null;
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -363,9 +446,11 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         // own locator and the first one's together, and falling back to the table's own key would be
         // claiming the first expansion's rows are one row.
         List<String> key = new ArrayList<>(upstream.key());
+        List<Set<String>> candidates = new ArrayList<>(upstream.keyCandidates());
         String locator = UnwindWriteKeys.elementLocator(unwind);
         if (locator != null && !key.contains(locator)) {
             key.add(locator);
+            candidates.add(Set.of(locator));
         }
         Map<String, String> origins = new LinkedHashMap<>(upstream.origins());
         origins.remove(unwind.path());
@@ -380,7 +465,9 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             strings.remove(replaced);
             unchanged.remove(replaced);
         }
-        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings);
+        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings,
+                unwind.sourceIdField() != null || upstream.unwindSourceIdFields().isEmpty()
+                        ? List.of(unwind.resolvedSourceIdField()) : upstream.unwindSourceIdFields(), candidates);
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -529,24 +616,36 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Set<String> unchanged = new LinkedHashSet<>();
         Set<String> consumed = new LinkedHashSet<>();
         Set<String> dropped = new LinkedHashSet<>();
+
+        applyRules(rules, upstream, upstreamTypes, out, numbers, strings, unchanged, consumed, dropped);
+        passThrough(upstream, out, numbers, strings, unchanged, consumed, dropped);
+        Map<String, String> origins = projectedOrigins(rules, upstream, out.keySet());
+
+        List<Set<String>> candidates = new ArrayList<>();
+        for (Set<String> names : KeyProjection.candidates(
+                upstream.keyCandidates(), rules, upstream.columns()::containsKey)) {
+            if (names.isEmpty()) {
+                candidates.add(Set.of());
+                continue;
+            }
+            Set<String> surviving = new LinkedHashSet<>(names);
+            surviving.retainAll(out.keySet());
+            if (!surviving.isEmpty()) candidates.add(surviving);
+        }
+        List<String> key = candidates.stream().filter(names -> !names.isEmpty())
+                .map(names -> names.iterator().next()).toList();
+        return new NodeColumns(out, key, null,
+                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields(), candidates);
+    }
+
+    private static void applyRules(
+            Map<String, FieldRule> rules, NodeColumns upstream, Map<String, TapstateType> upstreamTypes,
+            Map<String, String> out, Map<String, NumericType> numbers, Map<String, StringType> strings,
+            Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
         rules.forEach((output, rule) -> {
             switch (rule) {
-                case FieldRule.Rename rename -> {
-                    consumed.add(rename.sourceField());
-                    String renamed = upstream.columns().get(rename.sourceField());
-                    if (renamed != null) {
-                        out.put(output, renamed);
-                        if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
-                            unchanged.add(output);
-                        }
-                        if (upstream.stringTypes().containsKey(rename.sourceField())) {
-                            strings.put(output, upstream.stringTypes().get(rename.sourceField()));
-                        }
-                        if (upstream.numericTypes().containsKey(rename.sourceField())) {
-                            numbers.put(output, upstream.numericTypes().get(rename.sourceField()));
-                        }
-                    }
-                }
+                case FieldRule.Rename rename ->
+                        applyRename(rename, output, upstream, out, numbers, strings, unchanged, consumed);
                 case FieldRule.Drop ignored -> dropped.add(output);
                 // A literal is the one column here that is known not to be absent: it is the same
                 // written-down value on every row.
@@ -561,39 +660,80 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                 }
             }
         });
+    }
+
+    private static void applyRename(
+            FieldRule.Rename rename, String output, NodeColumns upstream,
+            Map<String, String> out, Map<String, NumericType> numbers, Map<String, StringType> strings,
+            Set<String> unchanged, Set<String> consumed) {
+        consumed.add(rename.sourceField());
+        String renamed = upstream.columns().get(rename.sourceField());
+        if (renamed != null) {
+            out.put(output, renamed);
+            if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
+                unchanged.add(output);
+            }
+            copyTypeDescriptors(output, rename.sourceField(), upstream, numbers, strings);
+        }
+    }
+
+    private static void passThrough(
+            NodeColumns upstream, Map<String, String> out,
+            Map<String, NumericType> numbers, Map<String, StringType> strings,
+            Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
         upstream.columns().forEach((name, type) -> {
             if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
                 out.put(name, type);
                 if (upstream.unchangedFields().contains(name)) {
                     unchanged.add(name);
                 }
-                if (upstream.stringTypes().containsKey(name)) {
-                    strings.put(name, upstream.stringTypes().get(name));
-                }
-                if (upstream.numericTypes().containsKey(name)) {
-                    numbers.put(name, upstream.numericTypes().get(name));
-                }
+                copyTypeDescriptors(name, name, upstream, numbers, strings);
             }
         });
+    }
+
+    private static void copyTypeDescriptors(
+            String target, String source, NodeColumns upstream,
+            Map<String, NumericType> numbers, Map<String, StringType> strings) {
+        if (upstream.stringTypes().containsKey(source)) {
+            strings.put(target, upstream.stringTypes().get(source));
+        }
+        if (upstream.numericTypes().containsKey(source)) {
+            numbers.put(target, upstream.numericTypes().get(source));
+        }
+    }
+
+    private static Map<String, String> projectedOrigins(
+            Map<String, FieldRule> rules, NodeColumns upstream, Set<String> outputColumns) {
         Map<String, String> origins = new LinkedHashMap<>();
-        for (String output : out.keySet()) {
-            FieldRule rule = rules.get(output);
-            // A rename with no source emits nothing. The original output-named column can still
-            // pass through, so its identity must follow that actual value rather than the rule.
-            if (rule instanceof FieldRule.Rename rename
-                    && !upstream.columns().containsKey(rename.sourceField())) {
-                rule = null;
-            }
-            String source = rule instanceof FieldRule.Rename rename ? rename.sourceField() : output;
-            if (rule == null || rule instanceof FieldRule.Rename) {
-                String origin = upstream.origins().get(source);
-                if (origin != null) {
-                    origins.put(output, origin);
-                }
+        for (String output : outputColumns) {
+            String origin = resolveOrigin(rules.get(output), output, upstream);
+            if (origin != null) {
+                origins.put(output, origin);
             }
         }
-        return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
-                origins, upstream.expanded(), numbers, unchanged, strings);
+        return origins;
+    }
+
+    private static String resolveOrigin(FieldRule rule, String output, NodeColumns upstream) {
+        // A rename with no source emits nothing. The original output-named column can still
+        // pass through, so its identity must follow that actual value rather than the rule.
+        if (rule instanceof FieldRule.Rename rename) {
+            String source = rename.sourceField();
+            return upstream.columns().containsKey(source)
+                    ? upstream.origins().get(source) : upstream.origins().get(output);
+        }
+        if (rule instanceof FieldRule.Computed computed) {
+            String moved = RowExpressions.movedAfterColumn(computed.celExpr());
+            if (moved != null && upstream.columns().containsKey(moved)) {
+                return upstream.origins().get(moved);
+            }
+            return null;
+        }
+        if (rule == null) {
+            return upstream.origins().get(output);
+        }
+        return null;
     }
 
     /**
@@ -617,28 +757,12 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     }
 
     /**
-     * What an upstream node's added key columns are called after a projection, and which of them
-     * still exist. A rename is followed rather than treated as a loss: the column is the same column
-     * under another name, and dropping the claim would leave rows an expansion made distinct looking
-     * like one row again - the failure the claim exists to remove, arriving through a rule that only
-     * renamed something. A column the projection does not carry at all is a loss, and is dropped:
-     * naming a column the target has not got reads as a key that is complete.
-     */
-    private static List<String> projectedKey(
-            Map<String, FieldRule> rules, List<String> upstreamKey, Map<String, String> out) {
-        if (upstreamKey.isEmpty()) {
-            return List.of();
-        }
-        return KeyProjection.renamed(upstreamKey, rules).stream().filter(out::containsKey).toList();
-    }
-
-    /**
      * What a written-down value is. A literal is written in the pipeline's own text, so its type is
      * whatever the text parsed to and nothing else is consulted; a shape the parser produces that is
      * not one of these is unknown rather than the closest of them, for the same reason a computed
      * value outside the expression language's own types is.
      */
-    private static TapstateType literalType(Object value) {
+    static TapstateType literalType(Object value) {
         return switch (value) {
             case Boolean ignored -> TapstateType.BOOLEAN;
             case String ignored -> TapstateType.STRING;

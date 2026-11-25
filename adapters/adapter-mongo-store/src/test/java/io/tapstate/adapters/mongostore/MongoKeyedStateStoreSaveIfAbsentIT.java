@@ -99,9 +99,9 @@ class MongoKeyedStateStoreSaveIfAbsentIT {
 
                 assertThat(failure).isInstanceOfSatisfying(TapstateException.class, coded -> {
                     assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
-                    assertThat(coded.getCause()).isInstanceOfSatisfying(MongoCommandException.class,
-                            command -> assertThat(command.getErrorCode()).isEqualTo(2));
-                    assertThat(coded.getCause()).isSameAs(trace.failures.getFirst());
+                    assertThat(coded.args()).containsEntry("detail", "MongoCommandException code=2");
+                    assertThat(coded.getCause()).isNull();
+                    assertThat(coded.toString()).doesNotContain("injected", "failCommand");
                 });
             });
 

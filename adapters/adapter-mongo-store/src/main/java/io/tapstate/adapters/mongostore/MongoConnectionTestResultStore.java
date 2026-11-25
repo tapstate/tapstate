@@ -54,25 +54,49 @@ public final class MongoConnectionTestResultStore implements ConnectionTestResul
 
     /** Maps a result to its stored document: the connection id as {@code _id}, outcome and items as fields. */
     static Document toDocument(ConnectionTestResult result) {
+        return toDocument(result, false);
+    }
+
+    private static Document toDocument(ConnectionTestResult result, boolean includeDiagnostics) {
         List<Document> items = new ArrayList<>();
         for (ConnectionTestItem item : result.items()) {
             // Optional diagnostics are stored as null values when absent, read back as null.
-            items.add(new Document("name", item.name())
+            Document stored = new Document("name", item.name())
                     .append("status", item.status().name())
                     .append("message", item.message())
                     .append("reason", item.reason())
                     .append("solution", item.solution())
-                    .append("connectorErrorCode", item.connectorErrorCode()));
+                    .append("connectorErrorCode", item.connectorErrorCode());
+            if (includeDiagnostics && !item.diagnostic().isEmpty()) {
+                stored.append("diagnostic", MongoConnectionDiagnostic.document(item.diagnostic()));
+            }
+            items.add(stored);
         }
         return new Document("_id", result.connectionId())
                 .append("connectorId", result.connectorId())
                 .append("outcome", result.outcome().name())
                 .append("items", items)
-                .append("testedAt", result.testedAt());
+                .append("testedAt", result.testedAt())
+                .append("diagnosticsRedacted", result.diagnosticsRedacted());
     }
 
     /** Reconstructs a result from its stored document, or fails coded when the shape is unreadable. */
     static ConnectionTestResult toResult(Document document) {
+        return toResult(document, false);
+    }
+
+    static ConnectionTestResult strictCacheResult(Document document) {
+        var result = toResult(document, true);
+        MongoConnectionDiagnostic.requireBounded(result);
+        if (!document.equals(toDocument(result, true))) throw unreadable(result.connectionId());
+        return result;
+    }
+
+    static Document compatibleCacheDocument(ConnectionTestResult result) {
+        return toDocument(result, true);
+    }
+
+    private static ConnectionTestResult toResult(Document document, boolean readDiagnostics) {
         String id = document.getString("_id");
         String connectorId = document.getString("connectorId");
         if (connectorId == null) {
@@ -82,12 +106,14 @@ public final class MongoConnectionTestResultStore implements ConnectionTestResul
         long testedAt = testedAt(document, id);
         List<ConnectionTestItem> items = new ArrayList<>();
         for (Document item : documentList(document.get("items"), id)) {
-            items.add(toItem(item, id));
+            items.add(toItem(item, id, readDiagnostics));
         }
-        return new ConnectionTestResult(id, connectorId, outcome, items, testedAt);
+        return new ConnectionTestResult(
+                id, connectorId, outcome, items, testedAt,
+                Boolean.TRUE.equals(document.get("diagnosticsRedacted")));
     }
 
-    private static ConnectionTestItem toItem(Document item, String id) {
+    private static ConnectionTestItem toItem(Document item, String id, boolean readDiagnostics) {
         String name = item.getString("name");
         if (name == null) {
             throw unreadable(id);
@@ -98,7 +124,9 @@ public final class MongoConnectionTestResultStore implements ConnectionTestResul
                 item.getString("message"),
                 item.getString("reason"),
                 item.getString("solution"),
-                item.getString("connectorErrorCode"));
+                item.getString("connectorErrorCode"),
+                readDiagnostics && item.containsKey("diagnostic")
+                        ? MongoConnectionDiagnostic.read(item.get("diagnostic")) : Map.of());
     }
 
     /** Reads the stored overall outcome: an absent or unrecognized value is corrupt. */

@@ -126,9 +126,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
 
             // Its own store, not the module's shared one: this case takes the store away, and taking
             // away something other cases are using is a different kind of failure entirely.
-            try (NetworkedMongo store = NetworkedMongo.start()) {
-                try (PartitionableCluster cluster = PartitionableCluster.start(
-                        store.uriForThisHost("e2e_store_outage"), "e2e-store-outage", nodes)) {
+            try (NetworkedMongo store = NetworkedMongo.start();
+                 PreparedNativeStore storage = PreparedNativeStore.createOn(store)) {
+                try (PartitionableCluster cluster = PartitionableCluster.startPrepared(storage, nodes)) {
                     cluster.awaitMembers("node-a", 3);
                     ControlPlane control = cluster.member("node-a");
                     start(control, connector, source, target);
@@ -188,8 +188,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                     // the outage was the store and nothing else.
                     store.thaw();
                     Await.until("the store to answer these members again", RECOVERY,
-                            () -> control.state(PIPELINE).isPresent(),
-                            () -> "the read face says " + stateOn(control));
+                            () -> PipelineState.RUNNING.name().equals(control.pipelineStatus(PIPELINE).get("state")),
+                            () -> "the read face says " + control.pipelineStatus(PIPELINE));
+                    assertThat(control.pipelineStatus(PIPELINE)).doesNotContainKey("observedState");
 
                     // With the store answering and nothing rejoined yet, this read reaches the engine
                     // half for the only stretch in this case where it can: the durable half of the
@@ -223,6 +224,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                             .describedAs("the run came back under one owner: a member that had acted "
                                     + "while it could not prove its claim would be a second one here")
                             .hasSize(1);
+                } finally {
+                    // Restore the owned server before its databases are cleaned, including on failure.
+                    store.thaw();
                 }
             }
         }

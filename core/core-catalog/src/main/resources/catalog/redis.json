@@ -170,7 +170,7 @@
   ],
   "provenance": {
     "specPath": "connectors/redis-connector/src/main/resources/spec_redis.json",
-    "specContentHash": "795c6bff1bc4ee5b",
+    "specContentHash": "66fb5c0f9fb79e0b",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

@@ -2,6 +2,9 @@
 target/
 build/
 dist/
+# The app assembly consumes this source directory; it is not generated output.
+!/app/src/dist/
+!/app/src/dist/**
 *.class
 .flattened-pom.xml
 

@@ -11,13 +11,15 @@
 # be read from. So this is also the case that pins that default resolving to what the view reads,
 # rather than to the view's own terminal sink.
 #
-# One directory backs both endpoints. That is safe here and not a shortcut: the two outputs write under
-# different names - the view under its own id, the sink under the source table - so a run that confused
-# them would collide in one file rather than quietly passing.
+# The managed view uses the installation's Mongo target while the serve output uses its own file
+# target. Both independently held endpoints must contain their named result at the end of the run.
 name: a-view-and-a-serve-block-each-receive-the-rows
 setup:
-  connectors: [e2e_file]
-  apply: [src_file.tap.yml, views.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  databases:
+    store: { kind: mongo }
+  connectors: [e2e_file, mongodb]
+  managed_target: views.tap.yml
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
   discover: [src_file]
 pipeline: pipeline.tap.yml
 seed:
@@ -26,3 +28,4 @@ steps:
   - start
   - await: { count: { views.order_state: 4 } }
   - await: { count: { tgt_file.orders: 4 } }
+  - assert: { count: { views.order_state: 4, tgt_file.orders: 4 } }

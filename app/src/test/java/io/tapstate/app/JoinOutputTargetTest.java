@@ -117,7 +117,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(UNKEYED_PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /**
@@ -132,7 +132,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(EXPRESSION_KEY_PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /** A composite fact key has to be published whole; publishing half of it identifies nothing. */
@@ -144,7 +144,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(HALF_COMPOSITE_KEY_PIPELINE, List.of("region", "id")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /**
@@ -194,7 +194,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(unkeyedInto("upsert")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /** The same, with the mode left out entirely - which is how the upsert default is written. */
@@ -203,7 +203,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(UNKEYED_PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     // ---- fixtures ----------------------------------------------------------------------
@@ -339,14 +339,14 @@ class JoinOutputTargetTest {
             Map<String, Map<String, TargetTable>> into) {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     Map<String, TargetTable> targets, PipelineNode node) {
                 into.put(connectorId, targets);

@@ -14,6 +14,11 @@ interface CaptureAttacher extends CaptureStarter {
 
     CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail);
 
+    /** Has the existing physical reader serve table selections registered since it opened. */
+    default void widen(CaptureRun run) {
+        run.widen();
+    }
+
     @Override
     default CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
         return start(spec, handoff, true);

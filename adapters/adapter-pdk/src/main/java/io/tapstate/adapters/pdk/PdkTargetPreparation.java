@@ -6,36 +6,137 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
+import io.tapdata.pdk.apis.entity.TapExecuteCommand;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.OnFullLoad;
+import io.tapstate.spi.capture.SourceOperationObserver;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.TargetTable;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.SinkPreparationStore;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
-/** Prepares each table before writing; a durable receipt prevents destructive preparation on recovery. */
+/**
+ * Prepares each table before writing; a durable receipt prevents destructive preparation on recovery.
+ *
+ * <p>Ordinary tables are prepared by the coordinator. For deferred tables the first eligible writer claims
+ * the scoped attempt, which serializes physical preparation before any writer can write to that table.
+ */
 final class PdkTargetPreparation {
+    private static final Set<String> MONGO_TARGETS = Set.of(
+            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
     private final TapConnectorContext context;
     private final ConnectorFunctions functions;
     private final OnFullLoad onFullLoad;
     private final boolean fullLoad;
     private final String namespace;
     private final KeyedStateStore stateStore;
+    private final boolean preparedAhead;
+    private final boolean mongoTarget;
+    private final Runnable requireActive;
     private final Set<String> prepared = new HashSet<>();
+    private final Set<TargetTable> verifiedReady = new HashSet<>();
+    private final PdkSinkPreparations receipts;
+
+    private SourceOperationObserver observer=SourceOperationObserver.NONE;
+    PdkTargetPreparation withOperationObserver(SourceOperationObserver observer){this.observer=java.util.Objects.requireNonNull(observer);return this;}
+    private <T> T operation(String access,SourceOperationObserver.Capability capability,PdkConnector.Action<T> action) throws Throwable {
+        T result;
+        try {result=action.run();} catch(Throwable failure){report(access,capability,failure);throw failure;}
+        report(access,capability,null);return result;
+    }
+    private void report(String access,SourceOperationObserver.Capability capability,Throwable failure){
+        try {observer.completed(access,capability,failure);}catch(RuntimeException unavailable){
+            org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");
+        }
+    }
 
     PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
             boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
+        this(null, context, functions, onFullLoad, fullLoad, node, stateStore, false);
+    }
+
+    /** As above, and where {@code preparedAhead}, one for tables prepared already, which prepares nothing. */
+    PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
+            boolean fullLoad, PipelineNode node, KeyedStateStore stateStore, boolean preparedAhead) {
+        this(null, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead);
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, false);
+    }
+
+    /**
+     * As above for the connector {@code connectorId} names, which decides how a target of it is prepared, and
+     * where {@code preparedAhead}, one for tables prepared already, which prepares nothing.
+     */
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead,
+                PipelineNode.Purpose.SYNC);
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead, PipelineNode.Purpose purpose) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead, purpose, () -> {});
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead, PipelineNode.Purpose purpose, Runnable requireActive) {
+        this(connectorId,context,functions,onFullLoad,fullLoad,node,stateStore,preparedAhead,purpose,requireActive,null);
+    }
+
+    PdkTargetPreparation(String connectorId,TapConnectorContext context,ConnectorFunctions functions,
+            OnFullLoad onFullLoad,boolean fullLoad,PipelineNode node,KeyedStateStore stateStore,
+            boolean preparedAhead,PipelineNode.Purpose purpose,Runnable requireActive,PdkSinkPreparations receipts) {
+        if(receipts!=null)receipts.requireInputs(node,purpose,onFullLoad,fullLoad);
+        this.receipts=receipts;
+        this.requireActive = java.util.Objects.requireNonNull(requireActive, "requireActive");
         this.context = context;
         this.functions = functions;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
-        this.namespace = SinkPreparationNamespace.of(node);
+        this.namespace = SinkPreparationNamespace.of(node, purpose);
         this.stateStore = stateStore;
+        this.preparedAhead = preparedAhead;
+        this.mongoTarget = connectorId != null && MONGO_TARGETS.contains(connectorId);
+    }
+
+    void prepareForWrite(TargetTable target, TapTable table) throws Throwable {
+        if (!verifiedReady.contains(target)) prepare(target, table);
     }
 
     void prepare(TargetTable target, TapTable table) throws Throwable {
+        requireActive.run();
+        if (receipts != null) {
+            if (target == null || (preparedAhead && !target.hasDeferredDecimal()) || prepared.contains(target.name())) {
+                PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
+                // The caller still checks the exact execution immediately before writeRecord.
+                if (preparedAhead) verifiedReady.add(target);
+                return;
+            }
+            prepareScoped(target, table);
+            if (preparedAhead) verifiedReady.add(target);
+            return;
+        }
         if (target == null || prepared.contains(target.name())) {
+            return;
+        }
+        if (preparedAhead) {
             return;
         }
         if (fullLoad && onFullLoad == OnFullLoad.CLEAR && namespace != null && stateStore == null) {
@@ -44,15 +145,21 @@ final class PdkTargetPreparation {
         }
         byte[] receipt = namespace == null || stateStore == null
                 ? null : stateStore.load(namespace, target.name()).orElse(null);
+        if (mongoTarget && receipt == null && fullLoad) {
+            // MongoDB create-table always reports new, and can already create indexes. Count or
+            // clear first; both operations also accept a missing collection without creating it.
+            prepareExisting(table);
+        }
         boolean created = create(table);
         boolean primaryKeyAlreadyCreated = created || (receipt != null && receipt[0] == 2);
         if (receipt == null) {
-            if (!created && fullLoad) {
+            if (!mongoTarget && !created && fullLoad) {
                 prepareExisting(table);
             }
             if (namespace != null && stateStore != null) {
                 // Before any row can land, and only after a successful clear/check. Rerun teardown owns
                 // removing this receipt; a member restart must keep it even when no source ack survived.
+                requireActive.run();
                 stateStore.save(namespace, target.name(), new byte[] {(byte) (created ? 2 : 1)});
             }
         }
@@ -60,11 +167,89 @@ final class PdkTargetPreparation {
             var event = TargetTapTable.createIndexEvent(target, primaryKeyAlreadyCreated);
             if (event != null) {
                 event.setTableId(table.getId());
-                functions.getCreateIndexFunction().createIndex(context, table, event);
+                requireActive.run();
+                operation(table.getId(),SourceOperationObserver.Capability.TARGET_WRITE,()->{functions.getCreateIndexFunction().createIndex(context, table, event);return null;});
             }
         }
         // A failed index call is not success: retry it before the next write without clearing again.
         prepared.add(target.name());
+    }
+
+    /**
+     * Refuses a writer of {@code node} for {@code targets} unless every one of them has its receipt. Such a
+     * writer opens only once the run has prepared every table it writes, so a missing receipt is a writer wired
+     * to a run that prepared nothing - and writing on would skip the clear a full load asked for. Where no
+     * receipt is kept at all there is nothing to check.
+     */
+    static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets) {
+        requirePrepared(node, stateStore, targets, PipelineNode.Purpose.SYNC);
+    }
+
+    static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets,
+            PipelineNode.Purpose purpose) {
+        String namespace = SinkPreparationNamespace.of(node, purpose);
+        if (namespace == null || stateStore == null) {
+            return;
+        }
+        for (TargetTable target : targets) {
+            if (target != null && stateStore.load(namespace, target.name()).isEmpty()) {
+                throw new IllegalStateException("target table " + target.name() + " of " + namespace
+                        + " was not prepared before its writers opened");
+            }
+        }
+    }
+
+    /**
+     * Deferred tables are prepared by a writer. Multiple writers can observe the same pending
+     * receipt, but only the writer that issues the attempt may perform physical preparation.
+     */
+    private SinkPreparationStore.Attempt beginDeferred(TargetTable target) {
+        var observed = PdkSinkPreparations.host(() -> receipts.load(target));
+        if (observed.phase() == SinkPreparationStore.Phase.READY) return null;
+        if (observed.revision() == 0) {
+            try {
+                return PdkSinkPreparations.host(() -> receipts.begin(target));
+            } catch (TapstateException refusal) {
+                if (refusal.code() != IoError.PIPELINE_STATE_REBUILD_REQUIRED) throw refusal;
+                observed = PdkSinkPreparations.host(() -> receipts.load(target));
+                if (observed.revision() == 0) throw refusal;
+            }
+        }
+        while (observed.phase() != SinkPreparationStore.Phase.READY) {
+            requireActive.run();
+            // Only a writer in this execution can publish an outstanding receipt. An older
+            // attempt may already have altered the target, so leave it for explicit recovery.
+            if (Thread.currentThread().isInterrupted() || !receipts.canAwait(observed)) {
+                PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
+                return null;
+            }
+            LockSupport.parkNanos(Duration.ofMillis(20).toNanos());
+            observed = PdkSinkPreparations.host(() -> receipts.load(target));
+        }
+        return null;
+    }
+
+    private void prepareScoped(TargetTable target,TapTable table)throws Throwable {
+        var held=PdkSinkPreparations.host(() -> receipts.load(target));boolean created;
+        if(held.phase()==SinkPreparationStore.Phase.READY)created=held.result().created();
+        else {
+            var original = target.hasDeferredDecimal() ? beginDeferred(target)
+                    : PdkSinkPreparations.host(() -> receipts.begin(target));
+            if (original == null) {
+                created = PdkSinkPreparations.host(() -> receipts.load(target)).result().created();
+            } else {
+                requireActive.run();
+                if(mongoTarget && fullLoad)prepareExisting(table);
+                created=create(table);
+                if(!mongoTarget && !created && fullLoad)prepareExisting(table);
+                requireActive.run();boolean confirmedCreated=created;PdkSinkPreparations.host(() -> {receipts.complete(original,confirmedCreated);return null;});
+            }
+        }
+        if(functions.getCreateIndexFunction()!=null) {
+            var event=TargetTapTable.createIndexEvent(target,created);
+            if(event!=null){event.setTableId(table.getId());requireActive.run();operation(table.getId(),SourceOperationObserver.Capability.TARGET_WRITE,()->{functions.getCreateIndexFunction().createIndex(context,table,event);return null;});}
+        }
+        requireActive.run();prepared.add(target.name());
     }
 
     private boolean create(TapTable table) throws Throwable {
@@ -73,11 +258,13 @@ final class PdkTargetPreparation {
         }
         TapCreateTableEvent event = new TapCreateTableEvent().table(table);
         event.setTableId(table.getId());
-        var options = functions.getCreateTableV2Function().createTable(context, event);
-        if (options == null || options.getTableExists() == null) {
-            throw new IllegalStateException("create-table did not report existence for target table " + table.getId());
-        }
-        return !options.getTableExists();
+        requireActive.run();
+        return operation(table.getId(),SourceOperationObserver.Capability.TARGET_WRITE,()->{
+            var options=functions.getCreateTableV2Function().createTable(context,event);
+            if(options==null || options.getTableExists()==null)
+                throw new IllegalStateException("create-table did not report existence for target table " + table.getId());
+            return !options.getTableExists();
+        });
     }
 
     private void prepareExisting(TapTable table) throws Throwable {
@@ -85,28 +272,66 @@ final class PdkTargetPreparation {
             case APPEND -> { }
             case CLEAR -> {
                 if (functions.getClearTableFunction() == null) {
+                    if (mongoTarget && functions.getExecuteCommandFunction() != null) {
+                        clearMongo(table);
+                        break;
+                    }
                     throw new IllegalStateException("target table " + table.getId()
                             + " cannot honor on_full_load clear: connector provides no clear-table function");
                 }
                 TapClearTableEvent event = new TapClearTableEvent();
                 event.setTableId(table.getId());
-                functions.getClearTableFunction().clearTable(context, event);
+                requireActive.run();
+                operation(table.getId(),SourceOperationObserver.Capability.TARGET_WRITE,()->{functions.getClearTableFunction().clearTable(context, event);return null;});
             }
             case FAIL -> {
                 if (functions.getCountByPartitionFilterFunction() == null) {
                     throw new IllegalStateException("target table " + table.getId()
                             + " cannot honor on_full_load fail: connector provides no row-count function");
                 }
-                long rows = functions.getCountByPartitionFilterFunction()
-                        .countByPartitionFilter(context, table, TapAdvanceFilter.create());
-                if (rows < 0) {
-                    throw new IllegalStateException("row count is unknown for target table " + table.getId());
-                }
+                requireActive.run();
+                long rows = operation(table.getId(),SourceOperationObserver.Capability.TARGET_READ,()->{
+                    long count=functions.getCountByPartitionFilterFunction().countByPartitionFilter(context,table,TapAdvanceFilter.create());
+                    if(count<0)throw new IllegalStateException("row count is unknown for target table " + table.getId());
+                    return count;
+                });
                 if (rows > 0) {
                     throw new IllegalStateException("target table " + table.getId()
                             + " is not empty; on_full_load is fail");
                 }
             }
         }
+    }
+
+    private void clearMongo(TapTable table) throws Throwable {
+        // The connector rejects an empty delete filter. A constant true expression matches every
+        // document, including null or missing ids, without dropping indexes or collection options.
+        Map<String, Object> params = new HashMap<>();
+        params.put("op", "delete");
+        params.put("collection", table.getId());
+        params.put("filter", Map.of("$expr", true));
+        // The connector supplies its configured database by updating the mutable parameters.
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicBoolean completed = new AtomicBoolean();
+        requireActive.run();
+        operation(table.getId(),SourceOperationObserver.Capability.TARGET_WRITE,()->{
+            functions.getExecuteCommandFunction().execute(context,
+                    TapExecuteCommand.create().command("execute").params(params), result -> {
+                        if (result != null) {
+                            if (result.getError() != null) {
+                                failure.compareAndSet(null, result.getError());
+                            } else if (result.getResult() instanceof Number rows && rows.longValue() >= 0) {
+                                completed.set(true);
+                            }
+                        }
+                    });
+            if (failure.get() != null) {
+                throw failure.get();
+            }
+            if (!completed.get()) {
+                throw new IllegalStateException("clear command did not report success for target table " + table.getId());
+            }
+            return null;
+        });
     }
 }

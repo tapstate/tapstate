@@ -22,7 +22,7 @@
 #
 # Mutation evidence: in TapEventCodec.registered, hand on the source driver's own object in place of
 # the converted carrier. This case fails on both tiers at its first await, "tgt_mongo.orders expected
-# 5, found 0", and the runtime reports connector.write-failed from the sink: the target's codec
+# 5, found 0", and the runtime reports TS0060027 from the sink: the target's codec
 # registry cannot encode the source's ObjectId, which is the same driver's class from another class
 # loader. a-real-change-stream-carries-rows-written-after-start passes on both tiers in the same run,
 # because MySQL rows carry no driver-typed value and never reach the carrier. Restoring the carrier

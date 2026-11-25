@@ -73,8 +73,8 @@ class APipelineWhoseDriverSurvivesIsRebuiltWhenAnotherMemberOfItsRunIsKilledIT {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_kept_driver_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-kept-driver")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -123,9 +123,7 @@ class APipelineWhoseDriverSurvivesIsRebuiltWhenAnotherMemberOfItsRunIsKilledIT {
                                 + "pipeline is " + driver.state(lane.pipeline()) + " and is driven by "
                                 + driver.pipelineControllerOf(lane.pipeline()));
 
-                assertThat(driver.state(lane.pipeline()))
-                        .describedAs("the pipeline is running again, and nobody asked it to be")
-                        .contains(PipelineState.RUNNING);
+                PipelineContinuesOnSurvivingMemberIT.assertRunningAgain(() -> driver.state(lane.pipeline()));
                 assertThat(driver.pipelineControllerOf(lane.pipeline()))
                         .describedAs("the member driving it never went anywhere, so the pipeline did not change "
                                 + "hands: this is the driver replacing its own run, not an heir picking one up")

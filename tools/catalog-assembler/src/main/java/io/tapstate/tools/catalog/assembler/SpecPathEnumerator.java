@@ -68,7 +68,13 @@ final class SpecPathEnumerator {
      * nine of which nobody would ever act on, which is how a report stops being read.
      */
     static List<String> specPathsToFetch(List<ConnectorCatalogEntry> snapshot, List<String> upstreamPaths) {
-        TreeSet<String> paths = new TreeSet<>(declaredSpecPaths(snapshot));
+        return specPathsToFetch(snapshot, upstreamPaths, SpecRepository.OSS);
+    }
+
+    static List<String> specPathsToFetch(List<ConnectorCatalogEntry> snapshot, List<String> upstreamPaths,
+                                       SpecRepository repository) {
+        TreeSet<String> paths = new TreeSet<>(declaredSpecPaths(snapshot.stream()
+                .filter(row -> SpecRepository.of(row) == repository).toList()));
         for (String path : upstreamPaths) {
             if (MODULE_RESOURCE_JSON.matcher(path).matches() && !ConnectorWalker.isExcludedModule(moduleOf(path))) {
                 paths.add(path);

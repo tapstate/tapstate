@@ -1,0 +1,1083 @@
+package io.tapstate.app;
+
+import io.tapstate.control.core.*;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.spi.store.DataBrowserTableInfo;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import io.tapstate.core.lifecycle.*;
+import io.tapstate.core.dsl.PipelineInputs;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class PipelineOutputNamesTest {
+    @Test
+    void undiscoveredUnwindListsOnlyItsDeclaredOutputWhileStartStillRequiresDiscovery() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                transforms:
+                  - id: expanded
+                    type: unwind
+                    from: orders
+                    path: items
+                    element_key: sku
+                serve:
+                  from: expanded
+                  sync: [{id: sink, source: target, rename: {prefix: unwind_}}]
+                """);
+        var resolver = new StoreBackedDagSource(store);
+        assertThat(resolver.outputNames(pipeline)).singleElement().satisfies(output -> {
+            assertThat(output.table()).isEqualTo("unwind_orders");
+            assertThat(output.identity()).isEqualTo("sink:orders");
+        });
+        assertThat(catalog(store).list()).singleElement().satisfies(row -> {
+            assertThat(row.id()).isEqualTo("p:sink:orders");
+            assertThat(row.location()).isEqualTo(new ViewCatalogItem.Location("target", "dest", "unwind_orders"));
+            assertThat(row.documents()).isNull();
+            assertThat(row.status().state()).isEqualTo("not-loaded");
+        });
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("TS0360004");
+    }
+
+    @Test
+    void nestAndJoinUseTheRootAndFactRatherThanTheirStepIds() {
+        for (String transform : List.of("""
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                """, """
+                transforms:
+                  - id: assembled
+                    type: join
+                    from: {o: orders, c: customers}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id
+                """)) {
+            var store = sources();
+            var pipeline = pipeline(store, transform + """
+                    serve:
+                      from: assembled
+                      sync: [{id: sink, source: target, rename: {prefix: shaped_}}]
+                    """);
+            assertThat(new StoreBackedDagSource(store).outputNames(pipeline)).singleElement()
+                    .satisfies(output -> assertThat(output.table()).isEqualTo("shaped_orders"));
+        }
+    }
+
+    @Test
+    void partialMapDoesNotFilterOutputsAndEachSinkUsesItsOwnRename() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                serve:
+                  from: [orders, customers]
+                  sync:
+                    - {id: one, source: target, rename: {map: {orders: chosen}, prefix: pre_}}
+                    - {id: two, source: target, rename: {case: upper, suffix: _COPY}}
+                """);
+        assertThat(new StoreBackedDagSource(store).outputNames(pipeline))
+                .extracting(PipelineOutputNames.Output::table)
+                .containsExactly("chosen", "pre_customers", "ORDERS_COPY", "CUSTOMERS_COPY");
+    }
+
+    @Test
+    void unavailableDiscoveryIsReportedWithoutDroppingHealthyPipelines() {
+        var store = sources();
+        pipeline(store, """
+                serve:
+                  from: orders
+                  sync: [{id: sink, source: target}]
+                """);
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                config: {uri: "mongodb://localhost/input"}
+                tables: ["/order.*/"]
+                """));
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: unresolved
+                source: unknown
+                serve:
+                  from: unknown
+                  sync: [{id: sink, source: target}]
+                """));
+        var result = catalog(store).catalog();
+        assertThat(result.items()).singleElement().satisfies(row -> assertThat(row.pipelineId()).isEqualTo("p"));
+        assertThat(result.unresolved()).singleElement().satisfies(problem -> {
+            assertThat(problem.pipelineId()).isEqualTo("unresolved");
+            assertThat(problem.code()).isEqualTo("TS0360004");
+            assertThat(problem.params()).containsEntry("source", "unknown");
+        });
+    }
+
+    @Test
+    void knownSyncSurvivesAnUnavailableInputInTheSamePipeline() {
+        var store = sources();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/customer.*/"]
+                """));
+        var pipeline = (PipelineResource) parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: partial
+                source: [src, unknown]
+                serve:
+                  from: [src.orders, unknown]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """);
+        store.artifacts().save(pipeline);
+        var report = catalog(store).catalog();
+        assertThat(report.items()).singleElement().satisfies(row ->
+                assertThat(row.location().collection()).isEqualTo("out_orders"));
+        assertThat(report.unresolved()).singleElement().satisfies(problem -> {
+            assertThat(problem.code()).isEqualTo("TS0360004");
+            assertThat(problem.params()).containsEntry("source", "unknown");
+        });
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("TS0360004");
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("unknown", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("customers",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
+        var recovered = catalog(store).catalog();
+        assertThat(recovered.items()).extracting(row -> row.location().collection())
+                .containsExactlyInAnyOrder("out_orders", "out_customers");
+        assertThat(recovered.unresolved()).isEmpty();
+    }
+
+    @Test
+    void mixedSelectorsRetainKnownTablesWithinOneSourceBeforeDiscovery() {
+        for (String selectors : List.of("[orders, \"/customer.*/\"]",
+                "[{name: orders}, \"/customer.*/\"]", "[\"/customer.*/\", orders]")) {
+            var store = sources();
+            var parser = new DslParser();
+            store.artifacts().save(parser.parse("version: tapstate/v1\nkind: source\nid: src\nconnector: mongodb\nmode: cdc\ntables: "
+                    + selectors + "\n"));
+            var pipeline = pipeline(store, """
+                    serve:
+                      from: [src.orders, src]
+                      sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                    """);
+            var resolver = new StoreBackedDagSource(store);
+            var before = resolver.outputNameResult(pipeline);
+            assertThat(before.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(before.unresolved()).singleElement().satisfies(problem -> {
+                assertThat(problem.code()).isEqualTo("TS0360004");
+                assertThat(problem.params()).containsEntry("source", "src");
+            });
+            assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                    .hasMessageContaining("TS0360004");
+            assertThatThrownBy(() -> resolver.validateStart(pipeline.id()))
+                    .hasMessageContaining("TS0360004");
+            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("src", "mongodb", 0L,
+                    new io.tapstate.spi.store.SourceModel(List.of(
+                            new io.tapstate.spi.store.SourceTable("orders", List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of()),
+                            new io.tapstate.spi.store.SourceTable("customers", List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
+            var after = resolver.outputNameResult(pipeline);
+            assertThat(after.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders", "out_customers");
+            assertThat(after.unresolved()).isEmpty();
+            assertThat(after.outputs().getFirst().identity()).isEqualTo(before.outputs().getFirst().identity());
+        }
+    }
+
+    @Test
+    void explicitKnownReferencesDoNotDependOnOtherSelectorsOfTheSameSource() {
+        for (String from : List.of("src.orders", "orders")) {
+            var store = mixedSourceStore("[orders, \"/customer.*/\"]");
+            var pipeline = pipeline(store, "serve: {from: " + from
+                    + ", sync: [{id: sink, source: target, rename: {prefix: out_}}]}\n");
+            var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(report.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(report.unresolved()).isEmpty();
+            assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                    .hasMessageContaining("TS0360004");
+        }
+    }
+
+    @Test
+    void wholeSourceAndRegexReferencesReportTheirUnexpandedMembers() {
+        for (String from : List.of("src", "\"/.*/\"", "[src.orders, src.customers]")) {
+            var store = mixedSourceStore("[orders, \"/customer.*/\"]");
+            var pipeline = pipeline(store, "serve: {from: " + from
+                    + ", sync: [{id: sink, source: target, rename: {prefix: out_}}]}\n");
+            var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(report.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(report.unresolved()).singleElement().satisfies(problem ->
+                    assertThat(problem.code()).isEqualTo("TS0360004"));
+        }
+    }
+
+    @Test
+    void absentQualifiedTableInACompleteSelectionIsStillDiagnosed() {
+        var store = sources();
+        var pipeline = pipeline(store, "serve: {from: src.absent, sync: [{id: sink, source: target}]}\n");
+        var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(report.outputs()).isEmpty();
+        assertThat(report.unresolved()).singleElement().satisfies(problem -> {
+            assertThat(problem.code()).isEqualTo("TS0360005");
+            assertThat(problem.params()).containsEntry("source", "src").containsEntry("table", "absent");
+        });
+    }
+
+    private static InMemoryStorePort mixedSourceStore(String selectors) {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("version: tapstate/v1\nkind: source\nid: src\nconnector: mongodb\nmode: cdc\ntables: "
+                + selectors + "\n"));
+        return store;
+    }
+
+    @Test
+    void unionAndUnwindKeepTheResolvableBranchAndDoNotInventTheMissingOne() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                transforms:
+                  - {id: merged, type: union, from: [src.orders, unknown]}
+                  - {id: expanded, type: unwind, from: merged, path: items, element_key: sku}
+                serve:
+                  from: expanded
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "customer.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+        assertThat(result.unresolved()).hasSize(1);
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("TS0360004");
+    }
+
+    @Test
+    void unavailableSourceCannotSilentlyDisambiguateABareTableOrJoinFact() {
+        for (String from : List.of("[orders, src.customers]", "[shaped, src.customers]")) {
+            var store = sources();
+            var pipeline = partialPipeline(store, """
+                    transforms:
+                      - id: shaped
+                        type: join
+                        from: {o: src.orders, c: unknown.orders}
+                        engine: builtin
+                        sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                    serve:
+                      from: %s
+                      sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                    """.formatted(from), "order.*");
+            var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_customers");
+            assertThat(result.unresolved()).singleElement().satisfies(problem ->
+                    assertThat(problem.params()).containsEntry("source", "unknown"));
+        }
+    }
+
+    @Test
+    void partialRegexDoesNotClaimCompletenessOrSuppressExplicitKnownOutput() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                serve:
+                  from: [src.orders, "/customer.*/"]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "customer.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table)
+                .containsExactly("out_orders", "out_customers");
+        assertThat(result.unresolved()).singleElement().satisfies(problem ->
+                assertThat(problem.code()).isEqualTo("TS0360004"));
+    }
+
+    @Test
+    void unavailableNestRootIsNotNamedAfterItsUnresolvedReference() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                transforms:
+                  - id: shaped
+                    type: nest
+                    from: {o: unknown.orders, c: src.customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                serve:
+                  from: [shaped, src.customers]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "order.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_customers");
+        assertThat(result.unresolved()).hasSize(1);
+    }
+
+    @Test
+    void unselectedTableCannotMakeAQualifiedFactNameAmbiguous() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                transforms:
+                  - id: shaped
+                    type: join
+                    from: {o: src.orders, c: unknown.order_items}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                serve:
+                  from: shaped
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "order.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+        assertThat(result.unresolved()).isEmpty();
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("TS0360004");
+    }
+
+    @Test
+    void reconvergingUnionDagIsResolvedWithoutEnumeratingEveryPath() {
+        var store = sources();
+        StringBuilder body = new StringBuilder("transforms:\n");
+        body.append("  - {id: s0, type: filter, from: src.orders, expr: 'true'}\n");
+        body.append("  - {id: s1, type: filter, from: s0, expr: 'true'}\n");
+        for (int index = 2; index <= 45; index++) {
+            body.append("  - {id: s").append(index).append(", type: union, from: [s")
+                    .append(index - 1).append(", s").append(index - 2).append("]}\n");
+        }
+        body.append("serve: {from: s45, sync: [{id: sink, source: target, rename: {prefix: out_}}]}\n");
+        var pipeline = pipeline(store, body.toString());
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(10), () -> {
+            var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(result.unresolved()).isEmpty();
+        });
+    }
+
+    private static PipelineResource partialPipeline(InMemoryStorePort store, String body, String selector) {
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("version: tapstate/v1\nkind: source\nid: unknown\nconnector: mongodb\ntables: [\"/"
+                + selector + "/\"]\n"));
+        var pipeline = (PipelineResource) parser.parse(
+                "version: tapstate/v1\nkind: pipeline\nid: partial\nsource: [src, unknown]\n" + body);
+        store.artifacts().save(pipeline);
+        return pipeline;
+    }
+
+    @Test
+    void knownManagedViewSurvivesAnUnresolvedSyncInTheSamePipeline() {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/order.*/"]
+                """));
+        var pipeline = (PipelineResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: mixed
+                source: [src, unknown]
+                view: {id: managed, from: src.orders, primary_key: _id, storage: {warm: {collection: known}}}
+                serve: {from: unknown, sync: [{id: sink, source: target}]}
+                """);
+        store.artifacts().save(pipeline);
+        var result = catalog(store).catalog();
+        assertThat(result.items()).singleElement().satisfies(row -> assertThat(row.location().collection()).isEqualTo("known"));
+        assertThat(result.unresolved()).hasSize(1);
+    }
+
+    @Test
+    void qualifiedJoinPreservesTheDrivingSourceWhenPhysicalNamesRepeat() {
+        assertQualifiedJoin(", rename: {map: {left.orders: wrong, right.orders: correct}}", "correct");
+    }
+
+    @Test
+    void qualifiedJoinKeepsItsExistingDefaultWriteAddress() {
+        assertQualifiedJoin("", "right.orders");
+    }
+
+    @Test
+    void qualifiedNestUsesTheConfiguredRootSourcesRename() {
+        assertQualifiedOutput("""
+                  - id: shaped
+                    type: nest
+                    from: {o: right.orders, c: left.orders}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: id}, as: object, path: related}]
+                """, ", rename: {map: {left.orders: wrong, right.orders: correct}}", "correct");
+    }
+
+    private static void assertQualifiedJoin(String rename, String expected) {
+        assertQualifiedOutput("""
+                  - id: shaped
+                    type: join
+                    from: {o: right.orders, c: left.orders}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                """, rename, expected);
+    }
+
+    private static void assertQualifiedOutput(String transform, String rename, String expected) {
+        var store = sources();
+        var parser = new DslParser();
+        for (String id : List.of("left", "right")) {
+            store.artifacts().save(parser.parse("version: tapstate/v1\nkind: source\nid: " + id
+                    + "\nconnector: mongodb\ntables: [orders]\n"));
+        }
+        var pipeline = (PipelineResource) parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: joined
+                source: [left, right]
+                transforms:
+                %sserve:
+                  from: shaped
+                  sync: [{id: sink, source: target%s}]
+                """.formatted(transform, rename));
+        assertThat(new StoreBackedDagSource(store).outputNames(pipeline)).singleElement()
+                .satisfies(output -> assertThat(output.table()).isEqualTo(expected));
+        store.artifacts().save(pipeline);
+        for (String source : List.of("left", "right")) {
+            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel(source, "mongodb", 0L,
+                    new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                            List.of(new io.tapstate.spi.store.SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64, null)),
+                            List.of("id"), List.of())))));
+        }
+        assertThat(new StoreBackedPipelineWriteTargets(store).of(pipeline)).singleElement()
+                .satisfies(target -> assertThat(target.table()).isEqualTo(expected));
+        OpenRingGenerations.forSources(store, "left", "right");
+        Map<String, io.tapstate.spi.sink.TargetTable> bound = new java.util.LinkedHashMap<>();
+        var binder = new StoreBackedDagSource.SinkWriterBinder() {
+            @Override
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
+                    String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
+                    io.tapstate.spi.sink.DdlPolicy ddl, io.tapstate.spi.sink.TargetTable target,
+                    io.tapstate.core.model.PipelineNode node) {
+                throw new AssertionError("Expected a stream-keyed binding");
+            }
+
+            @Override
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
+                    String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
+                    io.tapstate.spi.sink.DdlPolicy ddl, Map<String, io.tapstate.spi.sink.TargetTable> targets,
+                    io.tapstate.core.model.PipelineNode node) {
+                bound.putAll(targets);
+                return () -> null;
+            }
+        };
+        new StoreBackedDagSource(store, binder).dagFor("joined");
+        assertThat(bound).containsOnlyKeys("shaped");
+        assertThat(bound.get("shaped").name()).isEqualTo(expected);
+    }
+
+    @Test
+    void reusableServeAndChainedTransformsKeepTheExplicitTargetAndStableIdentity() {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: serve
+                id: publish
+                sync: [{id: sink, source: target, rename: {map: {orders: exact_name}, prefix: ignored_}}]
+                """));
+        var pipeline = pipeline(store, """
+                transforms:
+                  - {id: first, type: filter, from: src.orders, expr: "true"}
+                  - {id: second, type: unwind, from: first, path: items, element_key: sku}
+                serve: {use: publish, from: second}
+                """);
+        assertThat(new StoreBackedDagSource(store).outputNames(pipeline)).singleElement().satisfies(output -> {
+            assertThat(output.table()).isEqualTo("exact_name");
+            assertThat(output.identity()).isEqualTo("sink:orders");
+        });
+    }
+
+    @Test
+    void renamedMirrorOutputsKeepOnlyTheirOriginalInputLag() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                serve:
+                  from: [orders, customers]
+                  sync: [{id: sink, source: target, rename: {map: {orders: chosen}, prefix: out_}}]
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        for (var output : description.names().outputs()) {
+            String original = output.table().equals("chosen") ? "orders" : "customers";
+            assertThat(description.inputs().get(output.identity())).containsExactly(new PipelineInputs.Input("src", original));
+        }
+        lag(store, Map.of("orders", 1L, "customers", 900L, "unrelated", 9999L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+        assertThat(rows).hasSize(2);
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("chosen")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(2);
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("out_customers")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(901);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"nest", "join"})
+    void aMaterializedAssemblyKeepsRootAndLookupInputLineage(String assembly) {
+        boolean nest = assembly.equals("nest");
+        String transform = nest ? """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                """ : """
+                transforms:
+                  - id: assembled
+                    type: join
+                    from: {o: orders, c: customers}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id
+                """;
+        var store = sources();
+        var pipeline = pipeline(store, transform + """
+                serve:
+                  from: assembled
+                  sync: [{id: sink, source: target, rename: {prefix: shaped_}}]
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        var output = description.names().outputs().getFirst();
+        assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
+                new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+
+        lag(store, Map.of("assembled", 5L, "orders", 1L, "customers", 900L, "unrelated", 9999L));
+        var status = query.list().getFirst().status();
+        assertThat(status.state()).isEqualTo("fresh");
+        assertThat(status.eventAgeSeconds()).isEqualTo(nest ? 6L : 901L);
+        assertThat(status.aggregation()).isEqualTo(nest ? null : "max-input-table-event-age");
+
+        lag(store, nest ? Map.of("orders", 1L, "customers", 900L) : Map.of("assembled", 5L, "orders", 1L));
+        assertThat(query.list().getFirst().status().reason()).isEqualTo("measurement-unavailable");
+    }
+
+    @Test
+    void aNestViewUsesItsConfirmedOutputEventInsteadOfSiblingTableMetrics() {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                serve:
+                  from: [assembled, customers]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """);
+        var clock = Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC);
+        var query = catalog(store, clock);
+
+        lag(store, Map.of("assembled", 5L, "customers", 900L));
+        assertThat(query.list()).anySatisfy(row -> {
+            assertThat(row.location().collection()).isEqualTo("out_orders");
+            assertThat(row.status().state()).isEqualTo("fresh");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(6);
+            assertThat(row.status().aggregation()).isNull();
+        }).anySatisfy(row -> {
+            assertThat(row.location().collection()).isEqualTo("out_customers");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
+            assertThat(row.status().aggregation()).isEqualTo("max-input-table-event-age");
+        });
+
+        lag(store, Map.of("customers", 900L, "orders", 1L));
+        assertThat(query.list()).anySatisfy(row -> {
+            assertThat(row.location().collection()).isEqualTo("out_orders");
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+        });
+    }
+
+    @Test
+    void viewsSharingANestStreamRequireEvidenceForTheirOwnTarget() {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                serve:
+                  from: [assembled, customers]
+                  sync:
+                    - {id: first, source: target, rename: {prefix: first_}}
+                    - {id: second, source: target, rename: {prefix: second_}}
+                """);
+        lag(store, Map.of("assembled", 5L, "orders", 10L, "customers", 900L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+        assertThat(rows.stream().filter(row -> row.location().collection().endsWith("_orders")).toList())
+                .hasSize(2).allSatisfy(row -> {
+                    assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+                    assertThat(row.status().eventAgeSeconds()).isNull();
+                });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"managed, mongodb://localhost/views, 'uri: mongodb://localhost/views', combined, true",
+            "target, mongodb://localhost/views, 'uri: \"mongodb://sink:secret@LOCALHOST:27017/views?authSource=admin\"', combined, true",
+            "target, mongodb://localhost/views, 'isUri: false, host: LOCALHOST:27017, database: views', combined, true",
+            "target, mongodb://localhost/views, 'uri: \"mongodb://otherhost,localhost/views\"', combined, true",
+            "target, mongodb://localhost/views, 'uri: mongodb://localhost/dest', combined, false",
+            "target, mongodb://localhost/views, 'uri: mongodb://otherhost/views', combined, false",
+            "managed, mongodb://localhost/views, 'uri: mongodb://localhost/views', copied, false",
+            "target, mongodb+srv://views.example.invalid/views, 'uri: mongodb+srv://VIEWS.EXAMPLE.INVALID/views', combined, true",
+            "target, mongodb+srv://views.example.invalid/views, 'uri: \"mongodb+srv://views.example.invalid/views?srvServiceName=other\"', combined, false"})
+    void aNestViewRequiresExclusiveWritesToItsStoreAndCollection(
+            String syncStore, String viewUri, String syncConfig, String syncCollection, boolean shared) {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: target
+                connector: mongodb
+                config: {%s}
+                """.formatted(syncConfig)));
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: managed
+                metadata: {labels: {store: "true"}}
+                connector: mongodb
+                config: {uri: "%s"}
+                """.formatted(viewUri)));
+        var pipeline = pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                view: {id: combined, from: assembled, primary_key: id}
+                serve:
+                  from: customers
+                  sync: [{id: sink, source: %s, rename: {map: {customers: %s}}}]
+                """.formatted(syncStore, syncCollection));
+        var bindings = buildViewFixture(store, pipeline);
+        assertThat(bindings.get("combined")).containsEntry("assembled", "combined");
+        assertThat(bindings.get("sink")).containsEntry("customers", syncCollection);
+        lag(store, Map.of("assembled", 5L, "orders", 1L, "customers", 900L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+
+        assertThat(rows).hasSize(2).anySatisfy(row -> {
+            assertThat(row.id()).isEqualTo("p:combined");
+            assertThat(row.location().collection()).isEqualTo("combined");
+            assertThat(row.location().storeId()).isEqualTo("managed");
+            if (shared) {
+                assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+                assertThat(row.status().eventAgeSeconds()).isNull();
+            } else {
+                assertThat(row.status().reason()).isEqualTo("observed");
+                assertThat(row.status().eventAgeSeconds()).isEqualTo(6);
+            }
+        }).anySatisfy(row -> {
+            assertThat(row.id()).isEqualTo("p:sink:customers");
+            assertThat(row.location().collection()).isEqualTo(syncCollection);
+            assertThat(row.location().storeId()).isEqualTo(syncStore);
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"orders", "forwarded"})
+    void aPassthroughNestUsesTheStreamItsSinkConfirms(String root) {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                transforms:
+                  - {id: forwarded, type: nest, from: {o: orders}, root: {from: o, key: [id]}}
+                  - {id: materialized, type: nest, from: {input: %s}, root: {from: input, key: [id]}}
+                view: {id: combined, from: materialized, primary_key: id}
+                """.formatted(root));
+        assertThat(buildViewFixture(store, pipeline).get("combined")).containsEntry("orders", "combined");
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+
+        lag(store, Map.of("orders", 5L, "materialized", 900L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().reason()).isEqualTo("observed");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(6);
+        });
+
+        lag(store, Map.of("materialized", 900L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+        });
+    }
+
+    @Test
+    void aPassthroughNestRequiresAnExclusiveSinkForItsRootStream() {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - {id: forwarded, type: nest, from: {o: orders}, root: {from: o, key: [id]}}
+                view: {id: combined, from: forwarded, primary_key: id}
+                serve:
+                  from: orders
+                  sync: [{id: sink, source: target}]
+                """);
+        lag(store, Map.of("orders", 5L, "forwarded", 900L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+
+        assertThat(rows).anySatisfy(row -> {
+            assertThat(row.id()).isEqualTo("p:combined");
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"orders", "customers"})
+    void aPassthroughNestCountsEveryStreamForwardedByAnotherSink(String root) {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                transforms:
+                  - {id: selected, type: nest, from: {one: %s}, root: {from: one, key: [id]}}
+                  - {id: merged, type: union, from: [orders, customers]}
+                  - {id: forwarded, type: nest, from: {both: merged}, root: {from: both, key: [id]}}
+                view: {id: combined, from: selected, primary_key: id}
+                serve:
+                  from: forwarded
+                  sync: [{id: sink, source: target}]
+                """.formatted(root));
+        var bindings = buildViewFixture(store, pipeline);
+        assertThat(bindings.get("combined")).containsEntry(root, "combined");
+        assertThat(bindings.get("sink")).containsKeys("orders", "customers");
+        lag(store, Map.of("orders", 5L, "customers", 20L));
+        assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list())
+                .filteredOn(row -> row.id().equals("p:combined")).singleElement().satisfies(row -> {
+                    assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+                    assertThat(row.status().eventAgeSeconds()).isNull();
+                });
+    }
+
+    @Test
+    void aNestViewWaitsForLookupSnapshotDeliveryEvenWithoutAnEstimate() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                view: {id: combined, from: assembled, primary_key: id}
+                """);
+        buildViewFixture(store, pipeline);
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        var landed = new TableSnapshot(5, 5L, 100, true);
+
+        lag(store, Map.of("assembled", 5L), Map.of("orders", landed,
+                "customers", new TableSnapshot(2, null, null, false)));
+        var loading = query.list().getFirst().status();
+        assertThat(loading.state()).isEqualTo("loading");
+        assertThat(loading.reason()).isEqualTo("snapshot-loading");
+        assertThat(loading.percent()).isNull();
+        assertThat(loading.eventAgeSeconds()).isNull();
+
+        lag(store, Map.of("assembled", 5L), Map.of("orders", landed, "customers", landed,
+                "unrelated", new TableSnapshot(2, null, null, false)));
+        var fresh = query.list().getFirst().status();
+        assertThat(fresh.state()).isEqualTo("fresh");
+        assertThat(fresh.eventAgeSeconds()).isEqualTo(6);
+    }
+
+    @Test
+    void sameNamedTablesInDifferentSourcesRequireTheirOriginalQualifiedMeasurement() {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: second
+                connector: mongodb
+                config: {uri: "mongodb://localhost/second"}
+                tables: [orders]
+                """));
+        var pipeline = (PipelineResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, second]
+                serve:
+                  from: [src.orders, second.orders]
+                  sync: [{id: sink, source: target, rename: {map: {src.orders: first_orders, second.orders: second_orders}}}]
+                """);
+        store.artifacts().save(pipeline);
+        lag(store, Map.of("orders", 5L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.list()).hasSize(2).allSatisfy(row -> {
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+        lag(store, Map.of("src.orders", 1L, "second.orders", 900L));
+        var rows = query.list();
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("first_orders")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(2);
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("second_orders")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(901);
+    }
+
+    @Test
+    void aSingleTableSourceReferenceKeepsItsPhysicalInputThroughAViewAlias() {
+        var store = mixedSourceStore("[orders]");
+        var pipeline = pipeline(store, """
+                view: {id: managed, from: src, primary_key: id}
+                serve: {from: managed, sync: [{id: sink, source: target}]}
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        assertThat(description.names().outputs()).hasSize(2);
+        assertThat(description.inputs().values()).allSatisfy(inputs ->
+                assertThat(inputs).containsExactly(new PipelineInputs.Input("src", "orders")));
+        lag(store, Map.of("orders", 7L));
+        assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list())
+                .allSatisfy(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+    }
+
+    @Test
+    void collidingPhysicalTargetsKeepEveryContributingInputMeasurement() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                serve:
+                  from: [orders, customers]
+                  sync: [{id: sink, source: target, rename: {map: {orders: combined, customers: combined}}}]
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        assertThat(description.names().outputs()).singleElement().satisfies(output -> {
+            assertThat(output.identity()).isEqualTo("sink:orders");
+            assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
+                    new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
+        });
+        lag(store, Map.of("orders", 1L, "customers", 900L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.list()).singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(901));
+        lag(store, Map.of("orders", 1L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+    }
+
+    @Test
+    void anUnavailableDisjointBranchDoesNotHideAProvenOutputButPossibleCollisionsDo() {
+        var store = sources();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/customer.*/"]
+                """));
+        String definition = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, unknown]
+                serve:
+                  from: [src.orders, unknown]
+                  sync: [{id: sink, source: target, rename: %s}]
+                """;
+        store.artifacts().save(parser.parse(definition.formatted("{prefix: out_}")));
+        lag(store, Map.of("src.orders", 7L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.catalog().unresolved()).hasSize(1);
+        assertThat(query.list()).singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+        store.artifacts().save(parser.parse(definition.formatted("{prefix: out_, map: {customers: distinct, unknown.customers: out_orders}}")));
+        assertThat(query.list()).singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+        store.artifacts().save(parser.parse(definition.formatted("{prefix: out_, map: {unknown.customers: out_orders}}")));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+    }
+
+    @Test
+    void anUnavailableSeparateViewCannotInvalidateAnIndependentSync() {
+        for (String caseRule : List.of("", "case: lower, ")) {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/customer.*/"]
+                """));
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, unknown]
+                view: {id: managed, from: unknown.customers, primary_key: id}
+                serve:
+                  from: src.orders
+                  sync: [{id: sink, source: target, rename: {%sprefix: out_, map: {unknown.customers: out_orders}}}]
+                """.formatted(caseRule)));
+        lag(store, Map.of("src.orders", 7L));
+        assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list()
+                .stream().filter(row -> row.location().collection().equals("out_orders")).toList())
+                .singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+        }
+    }
+
+    @Test
+    void anUnresolvedQualifiedJoinCannotHideBehindACollidingKnownTarget() {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/order.*/"]
+                """));
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, unknown]
+                transforms:
+                  - id: assembled
+                    type: join
+                    from: {o: unknown.orders, c: src.orders}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                serve:
+                  from: [src.orders, assembled]
+                  sync: [{id: sink, source: target, rename: {map: {src.orders: unknown.orders}}}]
+                """));
+        lag(store, Map.of("src.orders", 7L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.location().collection()).isEqualTo("unknown.orders");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("unknown", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
+        lag(store, Map.of("src.orders", 7L, "unknown.orders", 900L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.location().collection()).isEqualTo("unknown.orders");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
+        });
+    }
+
+    private static final Instant LAG_AT = Instant.parse("2026-10-29T00:00:00Z");
+    private static void lag(InMemoryStorePort store, Map<String, Long> tables) {
+        lag(store, tables, Map.of());
+    }
+
+    private static void lag(InMemoryStorePort store, Map<String, Long> tables, Map<String, TableSnapshot> snapshot) {
+        var points = tables.entrySet().stream().map(entry -> MetricPoint.reading(
+                Map.of(MetricAttributes.PIPELINE_ID, "p", MetricAttributes.TABLE_ID, entry.getKey()), LAG_AT, entry.getValue())).toList();
+        store.observations().save(new Observation("p", PipelineState.RUNNING, Map.of(), snapshot, Map.of(), null, LAG_AT,
+                List.of(new MetricFact("tapstate.pipeline.lag", MetricType.GAUGE, "s", points))));
+    }
+
+    private static Map<String, Map<String, String>> buildViewFixture(InMemoryStorePort store, PipelineResource pipeline) {
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: views
+                connector: mongodb
+                config: {uri: "mongodb://localhost/default_views"}
+                """));
+        io.tapstate.core.dsl.Workspace.of(store.artifacts().list());
+        var fields = List.of(new io.tapstate.spi.store.SourceField("id", "long"),
+                new io.tapstate.spi.store.SourceField("customer_id", "long"));
+        var tables = List.of("orders", "customers").stream()
+                .map(table -> new io.tapstate.spi.store.SourceTable(table, fields, List.of("id"), List.of())).toList();
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("src", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(tables)));
+        OpenRingGenerations.forSources(store, "src");
+        Map<String, Map<String, String>> bindings = new java.util.HashMap<>();
+        var binder = new StoreBackedDagSource.SinkWriterBinder() {
+            @Override
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
+                    String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
+                    io.tapstate.spi.sink.DdlPolicy ddl, io.tapstate.spi.sink.TargetTable target,
+                    io.tapstate.core.model.PipelineNode node) {
+                throw new AssertionError("Expected a stream-keyed binding");
+            }
+
+            @Override
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
+                    String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
+                    io.tapstate.spi.sink.DdlPolicy ddl, Map<String, io.tapstate.spi.sink.TargetTable> targets,
+                    io.tapstate.core.model.PipelineNode node) {
+                var collections = new java.util.HashMap<String, String>();
+                targets.forEach((stream, target) -> collections.put(stream, target.name()));
+                bindings.put(node.nodeId(), collections);
+                return () -> null;
+            }
+        };
+        new StoreBackedDagSource(store, binder).dagFor(pipeline.id());
+        return bindings;
+    }
+
+    private static InMemoryStorePort sources() {
+        var store = new InMemoryStorePort();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: src
+                connector: mongodb
+                mode: cdc
+                config: {uri: "mongodb://localhost/input"}
+                tables: [orders, customers]
+                """));
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: target
+                connector: mongodb
+                config: {uri: "mongodb://localhost/dest"}
+                """));
+        return store;
+    }
+
+    private static PipelineResource pipeline(InMemoryStorePort store, String body) {
+        var pipeline = (PipelineResource) new DslParser().parse(
+                "version: tapstate/v1\nkind: pipeline\nid: p\nsource: src\n" + body);
+        store.artifacts().save(pipeline);
+        return pipeline;
+    }
+
+    private static ViewCatalogService catalog(InMemoryStorePort store) { return catalog(store, Clock.systemUTC()); }
+
+    private static ViewCatalogService catalog(InMemoryStorePort store, Clock clock) {
+        var artifacts = new ArtifactQueryService(store.artifacts());
+        var browser = new DataBrowserService(store.artifacts(), store.schemas(), config -> List.of(),
+                (config, collection) -> new DataBrowserTableInfo(7L, 42L, 6L),
+                (config, query) -> { throw new AssertionError("must not read rows"); },
+                (config, request, listener) -> { throw new AssertionError("must not follow rows"); });
+        return new ViewCatalogService(artifacts, new PipelineObservationQueryService(artifacts, store.observations()),
+                browser, new StoreBackedPipelineOutputNames(store, false), clock);
+    }
+}

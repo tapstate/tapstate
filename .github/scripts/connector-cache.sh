@@ -19,8 +19,6 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(sys.argv[1])
 MODULES = 'mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector'
-KINDS = [module.split('=', 1)[0] for module in MODULES.split(',')]
-MODULE_PATHS = ','.join(module.split('=', 1)[1] for module in MODULES.split(','))
 STAMP = 'connector-cache-manifest.json'
 
 
@@ -41,6 +39,19 @@ def xml(path):
 
 def fail(message):
     raise ValueError(message)
+
+
+def module_selection(value):
+    if not isinstance(value, str) or not value:
+        fail('connector modules must be a nonempty id=connectors/module list')
+    selected = []
+    for entry in value.split(','):
+        if not re.fullmatch(r'[a-z][a-z0-9-]*=connectors/[a-z0-9-]+', entry):
+            fail(f'invalid connector module entry: {entry}')
+        selected.append(entry.split('=', 1))
+    if len({entry[0] for entry in selected}) != len(selected) or len({entry[1] for entry in selected}) != len(selected):
+        fail('connector module IDs and paths must be unique')
+    return selected
 
 
 def fingerprints(repository, reactor=()):
@@ -138,15 +149,17 @@ def load(path):
         fail('incomplete connector cache manifest')
     if set(data['source_sha']) != {'oss', 'enterprise'} or any(not re.fullmatch('[0-9a-f]{40}', sha) for sha in data['source_sha'].values()):
         fail('connector cache manifest needs OSS and enterprise revisions')
+    module_selection(data.get('modules'))
     return data
 
 
-def jars_at(directory):
+def jars_at(directory, modules):
+    kinds = [entry[0] for entry in module_selection(modules)]
     paths = sorted(directory.glob('*.jar'))
-    for connector in KINDS:
+    for connector in kinds:
         if len([p for p in paths if p.name.startswith(connector + '-connector-v')]) != 1:
             fail(f'expected exactly one shaded {connector} connector jar')
-    if len(paths) != len(KINDS):
+    if len(paths) != len(kinds):
         fail('unexpected connector jar set')
     if any(not path.stat().st_size for path in paths):
         fail('empty connector jar')
@@ -159,6 +172,7 @@ prepare = sub.add_parser('prepare')
 prepare.add_argument('--checkout', type=Path, action='append', required=True)
 prepare.add_argument('--repo-local', type=Path, required=True)
 prepare.add_argument('--output', type=Path, required=True)
+prepare.add_argument('--modules', default=MODULES)
 for name in ('key', 'seal', 'verify'):
     command = sub.add_parser(name)
     command.add_argument('--manifest', type=Path, required=True)
@@ -169,6 +183,7 @@ for name in ('key', 'seal', 'verify'):
 args = parser.parse_args(sys.argv[2:])
 try:
     if args.command == 'prepare':
+        modules = module_selection(args.modules)
         if len(args.checkout) != 2:
             fail('prepare requires two --checkout arguments: OSS then enterprise')
         checkouts = dict(zip(('oss', 'enterprise'), (path.resolve() for path in args.checkout)))
@@ -188,7 +203,7 @@ try:
         with tempfile.TemporaryDirectory() as temporary:
             effective_projects = []
             selected = {label: [] for label in checkouts}
-            for module in MODULE_PATHS.split(','):
+            for _, module in modules:
                 owners = [label for label, checkout in checkouts.items() if (checkout / module).is_dir()]
                 if len(owners) != 1:
                     fail(f'module must belong to exactly one checkout: {module}')
@@ -245,7 +260,7 @@ try:
             if version.endswith('-SNAPSHOT') and f'io/tapdata/{artifact}/{version}/{filename}' not in snapshots:
                 fail(f'unresolved required PDK component: {artifact}:{version}:{kind}:{classifier}')
         inputs = {str(path.relative_to(ROOT)): digest(path) for path in [ROOT / 'scripts/build-real-connectors.sh', ROOT / '.github/scripts/connector-cache.sh', settings]}
-        manifest = {'schema': 2, 'reactor': reactor, 'source_sha': source_sha, 'modules': MODULES, 'roots': roots, 'snapshots': snapshots, 'inputs': inputs}
+        manifest = {'schema': 2, 'reactor': reactor, 'source_sha': source_sha, 'modules': args.modules, 'roots': roots, 'snapshots': snapshots, 'inputs': inputs}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
         print(key(manifest))
@@ -263,12 +278,12 @@ try:
             fail('connector build inputs changed between probe and build')
         if fingerprints(args.repo_local.resolve(), manifest['reactor']) != manifest['snapshots']:
             fail('PDK snapshot provenance changed between probe and connector build')
-        stamp = {'key': key(manifest), 'provenance': manifest, 'jars': jars_at(args.jars)}
+        stamp = {'key': key(manifest), 'provenance': manifest, 'jars': jars_at(args.jars, manifest['modules'])}
         (args.jars / STAMP).write_text(json.dumps(stamp, indent=2, sort_keys=True) + '\n')
     else:
         manifest = load(args.manifest)
         stamp = json.loads((args.jars / STAMP).read_text())
-        if stamp.get('key') != key(manifest) or stamp.get('provenance') != manifest or stamp.get('jars') != jars_at(args.jars):
+        if stamp.get('key') != key(manifest) or stamp.get('provenance') != manifest or stamp.get('jars') != jars_at(args.jars, manifest['modules']):
             fail('cached connector jars do not match the requested provenance and file hashes')
         print('connector cache provenance and jar hashes verified')
 except (ValueError, OSError, ET.ParseError, subprocess.CalledProcessError) as error:

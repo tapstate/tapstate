@@ -3,12 +3,14 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
+import io.tapstate.spi.store.ContentHash;
+import io.tapstate.spi.store.ArtifactStreams;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.LinkOption;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -18,42 +20,118 @@ import java.util.stream.Collectors;
  * Resolves a connector id against the distribution store and materializes it for loading: it finds the
  * id's registration, stages the registered artifact bytes into a content-addressed on-disk cache — a
  * file named for the content hash, written once and reused on every later resolve — and introspects the
- * staged jar into the {@link ConnectorRef} the bridge loads from. Staging is content-addressed, so the
- * bytes are fetched from the store only the first time a given artifact is seen.
+ * staged jar into the {@link ConnectorRef} the bridge loads from. Cached bytes are checked against
+ * their content address on every resolve; valid caches do not fetch the store's bytes again.
  *
  * <p>An id that resolves to no registered artifact, or to more than one, is refused with a coded
  * connector-domain exception rather than loaded blindly: selecting among connector versions is out of
  * scope, and a silent wrong-version load is never taken. A registration whose bytes the store cannot
- * produce is a load failure. A raw I/O failure staging the artifact is not a connector defect and
- * surfaces as an unchecked I/O exception.
+ * produce, validate or stage is a load failure, reported without paths or underlying causes.
  */
 public final class RegistryConnectorProvisioner implements ConnectorProvisioner {
+
+    /** Fixed stripes serialize the same cache path without retaining a lock per artifact forever. */
+    private static final Object[] STAGING = new Object[64];
+    static { java.util.Arrays.setAll(STAGING, ignored -> new Object()); }
 
     private final ConnectorRegistry registry;
     private final ConnectorIntrospector introspector;
     private final Path cacheDir;
+    private final Path seedDir;
+    private final boolean loadSeedInPlace;
 
     public RegistryConnectorProvisioner(
             ConnectorRegistry registry, ConnectorIntrospector introspector, Path cacheDir) {
+        this(registry, introspector, cacheDir, null);
+    }
+
+    /** A verified release may supply the original bytes; registry ownership is still required. */
+    public RegistryConnectorProvisioner(
+            ConnectorRegistry registry, ConnectorIntrospector introspector, Path cacheDir, Path seedDir) {
+        this(registry, introspector, cacheDir, seedDir, false);
+    }
+
+    public RegistryConnectorProvisioner(ConnectorRegistry registry, ConnectorIntrospector introspector,
+                                         Path cacheDir, Path seedDir, boolean loadSeedInPlace) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.introspector = Objects.requireNonNull(introspector, "introspector");
         this.cacheDir = Objects.requireNonNull(cacheDir, "cacheDir");
+        this.seedDir = seedDir;
+        this.loadSeedInPlace = loadSeedInPlace;
     }
 
     @Override
     public ConnectorRef resolve(String connectorId) {
-        ConnectorRegistration registration = resolveRegistration(connectorId);
+        return materialize(connectorId, resolveRegistration(connectorId), false);
+    }
+
+    @Override public ConnectorRef resolveCaptureStartup(String connectorId) {
+        return materialize(connectorId, selectRegistration(connectorId, registry.findAll(connectorId)), false);
+    }
+
+    @Override public ConnectorRef revalidateCaptureStartup(String connectorId, ConnectorRef captured) {
+        var hash = captured.contentHash();
+        if (hash == null || !hash.matches("[a-f0-9]{64}")) return ConnectorProvisioner.super.revalidateCaptureStartup(connectorId, captured);
+        var matches = registry.findAll(connectorId).stream()
+                .filter(row -> connectorId.equals(row.connectorId()) && hash.equals(row.contentHash())).toList();
+        if (matches.size() != 1) throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
+        var target = cacheDir.resolve(hash + ".jar");
+        if (!captured.classpath().equals(List.of(target)) || !Files.exists(target))
+            return materialize(connectorId, matches.getFirst(), true);
+        validatedCache(connectorId, hash, target);
+        return captured;
+    }
+
+    @Override public ConnectorRef resolveDefaultTest(String connectorId) {
+        return materialize(connectorId, resolveRegistration(connectorId), false, true);
+    }
+
+    @Override
+    public ConnectorRef resolve(String connectorId, String contentHash) {
+        if (contentHash == null || !contentHash.matches("[a-f0-9]{64}")) {
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
+        List<ConnectorRegistration> matches = registry.findAll(connectorId).stream()
+                .filter(registration -> contentHash.equals(registration.contentHash())).toList();
+        if (matches.size() != 1) {
+            throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
+        }
+        return materialize(connectorId, matches.getFirst(), true);
+    }
+
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash) {
+        return materialize(connectorId, registration, retainedHash, false);
+    }
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash, boolean defaultTest) {
         Path staged = stage(connectorId, registration.contentHash());
-        IntrospectedConnector introspected = introspector.introspect(List.of(staged));
+        if (seedDir != null) {
+            // Local bytes grant no authority: recheck the original selector after staging.
+            // A retained hash can coexist with other versions; ID-only resolution cannot.
+            List<ConnectorRegistration> current = registry.findAll(connectorId).stream()
+                    .filter(candidate -> !retainedHash || candidate.contentHash().equals(registration.contentHash())).toList();
+            if (current.size() != 1 || !current.getFirst().equals(registration))
+                throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
+        IntrospectedConnector introspected = defaultTest ? introspector.introspectDefaultTest(List.of(staged)) : introspector.introspect(List.of(staged));
+        boolean shareSafe = registry.shareSafeCertification(connectorId, registration.contentHash()).isPresent();
         return new ConnectorRef(List.of(staged), introspected.className(), introspected.pdkApiVersion(), null,
-                introspected.spec());
+                introspected.spec(), registration.contentHash(), shareSafe);
+    }
+
+    @Override
+    public String cacheIdentity(String connectorId) {
+        return resolveRegistration(connectorId).contentHash();
     }
 
     /** The single registration for the id, refusing with a code when none or more than one matches. */
     private ConnectorRegistration resolveRegistration(String connectorId) {
-        List<ConnectorRegistration> matches = registry.list().stream()
-                .filter(registration -> registration.connectorId().equals(connectorId))
-                .toList();
+        return selectRegistration(connectorId,
+                loadSeedInPlace ? registry.findAll(connectorId) : registry.list());
+    }
+
+    private static ConnectorRegistration selectRegistration(String connectorId, List<ConnectorRegistration> registrations) {
+        List<ConnectorRegistration> matches = registrations.stream()
+                .filter(registration -> registration.connectorId().equals(connectorId)).toList();
         if (matches.isEmpty()) {
             throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
         }
@@ -67,31 +145,91 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     /**
      * The path to the artifact staged under its content hash: it writes the store's bytes into the cache
      * the first time the hash is seen and reuses the file every time after, so an already-staged hash is
-     * never re-fetched. The write goes through a temp file moved into place, so a reader never sees a
-     * half-written jar.
+     * never re-fetched. Store bytes and each reused cache are checked against their content address.
+     * The write goes through a temp file renamed into place, so a reader never sees a half-written jar.
+     *
+     * <p>A staged file is never replaced, not even by the identical bytes of a second stager. A running
+     * server keeps one class loader per staged artifact, keyed by the file as it first found it, and a
+     * file replaced under that key reads as another artifact: the connector would then be split across two
+     * loaders, which a connector holding a native library cannot survive. So staging in this process is
+     * serialized per cache path and checks again once it holds the lock; a file another process staged first is kept
+     * rather than renamed over.
      */
     private Path stage(String connectorId, String contentHash) {
+        if (loadSeedInPlace) {
+            try {
+                Path seed = seedFile(connectorId, contentHash);
+                if (seed != null) return seed;
+            } catch (IOException e) {
+                throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+            }
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
         Path target = cacheDir.resolve(contentHash + ".jar");
         if (Files.exists(target)) {
-            return target;
+            return validatedCache(connectorId, contentHash, target);
         }
-        byte[] bytes = registry.artifact(contentHash).orElseThrow(() ->
-                new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null));
-        try {
-            Files.createDirectories(cacheDir);
-            Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
-            try {
-                Files.write(tmp, bytes);
-                // Content-addressed: any concurrently-staged file under this hash holds identical bytes,
-                // so replacing it is safe.
-                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } finally {
-                Files.deleteIfExists(tmp);
+        synchronized (STAGING[Math.floorMod(target.toAbsolutePath().normalize().hashCode(), STAGING.length)]) {
+            if (Files.exists(target)) {
+                return validatedCache(connectorId, contentHash, target);
             }
-        } catch (IOException e) {
-            throw new UncheckedIOException("staging connector artifact " + target, e);
+            try {
+                Files.createDirectories(cacheDir);
+                Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
+                try {
+                    try (var output = Files.newOutputStream(tmp)) {
+                        Path seed = seedFile(connectorId, contentHash);
+                        if (seed != null) {
+                            try (var input = Files.newInputStream(seed)) {
+                                ArtifactStreams.copyVerified(input, output, contentHash, Files.size(seed));
+                            }
+                        } else if (!registry.copyArtifactTo(contentHash, output)) {
+                            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+                        }
+                    }
+                    validatedCache(connectorId, contentHash, tmp);
+                    // Linking within the cache filesystem publishes atomically without replacing a
+                    // winner from another process, including a winner appearing during publication.
+                    Files.createLink(target, tmp);
+                } catch (FileAlreadyExistsException stagedElsewhere) {
+                    // Keep the other stager's file and validate it before returning it.
+                } finally {
+                    Files.deleteIfExists(tmp);
+                }
+            } catch (IOException | TapstateException | UnsupportedOperationException e) {
+                throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+            }
         }
-        return target;
+        return validatedCache(connectorId, contentHash, target);
+    }
+
+    private Path seedFile(String connectorId, String contentHash) throws IOException {
+        if (seedDir == null || !connectorId.matches("[A-Za-z0-9][A-Za-z0-9._-]*")) return null;
+        Path seed = seedDir.resolve(connectorId + "-connector.jar");
+        if (Files.notExists(seed, LinkOption.NOFOLLOW_LINKS)) return null;
+        if (!Files.isRegularFile(seed, LinkOption.NOFOLLOW_LINKS)) return null;
+        // OP seeds are optional: a stale or conflicting release must not shadow the
+        // registered artifact. Copying verifies again, so a changed source is never published.
+        try (var input = Files.newInputStream(seed)) {
+            return contentHash.equals(ContentHash.of(input)) ? seed : null;
+        } catch (IOException unavailableSeed) {
+            return null;
+        }
+    }
+
+    private static Path validatedCache(String connectorId, String contentHash, Path target) {
+        try (var bytes = Files.newInputStream(target)) {
+            validateContent(connectorId, contentHash, ContentHash.of(bytes));
+            return target;
+        } catch (IOException e) {
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
+    }
+
+    private static void validateContent(String connectorId, String contentHash, String actualHash) {
+        if (!contentHash.equals(actualHash)) {
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
     }
 
     private static String contentHashes(List<ConnectorRegistration> registrations) {

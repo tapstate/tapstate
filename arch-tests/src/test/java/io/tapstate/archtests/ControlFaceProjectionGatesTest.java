@@ -2,8 +2,6 @@ package io.tapstate.archtests;
 
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethod;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.Operation;
@@ -41,9 +39,7 @@ class ControlFaceProjectionGatesTest {
 
     @BeforeAll
     static void importFace() {
-        restApi = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate.control.restapi");
+        restApi = ProductionClassImports.packages("io.tapstate.control.restapi");
     }
 
     /** Every operation id an HTTP handler declares it projects. */
@@ -72,18 +68,34 @@ class ControlFaceProjectionGatesTest {
                         || type.isMetaAnnotatedWith(RequestMapping.class));
     }
 
-    /** Every operation the registry opens on the CLI face — the online verb surface. */
+    /** Every operation the registry opens on a face served by the HTTP surface. */
     private static Set<String> registeredVerbs() {
-        return ControlOperations.registry().exposedOn(Frontend.CLI).stream()
+        return java.util.stream.Stream.concat(
+                        ControlOperations.registry().exposedOn(Frontend.CLI).stream(),
+                        ControlOperations.registry().exposedOn(Frontend.REST).stream())
                 .map(Operation::id)
                 .collect(toCollection(TreeSet::new));
+    }
+
+    @Test void storageRoutesMatchTheSharedClientAndCanonicalRegistry() {
+        var ids = io.tapstate.control.client.StorageControlClient.OPERATIONS;
+        assertThat(ids).contains("configuration.export", "storage.setup.activate").hasSize(12);
+        for (var id : ids) {
+            var methods = restApi.stream().flatMap(type -> type.getMethods().stream()).filter(method -> method.isAnnotatedWith(Verb.class)
+                    && method.getAnnotationOfType(Verb.class).value().equals(id)).toList();
+            assertThat(methods).as(id).hasSize(1);
+            var mapping = methods.getFirst().getAnnotationOfType(org.springframework.web.bind.annotation.PostMapping.class);
+            assertThat(mapping.value()).containsExactly(io.tapstate.control.client.StorageControlClient.path(id).substring("/api".length()));
+            for (var face : java.util.List.of(Frontend.CLI, Frontend.REST, Frontend.MCP))
+                assertThat(ControlOperations.registry().resolve(id).exposure()).containsKey(face);
+        }
     }
 
     @Test
     @DisplayName("every HTTP handler projects a registered operation")
     void everyProjectedVerbIsRegistered() {
         assertThat(projectedVerbs())
-                .as("an endpoint may only project a registered, CLI-exposed operation — a face composes "
+                .as("an endpoint may only project a registered operation on an HTTP-served face — a face composes "
                         + "registered operations, it never invents an endpoint")
                 .isSubsetOf(registeredVerbs());
     }
@@ -117,7 +129,7 @@ class ControlFaceProjectionGatesTest {
         unreachable.removeAll(DEFERRED_WITH_NO_FACE);
 
         assertThat(unreachable)
-                .as("the CLI drives the server over this HTTP face, so an operation the registry opens on "
+                .as("an operation the registry opens on an HTTP-served face with no endpoint behind it "
                         + "the CLI face with no endpoint behind it cannot be invoked at all — give it an "
                         + "endpoint, or record it as deliberately deferred")
                 .isEmpty();

@@ -28,6 +28,7 @@ import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @EnableWebSocket
 public class DataBrowserStreamConfiguration {
+    static final String TAIL_PATH = "/api/data-browser/*/*/tail";
 
     /**
      * Held as a bean so its live follows are released when the context goes. What a follow holds is a
@@ -48,7 +49,7 @@ public class DataBrowserStreamConfiguration {
         // Missing this interceptor is not a visible failure -- the endpoint would upgrade, and an
         // anonymous caller would be handed every change to the collection. No projection gate covers a
         // websocket path and no arch rule requires one carry an interceptor, so nothing else would say.
-        return registry -> registry.addHandler(handler, "/api/data-browser/*/*/tail")
+        return registry -> registry.addHandler(handler, TAIL_PATH)
                 .addInterceptors(new PipelineStreamHandshakeInterceptor(
                         credentials, ControlOperations.DATA_BROWSER_FIND));
     }

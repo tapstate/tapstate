@@ -1,0 +1,5 @@
+<testsuite name="io.tapstate.testsupport.CiInterfaceDisabledEvidenceTest" tests="1" errors="0" skipped="1" failures="0">
+  <testcase name="interfaceDisabled(String)" classname="io.tapstate.testsupport.CiInterfaceDisabledEvidenceTest">
+    <skipped message="interface skip control" />
+  </testcase>
+</testsuite>

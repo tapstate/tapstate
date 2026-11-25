@@ -27,8 +27,17 @@ public final class PdkCapabilityDeriver implements CapabilityDeriver {
 
     @Override
     public ConnectorCapabilities derive(String connectorId) {
-        PdkConnector connector =
-                PdkConnector.open(connectorId, provisioner.resolve(connectorId), Map.of());
+        return derive(connectorId,provisioner.resolve(connectorId));
+    }
+
+    /** Recovery preflight inspects the exact registered artifact without opening a source or target connection. */
+    public ConnectorCapabilities derive(String connectorId,String contentHash) {
+        return derive(connectorId,provisioner.resolve(connectorId,contentHash));
+    }
+
+    // Artifact resolution and streaming can overlap; plugin construction/probing stays serialized.
+    synchronized ConnectorCapabilities derive(String connectorId,ConnectorRef original) {
+        PdkConnector connector = PdkConnector.open(connectorId,original,Map.of());
         try {
             return toCapabilities(connector.functions());
         } finally {

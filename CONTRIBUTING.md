@@ -37,6 +37,28 @@ and not a bar applied to you.)
 4. **Open a pull request** against `main`. Describe what changed and why. CI runs
    the build and a few repository checks on every PR — make sure it's green.
 
+
+## Real connector inputs
+
+The Real connectors workflow runs the same ten witness shards with two input policies:
+
+- **Fixed shipping inputs:** manually dispatch with `connector-inputs=release`. It downloads eight
+  connector assets, including Dummy, from `connectors-preview`, verifies their size, SHA-256, manifest and
+  specification against `deploy/cloud/connectors.lock.json`, and reports `real-connectors-release`.
+  Every shard and the aggregate must agree on the actual input identities. A missing or changed
+  asset fails; the workflow does not substitute an upstream build. The Cloud image staging path
+  retains its separate contract for locked connectors and companion licenses.
+- **Upstream compatibility:** schedules and default manual dispatches build current upstream
+  source and SNAPSHOT inputs and report `real-connectors`. This detects new compatibility work;
+  its result does not substitute for shipping acceptance on a different connector set.
+
+Both policies retain the existing witness selection, tiers, report admission and explicit external
+fixture deferrals. The release publication workflow continues to require its existing upstream
+`real-connectors` verdict. Making the fixed-input verdict a publication requirement is a separate
+change after the complete fixed-input matrix is validated. A fixed-input run can report product
+failures; successful artifact verification alone does not establish release acceptance. The release
+tag can move, so the lock and recorded artifact digests identify what was actually tested.
+
 ## External contributions
 
 You need access to nothing private to contribute here. There are two ways in, and they differ in
@@ -230,7 +252,9 @@ round of review when they are missed:
 - **A user-facing error carries a code; a bug crashes.** An error a user can act on — bad
   configuration, a rejected specification, a connector that will not start — is raised through the
   error-code system: a typed exception, an enum constant for the code, named parameters, and
-  catalog text (English mandatory). Never a hand-written code string, and never a bare
+  catalog text (English, Simplified Chinese and Traditional Chinese for product definitions).
+  Follow the [diagnostic maintenance guide](docs/diagnostics/README.md) for declaration,
+  lookup, validation, export, deprecation and independent history checks. Never a hand-written code string, and never a bare
   `RuntimeException` as something a user is meant to read. A programmer error is the opposite — a
   null that should not be null, an invariant that does not hold — so throw it bare and let it crash
   with a stack trace. Laundering one of those into an error code hides a defect behind a message
@@ -246,6 +270,9 @@ its own private channel — see [SECURITY.md](SECURITY.md) — and never a publi
 **A change to product source is admitted only with an end-to-end case alongside it.**
 A CI check enforces this on every pull request. It is not a coverage target: one
 smoke-level case is the floor — a case that fails if your change is reverted.
+
+See [Test placement](.github/workflows/README.md#test-placement) to choose which
+jobs run your case and record the execution evidence for review.
 
 **Write it declaratively first.** A case is a directory under `e2e/examples/`:
 

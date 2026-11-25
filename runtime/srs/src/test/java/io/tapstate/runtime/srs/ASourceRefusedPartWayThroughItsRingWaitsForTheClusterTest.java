@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import static com.hazelcast.jet.core.Edge.between;
+import static io.tapstate.runtime.srs.SplitBrainProtectionTestSupport.awaitMinimumSize;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.config.Config;
@@ -29,6 +30,8 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -57,11 +60,15 @@ class ASourceRefusedPartWayThroughItsRingWaitsForTheClusterTest {
     private static final String PIPELINE = "orders_pipeline";
     private static final int BEFORE = 3;
     private static final int AFTER = 2;
+    /** Keeps the asynchronous first verdict visibly in flight, as machine load did in the reported runs. */
+    private static final Duration INITIAL_VERDICT_DELAY = Duration.ofSeconds(10);
 
     /** The protection's whole answer. Static, because the member holds the function it is read by. */
     private static final AtomicBoolean ADMITS = new AtomicBoolean(true);
 
     private final String cluster = "srs-part-way-refusal-" + System.nanoTime();
+    private final AtomicBoolean delayFirstVerdict = new AtomicBoolean(true);
+    private final CountDownLatch firstVerdictStarted = new CountDownLatch(1);
     private HazelcastInstance member;
 
     @AfterEach
@@ -76,6 +83,11 @@ class ASourceRefusedPartWayThroughItsRingWaitsForTheClusterTest {
     void aSourceRefusedAfterItHasStartedReadingWaitsForTheClusterInsteadOfEndingTheRun()
             throws InterruptedException {
         member = Hazelcast.newHazelcastInstance(member());
+        if (!firstVerdictStarted.await(20, TimeUnit.SECONDS)) {
+            throw new AssertionError("the protection never started working out its first verdict");
+        }
+        assertThat(ADMITS.get()).as("the configured protection function still admits the write").isTrue();
+        awaitMinimumSize(PROTECTION, member);
         SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
         append(ring, 0, BEFORE);
         Job job = member.getJet().newJob(sourceToList(), new JobConfig()
@@ -126,7 +138,17 @@ class ASourceRefusedPartWayThroughItsRingWaitsForTheClusterTest {
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(PROTECTION, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
-                .setFunctionImplementation(members -> ADMITS.get()));
+                .setFunctionImplementation(members -> {
+                    if (delayFirstVerdict.compareAndSet(true, false)) {
+                        firstVerdictStarted.countDown();
+                        try {
+                            Thread.sleep(INITIAL_VERDICT_DELAY.toMillis());
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    return ADMITS.get();
+                }));
         config.addRingBufferConfig(new RingbufferConfig("srs.*")
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)

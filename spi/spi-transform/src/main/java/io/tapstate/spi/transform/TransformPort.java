@@ -20,11 +20,16 @@ import java.util.List;
  * input streams, and their execution contracts land with the execution engine.
  */
 @FunctionalInterface
-public interface TransformPort {
+public interface TransformPort extends AutoCloseable {
 
     /**
      * Transforms one event into the events it becomes: a single event for a map, none for a filtered
      * drop, or several for a fan-out. Returns an empty list to drop; never {@code null}.
      */
     List<Envelope> transform(Envelope event);
+
+    /** Releases resources held for the lifetime of this transform processor. */
+    @Override
+    default void close() {
+    }
 }

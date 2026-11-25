@@ -3,6 +3,7 @@ package io.tapstate.tools.catalog.assembler;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -12,10 +13,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import io.tapstate.core.catalog.CatalogEntryReader;
 import io.tapstate.core.catalog.CatalogJson;
+import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.model.SourceMode;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 class CatalogRefreshPersistenceTest {
     @TempDir
@@ -30,6 +33,58 @@ class CatalogRefreshPersistenceTest {
         assertThat(result.entries()).containsOnlyKeys("mysql", "oracle");
         assertThat(result.report()).contains("Ingested connectors: 2");
         assertThat(CatalogEntryReader.read(result.entries().get("oracle")).modes()).contains(SourceMode.CDC);
+    }
+
+    @Test
+    void unchangedEnterpriseSpecsDoNotForceTheDailyOssScanOpen() throws IOException {
+        Path oss = checkout("oss", "mysql");
+        Path enterprise = checkout("enterprise", "oracle");
+        checkout("enterprise", "sqlserver");
+        GeneratedCatalog original = CatalogGenerator.generate(List.of(oss, enterprise), "sha", "caps", Map.of());
+        assertThat(original.entries()).containsOnlyKeys("mysql", "oracle", "sqlserver");
+
+        Path catalog = temp.resolve("catalog");
+        Path bitmap = temp.resolve("bitmap.tsv");
+        Path reportFile = temp.resolve("report.md");
+        CatalogArtifactStore.write(original, "", catalog, bitmap, reportFile);
+        GeneratedCatalog refreshed = CatalogArtifactStore.merge(
+                CatalogGenerator.generate(oss, "sha", "caps", Map.of()), "", catalog, bitmap, reportFile).catalog();
+        assertThat(refreshed.entries()).as("an OSS-only refresh preserves unchanged enterprise rows")
+                .isEqualTo(original.entries());
+        assertThat(refreshed.index()).isEqualTo(original.index());
+
+        List<ConnectorCatalogEntry> snapshot = original.entries().values().stream()
+                .map(CatalogEntryReader::read).toList();
+        List<String> upstreamPaths;
+        try (var files = Files.walk(oss)) {
+            upstreamPaths = files.filter(Files::isRegularFile)
+                    .map(path -> oss.relativize(path).toString().replace('\\', '/')).toList();
+        }
+
+        // The daily lane enumerates the combined catalog but fetches from the OSS checkout only.
+        Map<String, String> fetchedByPath = new LinkedHashMap<>();
+        for (String relative : SpecPathEnumerator.specPathsToFetch(snapshot, upstreamPaths)) {
+            Path file = oss.resolve(relative);
+            if (Files.isRegularFile(file)) {
+                fetchedByPath.put(relative, Files.readString(file));
+            }
+        }
+        for (ConnectorCatalogEntry row : snapshot) {
+            Path owner = row.id().equals("mysql") ? oss : enterprise;
+            assertThat(SpecHash.of(Files.readString(owner.resolve(row.provenance().specPath()))))
+                    .as("%s still exists unchanged in its owning checkout", row.id())
+                    .isEqualTo(row.provenance().specContentHash());
+        }
+
+        SpecDrift.Report drift = SpecDrift.compare(snapshot, fetchedByPath);
+        assertThat(drift.changedIds()).isEmpty();
+        assertThat(drift.newConnectorIds()).isEmpty();
+        assertAll(
+                () -> assertThat(drift.vanishedIds()).as("unchanged enterprise specifications have not vanished")
+                        .isEmpty(),
+                () -> assertThat(DriftTriage.decide(drift.allIds(), 1, false))
+                        .as("no specification drift, no open PR, and the age is below the fallback threshold")
+                        .isEqualTo(DriftTriage.Decision.NOTHING));
     }
 
     @Test

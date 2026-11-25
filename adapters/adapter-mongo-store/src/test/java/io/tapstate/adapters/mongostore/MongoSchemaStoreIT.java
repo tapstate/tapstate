@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -13,9 +14,7 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -44,10 +43,10 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class MongoSchemaStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoSchemaStoreIT.class);
 
     private static SourceModel ordersModel() {
         return new SourceModel(List.of(
@@ -216,7 +215,7 @@ class MongoSchemaStoreIT {
 
             assertThatThrownBy(() -> store.get("torn"))
                     .isInstanceOfSatisfying(TapstateException.class, error ->
-                            assertThat(error.code().code()).isEqualTo("io.document-unreadable"));
+                            assertThat(error.code().code()).isEqualTo("TS0480004"));
         });
     }
 
@@ -306,7 +305,7 @@ class MongoSchemaStoreIT {
 
             assertThat(failure).isInstanceOf(TapstateException.class);
             TapstateException coded = (TapstateException) failure;
-            assertThat(coded.code().code()).isEqualTo("io.schema-read-contention");
+            assertThat(coded.code().code()).isEqualTo("TS0480007");
             assertThat(coded.args()).containsExactlyEntriesOf(Map.of("connectionId", "orders-db"));
             assertThat(reads.get()).isEqualTo(8);
             assertThat(publications.get()).isEqualTo(8);
@@ -353,8 +352,12 @@ class MongoSchemaStoreIT {
                     () -> { throw failure; }, false);
 
             assertThatThrownBy(() -> new MongoSchemaStore(interrupted).save(observation(2, "abandoned")))
-                    .isInstanceOf(TapstateException.class)
-                    .hasCause(failure);
+                    .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(coded.args()).containsEntry("detail", "MongoException");
+                        assertThat(coded.getCause()).isNull();
+                        assertThat(coded.toString()).doesNotContain(failure.getMessage());
+                    });
             assertThat(store.get("orders-db")).contains(before);
             Document abandoned = collection.find(new Document("name", "abandoned")).first();
             assertThat(abandoned).isNotNull();
@@ -490,7 +493,7 @@ class MongoSchemaStoreIT {
     /** Runs a test body against a fresh schema store over a clean collection on the real replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("source_schemas");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("source_schemas");
             collection.drop();
             test.run(new MongoSchemaStore(collection), collection);
         }

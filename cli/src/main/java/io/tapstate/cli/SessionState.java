@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.RequestErrorDefinitions;
 
 import java.net.URI;
 import java.time.Clock;
@@ -17,6 +18,7 @@ final class SessionState {
 
     private static final Duration REFRESH_SKEW = Duration.ofSeconds(60);
     private static final Set<String> DISPLAYABLE_REJECTION_CODES = Set.of(
+            RequestErrorDefinitions.UNAUTHENTICATED.code(),
             "control.unauthenticated",
             "control.auth-session-expired",
             "control.auth-session-revoked",

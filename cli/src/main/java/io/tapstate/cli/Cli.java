@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -73,13 +74,15 @@ import java.util.function.Supplier;
         })
 public final class Cli implements Runnable {
 
+    private static final String LONG_HELP_OPTION = "--help";
+
     /**
      * What {@code -V} prints, on the root and on every verb alike. A compile-time constant rather than a
      * manifest or bundled-resource lookup: neither survives into the native image without extra
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.6.0";
+    static final String VERSION = "tapstate 0.8.0";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and
@@ -127,6 +130,10 @@ public final class Cli implements Runnable {
     static final String DATA_BROWSER_VERB = "data-browser";
 
     public static final Map<String, String> VERB_BY_OPERATION = Map.ofEntries(
+            Map.entry("storage.status", "storage"), Map.entry("storage.test", "storage"), Map.entry("storage.setup.commit", "storage"), Map.entry("storage.setup.status", "storage"), Map.entry("storage.setup.activate", "storage"),
+            Map.entry("storage.recovery.plan", "storage"), Map.entry("storage.recovery.confirm", "storage"), Map.entry("storage.recovery.status", "storage"),
+            Map.entry("configuration.export", "configuration"),
+            Map.entry("configuration.import.preflight", "configuration"), Map.entry("configuration.import.commit", "configuration"), Map.entry("configuration.import.status", "configuration"),
             Map.entry("data-browser.collections", DATA_BROWSER_VERB),
             Map.entry("data-browser.find", DATA_BROWSER_VERB),
             Map.entry("data-browser.stats", DATA_BROWSER_VERB),
@@ -147,6 +154,9 @@ public final class Cli implements Runnable {
             Map.entry("token.list", "token"),
             Map.entry("token.revoke", "token"),
             Map.entry("pipeline.start", "start"),
+            // Read through the start verb itself, as start --checks-only: what a start would be asked is
+            // looked at where the start is made.
+            Map.entry("pipeline.start-checks", "start"),
             Map.entry("pipeline.stop", "stop"),
             Map.entry("pipeline.pause", "pause"),
             Map.entry("pipeline.resume", "resume"),
@@ -155,11 +165,16 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.metrics.history", "metrics"),
             Map.entry("pipeline.snapshot", "snapshot"),
             Map.entry("pipeline.logs", "logs"),
+            Map.entry("pipeline.log-level", "logs"),
             Map.entry("pipeline.explain", "explain"),
             Map.entry("pipeline.position", "position"),
             Map.entry("pipeline.set-position", "position"),
             Map.entry("pipeline.derived-schema", "derived-schema"),
-            Map.entry("pipeline.accept-derived-schema", "derived-schema"));
+            Map.entry("pipeline.accept-derived-schema", "derived-schema"),
+            // One verb for both, as with the derived schema: a repair is the same look followed by a
+            // decision about what it showed.
+            Map.entry("pipeline.aggregate-check", "aggregate"),
+            Map.entry("pipeline.aggregate-repair", "aggregate"));
 
     /**
      * Verbs that chain several registered operations rather than projecting one ({@code run} is apply
@@ -225,6 +240,8 @@ public final class Cli implements Runnable {
      * that only some of these verbs accept.
      */
     static final Map<String, VerbHelp> VERB_HELP = Map.ofEntries(
+            Map.entry("storage", new VerbHelp("<status|test|setup ACTION|recovery ACTION> [--file request.json]", "Query storage or submit one confirmed operation; request secrets stay in the file.")),
+            Map.entry("configuration", new VerbHelp("export|import <preflight|commit|status> --file request.json", "Export encrypted configuration, or preflight, confirm, and query an import by its original ID.")),
             Map.entry("apply", new VerbHelp("[<path>] [--if-match <hash>]",
                     "Upload the workspace, or one artifact, creating or updating each resource.")),
             Map.entry("get", new VerbHelp("<id>",
@@ -247,12 +264,16 @@ public final class Cli implements Runnable {
                     "Show a connection's discovered schema, or one table of it.")),
             Map.entry("token", new VerbHelp("<create|list|revoke> [ARGS...] [-o text|json|yaml]",
                     "Create, list, or revoke machine tokens.")),
-            Map.entry("start", new VerbHelp("<pipeline-id>",
-                    "Start a pipeline.")),
+            Map.entry("start", new VerbHelp(
+                    "<pipeline-id> [-y] [--decide <check>[/<subject>]=<answer>]... [--checks-only] [-o text|json|yaml]",
+                    "Start a pipeline after its start checks: answer their questions at the terminal, with "
+                            + "--decide, or with -y to go ahead as configured; --checks-only only shows them.")),
             Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
                     "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
-            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
-                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
+            Map.entry("restart", new VerbHelp(
+                    "<pipeline-id> [--rerun] [-y] [--decide <check>[/<subject>]=<answer>]...",
+                    "Cycle a pipeline and carry on; --rerun reads the whole source again, asking its start "
+                            + "checks before anything is stopped.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",
@@ -265,6 +286,10 @@ public final class Cli implements Runnable {
                     "Show a pipeline's per-table snapshot progress.")),
             Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
                     "Compare a join's recorded and current columns; --accept re-reads the sources.")),
+            // "the rows the step holds" is the load-bearing part. A check that came back clean and was
+            // read as "the view matches the source" would be believed for something it never looked at.
+            Map.entry("aggregate", new VerbHelp("<pipeline-id> <step> [--group <name=value,...>] [--repair]",
+                    "Check an aggregate step's totals against the rows the step holds; --repair rewrites them.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",
                     "Tail a pipeline's log on its node; --follow streams until Ctrl-C.")),
             Map.entry("position", new VerbHelp("<pipeline-id> [-f <file>]",
@@ -470,7 +495,53 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
-        System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+        System.exit(runSession(launch, HttpControlPlaneClient::new));
+    }
+
+    /** Checks for help before creating the client for an online command or interactive session. */
+    static int runSession(LaunchOptions launch, Supplier<ControlPlaneClient> client) {
+        if (launch.isOneShot()) {
+            Integer helpExit = executeHelpRequest(launch.command());
+            if (helpExit != null) {
+                return helpExit;
+            }
+        }
+        return runSession(launch, client.get(), Cli::terminalPrompter);
+    }
+
+    private static Integer executeHelpRequest(List<String> words) {
+        if (words.getFirst().equals(DATA_BROWSER_VERB)) {
+            // The data-browser dispatcher joins every operand into one query. Help or version replaces it.
+            if (words.size() != 2) {
+                return null;
+            }
+            return switch (words.get(1)) {
+                case "-h", LONG_HELP_OPTION, "-V", "--version" ->
+                        newCommandLine().execute(words.toArray(new String[0]));
+                default -> null;
+            };
+        }
+        if (words.stream().noneMatch(Cli::isUsageHelpOption)) {
+            return null;
+        }
+        CommandLine commandLine = newCommandLine();
+        CommandLine verb = commandLine.getSubcommands().get(words.getFirst());
+        if (verb != null && verb.getCommand() instanceof ConnectedVerb) {
+            ConnectedVerb.recognizeValueOptionsForHelp(verb);
+        }
+        CommandLine.ParseResult parsed;
+        try {
+            parsed = commandLine.parseArgs(words.toArray(new String[0]));
+        } catch (CommandLine.ParameterException ignored) {
+            // The session still owns validation and dispatch for ordinary online commands.
+            return null;
+        }
+        return parsed.asCommandLineList().stream().anyMatch(CommandLine::isUsageHelpRequested)
+                ? CommandLine.executeHelpRequest(parsed) : null;
+    }
+
+    private static boolean isUsageHelpOption(String word) {
+        return word.equals("-h") || word.equals(LONG_HELP_OPTION);
     }
 
     /**
@@ -482,8 +553,7 @@ public final class Cli implements Runnable {
         if (launch.isOneShot() && !launch.command().isEmpty()
                 && launch.command().getFirst().equals("explain")
                 && (launch.command().size() == 1
-                        || launch.command().stream().anyMatch(
-                                word -> word.equals("-h") || word.equals("--help")))) {
+                        || launch.command().stream().anyMatch(Cli::isUsageHelpOption))) {
             return true;
         }
         if (!launch.isOneShot() || Repl.isOnlineVerb(launch.command().getFirst())) {
@@ -512,24 +582,38 @@ public final class Cli implements Runnable {
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter) {
         Path home = Path.of(System.getProperty("user.home"));
-        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
-        AuthService authService = new AuthService(
-                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
-        return runSession(launch, controlPlane, prompter, resolver, authService, Workbench::run);
+        ContextResolver resolver = HomeStores.resolver(home, launch::environment);
+        AuthService authService = HomeStores.auth(home, controlPlane, java.time.Clock.systemUTC());
+        return runSession(launch, controlPlane, prompter, resolver, authService, Cli::runInteractiveSession);
     }
 
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver) {
-        return runSession(launch, controlPlane, prompter, resolver, null, Workbench::run);
+        return runSession(launch, controlPlane, prompter, resolver, null, Cli::runInteractiveSession);
+    }
+
+    /** Test seam for the terminal-dependent one-shot confirmation path. */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, BooleanSupplier terminal) {
+        Path home = Path.of(System.getProperty("user.home"));
+        return runSession(launch, controlPlane, prompter, HomeStores.resolver(home, launch::environment),
+                HomeStores.auth(home, controlPlane, java.time.Clock.systemUTC()), Cli::runInteractiveSession,
+                newCommandLine(), home, terminal);
+    }
+
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine) {
+        return runSession(launch, controlPlane, prompter, resolver, authService, commandLine,
+                Path.of(System.getProperty("user.home")));
     }
 
     /** Test seam for the bare-command workbench handoff. */
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, Function<Repl, Integer> workbench) {
         Path home = Path.of(System.getProperty("user.home"));
-        ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), launch::environment);
-        AuthService authService = new AuthService(
-                controlPlane, AuthFileStore.underHome(home), java.time.Clock.systemUTC());
+        ContextResolver resolver = HomeStores.resolver(home, launch::environment);
+        AuthService authService = HomeStores.auth(home, controlPlane, java.time.Clock.systemUTC());
         return runSession(launch, controlPlane, prompter, resolver, authService, workbench);
     }
 
@@ -545,7 +629,7 @@ public final class Cli implements Runnable {
     static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                           Supplier<Prompter> prompter, ContextResolver resolver,
                           AuthService authService, CommandLine commandLine, Path home) {
-        return runSession(launch, controlPlane, prompter, resolver, authService, Workbench::run,
+        return runSession(launch, controlPlane, prompter, resolver, authService, Cli::runInteractiveSession,
                 commandLine, home);
     }
 
@@ -553,6 +637,14 @@ public final class Cli implements Runnable {
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService, Function<Repl, Integer> workbench,
                                   CommandLine commandLine, Path home) {
+        return runSession(launch, controlPlane, prompter, resolver, authService, workbench,
+                commandLine, home, () -> System.console() != null);
+    }
+
+    private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                                  Supplier<Prompter> prompter, ContextResolver resolver,
+                                  AuthService authService, Function<Repl, Integer> workbench,
+                                  CommandLine commandLine, Path home, BooleanSupplier terminal) {
         Prompter oneShotPrompter = null;
         PromptOwner launchPrompt = new PromptOwner(prompter);
         try {
@@ -581,6 +673,7 @@ public final class Cli implements Runnable {
             Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
                     new ContextManager(ContextConfigStore.underHome(home)));
+            repl.terminalCheck(terminal);
             repl.prompterSource(launchPrompt::get);
             String machineToken = launch.machineToken();
             if (machineToken != null) {
@@ -608,6 +701,13 @@ public final class Cli implements Runnable {
             }
             controlPlane.close();
         }
+    }
+
+    /** Interactive terminals get the workbench; a pipe retains the scriptable session contract. */
+    private static int runInteractiveSession(Repl repl) {
+        if (System.console() != null) return Workbench.run(repl);
+        repl.run();
+        return repl.sessionExitCode();
     }
 
     /** Retains a lazily opened prompt owner until its terminal can be closed before workbench handoff. */

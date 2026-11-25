@@ -18,6 +18,9 @@ enum StepKeyword {
     /** Polls a matcher until it holds or the bound expires. */
     AWAIT,
 
+    /** Requires a start admission conflict with the named code. */
+    START_REFUSED,
+
     /** Checks a matcher once, now. */
     ASSERT;
 

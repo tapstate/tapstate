@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "graph": [],
+  "inputs": {
+    "dummy_records": {
+      "primary_key": "serial",
+      "workload": "repeatable finite Dummy input"
+    }
+  },
+  "parameters": {
+    "connector_provisioning": "published locked Dummy artefact",
+    "source_and_target_rate_limit": "disabled",
+    "trial_parameters": [
+      "row count",
+      "parallelism",
+      "batch size"
+    ]
+  },
+  "expected": {
+    "readback": [
+      "Check exact Dummy keys and values independently of actual consumption acknowledgement.",
+      "Use the existing Dummy walkthrough and runtime witness. Disable the detailed observer when scoring."
+    ]
+  },
+  "completion": {
+    "target_unit": "acknowledged Dummy consumption",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

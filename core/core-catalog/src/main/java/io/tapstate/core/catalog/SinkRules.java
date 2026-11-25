@@ -18,6 +18,11 @@ public final class SinkRules {
     private SinkRules() {
     }
 
+    /** Applies the running release's role restriction to a derived or previously stored sink. */
+    static SinkCapability applySupportPolicy(String connectorId, SinkCapability sink) {
+        return OfficialConnectors.isSourceOnly(connectorId) ? new SinkCapability(false, List.of()) : sink;
+    }
+
     public static SinkCapability derive(boolean writeRecordCapable,
                                         List<String> dmlInsertAlternatives,
                                         boolean hasDmlUpdatePolicy) {

@@ -143,8 +143,64 @@ class RingBufferLogSinkTest {
     }
 
     @Test
+    void aVerifiedLifetimeKeepsItsRebuiltGenerationsButNeverShowsItsPredecessor() {
+        RingBufferLogSink sink = new RingBufferLogSink(2, 8);
+        sink.append("flow", line("unattributed lifetime"));
+        sink.append("flow", 2, line("retired pipeline"));
+        sink.append("flow", 3, line("created"));
+        sink.append("other", 2, line("different pipeline"));
+        sink.append("flow", 4, line("rebuilt"));
+
+        assertThat(sink.tail("flow", 3, 3)).extracting(LogLine::message).containsExactly("created");
+        assertThat(sink.tail("flow", 3, 4)).extracting(LogLine::message).containsExactly("created", "rebuilt");
+        assertThat(sink.tail("other", 2, 2)).extracting(LogLine::message).containsExactly("different pipeline");
+        assertThat(sink.tail("flow", 1, 2)).isEmpty();
+    }
+
+    @Test
+    void aLatePredecessorCannotFillTheSuccessorsBoundedBuffer() {
+        RingBufferLogSink sink = new RingBufferLogSink(1, 2);
+        sink.append("flow", 1, line("retired"));
+        sink.append("flow", 3, line("replacement initialized"));
+        assertThat(sink.tail("flow", 3, 3)).extracting(LogLine::message).containsExactly("replacement initialized");
+        sink.append("flow", 3, line("replacement running"));
+
+        for (int i = 0; i < 3; i++) {
+            sink.append("flow", 1, line("late predecessor"));
+        }
+
+        assertThat(sink.tail("flow", 3, 3)).extracting(LogLine::message)
+                .containsExactly("replacement initialized", "replacement running");
+    }
+
+    @Test
+    void lateOlderLinesCannotCrowdOutNewerLinesBeforeAnyScopedRead() {
+        RingBufferLogSink sink = new RingBufferLogSink(1, 2);
+        sink.append("flow", 3, line("replacement initialized"));
+        sink.append("flow", 1, line("late first"));
+        sink.append("flow", 1, line("late second"));
+        sink.append("flow", 3, line("replacement running"));
+
+        assertThat(sink.tail("flow", 3, 3)).extracting(LogLine::message)
+                .containsExactly("replacement initialized", "replacement running");
+    }
+
+    @Test
     void rejectsNonPositiveBounds() {
         assertThatIllegalArgumentException().isThrownBy(() -> new RingBufferLogSink(0, 8));
         assertThatIllegalArgumentException().isThrownBy(() -> new RingBufferLogSink(8, 0));
+    }
+    @Test
+    void legacyLinesRemainReadableAcrossScopedLifetimeChanges() {
+        var sink = new RingBufferLogSink(2, 4);
+        var before = new LogLine(1L, "INFO", "unscoped before");
+        var scoped = new LogLine(2L, "INFO", "scoped");
+        var after = new LogLine(3L, "INFO", "unscoped after");
+        sink.append("orders", before);
+        sink.append("orders", 2L, scoped);
+        assertThat(sink.tail("orders", 2L, 2L)).containsExactly(scoped);
+        sink.append("orders", after);
+        assertThat(sink.tail("orders")).containsExactly(before, scoped, after);
+        assertThat(sink.tail("orders", 2L, 2L)).containsExactly(scoped);
     }
 }

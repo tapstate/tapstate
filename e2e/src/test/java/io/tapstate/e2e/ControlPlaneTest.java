@@ -1,14 +1,22 @@
 package io.tapstate.e2e;
 
+import com.sun.net.httpserver.HttpServer;
 import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.IoError;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -26,8 +34,178 @@ class ControlPlaneTest {
     private static final String PIPELINE = "mongo2mongo";
 
     @Test
+    void allSelectedTablesMustReachTheSampleBeforeTheirReadCountsAreUsed() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of(), Map.of("alpha", 2L), Map.of("alpha", 2L, "beta", 3L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofSeconds(2)))
+                    .containsEntry("alpha", 2L).containsEntry("beta", 3L);
+            assertThat(fixture.reads.get()).as("both earlier incomplete observations were read").isEqualTo(3);
+        }
+    }
+
+    @Test
+    void aPermanentlyMissingSelectedTableFailsWithTheLastSample() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(Map.of("alpha", 2L)))) {
+            assertThatThrownBy(() -> fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofMillis(200)))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("beta").hasMessageContaining("alpha=2");
+        }
+    }
+
+    @Test
+    void nonPositivePublicationBudgetsAreRejectedWithoutReadingMetrics() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(Map.of("alpha", 2L)))) {
+            for (Duration invalid : List.of(Duration.ZERO, Duration.ofNanos(-1))) {
+                assertThatThrownBy(() -> fixture.control.awaitSnapshotRowsRead(PIPELINE, Set.of("alpha"), invalid))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("positive");
+            }
+            assertThat(fixture.reads.get()).isZero();
+        }
+    }
+
+    @Test
+    void collidingTableNamesKeepTheirQualifiedKeysAndSeparateCounts() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of("left.orders", 2L), Map.of("left.orders", 2L, "right.orders", 5L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("left.orders", "right.orders")))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("left.orders", 2L, "right.orders", 5L));
+            assertThat(fixture.reads.get()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void aCompleteSampleIsReturnedBeforeALaterSampleCanRepairItsWrongCounts() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of("alpha", 2L, "beta", 99L), Map.of("alpha", 2L, "beta", 3L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofSeconds(2)))
+                    .containsEntry("beta", 99L);
+            assertThat(fixture.reads.get()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void onlyStartupStorageUnavailabilityIsPending() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            AtomicInteger reads = new AtomicInteger();
+            fixture.server.createContext("/api/storage/status", exchange -> {
+                int read = reads.incrementAndGet();
+                Map<String, String> reply = switch (read) {
+                    case 1 -> Map.of("code", "TS0210030");
+                    case 2 -> Map.of("code", io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE.code());
+                    default -> Map.of("businessPhase", "READY");
+                };
+                byte[] bytes = JsonWriter.write(reply).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(read < 3 ? 503 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThat(fixture.control.storageStatusDuringStartup()).isEmpty();
+            assertThatThrownBy(fixture.control::storageStatusDuringStartup)
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("503");
+            assertThat(fixture.control.storageStatusDuringStartup().orElseThrow().get("businessPhase"))
+                    .isEqualTo("READY");
+        }
+    }
+
+    @Test
+    void logLifetimeDeletionRetriesTheCurrentClaimFenceForTheSameArtifact() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            var deletes = new AtomicInteger();
+            var reads = new AtomicInteger();
+            String hash = "original-hash";
+            fixture.server.createContext("/api/artifacts/" + PIPELINE, exchange -> {
+                boolean deleting = exchange.getRequestMethod().equals("DELETE");
+                if (deleting && deletes.incrementAndGet() > 1) {
+                    exchange.sendResponseHeaders(204, -1);
+                    exchange.close();
+                    return;
+                }
+                if (!deleting) reads.incrementAndGet();
+                String body = deleting ? JsonWriter.write(Map.of("code", IoError.WORKLOAD_CLAIM_FENCED.code(),
+                        "params", Map.of(), "message", "rendered"))
+                        : JsonWriter.write(Map.of("id", PIPELINE, "kind", "pipeline",
+                                "canonicalForm", "fixture", "contentHash", hash));
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(deleting ? 500 : 200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+
+            PipelineLogLifetimeIT.deleteAtRest(fixture.control, PIPELINE, hash);
+            assertThat(deletes).hasValue(2);
+            assertThat(reads).hasValue(2);
+        }
+    }
+
+    @Test
+    void logLifetimeDeletionDoesNotRetryAnUnrelatedErrorMentioningTheClaimFence() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of())) {
+            var calls = new AtomicInteger();
+            fixture.server.createContext("/api/artifacts/" + PIPELINE, exchange -> {
+                calls.incrementAndGet();
+                byte[] bytes = JsonWriter.write(Map.of("code", IoError.STORE_UNAVAILABLE.code(),
+                        "message", "Earlier refusal: io.workload-claim-fenced / " + IoError.WORKLOAD_CLAIM_FENCED.code()))
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(500, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            assertThatThrownBy(() -> PipelineLogLifetimeIT.deleteAtRest(fixture.control, PIPELINE, "original-hash"))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining(IoError.STORE_UNAVAILABLE.code());
+            assertThat(calls).hasValue(1);
+        }
+    }
+
+    @Test
     void readsThePublishedState() {
         assertThat(ControlPlane.interpretState(200, status("RUNNING"), PIPELINE)).contains(PipelineState.RUNNING);
+    }
+
+    @Test
+    void doesNotTreatTheMergedDesiredStateAsARuntimeObservation() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "RUNNING",
+                "desiredState", "RUNNING",
+                "hasArtifact", true));
+
+        assertThat(ControlPlane.interpretState(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
+    void readsTheObservedStateFromTheMergedStatusProjection() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "PAUSED",
+                "desiredState", "RUNNING",
+                "observedState", "PAUSED",
+                "hasArtifact", true));
+
+        assertThat(ControlPlane.interpretState(200, body, PIPELINE)).contains(PipelineState.PAUSED);
+    }
+
+    @Test
+    void absentObservationTimeAndAgeAreEmptyOnAggregateStatus() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "NEW",
+                "displayState", "STARTING",
+                "desiredState", "RUNNING"));
+
+        assertThat(ControlPlane.interpretObservedAt(200, body, PIPELINE)).isEmpty();
+        assertThat(ControlPlane.interpretObservedAgeMillis(200, body, PIPELINE)).isEmpty();
+    }
+
+    @Test
+    void missingAgeRemainsUnknownEvenWhenTheStatusCarriesAnObservationTime() {
+        String body = JsonWriter.write(Map.of(
+                "pipelineId", PIPELINE,
+                "state", "RUNNING",
+                "observedAt", "2026-01-01T00:00:00Z"));
+
+        assertThat(ControlPlane.interpretObservedAt(200, body, PIPELINE))
+                .contains(java.time.Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(ControlPlane.interpretObservedAgeMillis(200, body, PIPELINE)).isEmpty();
     }
 
     @Test
@@ -103,7 +281,7 @@ class ControlPlaneTest {
         // failed two ways -- which is the ordinary case for anything that fails more than once.
         String body = JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of(
                 "errors.connector.write-failed", 2L,
-                "errors.engine.job-failed", 1L,
+                "errors.TS0440008", 1L,
                 "recordCount", 500L)));
 
         assertThat(ControlPlane.interpretErrorCount(200, body, PIPELINE)).contains(3L);
@@ -259,9 +437,9 @@ class ControlPlaneTest {
 
     @Test
     void readsAClientErrorAsTheRefusalItIs() {
-        assertThat(ControlPlane.interpretRefusal(400, coded("dsl.row-expression-type-unsupported"), "the batch"))
+        assertThat(ControlPlane.interpretRefusal(400, coded("TS0010021"), "the batch"))
                 .isEqualTo(new ControlPlane.Refusal(
-                        400, "dsl.row-expression-type-unsupported", Map.of("pipeline", PIPELINE)));
+                        400, "TS0010021", Map.of("pipeline", PIPELINE)));
     }
 
     /**
@@ -392,6 +570,41 @@ class ControlPlaneTest {
                 .hasMessageContaining("would not say why");
     }
 
+    private static final class SnapshotMetrics implements AutoCloseable {
+        final HttpServer server;
+        final AtomicInteger reads = new AtomicInteger();
+        final ControlPlane control;
+
+        SnapshotMetrics(List<Map<String, Long>> samples) throws Exception {
+            server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/", exchange -> {
+                Map<String, ?> body;
+                if (exchange.getRequestURI().getPath().equals("/auth/login")) {
+                    body = Map.of("token", "controlled-token");
+                } else {
+                    Map<String, Long> sample = samples.get(Math.min(reads.getAndIncrement(), samples.size() - 1));
+                    Map<String, Long> metrics = new java.util.LinkedHashMap<>();
+                    sample.forEach((table, count) -> metrics.put("snapshot.rows.read." + table, count));
+                    body = Map.of("metrics", metrics);
+                }
+                byte[] bytes = JsonWriter.write(body).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            try {
+                server.start();
+                control = new ControlPlane(URI.create("http://127.0.0.1:" + server.getAddress().getPort()));
+                control.login("test", "local-password");
+            } catch (RuntimeException | Error failure) {
+                try { server.stop(0); }
+                catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
+        }
+
+        @Override public void close() { server.stop(0); }
+    }
+
     /** A topology answer naming {@code nodeIds}, in the order given. */
     private static String topology(String... nodeIds) {
         List<Map<String, String>> members =
@@ -400,7 +613,8 @@ class ControlPlaneTest {
     }
 
     private static String status(String state) {
-        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", state));
+        return JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", state,
+                "displayState", state, "observedState", state));
     }
 
     private static String metrics(long errorCount) {

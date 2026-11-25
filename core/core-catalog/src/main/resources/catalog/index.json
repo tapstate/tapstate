@@ -1,6 +1,6 @@
 {
-  "specSha": "cc13816",
-  "capabilitySha": "f3bd43a",
+  "specSha": "ebdb247",
+  "capabilitySha": "cc13816",
   "entries": [
     "GitHub",
     "activemq",
@@ -22,6 +22,8 @@
     "csv",
     "custom",
     "databend",
+    "db2",
+    "db2i",
     "doris",
     "dummy",
     "dws",

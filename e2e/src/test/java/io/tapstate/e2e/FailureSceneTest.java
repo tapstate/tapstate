@@ -198,6 +198,11 @@ class FailureSceneTest {
         }
 
         @Override
+        public void startRefused(String pipelineId, String expectedCode) {
+            throw new UnsupportedOperationException("failure scenes do not submit commands");
+        }
+
+        @Override
         public void driveStream(String sourceId, StreamVerb verb) {
         }
 

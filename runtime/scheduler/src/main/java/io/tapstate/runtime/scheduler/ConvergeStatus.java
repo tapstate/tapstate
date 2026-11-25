@@ -9,6 +9,9 @@ public enum ConvergeStatus {
     /** There was nothing to converge: no desired intent, or no checkpoint to complete. */
     NOTHING_TO_DO,
 
+    /** An automatic replacement has yet to publish a live execution. */
+    RECOVERING,
+
     /**
      * The pass was fenced on every attempt and gave up within its retry bound, having been superseded
      * by another writer. Not an error — the next pass re-reads and retries.

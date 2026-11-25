@@ -46,6 +46,13 @@ public class TapstateException extends RuntimeException {
         return args;
     }
 
+    /** Copies this diagnostic with replacement arguments and no cause, preserving its stack trace. */
+    public TapstateException withoutCause(Map<String, Object> replacementArgs) {
+        TapstateException copy = new TapstateException(code, replacementArgs, null);
+        copy.setStackTrace(getStackTrace());
+        return copy;
+    }
+
     /**
      * Deterministic developer / log string: the canonical code, then the named arguments sorted
      * by key (so the same error always renders identically), or the bare code when there are none.

@@ -57,20 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - name: Mint the app token
-        id: token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
-          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
-
       - uses: actions/checkout@v4
-        with:
-          # Given to checkout as well as to the pull request step. With only the latter, the
-          # credentials checkout persisted are what pushes the branch, and a branch pushed by the
-          # default token triggers none of the required checks - a pull request that looks fine and
-          # can never merge.
-          token: ${{ steps.token.outputs.token }}
 
       - name: A JDK 17 for the connectors, whose pinned Lombok predates JDK 21
         # Their build dies mid-reactor under a newer JDK, on a javac internal that names nothing about
@@ -117,6 +104,16 @@ jobs:
             echo "changed=yes" >> "$GITHUB_OUTPUT"
             git diff --stat
           fi
+
+      - name: Mint the publication token
+        # App tokens expire after one hour; the rebuild can take up to three. Mint after the
+        # rebuild so the pull request action gets fresh credentials for both Git and the API.
+        if: steps.diff.outputs.changed == 'yes' && github.event_name != 'pull_request'
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
+          private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
 
       - name: Open the pull request
         # Not on a pull request: that run is here to prove the rebuild works, not to act on what it

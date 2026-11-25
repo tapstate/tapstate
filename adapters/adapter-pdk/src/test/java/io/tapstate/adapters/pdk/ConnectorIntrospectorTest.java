@@ -5,8 +5,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectorCapabilities;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.zip.ZipException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -59,6 +64,44 @@ class ConnectorIntrospectorTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code())
                         .isEqualTo(ConnectorError.SPEC_NOT_FOUND));
+    }
+
+    @Test
+    void refusesAnUnreadableSpecWithACodedArtifactError(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.annotatedConnector(dir);
+        ConnectorIntrospector introspector = new ConnectorIntrospector();
+        assertThat(introspector.introspect(List.of(jar)).spec()).isEqualTo("{\"id\":\"orders\"}");
+        corruptSpecStream(jar);
+
+        assertThatThrownBy(() -> introspector.introspect(List.of(jar)))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ConnectorError.ARTIFACT_UNREADABLE);
+                    assertThat(error.args()).containsEntry("artifact", jar.getFileName().toString());
+                    assertThat(error).hasCauseInstanceOf(ZipException.class);
+                    assertThat(error.getCause().getStackTrace())
+                            .anySatisfy(frame -> assertThat(frame.getMethodName()).isEqualTo("readSpec"));
+                });
+    }
+
+    private static void corruptSpecStream(Path jar) throws Exception {
+        byte[] archive = Files.readAllBytes(jar);
+        ByteBuffer headers = ByteBuffer.wrap(archive).order(ByteOrder.LITTLE_ENDIAN);
+        for (int offset = 0; offset + 30 <= archive.length; offset++) {
+            if (headers.getInt(offset) != 0x04034b50) {
+                continue;
+            }
+            int nameLength = Short.toUnsignedInt(headers.getShort(offset + 26));
+            int extraLength = Short.toUnsignedInt(headers.getShort(offset + 28));
+            int content = offset + 30 + nameLength + extraLength;
+            if (content < archive.length && new String(archive, offset + 30, nameLength,
+                    StandardCharsets.UTF_8).equals("orders-spec.json")) {
+                // A reserved DEFLATE block type makes only the spec unreadable; classes still scan and load.
+                archive[content] = 0x07;
+                Files.write(jar, archive);
+                return;
+            }
+        }
+        throw new AssertionError("the fixture carries no local spec entry");
     }
 
     @Test

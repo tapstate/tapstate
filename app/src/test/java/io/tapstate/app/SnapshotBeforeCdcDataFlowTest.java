@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -31,6 +32,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -83,9 +85,11 @@ class SnapshotBeforeCdcDataFlowTest {
     private static final String TABLE = "orders";
 
     private HazelcastInstance member;
+    private InMemorySrsLogStore log;
 
     @BeforeEach
     void startMember() {
+        log = new InMemorySrsLogStore();
         Config config = new Config();
         config.setClusterName("snapshot-before-cdc-test-" + System.nanoTime());
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -98,7 +102,9 @@ class SnapshotBeforeCdcDataFlowTest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -129,13 +135,14 @@ class SnapshotBeforeCdcDataFlowTest {
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
-        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
                 new SourceTable(TABLE, List.of(new SourceField("id", "INT")), List.of("id"), List.of())))));
 
         // Make the member SRS-capable, sink-capable and snapshot-capable, exactly as the assembly root does.
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         ConnectorProvisioner provisioner = connectorId -> {
             throw new UnsupportedOperationException("not resolved by this data-flow test");
         };
@@ -167,10 +174,13 @@ class SnapshotBeforeCdcDataFlowTest {
             actuator.stop(PIPELINE, true);
         }
 
-        // The load-bearing assertion: the three snapshot reads (op r) arrive first, in buffered order, then the
-        // two cdc inserts (op i), in change order. Exact order proves all snapshot precedes all cdc AND that the
-        // content is snapshot union cdc, all through the one transform-to-sink chain.
-        assertThat(arrived).containsExactly("r|100", "r|101", "r|102", "i|0", "i|1");
+        // The load-bearing assertion: the three snapshot reads (op r) arrive first, then the two cdc inserts
+        // (op i) - all snapshot before any cdc, and the content snapshot union cdc, through the one
+        // transform-to-sink chain. The sink runs several writers, so neither group arrives in any order of its
+        // own: a table's snapshot rows are spread over every writer, and the two changes are of different keys.
+        assertThat(arrived).hasSize(5);
+        assertThat(arrived.subList(0, 3)).containsExactlyInAnyOrder("r|100", "r|101", "r|102");
+        assertThat(arrived.subList(3, 5)).containsExactlyInAnyOrder("i|0", "i|1");
     }
 
     private static Envelope snapshot(int id) {

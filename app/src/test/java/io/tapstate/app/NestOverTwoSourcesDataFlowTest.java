@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -14,6 +15,11 @@ import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -32,12 +38,17 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
+import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -56,6 +67,7 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Duration;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -63,6 +75,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.OptionalLong;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -70,6 +86,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * The data-flow proof for a nest started end to end over two sources: two single-table capture units fill
@@ -100,9 +118,15 @@ class NestOverTwoSourcesDataFlowTest {
     private static final String EMBED_PATH = "items";
 
     private HazelcastInstance member;
+    private InMemorySrsLogStore log;
+    private PipelineCaptureCoordinator coordinator;
+    private FakeSource source;
+    private CountDownLatch captureCompletion;
+    private HazelcastExecutionPlans plans;
 
     @BeforeEach
     void startMember() {
+        log = new InMemorySrsLogStore();
         Config config = new Config();
         config.setClusterName("nest-two-source-test-" + System.nanoTime());
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -115,7 +139,9 @@ class NestOverTwoSourcesDataFlowTest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -161,6 +187,33 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /**
+     * A nest reading what a nest with nothing to assemble passed on takes those rows as it would take the root's
+     * own: each still sits where it sat on its own stream, which is what a nest orders every row it keeps by. Moved
+     * under the first nest's name on the way, a row would sit nowhere, and the second nest would fail the run on the
+     * first of them.
+     */
+    @Test
+    @DisplayName("a nest assembles the rows a nest with nothing to assemble passed on to it")
+    void aNestAssemblesWhatANestWithNothingToAssemblePassedOn() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_AND_CDC, pipelineAfterAPassThrough());
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+
+        actuator.start(PIPELINE);
+        List<Map<String, Object>> documents;
+        try {
+            awaitAssembled("order-1");
+            documents = List.copyOf(CapturingSinkWriter.collected());
+        } finally {
+            stopQuietly(actuator);
+        }
+
+        Map<Object, Map<String, Object>> latest = latestPerRoot(documents);
+        assertThat(latest.keySet()).containsExactlyInAnyOrder(1L, 2L);
+        assertThat(elementsOf(latest.get(1L))).hasSize(3);
+        assertThat(elementsOf(latest.get(2L))).hasSize(1);
+    }
+
+    /**
      * Mutation evidence: forwarding the drain unchanged fails before the first document with "no order";
      * pinning every run to generation one lets the first half pass and makes the second await time out with
      * an empty sink. The snapshot-and-cdc sibling above stays green under both mutations.
@@ -188,7 +241,7 @@ class NestOverTwoSourcesDataFlowTest {
             awaitAssembled("order-1");
             Job job = member.getJet().getJob(PIPELINE);
             assertThat(job).isNotNull();
-            assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+            awaitCompleted(job);
             assertThat(store.meta().miningChainIdsWithConsumer(PIPELINE))
                     .describedAs("an ordering generation is not a durable change-chain position")
                     .isEmpty();
@@ -199,7 +252,7 @@ class NestOverTwoSourcesDataFlowTest {
             CapturingSinkWriter.reset();
             actuator.start(PIPELINE);
             awaitAssembled("order-1");
-            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+            awaitCompleted(member.getJet().getJob(PIPELINE));
         } finally {
             stopQuietly(actuator);
         }
@@ -231,7 +284,7 @@ class NestOverTwoSourcesDataFlowTest {
             awaitAssembled("order-1-after-stop");
             assertThat(latestPerRoot(new ArrayList<>(CapturingSinkWriter.collected())).get(1L))
                     .containsEntry("name", "order-1-after-stop");
-            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+            awaitCompleted(member.getJet().getJob(PIPELINE));
         } finally {
             stopQuietly(actuator);
         }
@@ -286,6 +339,206 @@ class NestOverTwoSourcesDataFlowTest {
 
     // ---- the pipeline under test ------------------------------------------------------
 
+    @Test
+    void snapshotOnlyWaitsForTargetSettlementThenCompletesAndKeepsItsFinalProgress() throws Exception {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        CapturingSinkWriter.settlement = new CompletableFuture<>();
+        ObservationPublisher publisher = new ObservationPublisher(store.state(), store.observations(),
+                id -> OptionalLong.empty(), id -> Map.of(), coordinator::snapshotProgress);
+        PipelineConverger converger = new PipelineConverger(store.desired(), store.state(), actuator,
+                Clock.systemUTC(), RebuildAdmission.never(), publisher::publish);
+        store.desired().save(new DesiredState(PIPELINE, PipelineState.RUNNING, "test"));
+        converger.converge(PIPELINE);
+        try {
+            awaitPendingWrite();
+            assertThat(coordinator.snapshotProgress(PIPELINE).byTable().values())
+                    .hasSize(2).allMatch(reading -> !reading.landed());
+            assertThat(actuator.completed(PIPELINE)).as("reading every row is not target settlement").isFalse();
+            converger.converge(PIPELINE);
+            assertThat(store.state().read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.RUNNING));
+            CapturingSinkWriter.settlement.complete(null);
+            awaitCompleted(member.getJet().getJob(PIPELINE));
+            awaitAssembled("order-1");
+
+            converger.converge(PIPELINE);
+            publisher.publish(PIPELINE);
+            long completedJob = member.getJet().getJob(PIPELINE).getId();
+            assertThat(store.state().read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.COMPLETED));
+            assertThat(coordinator.isCapturing(PIPELINE)).isFalse();
+            assertThat(plans.current(List.of(PIPELINE))).isEmpty();
+            assertThat(plans.last(PIPELINE)).isNotNull();
+            assertThat(store.observations().read(PIPELINE).orElseThrow().snapshot())
+                    .containsEntry(PARENT_TABLE, new TableSnapshot(2, 2L, 100, true))
+                    .containsEntry(CHILD_TABLE, new TableSnapshot(4, 4L, 100, true));
+            converger.converge(PIPELINE);
+            new ObservationPublisher(store.state(), store.observations()).publish(PIPELINE);
+            assertThat(member.getJet().getJob(PIPELINE).getId()).isEqualTo(completedJob);
+            assertThat(store.observations().read(PIPELINE).orElseThrow().snapshot()).hasSize(2);
+        } finally {
+            CapturingSinkWriter.settlement.complete(null);
+            stopQuietly(actuator);
+        }
+    }
+
+    @Test
+    void aFailedSnapshotTargetNeverBecomesACompletedOrLandedRun() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        CapturingSinkWriter.settlement = new CompletableFuture<>();
+        PipelineConverger converger = new PipelineConverger(store.desired(), store.state(), actuator,
+                Clock.systemUTC());
+        store.desired().save(new DesiredState(PIPELINE, PipelineState.RUNNING, "test"));
+        converger.converge(PIPELINE);
+        try {
+            awaitPendingWrite();
+            CapturingSinkWriter.settlement.completeExceptionally(new IllegalStateException("test target refused"));
+            Job job = member.getJet().getJob(PIPELINE);
+            try {
+                job.getFuture().get(20, TimeUnit.SECONDS);
+                throw new AssertionError("a refused target write must fail the job");
+            } catch (java.util.concurrent.ExecutionException expected) {
+                assertThat(job.getStatus()).isEqualTo(JobStatus.FAILED);
+            } catch (Exception unexpected) {
+                throw new AssertionError(unexpected);
+            }
+            assertThat(actuator.completed(PIPELINE)).isFalse();
+            assertThat(coordinator.snapshotProgress(PIPELINE).byTable().values())
+                    .allMatch(reading -> !reading.landed());
+            converger.converge(PIPELINE);
+            assertThat(store.state().read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.FAILED));
+        } finally {
+            stopQuietly(actuator);
+        }
+    }
+
+    private void awaitPendingWrite() {
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (CapturingSinkWriter.collected().isEmpty() && System.nanoTime() < deadline) {
+            sleep();
+        }
+        assertThat(CapturingSinkWriter.collected()).isNotEmpty();
+    }
+
+    @Test
+    void aSuccessfulJobWaitsForCaptureBookkeepingWithoutStartingAnotherSnapshot() throws Exception {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        captureCompletion = new CountDownLatch(1);
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        PipelineConverger converger = new PipelineConverger(store.desired(), store.state(), actuator,
+                Clock.systemUTC());
+        store.desired().save(new DesiredState(PIPELINE, PipelineState.RUNNING, "test"));
+        converger.converge(PIPELINE);
+        try {
+            Job job = member.getJet().getJob(PIPELINE);
+            awaitCompleted(job);
+            assertThat(actuator.completed(PIPELINE)).isFalse();
+            converger.converge(PIPELINE);
+            assertThat(member.getJet().getJob(PIPELINE).getId()).isEqualTo(job.getId());
+            assertThat(store.state().read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.RUNNING));
+            captureCompletion.countDown();
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (!actuator.completed(PIPELINE) && System.nanoTime() < deadline) {
+                sleep();
+            }
+            converger.converge(PIPELINE);
+            assertThat(store.state().read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.COMPLETED));
+            assertThat(member.getJet().getJob(PIPELINE).getId()).isEqualTo(job.getId());
+        } finally {
+            captureCompletion.countDown();
+            stopQuietly(actuator);
+        }
+    }
+
+    @Test
+    void completingAnOldSubmissionNeverCancelsAReplacementWithTheSamePipelineName() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        actuator.start(PIPELINE);
+        try {
+            Job old = member.getJet().getJob(PIPELINE);
+            awaitCompleted(old);
+            new Engine(member).submit(PIPELINE, new IdleDagSource().dagFor(PIPELINE));
+            Job replacement = member.getJet().getJob(PIPELINE);
+            assertThat(replacement.getId()).isNotEqualTo(old.getId());
+            actuator.complete(PIPELINE);
+            assertThat(actuator.completed(PIPELINE)).isFalse();
+            assertThat(replacement.getStatus().isTerminal()).isFalse();
+        } finally {
+            stopQuietly(actuator);
+        }
+    }
+
+    @Test
+    void anOldCompletionCannotRemoveAReplacementExecutionPlan() {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_ONLY);
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        actuator.start(PIPELINE);
+        try {
+            awaitCompleted(member.getJet().getJob(PIPELINE));
+            ExecutionPlan old = plans.last(PIPELINE);
+            ExecutionPlan replacement = new ExecutionPlan(PIPELINE, old.claimGeneration(), old.executionGeneration(),
+                    old.topologyRevision(), old.members(), old.nodes(), old.plannedAt().plusSeconds(1));
+            plans.record(replacement);
+            actuator.complete(PIPELINE);
+            assertThat(plans.current(List.of(PIPELINE))).containsEntry(PIPELINE, replacement);
+            assertThat(plans.last(PIPELINE)).isEqualTo(replacement);
+        } finally {
+            stopQuietly(actuator);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void snapshotAndCdcKeepsTailingAfterLandingAndAnArtifactEditCannotMakeItBounded(boolean srs)
+            throws InterruptedException {
+        InMemoryStorePort store = seedStore(ReadMode.SNAPSHOT_AND_CDC);
+        PipelineResource pipeline = pipeline(ReadMode.SNAPSHOT_AND_CDC);
+        store.artifacts().save(new PipelineResource(pipeline.id(), pipeline.metadata(),
+                List.of(SourceRef.spec(PARENT_SOURCE, srs), SourceRef.spec(CHILD_SOURCE, srs)),
+                pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental()));
+        LifecycleActuator actuator = wireRuntime(store, new SrsCoordinator(store.meta()));
+        actuator.start(PIPELINE);
+        try {
+            awaitAssembled("order-1");
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (!coordinator.snapshotProgress(PIPELINE).byTable().values().stream().allMatch(TableSnapshot::landed)
+                    && System.nanoTime() < deadline) {
+                sleep();
+            }
+            assertThat(coordinator.snapshotProgress(PIPELINE).byTable().values())
+                    .hasSize(2).allMatch(TableSnapshot::landed);
+            Thread.sleep(300);
+            long job = member.getJet().getJob(PIPELINE).getId();
+            store.artifacts().save(pipeline(ReadMode.SNAPSHOT_ONLY));
+            assertThat(actuator.completed(PIPELINE)).isFalse();
+            source.listeners.get(PARENT_TABLE).onBatch(List.of(Envelope.update(100L, PARENT_TABLE,
+                    Map.of("id", 1L, "name", "order-1"),
+                    Map.of("id", 1L, "name", "after-idle"), Map.of())),
+                    Optional.of(new SourcePosition("after-idle")));
+            awaitAssembled("after-idle");
+            assertThat(member.getJet().getJob(PIPELINE).getId()).isEqualTo(job);
+            assertThat(member.getJet().getJob(PIPELINE).getStatus()).isEqualTo(JobStatus.RUNNING);
+            assertThat(actuator.completed(PIPELINE)).isFalse();
+        } finally {
+            stopQuietly(actuator);
+        }
+    }
+
+    private static void awaitCompleted(Job job) {
+        try {
+            job.getFuture().get(20, TimeUnit.SECONDS);
+        } catch (Exception failure) {
+            throw new AssertionError("bounded job did not complete: " + job.getStatus(), failure);
+        }
+        assertThat(job.getStatus()).isEqualTo(JobStatus.COMPLETED);
+    }
+
     /**
      * The runtime around the seeded store: one fake connector serving both capture units, the real capture
      * coordinator and store-backed topology, and a sink bound to a capturing writer. Everything between is
@@ -301,6 +554,7 @@ class NestOverTwoSourcesDataFlowTest {
             Map<String, List<Envelope>> rowsByTable) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         member.getUserContext().put(PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY,
                 (ConnectorProvisioner) connectorId -> {
                     throw new UnsupportedOperationException("not resolved by this data-flow test");
@@ -310,16 +564,38 @@ class NestOverTwoSourcesDataFlowTest {
 
         // One fake connector for both capture units, telling them apart by the stream each asks for -
         // which is what a single-table capture unit names.
-        CaptureRunUnit captureRunUnit =
-                new CaptureRunUnit(new FakeSource(rowsByTable), srsCoordinator, meta, member);
-        PipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
-                store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+        source = new FakeSource(rowsByTable);
+        CaptureRunUnit captureRunUnit = new CaptureRunUnit(source, srsCoordinator, meta, member);
+        CaptureStarter starter = captureCompletion == null ? captureRunUnit::start
+                : (spec, handoff) -> captureRunUnit.begin(spec, new CaptureHandoff() {
+                    @Override
+                    public void accept(Envelope event) {
+                        handoff.accept(event);
+                    }
+
+                    @Override
+                    public void loaded(String table) {
+                        handoff.loaded(table);
+                        try {
+                            if (!captureCompletion.await(20, TimeUnit.SECONDS)) {
+                                throw new AssertionError("capture bookkeeping was never released");
+                            }
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        }
+                    }
+                });
+        coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, srsCoordinator, snapshotBuffer);
 
         StoreBackedDagSource.SinkWriterBinder capturingSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
+        plans = new HazelcastExecutionPlans(member);
         return new EngineLifecycleActuator(
                 new Engine(member), new StoreBackedDagSource(store, capturingSink), coordinator,
-                new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
+                new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()),
+                PipelineActuationOwnership.single(), plans, Clock.systemUTC());
     }
 
     private static Map<String, List<Envelope>> snapshotRows() {
@@ -330,19 +606,23 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /** The two sources, the sink connection and the nest pipeline, plus a discovered model for each source. */
-    private static InMemoryStorePort seedStore() {
+    private InMemoryStorePort seedStore() {
         return seedStore(ReadMode.SNAPSHOT_AND_CDC);
     }
 
-    private static InMemoryStorePort seedStore(ReadMode readMode) {
+    private InMemoryStorePort seedStore(ReadMode readMode) {
+        return seedStore(readMode, pipeline(readMode));
+    }
+
+    private InMemoryStorePort seedStore(ReadMode readMode, PipelineResource pipeline) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
 
-        artifacts.save(pipeline(readMode));
+        artifacts.save(pipeline);
 
-        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         // Both models are discovered: the parent's resolves the target the sink writes, and each supplies
         // the key an embed falls back on when it declares no arrayKey of its own.
         store.schemas().save(discovered(PARENT_SOURCE,
@@ -372,6 +652,28 @@ class NestOverTwoSourcesDataFlowTest {
                 new ServeBlock.Inline(null, FromRef.literal(STEP),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, readMode, "earliest"), null);
+    }
+
+    /**
+     * The same documents, assembled by a nest whose root reads a nest with nothing to assemble over the orders,
+     * rather than the orders themselves.
+     */
+    private static PipelineResource pipelineAfterAPassThrough() {
+        Step pass = Step.inline("pass", FromClause.aliases(Map.of("c", FromRef.literal(PARENT_TABLE))),
+                new TransformBody.Nest(null, null, new NestRoot("c", List.of("id"), null, null, List.of())), null);
+        Embed item = new Embed("i", Map.of("order_id", "id"), EmbedAs.ARRAY, EMBED_PATH, List.of("id"),
+                null, null, null);
+        Map<String, FromRef> aliases = new LinkedHashMap<>();
+        aliases.put("p", FromRef.literal("pass"));
+        aliases.put("i", FromRef.literal(CHILD_TABLE));
+        Step step = Step.inline(STEP, FromClause.aliases(aliases),
+                new TransformBody.Nest(null, null, new NestRoot("p", List.of("id"), null, null, List.of(item))), null);
+        return new PipelineResource(PIPELINE, null,
+                List.of(SourceRef.spec(PARENT_SOURCE, true), SourceRef.spec(CHILD_SOURCE, true)),
+                List.of(pass, step), null,
+                new ServeBlock.Inline(null, FromRef.literal(STEP),
+                        List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null);
     }
 
     private static SourceResource source(String id, String table) {
@@ -486,6 +788,7 @@ class NestOverTwoSourcesDataFlowTest {
     private static final class FakeSource implements CapturePort {
 
         private final Map<String, List<Envelope>> rowsByTable;
+        private final Map<String, CaptureListener> listeners = new ConcurrentHashMap<>();
 
         FakeSource(Map<String, List<Envelope>> rowsByTable) {
             this.rowsByTable = rowsByTable;
@@ -498,8 +801,7 @@ class NestOverTwoSourcesDataFlowTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-            // Nothing changes after the snapshot: what is under test is that the rows already there
-            // assemble, which is exactly what the real two-source witness seeds.
+            config.streams().forEach(table -> listeners.put(table, listener));
             return () -> { };
         }
 
@@ -553,6 +855,7 @@ class NestOverTwoSourcesDataFlowTest {
     private static final class CapturingSinkWriter implements SinkWriter {
 
         private static final Queue<Map<String, Object>> COLLECTED = new ConcurrentLinkedQueue<>();
+        private static volatile CompletableFuture<Void> settlement;
 
         static Queue<Map<String, Object>> collected() {
             return COLLECTED;
@@ -560,6 +863,7 @@ class NestOverTwoSourcesDataFlowTest {
 
         static void reset() {
             COLLECTED.clear();
+            settlement = null;
         }
 
         @Override
@@ -569,7 +873,9 @@ class NestOverTwoSourcesDataFlowTest {
                     COLLECTED.add(record.after());
                 }
             }
-            return CompletableFuture.completedFuture(new WriteResult(records.size()));
+            CompletableFuture<Void> pending = settlement;
+            return pending == null ? CompletableFuture.completedFuture(new WriteResult(records.size()))
+                    : pending.thenApply(ignored -> new WriteResult(records.size()));
         }
 
         @Override

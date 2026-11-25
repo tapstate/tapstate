@@ -315,7 +315,7 @@
   ],
   "provenance": {
     "specPath": "connectors/starrocks-connector/src/main/resources/spec_starrocks.json",
-    "specContentHash": "1931a8891569f505",
+    "specContentHash": "8177fc92542cc696",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

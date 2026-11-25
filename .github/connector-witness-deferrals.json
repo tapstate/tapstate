@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "issue": "https://github.com/tapstate/tapstate/issues/702",
+  "reason": "External managed Atlas acceptance is deferred until controlled fixtures have adequate capacity and both URI secrets are configured. This does not establish managed Atlas acceptance.",
+  "classes": [
+    "io.tapstate.e2e.CloudAtlasObservabilityRecoveryIT",
+    "io.tapstate.e2e.RealAtlasSourceHttpIT",
+    "io.tapstate.e2e.RealAtlasToAtlasPipelineIT",
+    "io.tapstate.e2e.RealMySqlToAtlasPipelineIT"
+  ]
+}

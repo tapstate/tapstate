@@ -99,10 +99,11 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
         FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,amount\n1,12\n");
 
         Set<HazelcastInstance> runningBefore = Hazelcast.getAllHazelcastInstances();
-        try (InProcessServer server = InProcessServer.start(SharedMongo.replicaSetUrl("engine_out_of_memory"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                InProcessServer server = InProcessServer.startPrepared(storage)) {
             HazelcastInstance engine = theMemberThisServerStarted(runningBefore);
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(E2eConnectorJar.buildInto(jars)));
             control.apply(Map.of(
                     "src_file.tap.yml", sourceYaml(source),

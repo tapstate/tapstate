@@ -3,6 +3,26 @@
   "$id": "https://tapstate.io/schema/tapstate/v1.json",
   "$ref": "#/$defs/Resource",
   "$defs": {
+    "BatchSpec": {
+      "type": "object",
+      "description": "The batch a node forms: at most max_records rows, closed early once max_wait has passed since its first row.",
+      "properties": {
+        "max_records": {
+          "description": "The most rows one batch holds, from 1 to 65536.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "default": 1024
+        },
+        "max_wait": {
+          "description": "How long a batch may wait for more rows after its first one: a whole number followed by ms, s or m, at most 60s. 0ms means no waiting.",
+          "type": "string",
+          "pattern": "^(?:(?:[0-9]|[1-9][0-9]{1,3}|[1-5][0-9]{4}|60000)ms|(?:[0-9]|[1-5][0-9]|60)s|[01]m)$",
+          "default": "0ms"
+        }
+      },
+      "additionalProperties": false
+    },
     "DdlPolicy": {
       "type": "string",
       "description": "How the sink reacts to incoming schema-change (DDL) events; defaults to fail to avoid silent drift.",
@@ -37,11 +57,11 @@
           }
         },
         "as": {
-          "description": "How matched child rows contribute under the parent: an array, an object, or flat fields.",
+          "description": "How matched child rows contribute under the parent: an array, an object, flat fields, or only the rollup fields computed over them.",
           "$ref": "#/$defs/EmbedAs"
         },
         "path": {
-          "description": "Target field path for array and object embeds. Flat embeds must omit it.",
+          "description": "Target field path for array and object embeds. Flat and rollup embeds must omit it.",
           "type": "string"
         },
         "key": {
@@ -71,6 +91,23 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Embed"
+          }
+        },
+        "rollup": {
+          "description": "Fields computed over this embed's live elements and written on its parent, keyed by field name. Allowed on array and rollup embeds; a rollup embed must declare at least one.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RollupField"
+          }
+        },
+        "orOn": {
+          "description": "Further ways to match the child row, each mapping child fields to parent fields like on. They are tried in order after on, and the first one that matches a live row supplies the child. Only for an embed that points at one shared row (many to one).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         }
       },
@@ -106,13 +143,48 @@
                     "arrayKey"
                   ]
                 }
+              },
+              {
+                "not": {
+                  "required": [
+                    "rollup"
+                  ]
+                }
               }
             ]
           },
           "else": {
-            "required": [
-              "path"
-            ]
+            "if": {
+              "properties": {
+                "as": {
+                  "const": "rollup"
+                }
+              },
+              "required": [
+                "as"
+              ]
+            },
+            "then": {
+              "allOf": [
+                {
+                  "not": {
+                    "required": [
+                      "path"
+                    ]
+                  }
+                },
+                {
+                  "required": [
+                    "rollup"
+                  ]
+                }
+              ]
+            },
+            "else": {
+              "required": [
+                "path"
+              ]
+            }
           }
         }
       ],
@@ -120,7 +192,7 @@
     },
     "EmbedAs": {
       "type": "string",
-      "description": "How a nested child contributes to its parent: as an array, an object, or fields merged in place.",
+      "description": "How a nested child contributes to its parent: as an array, an object, fields merged in place, or only through the rollup fields computed over it.",
       "oneOf": [
         {
           "const": "array",
@@ -133,6 +205,10 @@
         {
           "const": "flat",
           "description": "One-to-one or many-to-one relationship: the matched row's fields are merged into the parent."
+        },
+        {
+          "const": "rollup",
+          "description": "One-to-many relationship whose rows are kept only to compute the embed's rollup fields; no array is rendered."
         }
       ]
     },
@@ -153,6 +229,23 @@
           "description": "Stop the pipeline and report the failure."
         }
       ]
+    },
+    "ExecutionSpec": {
+      "type": "object",
+      "description": "How one pipeline node runs: its target total parallelism across the cluster and the batch it works in.",
+      "properties": {
+        "parallelism": {
+          "description": "Target total number of processors for this node across the whole cluster, from 1 to 1024. Omitted means the node type's default: 1 for sources and transforms, 4 for view and serve.sync sinks.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "batch": {
+          "description": "The batch this node forms before handing its rows on or writing them out.",
+          "$ref": "#/$defs/BatchSpec"
+        }
+      },
+      "additionalProperties": false
     },
     "FieldRule": {
       "description": "One field projection rule: rename a source field, drop a field, set a literal value, or compute a value from a CEL expression."
@@ -190,7 +283,7 @@
     },
     "Metadata": {
       "type": "object",
-      "description": "Optional annotation block: labels plus a free-text description. Never carries identity.",
+      "description": "Optional metadata: labels, description, and server-managed provenance. Never carries resource identity.",
       "properties": {
         "labels": {
           "description": "Arbitrary key/value labels attached to the resource for grouping and selection.",
@@ -201,6 +294,14 @@
         },
         "description": {
           "description": "Free-text description of the resource; never identity.",
+          "type": "string"
+        },
+        "cloud": {
+          "description": "Server-managed marker carried by resources created in a managed Cloud Cluster.",
+          "type": "boolean"
+        },
+        "user_id": {
+          "description": "Server-managed stable user id of the authenticated creator, when one is known.",
           "type": "string"
         }
       },
@@ -517,6 +618,102 @@
         }
       ]
     },
+    "RollupField": {
+      "type": "object",
+      "description": "A value computed over the live elements of this embed and written on its parent, beside the embed's path. Exactly one function is given.",
+      "properties": {
+        "count": {
+          "description": "Counts elements: true counts every element that passes the filter, an expression counts its non-null values."
+        },
+        "count_distinct": {
+          "description": "Counts the distinct non-null values of an expression.",
+          "type": "string"
+        },
+        "sum": {
+          "description": "Sums a numeric expression. Integer and decimal sums are exact or refused with a code.",
+          "type": "string"
+        },
+        "avg": {
+          "description": "Averages a numeric expression. An integer or decimal argument gives a decimal rounded half-even.",
+          "type": "string"
+        },
+        "min": {
+          "description": "The smallest value of a numeric, string or temporal expression.",
+          "type": "string"
+        },
+        "max": {
+          "description": "The largest value of a numeric, string or temporal expression.",
+          "type": "string"
+        },
+        "first": {
+          "description": "The value of the element with the smallest ordering.",
+          "$ref": "#/$defs/RollupPick"
+        },
+        "last": {
+          "description": "The value of the element with the greatest ordering.",
+          "$ref": "#/$defs/RollupPick"
+        },
+        "filter": {
+          "description": "A predicate: an element contributes to this field only while it holds.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Converts the result exactly to another type, refusing a conversion that is not exact.",
+          "$ref": "#/$defs/RollupResultType"
+        },
+        "default": {
+          "description": "The value rendered when no element contributes. It never replaces the null a missing reference gives."
+        }
+      },
+      "additionalProperties": false
+    },
+    "RollupPick": {
+      "type": "object",
+      "description": "Picks one element by an ordering and reads a value from it.",
+      "properties": {
+        "value": {
+          "description": "The value read from the chosen element: a $column or an =expression.",
+          "type": "string"
+        },
+        "by": {
+          "description": "The ordering: one $column or =expression, or a list compared left to right where a later entry only breaks ties of the earlier ones. An element whose ordering has a null is not a candidate.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "by"
+      ],
+      "additionalProperties": false
+    },
+    "RollupResultType": {
+      "type": "string",
+      "description": "The type a rollup field's result is converted to. The conversion must be exact; a value it would round, truncate or overflow is refused with a code.",
+      "oneOf": [
+        {
+          "const": "int64",
+          "description": "A 64-bit integer. A decimal converts only when it is integral and fits."
+        },
+        {
+          "const": "decimal",
+          "description": "An exact decimal. An integer always converts."
+        },
+        {
+          "const": "double",
+          "description": "A binary floating-point number, rounded as binary floating point rounds. Only on request."
+        }
+      ]
+    },
     "ServeBlock": {
       "description": "The publish surface of a pipeline: either an inline serve definition or a reference to a reusable serve body.",
       "oneOf": [
@@ -707,7 +904,7 @@
       ]
     },
     "SourceRef": {
-      "description": "A source this pipeline reads from: a bare source id, or an object carrying its srs switch.",
+      "description": "A source this pipeline reads from: a bare source id or a reference with local settings.",
       "oneOf": [
         {
           "type": "string"
@@ -719,20 +916,28 @@
     },
     "SourceRef.Spec": {
       "type": "object",
-      "description": "A source reference carrying this pipeline's own srs switch for that source.",
+      "description": "A source reference with optional Pipeline-owned settings.",
       "properties": {
         "id": {
           "description": "Id of the source this pipeline reads from.",
           "type": "string"
         },
         "srs": {
-          "description": "Whether this pipeline reads that source through the shared replay store. Materialized from the source on first apply, and only follows this file after.",
+          "description": "Whether this pipeline reads that source through the shared replay store. Materialized on apply when omitted.",
           "type": "boolean"
+        },
+        "nodeConfig": {
+          "description": "Connector node parameters for this Pipeline. Omitted fields inherit from the Source.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "as": {
+          "description": "Pipeline-local input name used in from references.",
+          "type": "string"
         }
       },
       "required": [
-        "id",
-        "srs"
+        "id"
       ],
       "additionalProperties": false
     },
@@ -779,6 +984,10 @@
         "srs": {
           "description": "Shared Record Store configuration; only valid on cdc sources.",
           "$ref": "#/$defs/Srs"
+        },
+        "execution": {
+          "description": "How this source is read: its target total parallelism (one processor reads a source today, whatever is written) and the batch it hands rows on in.",
+          "$ref": "#/$defs/ExecutionSpec"
         },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
@@ -859,6 +1068,10 @@
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
         },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
+        },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",
           "type": "object",
@@ -891,6 +1104,10 @@
         "from": {
           "description": "The upstream steps or sources this transform reads from.",
           "$ref": "#/$defs/FromClause"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         }
       },
       "required": [
@@ -997,6 +1214,10 @@
           "description": "Treatment of existing target rows before a new full load; resume, recovery and CDC-only never clear rows.",
           "$ref": "#/$defs/OnFullLoad",
           "default": "append"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         }
       },
       "required": [
@@ -1062,8 +1283,50 @@
           "$ref": "#/$defs/TransformBody.Nest"
         },
         {
+          "$ref": "#/$defs/TransformBody.Aggregate"
+        },
+        {
           "$ref": "#/$defs/TransformBody.Join"
         }
+      ]
+    },
+    "TransformBody.Aggregate": {
+      "type": "object",
+      "description": "Groups the rows of one input and keeps one output row per group, with fields computed over the group's rows.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "aggregate"
+        },
+        "key": {
+          "description": "The columns that identify one input row. Absent uses the input's primary key; required when the input has none.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "where": {
+          "description": "A predicate over the input row: a row that fails it belongs to no group, and a row that stops passing it leaves its group.",
+          "type": "string"
+        },
+        "groupBy": {
+          "description": "Output key fields by name, each a $column or an =expression over the input row; declared order is the order of the output key. Absent or empty gives one group holding every row.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "fields": {
+          "description": "Output fields by name, each one function over the group's rows.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RollupField"
+          }
+        }
+      },
+      "required": [
+        "type",
+        "fields"
       ]
     },
     "TransformBody.Filter": {
@@ -1134,16 +1397,31 @@
           "const": "map"
         },
         "fields": {
-          "description": "Output fields keyed by name, each mapped by a field rule; declared order is the output order.",
+          "description": "Output fields keyed by name, each mapped by a field rule; declared order is the output order. Required unless soft_delete is set.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/FieldRule"
           }
+        },
+        "soft_delete": {
+          "description": "Name of a boolean column marking deleted rows. A delete becomes an update of the last row image with this column set to true, and every other row carries it as false. Absent leaves deletes as deletes.",
+          "type": "string"
         }
       },
       "required": [
-        "type",
-        "fields"
+        "type"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "fields"
+          ]
+        },
+        {
+          "required": [
+            "soft_delete"
+          ]
+        }
       ]
     },
     "TransformBody.Nest": {
@@ -1225,6 +1503,11 @@
         "element_type": {
           "description": "Declared type of the expanded column; absent leaves the connector to infer one.",
           "type": "string"
+        },
+        "source_id_field": {
+          "description": "Field preserving the original parent identifier when the target requires a separate generated row identity. Used only when identity adaptation is needed.",
+          "type": "string",
+          "default": "_unwind_source_id"
         }
       },
       "required": [
@@ -1300,6 +1583,20 @@
         "storage": {
           "description": "Storage backend used to persist this view.",
           "$ref": "#/$defs/Storage"
+        },
+        "write_mode": {
+          "description": "How rows are written to the view — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         }
       },
       "required": [
@@ -1359,6 +1656,20 @@
         "storage": {
           "description": "Where and how the view's data is materialized.",
           "$ref": "#/$defs/Storage"
+        },
+        "write_mode": {
+          "description": "How rows are written to the view — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
+        },
+        "execution": {
+          "description": "How this node runs: its target total parallelism across the cluster and its batch.",
+          "$ref": "#/$defs/ExecutionSpec"
         },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",

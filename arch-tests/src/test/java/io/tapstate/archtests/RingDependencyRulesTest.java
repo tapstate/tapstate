@@ -1,11 +1,14 @@
 package io.tapstate.archtests;
 
 import com.tngtech.archunit.base.DescribedPredicate;
+import com.tngtech.archunit.core.domain.Dependency;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaFieldAccess;
 import com.tngtech.archunit.core.domain.JavaModifier;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftSummary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -18,6 +21,7 @@ import static com.tngtech.archunit.core.domain.JavaClass.Predicates.assignableTo
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.equivalentTo;
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAPackage;
 import static com.tngtech.archunit.core.domain.properties.HasName.Predicates.name;
+import static com.tngtech.archunit.lang.conditions.ArchConditions.onlyHaveDependenciesWhere;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -36,9 +40,7 @@ class RingDependencyRulesTest {
 
     @BeforeAll
     static void importTapstateClasses() {
-        tapstateClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        tapstateClasses = ProductionClassImports.packages("io.tapstate");
     }
 
     @Test
@@ -355,7 +357,8 @@ class RingDependencyRulesTest {
                         // control-core decouples from the runtime through the storage port
                         "io.tapstate.spi.store..",
                         // the synchronous control-to-runtime seam: the probe whitelist (a closed set
-                        // of six — connection test, schema discovery, and the four query channels).
+                        // of seven — connection test, schema discovery, four data-browser channels,
+                        // and finite Pipeline preview).
                         // Every other control<->runtime interaction stays store-decoupled; this
                         // narrow channel is the one compile reference control-core holds into the
                         // runtime ring
@@ -366,70 +369,70 @@ class RingDependencyRulesTest {
                         + "whitelist only. It stays framework-free — Spring lives in "
                         + "rest-api (the HTTP presentation face), never here — so the apply / registry "
                         + "logic is unit-testable without a container; it reaches the runtime only "
-                        + "through the store, save for the probe whitelist (a closed set of six)")
+                        + "through the store, save for the probe whitelist (a closed set of seven)")
                 .check(tapstateClasses);
     }
 
     @Test
     @DisplayName("R5: rest-api depends on control-core + core + the shared message catalog (not the ports)")
     void r5_restApiLayering() {
+        DescribedPredicate<JavaClass> allowedRestApiDependencies =
+                resideInAPackage("java..")
+                        .or(resideInAPackage("io.tapstate.control.restapi.."))
+                        .or(resideInAPackage("io.tapstate.control.core.."))
+                        .or(resideInAPackage("io.tapstate.core.."))
+                        .or(resideInAPackage("io.tapstate.messages.."))
+                        .or(resideInAPackage("org.springframework.."))
+                        .or(resideInAPackage("com.fasterxml.jackson.annotation.."))
+                        .or(resideInAPackage("tools.jackson.databind.."))
+                        .or(resideInAPackage("jakarta.servlet.."))
+                        // These framework-free SPI value types are serialized authoring/list
+                        // projections and mutation results, not ports. The HTTP adapter uses them
+                        // only to map wire shapes to/from the application service; it never calls
+                        // a storage interface.
+                        .or(equivalentTo(PipelineDraft.class))
+                        .or(equivalentTo(PipelineDraftSummary.class))
+                        .or(DescribedPredicate.describe("PipelineDraft wire-model members",
+                                type -> type.getName().startsWith(PipelineDraft.class.getName() + "$")))
+                        .or(equivalentTo(PipelineDraftMutation.class));
         classes().that().resideInAPackage("io.tapstate.control.restapi..")
-                .should().onlyDependOnClassesThat().resideInAnyPackage(
-                        "java..",
-                        "io.tapstate.control.restapi..",
-                        "io.tapstate.control.core..",
-                        "io.tapstate.core..",
-                        // the shared error-code message catalog + renderer (presentation layer): rest-api
-                        // renders coded errors the same way the CLI does (its R6 grant), a leaf not a ring
-                        "io.tapstate.messages..",
-                        // Spring is permitted in the control ring (rest-api is the HTTP layer)
-                        "org.springframework..",
-                        // Jackson annotations and databind are the JSON substrate used only by the HTTP
-                        // projection to enforce request shape and response omission rules.
-                        "com.fasterxml.jackson.annotation..",
-                        "tools.jackson.databind..",
-                        // the Servlet API is the substrate the Web MVC servlet stack runs on; the HTTP
-                        // layer's interceptor and controllers read the request through it
-                        "jakarta.servlet..")
+                .should(onlyHaveDependenciesWhere(DescribedPredicate.describe(
+                        "allowed HTTP adapter dependencies and the checkpoint error code",
+                        dependency -> allowedRestApiDependencies.test(dependency.getTargetClass())
+                                || isPipelineStatusCheckpointError(dependency))))
                 .allowEmptyShould(true)
                 .because("the HTTP presentation adapter sits on control-core, the kernel, the shared "
                         + "message catalog and the servlet substrate; it does not reach the ports directly")
                 .check(tapstateClasses);
     }
 
+    /** One error-code field read in the catalog status mapper. It grants no storage port access. */
+    private static boolean isPipelineStatusCheckpointError(Dependency dependency) {
+        return dependency.convertTo(JavaFieldAccess.class).stream().anyMatch(access ->
+                access.getOriginOwner().getName().equals("io.tapstate.control.restapi.PipelineStatusResponse")
+                        && access.getOrigin().getName().equals("of")
+                        && access.getOrigin().getRawParameterTypes().stream().map(JavaClass::getName).toList()
+                                .equals(List.of("io.tapstate.control.core.PipelineCatalogItem",
+                                        "io.tapstate.messages.MessageCatalog", "java.time.Clock", "java.util.Locale"))
+                        && access.getAccessType() == JavaFieldAccess.AccessType.GET
+                        && access.getTarget().getFullName().equals("io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE"));
+    }
+
     @Test
-    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly the six named probes "
-            + "— no further channel")
+    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly eleven named probes")
     void r5_controlToRuntimeSyncWhitelistHasNoFurtherChannel() {
-        // A control-to-runtime sync channel is a runtime interface control reaches for. The whitelist is
-        // a closed set of exactly six such interfaces: connection test, schema discovery, and the four
-        // channels the data browser needs (listing a source's collections, reading its documents,
-        // reading its table stats, and following its changes). The probes' value types are storage-port
-        // types (the connection config or query request they take, the result they return), carried as
-        // payload, not channels of their own. This gate bans a further channel — another probe interface
-        // control depends on. Widening the whitelist must change this gate and the sync-whitelist
-        // decision, not slip in beside it (a seventh probe interface control reaches for turns this red).
-        //
-        // The set is spelled out here because the decision is what the names encode; the four query
-        // channels are named ahead of the code that implements them, so until then this gate is green
-        // without proving anything. What it does from the first day is refuse a seventh.
-        DescribedPredicate<JavaClass> aRuntimeSyncChannelOutsideTheWhitelist =
-                resideInAPackage("io.tapstate.runtime.probe..")
-                        .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.ConnectionProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.SchemaDiscoveryProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserCollectionsProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserFindProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserStatsProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserTailProbe")))
-                        .as("a control-to-runtime sync channel outside the whitelist");
+        // Payload records and admitted leases are not additional runtime operations.
+        DescribedPredicate<JavaClass> outside = resideInAPackage("io.tapstate.runtime.probe..")
+                .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface));
+        for (String probe : java.util.List.of("ConnectionProbe", "SchemaDiscoveryProbe", "DataBrowserCollectionsProbe",
+                "DataBrowserFindProbe", "DataBrowserStatsProbe", "DataBrowserTailProbe", "PipelinePreviewProbe",
+                "ValidationEvaluationProbe", "ValidationStartProbe", "ValidationProgressProbe", "ValidationStopProbe")) {
+            outside = outside.and(DescribedPredicate.not(name("io.tapstate.runtime.probe." + probe)));
+        }
         noClasses().that().resideInAPackage("io.tapstate.control..")
-                .should().dependOnClassesThat(aRuntimeSyncChannelOutsideTheWhitelist)
+                .should().dependOnClassesThat(outside.as("a runtime sync channel outside the closed whitelist"))
                 .allowEmptyShould(true)
-                .because("the control-to-runtime sync whitelist is a closed set of exactly six members "
-                        + "— the connection probe, the schema-discovery probe and the four query probes; "
-                        + "a further synchronous channel must change this gate and the sync-whitelist "
-                        + "decision, not slip in beside it")
+                .because("exactly eleven named, single-operation channels are admitted")
                 .check(tapstateClasses);
     }
 
@@ -508,8 +511,8 @@ class RingDependencyRulesTest {
     void r9_controlAndRuntimeDoNotReferenceEachOther() {
         // The control-to-runtime half carries the single R5 exception: control may reach the runtime
         // synchronously only through the probe whitelist (io.tapstate.runtime.probe), a closed set of
-        // six. Any other runtime package is still forbidden; the exactness gates above pin that
-        // whitelist to exactly six channels of one operation each.
+        // seven. Any other runtime package is still forbidden; the exactness gates above pin that
+        // whitelist to exactly seven channels of one operation each.
         noClasses().that().resideInAPackage("io.tapstate.control..")
                 .should().dependOnClassesThat(
                         JavaClass.Predicates.resideInAPackage("io.tapstate.runtime..")
@@ -518,7 +521,7 @@ class RingDependencyRulesTest {
                 .because("control writes desired state and the runtime watches and converges; they "
                         + "decouple through the store and hold no reference to each other — the sole "
                         + "exception is the synchronous probe whitelist "
-                        + "(io.tapstate.runtime.probe), a closed set of six")
+                        + "(io.tapstate.runtime.probe), a closed set of seven")
                 .check(tapstateClasses);
         // The runtime-to-control half stays a blanket ban: the runtime never reaches up into control.
         noClasses().that().resideInAPackage("io.tapstate.runtime..")

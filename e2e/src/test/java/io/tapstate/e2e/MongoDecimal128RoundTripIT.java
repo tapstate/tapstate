@@ -66,19 +66,19 @@ class MongoDecimal128RoundTripIT {
 
     @Test
     void keepsEverySignificantDigitThroughSnapshotAndCdc() {
-        String storeUri = SharedMongo.replicaSetUrl("e2e_decimal128_store");
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
         EndpointAddress source = EndpointAddress.uri(sourceUri);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             mongo.insert(source, COLLECTION,
                     new Document("_id", "exact-decimal").append("marker", SNAPSHOT).append("amount", AMOUNT));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(Map.of(
                     "src_mongo.tap.yml", sourceYaml(sourceUri),

@@ -198,4 +198,32 @@ class CatalogEntryAssemblerTest {
 
         assertThat(entry.sink().capable()).isTrue();
     }
+
+    @Test
+    void aSourceOnlyConnectorIsNoTargetEvenThoughItsJarWrites() {
+        // The jar registers write_record and declares upsert policies, so every rule above would make
+        // this a sink. The support boundary withdraws it, and the read side of the row is untouched.
+        NormalizedSpec spec = spec("db2", ConnectorGroup.DATABASE,
+                List.of("update_on_exists", "ignore_on_exists", "just_insert"), true, null);
+
+        ConnectorCatalogEntry entry =
+                CatalogEntryAssembler.assemble(spec, DB_CAPS, noOverlay(), "db2/spec_db2.json", "h");
+
+        assertThat(entry.sink().capable()).isFalse();
+        assertThat(entry.sink().writeSemantics()).isEmpty();
+        assertThat(entry.modes()).containsExactly(SourceMode.CDC, SourceMode.SNAPSHOT);
+        assertThat(entry.provenance().modeSource().values()).containsOnly(ModeSource.DERIVED);
+    }
+
+    @Test
+    void aSourceOnlyConnectorOutranksADeclaredSink() {
+        // The overlay speaks for what a connector can do; the boundary speaks for what this release
+        // supports. A declaration added later must not quietly reopen the target role.
+        NormalizedSpec spec = spec("db2", ConnectorGroup.DATABASE, List.of(), false, null);
+
+        ConnectorCatalogEntry entry = CatalogEntryAssembler.assemble(spec, DB_CAPS,
+                overlayDeclaringSink("db2", "snapshot", "\"append\""), "path", "hash");
+
+        assertThat(entry.sink().capable()).isFalse();
+    }
 }

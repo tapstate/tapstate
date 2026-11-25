@@ -5,6 +5,7 @@ import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.ManagedViewStore;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -22,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Removal of an applied resource, one path for every kind. Deletion is real: the document leaves the
@@ -57,6 +59,12 @@ import java.util.Set;
  */
 public final class ArtifactMutationService {
 
+    /** Native lifecycle deletion owns its atomic retirement; the common service retains references and audit. */
+    @FunctionalInterface public interface PipelineDeletion {
+        /** Binds a read-only original command; the returned action runs only after audit succeeds. */
+        Runnable prepare(PipelineResource original, String expectedContentHash);
+    }
+
     private final ArtifactStore store;
     /**
      * The one reading of "is this pipeline at rest". Held rather than re-derived so this refusal and
@@ -75,6 +83,7 @@ public final class ArtifactMutationService {
     private final AuditGate auditGate;
 
     private final DataBrowserFollows follows;
+    private final PipelineDeletion pipelineDeletion;
 
     public ArtifactMutationService(
             ArtifactStore store,
@@ -206,6 +215,12 @@ public final class ArtifactMutationService {
             RateHistoryStore rateHistory,
             AuditGate auditGate,
             DataBrowserFollows follows) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory, auditGate, follows, null);
+    }
+
+    public ArtifactMutationService(ArtifactStore store, DesiredStore desired, StateStore state, ObservationStore observations,
+            PipelineLayoutStore layouts, SrsMetaStore srsMeta, DerivedSchemaStore derivedSchemas, RateHistoryStore rateHistory,
+            AuditGate auditGate, DataBrowserFollows follows, PipelineDeletion pipelineDeletion) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
@@ -217,6 +232,7 @@ public final class ArtifactMutationService {
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.follows = Objects.requireNonNull(follows, "follows");
         this.live = new LivePipelines(this.desired, this.state);
+        this.pipelineDeletion = pipelineDeletion;
     }
 
     /**
@@ -235,6 +251,15 @@ public final class ArtifactMutationService {
      * partly-executed removal would do next — learning nothing about the residue it now owns.
      */
     public void delete(String principal, String id, String expectedContentHash) {
+        delete(principal, id, expectedContentHash, ControlOperations.ARTIFACT_DELETE);
+    }
+
+    /** Shares Artifact guards and reclaim while attributing the whole-Pipeline operation to its own audit verb. */
+    void deletePipeline(String principal, String id, String expectedContentHash) {
+        delete(principal, id, expectedContentHash, ControlOperations.PIPELINE_DELETE);
+    }
+
+    private void delete(String principal, String id, String expectedContentHash, Operation operation) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(id, "id");
         if (expectedContentHash == null) {
@@ -247,13 +272,20 @@ public final class ArtifactMutationService {
         // same io diagnostic, including the removal of the document that cannot be read.
         Resource target = store.get(id)
                 .orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
+        if (target instanceof SourceResource source && source.metadata() != null
+                && "true".equals(source.metadata().labels().get("store"))) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the state store cannot be removed through artifact deletion"), null);
+        }
 
         // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
         // not: without the resource, its references are unknown rather than absent, so the strict list
         // fails closed before any audit record or deletion is written.
-        refuseWhenReferenced(id, store.list());
-        if (target instanceof PipelineResource) {
-            refuseWhenNotStopped(id);
+        refuseWhenReferenced(target, store.list());
+        Runnable nativeDeletion = null;
+        if (target instanceof PipelineResource pipeline) {
+            if (pipelineDeletion == null) refuseWhenNotStopped(id);
+            else nativeDeletion = Objects.requireNonNull(pipelineDeletion.prepare(pipeline, expectedContentHash), "original deletion");
         }
 
         // Both grounds are judged above, outside the gate, so a refusal writes no audit record and leaves
@@ -264,7 +296,11 @@ public final class ArtifactMutationService {
         // runs before the compare below, and on the branch where that compare refuses, the version the
         // caller offered is the only one that describes the attempt.
         AuditContext audit = new AuditContext(principal, id, expectedContentHash);
-        auditGate.dispatch(ControlOperations.ARTIFACT_DELETE, audit, () -> {
+        Runnable originalDeletion = nativeDeletion;
+        auditGate.dispatch(operation, audit, () -> {
+            if (originalDeletion != null) {
+                originalDeletion.run(); return null;
+            }
             switch (store.delete(id, expectedContentHash)) {
                 case DELETED -> {
                 }
@@ -428,13 +464,21 @@ public final class ArtifactMutationService {
         }
     }
 
-    private void refuseWhenReferenced(String id, List<Resource> stored) {
-        List<String> referrers = ReferenceGraph.of(stored).referencedBy(id).stream()
-                .map(ReferenceGraph.Edge::id)
-                .sorted()
-                .toList();
+    private void refuseWhenReferenced(Resource target, List<Resource> stored) {
+        String id = target.id();
+        Set<String> referrers = new TreeSet<>();
+        ReferenceGraph.of(stored).referencedBy(id).forEach(edge -> referrers.add(edge.id()));
+        if (target instanceof SourceResource && ManagedViewStore.SOURCE_ID.equals(id)) {
+            // Inline and reusable views both materialize into this source without naming it.
+            // The dependency exists even when the declaring pipeline has never run.
+            for (Resource resource : stored) {
+                if (resource instanceof PipelineResource pipeline && pipeline.view() != null) {
+                    referrers.add(pipeline.id());
+                }
+            }
+        }
         if (!referrers.isEmpty()) {
-            throw error(ArtifactError.IN_USE, Map.of("id", id, "referrers", referrers));
+            throw error(ArtifactError.IN_USE, Map.of("id", id, "referrers", List.copyOf(referrers)));
         }
     }
 
@@ -443,12 +487,10 @@ public final class ArtifactMutationService {
      * never run, which is the clean case rather than an unknown one.
      */
     private void refuseWhenNotStopped(String id) {
-        PipelineState actual = actualStateOf(id);
-        PipelineState intent = intentOf(id);
-        if (!isAtRest(actual, intent)) {
+        if (!isAtRest(id)) {
             throw error(
                     ArtifactError.PIPELINE_NOT_STOPPED,
-                    Map.of("id", id, "actual", actual.name(), "desired", intent.name()));
+                    Map.of("id", id, "actual", actualStateOf(id).name(), "desired", intentOf(id).name()));
         }
     }
 
@@ -459,10 +501,6 @@ public final class ArtifactMutationService {
      */
     private boolean isAtRest(String id) {
         return live.isAtRest(id);
-    }
-
-    private static boolean isAtRest(PipelineState actual, PipelineState intent) {
-        return LivePipelines.isAtRest(actual, intent);
     }
 
     private PipelineState actualStateOf(String id) {

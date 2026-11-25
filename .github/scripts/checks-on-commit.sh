@@ -75,16 +75,22 @@ if ! observed="$(gh api --paginate "repos/${repo}/commits/${sha}/check-runs" \
   exit 1
 fi
 
-# Two of the contexts a branch ruleset requires are `pull_request`-only workflows, so they cannot
-# produce a check-run on a commit that sits on the default branch at all, and a release cut from one
-# would refuse for ever. Where the answer is, when it is anywhere: on the pull request this commit is
-# the merge of.
+# Only known `pull_request`-only checks may borrow an answer from the merged pull request's head.
+# Push and dispatched checks must answer on this commit: their absent names may just mean that a
+# queued run has not created its jobs yet. In particular, build waits for the shards and sonarqube
+# waits for build, so borrowing their earlier PR verdicts would pass before the push reports.
+pull_request_only() {
+  case "$1" in
+    dco|e2e-admission|docs-classification|docs-impact) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 #
 # Only when that pull request's head carries the SAME TREE. That condition is the whole guard, and it
 # is not a formality -- it is what makes the head's verdict a verdict about this code. A merge that
 # combined the pull request with anything else produces a tree the head never had, the head was never
-# checked in that combination, and this refuses exactly as it did before. Resolved once and reused:
-# every name that is absent here is absent for the same structural reason.
+# checked in that combination, and this refuses exactly as it did before. Resolved once and reused
+# for the pull-request-only names; absence alone never makes another check eligible.
 fallback_head=""
 fallback_runs=""
 fallback_declined=""
@@ -183,7 +189,7 @@ while IFS= read -r name; do
   line="$(pick "$observed" "$name")"
   answered_on="$sha"
   answered_runs="$observed"
-  if [ -z "$line" ]; then
+  if [ -z "$line" ] && pull_request_only "$name"; then
     resolve_fallback
     if [ -n "$fallback_head" ]; then
       line="$(pick "$fallback_runs" "$name")"
@@ -195,7 +201,7 @@ while IFS= read -r name; do
     fi
   fi
   if [ -z "$line" ]; then
-    if [ -n "$fallback_declined" ]; then
+    if pull_request_only "$name" && [ -n "$fallback_declined" ]; then
       echo "::error::'${name}' did not run on ${sha}, and ${fallback_declined} — the head of the pull request it came from — carries a different tree, so what ran there is not an answer about this commit"
       stale_merge=1
     else

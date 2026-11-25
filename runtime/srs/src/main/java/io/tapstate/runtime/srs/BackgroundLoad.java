@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.capture.SnapshotSession;
 
 import java.time.Duration;
 import java.util.Map;
@@ -113,7 +114,8 @@ final class BackgroundLoad {
         }
         // The batch being read is closed under the reader and a wait for room is interrupted: those are the
         // two places the thread can be parked for a long time, and neither ends by itself.
-        load.close();
+        Throwable failure = null;
+        try { load.close(); } catch (RuntimeException | Error closeFailure) { failure = closeFailure; }
         if (Thread.currentThread() != thread) {
             // Closed from outside. Closed from the reading thread itself -- by something it calls on the way
             // -- there is nothing to wake and nobody else to wait for: it sees the abandonment as it returns.
@@ -127,11 +129,25 @@ final class BackgroundLoad {
         Subscription subscription;
         synchronized (this) {
             subscription = opened;
-            opened = null;
         }
         if (subscription != null) {
-            subscription.close();
+            try { closeTail(subscription); }
+            catch (RuntimeException | Error closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else if (closeFailure != failure) failure.addSuppressed(closeFailure);
+            }
         }
+        if (Thread.currentThread() != thread && thread.isAlive()) {
+            var ending = new io.tapstate.core.common.TapstateException(CaptureError.STILL_ENDING, Map.of("captureId", thread.getName()), null);
+            if (failure == null) failure = ending; else failure.addSuppressed(ending);
+        }
+        if (failure instanceof RuntimeException runtime) throw runtime;
+        if (failure instanceof Error error) throw error;
+    }
+
+    private void closeTail(Subscription original) {
+        original.close();
+        synchronized (this) { if (opened == original) opened = null; }
     }
 
     /**
@@ -152,11 +168,17 @@ final class BackgroundLoad {
     }
 
     private void run() {
+        boolean completed = false;
         try {
             readLoad();
             synchronized (this) {
                 loadOver = true;
-                if (loadLetGo && !cancelled) {
+                if (cancelled) {
+                    // Closed as the load ended: the run is over, and a tail opened now would set up on the source
+                    // what nothing is left to read through, confirm or let go of -- a replication slot, say.
+                    return;
+                }
+                if (loadLetGo) {
                     // The wake that ended the read is not the tail's to answer.
                     Thread.interrupted();
                 }
@@ -165,24 +187,56 @@ final class BackgroundLoad {
             boolean keep;
             synchronized (this) {
                 keep = !cancelled;
-                if (keep) {
-                    opened = subscription.orElse(null);
-                }
+                opened = subscription.orElse(null);
+                completed = keep;
             }
             if (!keep) {
                 // Abandoned while the tail was opening: nobody is left to close it but this thread.
-                subscription.ifPresent(Subscription::close);
+                subscription.ifPresent(this::closeTail);
             }
         } catch (RuntimeException | Error failure) {
             // A run closed while it ran was cut short by the stop somebody asked for. Anything else that cuts it
             // short is a failure, a cancellation among them: a hand-off released under a load nobody closed
             // throws one, and so can a connector, and neither is a stop.
             if (!isCancelled()) {
-                health.fail(failure);
+                health.fail(load.failureFact(failure));
             }
         } finally {
-            load.close();
-            finished.countDown();
+            finishClose(completed);
+        }
+    }
+
+    private void finishClose(boolean completed) {
+        boolean deferred = false;
+        try { load.close(); }
+        catch (SnapshotSession.PendingClose pending) {
+            if (completed && !isCancelled() && pending.getSuppressed().length == 0)
+                deferred = finishWhenClosed(pending);
+            else if (!isCancelled()) health.fail(pending);
+        }
+        catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
+        finally { if (!deferred) finished.countDown(); }
+    }
+
+    /** Observe the original cleanup attempt without another worker, read, tail or ownership transition. */
+    private boolean finishWhenClosed(SnapshotSession.PendingClose pending) {
+        try {
+            pending.completion().whenComplete((ignored, outcome) -> {
+                if (outcome == null) {
+                    finishClose(true);
+                } else {
+                    if (!isCancelled()) {
+                        Throwable original = outcome instanceof java.util.concurrent.CompletionException wrapped
+                                && wrapped.getCause() != null ? wrapped.getCause() : outcome;
+                        health.fail(original);
+                    }
+                    finished.countDown();
+                }
+            });
+            return true;
+        } catch (RuntimeException | Error failure) {
+            if (!isCancelled()) health.fail(failure);
+            return false;
         }
     }
 

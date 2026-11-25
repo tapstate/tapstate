@@ -9,8 +9,11 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -22,8 +25,12 @@ import java.util.Objects;
  * contract ({@code io.tapdata.*}), so every connector binds to the same {@code TapConnector} /
  * {@code TapEvent} types and events cross as one contract; and the runtime's own infrastructure a
  * connector links against but does not bundle — bytecode generation ({@code net.sf.cglib.*}) and the
- * logging facade ({@code org.slf4j.*}). Everything else on the host — the tapstate application classes and
- * the service framework libraries — is hidden from the connector.
+ * logging facade ({@code org.slf4j.*}). Log4j is shared only when the connector classpath does not
+ * bundle its own API; a bundled Log4j stays entirely isolated. Everything else on the host —
+ * the tapstate application classes and the service framework libraries — is hidden from the connector.
+ *
+ * <p>Introspection opens a private loader. Connector handles lease a shared loader. Loaders for
+ * connectors with process-wide native state stay available for the life of the process.
  */
 public final class ConnectorClassLoader implements AutoCloseable {
 
@@ -33,24 +40,101 @@ public final class ConnectorClassLoader implements AutoCloseable {
      * library — mapping connection config generates a {@code BeanMap} subclass and defines it into this
      * loader (the config bean lives here), so the generated subclass cannot link unless this loader
      * resolves cglib from the host. {@code org.slf4j.*} is the logging facade a thin connector and its
-     * bundled driver log through and do not carry themselves. The tapstate application classes and the
-     * service framework (Spring, Hazelcast, Mongo, the web container) stay hidden.
+     * bundled driver log through and do not carry themselves. Log4j is handled separately by the
+     * connector loader so its API and implementation cannot split across the host and connector. The tapstate
+     * application classes and the service framework (Spring, Hazelcast, Mongo, the web container) stay hidden.
      */
     private static final List<String> SHARED_HOST_PREFIXES =
             List.of("io.tapdata.", "net.sf.cglib.", "org.slf4j.");
 
-    private final URLClassLoader loader;
+    /** Shared loaders and their use counts are guarded by this map. */
+    private static final Map<ArtifactKey, ConnectorClassLoader> SHARED = new HashMap<>();
 
-    private ConnectorClassLoader(URLClassLoader loader) {
+    private final URLClassLoader loader;
+    private final boolean sharedLoader;
+    private int users;
+    private boolean pinned;
+
+    private ConnectorClassLoader(URLClassLoader loader, boolean sharedLoader) {
         this.loader = loader;
+        this.sharedLoader = sharedLoader;
     }
 
     /** Opens an isolated loader over {@code classpath} (the connector jar plus any bundled deps). */
     public static ConnectorClassLoader open(List<Path> classpath) {
+        return new ConnectorClassLoader(newLoader(classpath), false);
+    }
+
+    /** A shared loader borrowed without a release handle stays pinned for this JVM. */
+    public static ConnectorClassLoader shared(List<Path> classpath) {
+        synchronized (SHARED) {
+            var loader = sharedLoader(classpath);
+            loader.pinned = true;
+            return loader;
+        }
+    }
+
+    static SharedUse acquire(List<Path> classpath) {
+        synchronized (SHARED) {
+            var loader = sharedLoader(classpath);
+            loader.users++;
+            return new SharedUse(loader);
+        }
+    }
+
+    private static ConnectorClassLoader sharedLoader(List<Path> classpath) {
+        return SHARED.computeIfAbsent(ArtifactKey.of(classpath),
+                key -> new ConnectorClassLoader(newLoader(classpath), true));
+    }
+
+    /** Retires idle matching loaders before the owner makes a local artifact reclaimable. */
+    static boolean retireUnused(Path jar) {
+        var path = jar.toAbsolutePath().normalize();
+        synchronized (SHARED) {
+            var keys = SHARED.keySet().stream()
+                    .filter(key -> key.entries().stream().anyMatch(entry -> entry.path().equals(path)))
+                    .toList();
+            if (keys.stream().map(SHARED::get).anyMatch(loader -> loader.pinned || loader.users != 0)) return false;
+            for (var key : keys) {
+                var loader = SHARED.get(key);
+                try {
+                    loader.closeLoader();
+                } catch (RuntimeException | Error failure) {
+                    loader.pinned = true;
+                    throw failure;
+                }
+                SHARED.remove(key);
+            }
+            return true;
+        }
+    }
+
+    static final class SharedUse implements AutoCloseable {
+        private final ConnectorClassLoader loader;
+        private boolean closed;
+
+        private SharedUse(ConnectorClassLoader loader) { this.loader = loader; }
+
+        ConnectorClassLoader loader() { return loader; }
+
+        void keep() {
+            synchronized (SHARED) { loader.pinned = true; }
+        }
+
+        @Override public void close() {
+            synchronized (SHARED) {
+                if (closed) return;
+                closed = true;
+                loader.users--;
+            }
+        }
+    }
+
+    private static URLClassLoader newLoader(List<Path> classpath) {
         URL[] urls = classpath.stream().map(ConnectorClassLoader::toUrl).toArray(URL[]::new);
         ClassLoader host = ConnectorClassLoader.class.getClassLoader();
         ClassLoader sharedContract = new SharedContractClassLoader(host);
-        return new ConnectorClassLoader(new ConnectorJarLoader(urls, sharedContract));
+        return new ConnectorJarLoader(urls, sharedContract, host);
     }
 
     /** Loads {@code className} in isolation (from the connector jar or the shared PDK contract). */
@@ -74,10 +158,36 @@ public final class ConnectorClassLoader implements AutoCloseable {
 
     @Override
     public void close() {
+        if (!sharedLoader) closeLoader();
+    }
+
+    private void closeLoader() {
         try {
             loader.close();
         } catch (IOException e) {
             throw new UncheckedIOException("closing connector class loader", e);
+        }
+    }
+
+    /** One classpath entry as it stands on disk: where it is, and enough to notice it was replaced. */
+    private record ArtifactEntry(Path path, long size, long modifiedMillis) {
+
+        static ArtifactEntry of(Path jar) {
+            Path path = jar.toAbsolutePath().normalize();
+            try {
+                return new ArtifactEntry(path, Files.size(path), Files.getLastModifiedTime(path).toMillis());
+            } catch (IOException unreadable) {
+                // Nothing on disk to compare: the path alone, and the loader reports the missing jar itself.
+                return new ArtifactEntry(path, -1, -1);
+            }
+        }
+    }
+
+    /** The identity a shared loader is kept under: the whole classpath, in order. */
+    private record ArtifactKey(List<ArtifactEntry> entries) {
+
+        static ArtifactKey of(List<Path> classpath) {
+            return new ArtifactKey(classpath.stream().map(ArtifactEntry::of).toList());
         }
     }
 
@@ -109,8 +219,22 @@ public final class ConnectorClassLoader implements AutoCloseable {
             ClassLoader.registerAsParallelCapable();
         }
 
-        private ConnectorJarLoader(URL[] urls, ClassLoader parent) {
+        private final ClassLoader host;
+        private final boolean bundledLog4j;
+
+        private ConnectorJarLoader(URL[] urls, ClassLoader parent, ClassLoader host) {
             super(urls, parent);
+            this.host = host;
+            bundledLog4j = findResource("org/apache/logging/log4j/LogManager.class") != null;
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (!bundledLog4j && name.startsWith("org.apache.logging.log4j.")) {
+                // Thin connectors use the host facade as a whole; never mix in connector fallbacks.
+                return host.loadClass(name);
+            }
+            return super.loadClass(name, resolve);
         }
 
         @Override

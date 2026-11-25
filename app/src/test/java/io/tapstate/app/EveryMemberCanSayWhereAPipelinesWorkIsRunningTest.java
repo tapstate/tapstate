@@ -3,6 +3,8 @@ package io.tapstate.app;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.instance.impl.HazelcastInstanceProxy;
+import com.hazelcast.internal.server.tcp.LinkedAddresses;
 import com.hazelcast.jet.config.JetConfig;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -22,6 +24,9 @@ import io.tapstate.control.core.LivePipelineRun;
 import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.control.core.PipelineCaptures;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -29,11 +34,13 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -47,7 +54,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * other member, and that instance does nothing; a reader that counted them would report a pinned vertex
  * as running everywhere, which is the opposite of what pinning it means. Those instances are told apart
  * by the type the engine names for them, and this case is what stops that recognition from rotting: if
- * the engine ever stops naming them that way, the pinned vertex below reports two workers.
+ * the engine ever stops naming them that way, the pinned vertex below reports two workers. A pipeline pins
+ * its own vertices in two more shapes -- stood in for by instances of its own that pass bounds on, and
+ * taking input in batches, which wraps the instances it is given -- and the same reading has to know the
+ * stand-ins in each.
  *
  * <p>The second is that the readings are collected periodically and per member, so for the first seconds
  * of a run they have arrived from some members and not others. This case waits for both, and asserts the
@@ -66,6 +76,20 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
             Duration.ofMillis(new JetConfig().getScaleUpDelayMillis());
 
     @Test
+    void freePortsExcludeAPortAlreadyListeningOnTheMembersLoopbackAddress() throws Exception {
+        try (ServerSocket occupied = new ServerSocket(
+                0, 0, InetAddress.getByName("127.0.0.1"))) {
+            // The ephemeral allocator may wrap before a wildcard probe offers the occupied port.
+            // Exercise more than the full TCP port range while the loopback listener stays open.
+            for (int attempt = 0; attempt < 65_536; attempt++) {
+                assertThat(twoFreePorts())
+                        .as("ports for members binding 127.0.0.1 must exclude the open loopback listener")
+                        .doesNotContain(occupied.getLocalPort());
+            }
+        }
+    }
+
+    @Test
     void eitherMemberAnswersTheSamePlacementAndAPinnedVertexRunsInOnePlace() throws Exception {
         int[] ports = twoFreePorts();
         HazelcastInstance first = start(ports[0], ports[0], "node-a", "boot-a1");
@@ -82,6 +106,9 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
             assertThat(fromSecond.vertices())
                     .as("the same placement from either member, which is what makes it the cluster's "
                             + "answer rather than the answer of whoever was asked")
+                    // Per-member metrics can arrive in either order; every processor's fields must still agree.
+                    .usingRecursiveComparison()
+                    .ignoringCollectionOrderInFields("processors")
                     .isEqualTo(fromFirst.vertices());
             assertThat(fromFirst.executionId())
                     .as("and the execution these processors belong to, which is how a restarted run is "
@@ -112,10 +139,43 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                             + "told apart; numbered within each member they would collide")
                     .doesNotHaveDuplicates();
         } finally {
-            if (second != null) {
-                second.shutdown();
-            }
-            first.shutdown();
+            stopMembers(first, second);
+        }
+    }
+
+    @Test
+    void aVertexRunningOnceForTheClusterIsReadAsRunningInOnePlaceWhateverStandsInForItElsewhere()
+            throws Exception {
+        int[] ports = twoFreePorts();
+        HazelcastInstance first = start(ports[0], ports[0], "node-a", "boot-a1");
+        HazelcastInstance second = null;
+        try {
+            second = start(ports[1], ports[0], "node-b", "boot-b1");
+            awaitMembers(first, 2);
+            awaitMembers(second, 2);
+            first.getJet().newJob(pinnedAsAPipelinePinsDag(),
+                    new JobConfig().setName(PIPELINE).setAutoScaling(false));
+
+            LivePipelineRun run = awaitMeasuredFromBothMembers(first);
+
+            assertThat(workers(run, "step"))
+                    .as("a step running once for the cluster has stand-ins of its own on the other members, "
+                            + "which pass its bounds on and do no work; read as working, a step that runs in "
+                            + "one place would be reported running everywhere")
+                    .hasSize(1);
+            assertThat(vertex(run, "step").processors())
+                    .as("and they are seen and classified, as the engine's own are")
+                    .hasSize(2);
+            assertThat(workers(run, "batched"))
+                    .as("a vertex taking its input in batches has each of its processors wrapped to batch "
+                            + "it; a stand-in wrapped too would carry the wrapper's type and no longer be known "
+                            + "for one")
+                    .hasSize(1);
+            assertThat(vertex(run, "batched").processors())
+                    .as("and its stand-in is seen and classified all the same")
+                    .hasSize(2);
+        } finally {
+            stopMembers(first, second);
         }
     }
 
@@ -135,7 +195,7 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                             + "reporting a stopped pipeline as running on the member that last ran it")
                     .isEmpty();
         } finally {
-            only.shutdown();
+            stopMembers(only, null);
         }
     }
 
@@ -179,10 +239,52 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                             + "read off the run rather than off what any one member remembers")
                     .containsExactly("node-b");
         } finally {
-            if (joiner != null) {
-                joiner.shutdown();
+            stopMembers(first, joiner);
+        }
+    }
+
+    @Test
+    void fixtureCleanupReleasesAMemberWhosePeerAddressWasRegisteredAsItsOwn() throws Exception {
+        int[] ports = twoFreePorts();
+        HazelcastInstance first = start(ports[0], ports[0], "node-a", "boot-a1");
+        HazelcastInstance second = null;
+        try {
+            second = start(ports[1], ports[0], "node-b", "boot-b1");
+            awaitMembers(first, 2);
+            awaitMembers(second, 2);
+            // Reproduce the alias left by the Linux self-connection without waiting for port reuse.
+            var node = ((HazelcastInstanceProxy) first).getOriginal().node;
+            var addresses = LinkedAddresses.getResolvedAddresses(first.getCluster().getLocalMember().getAddress());
+            addresses.addAllResolvedAddresses(second.getCluster().getLocalMember().getAddress());
+            node.getLocalAddressRegistry().register(node.getThisUuid(), addresses);
+            assertThat(node.getLocalAddressRegistry().uuidOf(second.getCluster().getLocalMember().getAddress()))
+                    .isEqualTo(node.getThisUuid());
+
+            stopMembers(first, null);
+
+            assertThat(Hazelcast.getAllHazelcastInstances()).doesNotContain(first).contains(second);
+            assertThat(first.getLifecycleService().isRunning()).isFalse();
+        } finally {
+            // Keep a defective cleanup implementation from contaminating the other regression cases.
+            try {
+                if (second != null) second.getLifecycleService().terminate();
+            } finally {
+                first.getLifecycleService().terminate();
             }
-            first.shutdown();
+        }
+    }
+
+    /** Releases only this case's members after its topology assertions have finished. */
+    private static void stopMembers(HazelcastInstance first, HazelcastInstance second) {
+        // Graceful Jet shutdown contacts peers after their ephemeral listeners have closed. On Linux,
+        // a reconnect can reuse that port and connect to itself, aborting shutdown and leaking a member
+        // into later cases. These disposable clusters need no graceful migration or job handoff.
+        try {
+            if (second != null) {
+                second.getLifecycleService().terminate();
+            }
+        } finally {
+            first.getLifecycleService().terminate();
         }
     }
 
@@ -277,6 +379,25 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
         return dag;
     }
 
+    /**
+     * Two vertices pinned the ways a pipeline pins its own: a step whose stand-ins pass its bounds on, and a
+     * vertex taking its input in batches whose stand-ins are the engine's. Both are fed by a source running on
+     * each member, as a pipeline's steps are.
+     */
+    private static DAG pinnedAsAPipelinePinsDag() {
+        DAG dag = new DAG();
+        Vertex feed = dag.newVertex("feed", ProcessorSupplier.of((SupplierEx<Processor>) ForeverSource::new))
+                .localParallelism(1);
+        Vertex step = dag.newVertex("step", NodeWidth.totalOne("step", null).metaSupplier("step",
+                ProcessorSupplier.of((SupplierEx<Processor>) Swallow::new), ChainAxes.assign(List.of("orders")),
+                Map.of(0, List.of("orders"))));
+        Vertex batched = dag.newVertex("batched", NodeWidth.totalOne("batched", BatchSpec.DEFAULTS)
+                .metaSupplier("batched", ProcessorSupplier.of((SupplierEx<Processor>) Swallow::new)));
+        dag.edge(Edge.from(feed, 0).to(step).distributed().allToOne("step"));
+        dag.edge(Edge.from(feed, 1).to(batched).distributed().allToOne("batched"));
+        return dag;
+    }
+
     /** A member started the way the assembly starts one. */
     private static HazelcastInstance start(int memberPort, int seedPort, String nodeId, String bootId) {
         HazelcastProperties properties = new HazelcastProperties();
@@ -299,7 +420,9 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
     }
 
     private static int[] twoFreePorts() throws Exception {
-        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        try (ServerSocket first = new ServerSocket(0, 0, loopback);
+                ServerSocket second = new ServerSocket(0, 0, loopback)) {
             return new int[] {first.getLocalPort(), second.getLocalPort()};
         }
     }

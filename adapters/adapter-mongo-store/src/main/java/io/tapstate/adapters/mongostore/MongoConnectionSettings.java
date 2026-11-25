@@ -20,12 +20,20 @@ import java.util.Objects;
  *                               {@code null} falls back to the JVM default trust store
  * @param serverSelectionTimeout how long connection verification waits for a reachable server
  *                               before reporting the store unreachable (bounds startup fail-fast)
+ * @param processId              this start of the process, which the client is named after so that
+ *                               another process can find and end what this one leaves open at the
+ *                               store; {@code null} for a process nobody will need to do that for
  */
 public record MongoConnectionSettings(
-        String uri, String tlsCaFile, Duration serverSelectionTimeout) {
+        String uri, String tlsCaFile, Duration serverSelectionTimeout, String processId) {
 
     public MongoConnectionSettings {
         Objects.requireNonNull(uri, "uri");
         Objects.requireNonNull(serverSelectionTimeout, "serverSelectionTimeout");
+    }
+
+    /** Settings for a connection no other process will ever have to clean up after. */
+    public MongoConnectionSettings(String uri, String tlsCaFile, Duration serverSelectionTimeout) {
+        this(uri, tlsCaFile, serverSelectionTimeout, null);
     }
 }

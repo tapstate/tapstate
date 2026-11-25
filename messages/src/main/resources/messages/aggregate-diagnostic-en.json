@@ -1,0 +1,94 @@
+{
+  "TS0500001": {
+    "message": "Aggregate step `{step}` reads `{from}`, which is {kind}.",
+    "solution": "An aggregate step reads one source table, or a `filter`, `map` or `union` step over source tables. To put totals into an assembled document, aggregate the table first and embed the result with a nest."
+  },
+  "TS0500002": {
+    "message": "Aggregate step `{step}` reads the filter step `{filter}`, and source `{source}` does not guarantee to send a row as it was before an update, so a row that stops matching would stay in its group.",
+    "solution": "Move the condition into the aggregate step's `where:`. The step remembers each row, so it removes a row that stops matching whether or not the source says what the row was."
+  },
+  "TS0500003": {
+    "message": "Aggregate step `{step}` reads `{from}`, which has no primary key, and names no `key:`.",
+    "solution": "Add `key: [<columns>]` naming the columns that identify one input row. After a `union` of tables whose keys overlap, include the column that tells the tables apart."
+  },
+  "TS0500004": {
+    "message": "Aggregate step `{step}` uses the name `{name}` for both a key column and a field.",
+    "solution": "The output row holds the group names and the fields side by side, and a step with no `groupBy` keys its one row by a column named `aggregate`. Rename the field."
+  },
+  "TS0500005": {
+    "message": "Aggregate step `{step}`, field `{field}`: the {part} expression did not pass validation.",
+    "solution": "Expressions read the input row as `after`, and `$column` names one of its columns. Check the names against the discovered model with `tapstate desc`.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0500006": {
+    "message": "Aggregate step `{step}`, field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved.",
+    "solution": "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+  },
+  "TS0500007": {
+    "message": "Aggregate step `{step}` could not evaluate its {part} expression `{expression}` on an input row.",
+    "solution": "The expression passed its checks and then failed on the values of one row, for example a division by zero or a conversion of text that is not a number. Guard the expression against such values, or exclude the rows with `where:`.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0500008": {
+    "message": "Aggregate step `{step}`, field `{field}` of group {group} does not fit in {type}.",
+    "solution": "The value is not rounded or wrapped, and the group keeps its last good values until its rows bring the total back in range. Check the group's rows for an outlier."
+  },
+  "TS0500009": {
+    "message": "Aggregate step `{step}`, field `{field}` of group {group} met a {actual} value where its column was declared {declared}.",
+    "solution": "The value is not coerced and the row is not left out: the group keeps its last good values until the row is fixed or removed. Rediscover the source if the column's declared type has changed."
+  },
+  "TS0500010": {
+    "message": "Aggregate step `{step}`, field `{field}` of group {group} is the {from} value that `type: {to}` cannot hold exactly.",
+    "solution": "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal). The group keeps its last good values meanwhile."
+  },
+  "TS0500011": {
+    "message": "Aggregate step `{step}` holds state built by a different definition: its {changed} changed.",
+    "solution": "The stored rows and totals are valid only for the definition that built them, so the step does not start on them. Rebuild the pipeline from a full load, which clears the step's state and its target, or restore the previous definition."
+  },
+  "TS0500012": {
+    "message": "Target `{target}` reads the aggregate step `{step}` and is set to `on_full_load: {policy}`, which keeps the rows it already holds.",
+    "solution": "A full load rebuilds every group, and a group that no longer exists would stay in the target. Set `on_full_load: clear` on the target, or `fail` to refuse a full load while it holds rows."
+  },
+  "TS0500013": {
+    "message": "Aggregate step `{step}`, group {group}: the stored `{field}` is not what the group's stored rows give.",
+    "solution": "Run the repair for this group: it writes the group's totals again from its stored rows and sends the group on. This compares the step's totals with the rows the step holds; it says nothing about whether those rows match the source."
+  },
+  "TS0500014": {
+    "message": "No member is running an aggregate step `{step}` of pipeline `{pipeline}`.",
+    "solution": "A check or a repair is answered by the running step itself. Check the step id with `tapstate explain`, and start the pipeline if it is stopped."
+  },
+  "TS0500015": {
+    "message": "The supplied identifier does not name a valid group of aggregate step `{step}`.",
+    "solution": "Name the group by every name under the step's `groupBy:`, as `name=value` pairs; a name with no value means null. Copy a group as a check printed it.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0500016": {
+    "message": "Aggregate step `{step}` of pipeline `{pipeline}` did not answer in time.",
+    "solution": "The step answers a check or a repair between its own updates, a few at a time. Nothing was left half done: ask again, and narrow the request to one group if the step is under heavy load."
+  },
+  "TS0500017": {
+    "message": "Aggregate step `{step}` of pipeline `{pipeline}` failed while answering the check or repair.",
+    "solution": "The step's own updates are not affected by this answer. Look in the node's log for the failure at this time; asking again after a fix, or narrowing the request to one group, tells whether it recurs.",
+    "technicalParams": [
+      "reason"
+    ]
+  },
+  "TS0500018": {
+    "message": "Aggregate step `{step}` declares {count} fields; a step may declare at most {limit}.",
+    "solution": "Split the fields across two aggregate steps that read the same input and group the same way."
+  },
+  "TS0500019": {
+    "message": "Aggregate step `{step}` of pipeline {pipeline} keeps up to {entriesPerRow} state entries per input row: at most about {estimatedEntries} for the {inputRows} rows its inputs hold.",
+    "solution": "Nothing to fix. This is what the step stores to keep its totals exact through restarts and replays, and it holds the input's values. A field that keeps its inputs (min, max, first, last) adds one entry per row, and a distinct count one per distinct value in a group; `explain` shows the estimate beside what the running step counted."
+  },
+  "TS0500020": {
+    "message": "Aggregate step `{step}` of pipeline {pipeline} keeps up to {entriesPerRow} state entries per input row; an input reports no row count, so the total is not estimated.",
+    "solution": "Discover the source the step reads so its tables report row counts, then apply again to have the total estimated."
+  }
+}

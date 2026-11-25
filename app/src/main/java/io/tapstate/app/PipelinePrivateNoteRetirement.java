@@ -1,0 +1,178 @@
+package io.tapstate.app;
+
+import io.tapstate.adapters.pdk.ConnectorNoteScopes;
+import io.tapstate.adapters.pdk.ConnectorNoteOrigin;
+import io.tapstate.core.model.SourceResource;
+import java.util.function.BiFunction;
+import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.PdkCapturePort;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.store.*;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+/** Releases retained private connector resources before the original operation clears necessary notes. */
+final class PipelinePrivateNoteRetirement {
+    @FunctionalInterface interface Release {
+        Optional<TapstateException> run(RequiredNoteRetirement original,CaptureConfig config,
+                PipelineNode.Purpose purpose,String clusterId,Runnable requireOriginal);
+        default boolean privatePostgres(RequiredNoteRetirement original,CaptureConfig config,String clusterId,Runnable guard) {
+            Object policy=config.settings().get("autoClearSlot");
+            if(Boolean.FALSE.equals(policy) || "false".equalsIgnoreCase(String.valueOf(policy)))return false;
+            run(original,config,PipelineNode.Purpose.CAPTURE,clusterId,guard).ifPresent(failure -> {throw failure;});
+            return true;
+        }
+    }
+    private final RequiredNoteStore notes;
+    private final PipelineStateRebuilds operations;
+    private final Release release;
+    private final BiFunction<String,Map<String,Object>,RequiredNoteOrigin> origins;
+
+    PipelinePrivateNoteRetirement(RequiredNoteStore notes,PipelineStateRebuilds operations,ConnectorProvisioner connectors) {
+        this(notes,operations,(id,settings) -> ConnectorNoteOrigin.capture(id,connectors.resolve(id).contentHash(),settings),pdkRelease(connectors));
+    }
+    private static Release pdkRelease(ConnectorProvisioner connectors) {
+        Objects.requireNonNull(connectors);
+        return new Release() {
+            @Override public Optional<TapstateException> run(RequiredNoteRetirement retirement,CaptureConfig config,
+                    PipelineNode.Purpose purpose,String clusterId,Runnable guard) {
+                return port(retirement,config,purpose,clusterId,guard).release(config,purpose);
+            }
+            @Override public boolean privatePostgres(RequiredNoteRetirement retirement,CaptureConfig config,String clusterId,Runnable guard) {
+                var port=port(retirement,config,PipelineNode.Purpose.CAPTURE,clusterId,guard);
+                var origin = retirement.origin().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
+                connectors.resolveRetained(retirement.notes().guardedBy(guard), retirement.scope(), origin);
+                if(!port.automaticallyClearsPrivatePostgres(origin))return false;
+                port.releasePrivatePostgresSlot(config).ifPresent(failure -> {throw failure;});
+                return true;
+            }
+            private PdkCapturePort port(RequiredNoteRetirement retirement,CaptureConfig config,PipelineNode.Purpose purpose,String clusterId,Runnable guard) {
+                var fixed=retirement.scope();var store=retirement.notes();guard.run();
+                var global=store.open(new RequiredNoteOwner(fixed.owner().bindingVersion(),"pdk.global-state",
+                        RequiredNoteOwner.Kind.GLOBAL,clusterId,0));guard.run();
+                var scopes=ConnectorNoteScopes.forBoundRun(store,RequiredNoteOwner.namespace(config.node(),purpose),fixed,global,guard);
+                return PdkCapturePort.withRequiredNotes(connectors,null,scopes);
+            }
+        };
+    }
+
+    PipelinePrivateNoteRetirement(RequiredNoteStore notes,PipelineStateRebuilds operations,Release release) {
+        this(notes,operations,(id,settings) -> {throw new IllegalStateException("no context resolver supplied");},release);
+    }
+    PipelinePrivateNoteRetirement(RequiredNoteStore notes,PipelineStateRebuilds operations,
+            BiFunction<String,Map<String,Object>,RequiredNoteOrigin> origins,Release release) {
+        this.origins=Objects.requireNonNull(origins);
+        this.notes=Objects.requireNonNull(notes);this.operations=Objects.requireNonNull(operations);this.release=Objects.requireNonNull(release);
+    }
+
+    /** A cache-only rebuild preserves necessary identities; only a changed connection context is retired. */
+    void reconcile(PipelineRebuildPreparation original,Map<String,SourceResource> desired,Runnable requireRetiredExecution) {
+        requireRetiredExecution.run();operations.requirePending(original);var request=original.request();
+        for(var context:notes.guardedBy(requireRetiredExecution).privateContexts(request.originalScope(),request.operationId())) {
+            requireRetiredExecution.run();if(context.completed() || context.origin().isEmpty())continue;
+            var source=desired.get(context.scope().owner().namespace());
+            // A no-longer-drawn node still retains its necessary identity until an authorized deletion.
+            if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
+            operations.requirePending(original);
+            releaseOne(original.request().originalScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),request.operationId()),requireRetiredExecution);
+        }
+        operations.requirePending(original);requireRetiredExecution.run();
+    }
+
+    /** Only an explicit clearing stop may retire its proven private PostgreSQL capture notes. */
+    void retireDirectPostgres(PipelineRebuildPreparation original,Map<String,SourceResource> direct,Runnable guard) {
+        guard.run();operations.requirePending(original);var request=original.request();
+        for(var context:notes.guardedBy(guard).privateContexts(request.originalScope(),request.operationId())) {
+            guard.run();if(context.completed() || context.origin().isEmpty())continue;
+            var owner=context.scope().owner();var source=direct.get(owner.namespace());
+            var node=owner.pipelineNode(PipelineNode.Purpose.CAPTURE);
+            if(source==null || node.isEmpty()
+                    || !owner.ownerId().equals(request.originalScope().pipelineId())
+                    || owner.bindingVersion()!=request.originalScope().bindingVersion()
+                    || owner.stateGeneration()!=request.originalScope().stateGeneration()
+                    || !source.connector().equals("postgres"))continue;
+            if(!context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))throw unavailable();
+            var retirement=notes.guardedBy(guard).retirement(context.scope(),request.operationId());
+            if(retirement.completed())continue;
+            var config=new CaptureConfig("postgres",source.config(),List.of(),node.orElseThrow());
+            if(release.privatePostgres(retirement,config,request.originalScope().clusterId(),guard)) {
+                guard.run();operations.requirePending(original);retirement.completeAfterVerifiedRelease();guard.run();
+            }
+        }
+        operations.requirePending(original);guard.run();
+    }
+
+    /** Runs only for the winning first-preparation invocation after the original execution is isolated. */
+    void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,Runnable requireRetiredExecution) {
+        reconcileRecovered(confirmation, desired, null, requireRetiredExecution);
+    }
+    void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,
+            ConnectorRunBindings predecessor,Runnable requireRetiredExecution) {
+        var contexts = recoveryContexts(desired, predecessor);
+        Runnable guard=() -> {requireRetiredExecution.run();confirmation.requireActive();};
+        guard.run();
+        for(var context:notes.guardedBy(requireRetiredExecution).privateContexts(confirmation)) {
+            guard.run();if(context.completed() || context.origin().isEmpty())continue;
+            var source=contexts.get(context.scope().owner().namespace());
+            if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
+            releaseOne(confirmation.recovery().targetScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),confirmation),guard);
+        }
+        guard.run();
+    }
+
+    static Map<String, SourceResource> recoveryContexts(Map<String, SourceResource> canonical, ConnectorRunBindings predecessor) {
+        if (predecessor == null) return canonical;
+        var result = new java.util.HashMap<>(canonical);
+        var bindings = new java.util.ArrayList<>(predecessor.effective());
+        if (predecessor.handoff() != null) {
+            bindings.addAll(predecessor.handoff().candidates());
+            bindings.addAll(predecessor.handoff().previous());
+        }
+        for (var binding : bindings) {
+            if (binding.notes().owner().kind() != RequiredNoteOwner.Kind.PIPELINE) continue;
+            String logical = RequiredNoteOwner.namespace(new PipelineNode(predecessor.scope().pipelineId(), binding.nodeId()), binding.purpose());
+            var desired = canonical.get(logical);
+            if (desired != null) result.put(binding.notes().owner().namespace(), desired);
+        }
+        return Map.copyOf(result);
+    }
+
+    /** The lifecycle caller has already terminated the original job, writers, capture and hot state. */
+    void retire(PipelineRebuildPreparation original,Runnable requireRetiredExecution) {
+        Objects.requireNonNull(original);Objects.requireNonNull(requireRetiredExecution);
+        Runnable guard=requireRetiredExecution;guard.run();operations.requirePending(original);var request=original.request();
+        for(var retirement:notes.guardedBy(guard).retirements(request.originalScope(),request.operationId())) {
+            operations.requirePending(original);releaseOne(original.request().originalScope().clusterId(),retirement,guard);
+        }
+        operations.requirePending(original);guard.run();
+    }
+    /** Deletion has its own original lifecycle authority; a cache-only full never enters this path. */
+    void delete(PipelineRetirementPreparation original,PipelineRetirements lifecycle,Runnable guard,Runnable local) {
+        Objects.requireNonNull(original);Objects.requireNonNull(lifecycle);Objects.requireNonNull(guard);Objects.requireNonNull(local);
+        guard.run();lifecycle.requirePending(original);var request=original.request();
+        for(var retirement:notes.guardedBy(local).retirements(request.scope(),request.operationId())) {
+            lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard,local);
+        }
+        lifecycle.requirePending(original);guard.run();
+    }
+
+    private void releaseOne(String clusterId,RequiredNoteRetirement retirement,Runnable guard) {
+        releaseOne(clusterId,retirement,guard,guard);
+    }
+    private void releaseOne(String clusterId,RequiredNoteRetirement retirement,Runnable guard,Runnable local) {
+        guard.run();if(retirement.completed())return;var origin=retirement.origin();
+        if(origin.isPresent()) {
+            var owner=retirement.scope().owner();
+            var purpose=java.util.Arrays.stream(PipelineNode.Purpose.values()).filter(owner::hasPurpose).findFirst().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
+            String prefix="pdk.state."+owner.ownerId()+"."+purpose.segment()+".";
+            var config=new CaptureConfig(origin.orElseThrow().connectorId(),Map.of(),List.of(),new PipelineNode(owner.ownerId(),owner.namespace().substring(prefix.length())));
+            release.run(retirement,config,purpose,clusterId,local).ifPresent(failure -> {throw failure;});guard.run();
+        }
+        retirement.completeAfterVerifiedRelease();guard.run();
+    }
+    private static TapstateException unavailable(){return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);}
+}

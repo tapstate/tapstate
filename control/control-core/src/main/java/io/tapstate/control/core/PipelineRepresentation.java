@@ -2,9 +2,15 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.RollupResultType;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
@@ -44,6 +50,9 @@ import java.util.function.Function;
 /** Projects a canonical Pipeline artifact and its resolved Sources into a structured view. */
 public final class PipelineRepresentation {
 
+    private static final String FIELDS_KEY = "fields";
+    private static final String SOFT_DELETE_KEY = "soft_delete";
+
     private final PipelineDagProjection dagProjection = new PipelineDagProjection();
 
     /** Builds a Pipeline view while preserving the declared Source reference order. */
@@ -65,16 +74,23 @@ public final class PipelineRepresentation {
                 .equals(sourceSummaries.stream().map(PipelineSourceSummary::id).toList())) {
             throw new IllegalArgumentException("source summaries must match declared pipeline source references");
         }
+        List<PipelineSourceSummary> summaries = new ArrayList<>(sourceSummaries.size());
+        for (int index = 0; index < sourceSummaries.size(); index++) {
+            var source = sourceSummaries.get(index);
+            var ref = pipeline.sources().get(index);
+            summaries.add(new PipelineSourceSummary(source.id(), source.metadata(), source.connector(),
+                    source.resolved(), ref.nodeConfig(), ref.alias()));
+        }
         return new PipelineView(
                 pipeline.id(),
                 pipeline.metadata(),
-                sourceSummaries,
+                summaries,
                 transformViews(pipeline.transforms()),
                 viewValue(pipeline.view()),
                 serveValue(pipeline.serve()),
                 settingsValue(pipeline.settings()),
                 pipeline.experimental(),
-                dagProjection.project(pipeline, sourceSummaries),
+                dagProjection.project(pipeline, summaries),
                 contentHash,
                 status);
     }
@@ -90,9 +106,7 @@ public final class PipelineRepresentation {
             return new PipelineResource(
                     input.id(),
                     input.metadata(),
-                    sourceIds(input.sources()).stream()
-                            .map(id -> (SourceRef) SourceRef.bare(id))
-                            .toList(),
+                    sourceRefs(input.sources(), existing),
                     transforms(input.transforms()),
                     view(input.view()),
                     serve(input.serve()),
@@ -106,19 +120,36 @@ public final class PipelineRepresentation {
         }
     }
 
-    private static List<String> sourceIds(List<Object> values) {
-        List<String> ids = new ArrayList<>(values.size());
+    private static List<SourceRef> sourceRefs(List<Object> values, PipelineResource existing) {
+        Map<String, SourceRef> previous = new LinkedHashMap<>();
+        if (existing != null) {
+            existing.sources().forEach(ref -> previous.putIfAbsent(ref.binding(), ref));
+        }
+        List<SourceRef> sources = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Object value = values.get(index);
+            String path = "sources[" + index + "]";
             if (value instanceof PipelineSourceSummary summary) {
-                ids.add(summary.id());
+                sources.add(SourceRef.of(summary.id(), null, summary.nodeConfig(), summary.alias()));
             } else if (value instanceof Map<?, ?>) {
-                ids.add(requiredText(object(value, "sources[" + index + "]"), "id", "sources[" + index + "]"));
+                Map<String, Object> fields = object(value, path);
+                String id = requiredText(fields, "id", path);
+                String alias = fields.get("alias") == null ? null : requiredText(fields, "alias", path);
+                Map<String, Object> nodeConfig = fields.containsKey("nodeConfig")
+                        ? copyJson(object(fields.get("nodeConfig"), path + ".nodeConfig"))
+                        : previousNodeConfig(previous, id, alias);
+                sources.add(SourceRef.of(id, null, nodeConfig, alias));
             } else {
-                ids.add(requiredString(value, "sources[" + index + "]"));
+                String id = requiredString(value, path);
+                sources.add(SourceRef.of(id, null, previousNodeConfig(previous, id, null)));
             }
         }
-        return List.copyOf(ids);
+        return List.copyOf(sources);
+    }
+
+    private static Map<String, Object> previousNodeConfig(Map<String, SourceRef> previous, String id, String alias) {
+        SourceRef held = previous.get(alias == null ? id : alias);
+        return held != null && held.id().equals(id) ? held.nodeConfig() : Map.of();
     }
 
     private static List<Step> transforms(List<Map<String, Object>> values) {
@@ -148,12 +179,13 @@ public final class PipelineRepresentation {
         }
         String use = textOrNull(step.get("use"), path + ".use");
         FromClause from = fromClause(step.get("from"), path + ".from");
+        ExecutionSpec execution = execution(step.get("execution"), path + ".execution");
         if (use != null) {
-            return Step.use(id, use, from);
+            return Step.use(id, use, from, execution);
         }
         String type = transformType(step.get("type"), body, path);
         TransformBody transform = body(type, payload, path);
-        return Step.inline(id, from, transform,
+        return Step.inline(id, from, transform, execution,
                 copyJson(objectOrNull(step.get("experimental"), path + ".experimental")));
     }
 
@@ -167,7 +199,12 @@ public final class PipelineRepresentation {
         if (body.containsKey("script")) {
             return "js";
         }
-        if (body.containsKey("fields")) {
+        // Read before map: both carry fields, and only an aggregate says how rows are grouped. One
+        // with neither key has to name its type, as an unqualified fields map is a projection.
+        if (body.containsKey("groupBy") || body.containsKey("where")) {
+            return "aggregate";
+        }
+        if (body.containsKey(FIELDS_KEY) || body.containsKey(SOFT_DELETE_KEY) || body.containsKey("softDelete")) {
             return "map";
         }
         if (body.containsKey("expr")) {
@@ -188,13 +225,17 @@ public final class PipelineRepresentation {
         throw malformed(path + ".type is required");
     }
 
-    private static TransformBody body(String type, Map<String, Object> payload, String path) {
+    static TransformBody body(String type, Map<String, Object> payload, String path) {
         return switch (type) {
             case "js" -> new TransformBody.Js(requiredText(payload, "script", path));
-            case "map" -> new TransformBody.MapProjection(
-                    fieldRules(requiredObject(payload, "fields", path), path + ".fields"));
+            case "map" -> mapBody(payload, path);
             case "filter" -> new TransformBody.Filter(requiredText(payload, "expr", path));
             case "union" -> new TransformBody.Union();
+            case "aggregate" -> new TransformBody.Aggregate(
+                    stringsOrNull(payload.get("key"), path + ".key"),
+                    textOrNull(payload.get("where"), path + ".where"),
+                    groupBy(payload.get("groupBy"), path + ".groupBy"),
+                    rollupFields(requiredObject(payload, "fields", path), path + ".fields"));
             // An expansion's four optional keys are read as absent when absent, never defaulted:
             // this face round-trips what it wrote, and answering with a spelled-out false for a
             // key nobody wrote turns reading a pipeline into editing it.
@@ -206,7 +247,8 @@ public final class PipelineRepresentation {
                             "preserveNullAndEmptyArrays"), path + ".preserve_null_and_empty_arrays"),
                     textOrNull(value(payload, "element_key", "elementKey"), path + ".element_key"),
                     elementType(value(payload, "element_type", "elementType"),
-                            path + ".element_type"));
+                            path + ".element_type"),
+                    textOrNull(value(payload, "source_id_field", "sourceIdField"), path + ".source_id_field"));
             case "nest" -> new TransformBody.Nest(
                     textOrNull(value(payload, "primary_key", "primaryKey"), path + ".primary_key"),
                     enumValue(value(payload, "order"), NestOrder.values(), NestOrder::yaml, path + ".order"),
@@ -242,6 +284,9 @@ public final class PipelineRepresentation {
                     result.put(entry.getKey(), FieldRule.computed(
                             requiredString(typed.get("celExpr"), path + "." + entry.getKey())));
                 } else if (typed.size() == 1 && typed.containsKey("value")) {
+                    if (typed.get("value") == null) {
+                        throw malformed(path + "." + entry.getKey() + ".value cannot be null");
+                    }
                     result.put(entry.getKey(), FieldRule.literal(copyJsonValue(typed.get("value"))));
                 } else {
                     result.put(entry.getKey(), FieldRule.literal(copyJsonValue(value)));
@@ -273,14 +318,113 @@ public final class PipelineRepresentation {
             value.putAll(bodyValue(inline.body()));
             value.put("experimental", copyJson(inline.experimental()));
         }
+        value.put("execution", executionValue(step.execution()));
         return Collections.unmodifiableMap(value);
+    }
+
+    /**
+     * A node's execution block as the editor reads it, or null where the node says nothing. Absent parts
+     * stay absent rather than being filled with the node type's defaults: which default applies is the
+     * runtime's to report, beside whether the author wrote the value at all.
+     */
+    static Map<String, Object> executionValue(ExecutionSpec execution) {
+        if (execution == null) {
+            return null;
+        }
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("parallelism", execution.parallelism());
+        BatchSpec batch = execution.batch();
+        if (batch == null) {
+            value.put("batch", null);
+        } else {
+            Map<String, Object> limits = new LinkedHashMap<>();
+            limits.put("maxRecords", batch.maxRecords());
+            limits.put("maxWait", batch.maxWait());
+            value.put("batch", Collections.unmodifiableMap(limits));
+        }
+        return Collections.unmodifiableMap(value);
+    }
+
+    /**
+     * Reads a node's execution block from the editor payload, or null where there is none. The same rules
+     * as the authored form hold: the parallelism is a cluster-wide target and nothing else - a per-member
+     * count or a request to guess is refused by name rather than dropped, since a payload that lost it on
+     * the way in would read as accepted and run at a width nobody asked for.
+     */
+    static ExecutionSpec execution(Object raw, String path) {
+        Map<String, Object> value = objectOrNull(raw, path);
+        if (value == null) {
+            return null;
+        }
+        for (String key : value.keySet()) {
+            if (!key.equals("parallelism") && !key.equals("batch")) {
+                throw malformed(path + "." + key + " is not a field of execution; "
+                        + "set parallelism (the cluster-wide target) or batch");
+            }
+        }
+        Integer parallelism = boundedInteger(value.get("parallelism"), path + ".parallelism",
+                1, ExecutionSpec.MAX_PARALLELISM);
+        BatchSpec batch = null;
+        Map<String, Object> limits = objectOrNull(value.get("batch"), path + ".batch");
+        if (limits != null) {
+            for (String key : limits.keySet()) {
+                if (!java.util.Set.of("max_records", "maxRecords", "max_wait", "maxWait").contains(key)) {
+                    throw malformed(path + ".batch." + key + " is not a field of batch; "
+                            + "set maxRecords or maxWait");
+                }
+            }
+            Integer maxRecords = boundedInteger(value(limits, "max_records", "maxRecords"),
+                    path + ".batch.maxRecords", 1, BatchSpec.MAX_RECORDS_LIMIT);
+            String maxWait = textOrNull(value(limits, "max_wait", "maxWait"), path + ".batch.maxWait");
+            if (maxWait != null) {
+                long millis = BatchSpec.durationMillis(maxWait);
+                if (millis < 0 || millis > BatchSpec.MAX_WAIT_LIMIT_MILLIS) {
+                    throw malformed(path + ".batch.maxWait must be a duration from 0ms to 60s, "
+                            + "such as 0ms, 50ms or 2s; got '" + maxWait + "'");
+                }
+            }
+            batch = maxRecords == null && maxWait == null ? null : new BatchSpec(maxRecords, maxWait);
+        }
+        return parallelism == null && batch == null ? null : new ExecutionSpec(parallelism, batch);
+    }
+
+    /** A whole number from {@code min} to {@code max}, or null where the value is absent. */
+    private static Integer boundedInteger(Object value, String path, int min, int max) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Number number) || number.doubleValue() != number.longValue()
+                || number.longValue() < min || number.longValue() > max) {
+            throw malformed(path + " must be a whole number from " + min + " to " + max);
+        }
+        return number.intValue();
+    }
+
+    /** A map's fields may be absent only where soft_delete stands in for them, as in the document form. */
+    private static TransformBody.MapProjection mapBody(Map<String, Object> payload, String path) {
+        String softDelete = textOrNull(value(payload, SOFT_DELETE_KEY, "softDelete"), path + "." + SOFT_DELETE_KEY);
+        if (softDelete != null && softDelete.isBlank()) {
+            throw malformed(path + ".soft_delete must name a column");
+        }
+        Map<String, FieldRule> fields = softDelete != null && payload.get(FIELDS_KEY) == null
+                ? Map.of()
+                : fieldRules(requiredObject(payload, FIELDS_KEY, path), path + "." + FIELDS_KEY);
+        if (softDelete != null && fields.containsKey(softDelete)) {
+            throw malformed(path + ".soft_delete names a column also declared under fields");
+        }
+        return new TransformBody.MapProjection(fields, softDelete);
     }
 
     private static Map<String, Object> bodyValue(TransformBody body) {
         Map<String, Object> value = new LinkedHashMap<>();
         switch (body) {
             case TransformBody.Js js -> value.put("script", js.script());
-            case TransformBody.MapProjection map -> value.put("fields", fieldRuleValues(map.fields()));
+            case TransformBody.MapProjection map -> {
+                value.put(FIELDS_KEY, fieldRuleValues(map.fields()));
+                if (map.softDelete() != null) {
+                    value.put(SOFT_DELETE_KEY, map.softDelete());
+                }
+            }
             case TransformBody.Filter filter -> value.put("expr", filter.expr());
             // Every key, including the ones the author omitted: this face reports what a pipeline
             // is, and a key left out of the answer is indistinguishable from a key this face does
@@ -291,8 +435,15 @@ public final class PipelineRepresentation {
                 value.put("preserveNullAndEmptyArrays", unwind.preserveNullAndEmptyArrays());
                 value.put("elementKey", unwind.elementKey());
                 value.put("elementType", unwind.elementType());
+                value.put("sourceIdField", unwind.sourceIdField());
             }
             case TransformBody.Union ignored -> {
+            }
+            case TransformBody.Aggregate aggregate -> {
+                value.put("key", aggregate.key());
+                value.put("where", aggregate.where());
+                value.put("groupBy", aggregate.groupBy());
+                value.put("fields", rollupValues(aggregate.fields()));
             }
             case TransformBody.Nest nest -> {
                 value.put("primaryKey", nest.primaryKey());
@@ -327,8 +478,11 @@ public final class PipelineRepresentation {
             Map<String, Object> value = new LinkedHashMap<>();
             value.put("from", embed.from());
             value.put("on", embed.on());
+            if (embed.orOn() != null) {
+                value.put("orOn", embed.orOn());
+            }
             value.put("as", embed.as() == null ? null : embed.as().name());
-            if (embed.as() != EmbedAs.FLAT) {
+            if (embed.as() != EmbedAs.FLAT && embed.as() != EmbedAs.ROLLUP) {
                 value.put("path", embed.path());
             }
             value.put("key", embed.key());
@@ -336,8 +490,39 @@ public final class PipelineRepresentation {
             value.put("ignoreUpdates", embed.ignoreUpdates());
             value.put("trackKeyChanges", embed.trackKeyChanges());
             value.put("embed", embedValues(embed.embed()));
+            value.put("rollup", rollupValues(embed.rollup()));
             return Collections.unmodifiableMap(value);
         }).toList();
+    }
+
+    /** Rollup fields in the shape they are written in: one function key carrying its argument, then options. */
+    private static Map<String, Object> rollupValues(Map<String, RollupField> fields) {
+        if (fields == null) {
+            return null;
+        }
+        Map<String, Object> values = new LinkedHashMap<>();
+        fields.forEach((name, field) -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            Object argument = field.argument();
+            if (argument instanceof RollupPick pick) {
+                Map<String, Object> picked = new LinkedHashMap<>();
+                picked.put("value", pick.value());
+                picked.put("by", pick.by());
+                argument = Collections.unmodifiableMap(picked);
+            }
+            value.put(field.function().yaml(), argument);
+            if (field.filter() != null) {
+                value.put("filter", field.filter());
+            }
+            if (field.type() != null) {
+                value.put("type", field.type().yaml());
+            }
+            if (field.defaultValue() != null) {
+                value.put("default", field.defaultValue());
+            }
+            values.put(name, Collections.unmodifiableMap(value));
+        });
+        return Collections.unmodifiableMap(values);
     }
 
     private static Map<String, Object> fieldRuleValues(Map<String, FieldRule> rules) {
@@ -385,6 +570,9 @@ public final class PipelineRepresentation {
             value.put("from", fromRefValue(inline.from()));
             value.put("primaryKey", inline.primaryKey());
             value.put("storage", storageValue(inline.storage()));
+            value.put("writeMode", inline.writeMode() == null ? null : inline.writeMode().name());
+            value.put("onFullLoad", inline.onFullLoad() == null ? null : inline.onFullLoad().name());
+            value.put("execution", executionValue(inline.execution()));
         }
         return Collections.unmodifiableMap(value);
     }
@@ -442,6 +630,7 @@ public final class PipelineRepresentation {
             value.put("rename", renameValue(element.rename()));
             value.put("ddl", element.ddl() == null ? null : element.ddl().name());
             value.put("onFullLoad", element.onFullLoad() == null ? null : element.onFullLoad().name());
+            value.put("execution", executionValue(element.execution()));
             return Collections.unmodifiableMap(value);
         }).toList();
     }
@@ -534,18 +723,106 @@ public final class PipelineRepresentation {
             if (as == EmbedAs.FLAT && arrayKey != null) {
                 throw malformed(entryPath + ".arrayKey is forbidden when as is flat");
             }
+            if (as == EmbedAs.ROLLUP && embedPath != null) {
+                throw malformed(entryPath + ".path is forbidden when as is rollup");
+            }
+            Map<String, RollupField> rollup = rollupFields(value.get("rollup"), entryPath + ".rollup");
+            if ((as == EmbedAs.OBJECT || as == EmbedAs.FLAT) && rollup != null) {
+                throw malformed(entryPath + ".rollup is forbidden when as is " + as.yaml());
+            }
+            if (as == EmbedAs.ROLLUP && (rollup == null || rollup.isEmpty())) {
+                throw malformed(entryPath + ".rollup is required when as is rollup");
+            }
             result.add(new Embed(
                     requiredText(value, "from", entryPath),
                     stringMap(requiredObject(value, "on", entryPath), entryPath + ".on"),
                     as,
-                    as == EmbedAs.FLAT ? null : requiredText(value, "path", entryPath),
+                    as == EmbedAs.FLAT || as == EmbedAs.ROLLUP ? null : requiredText(value, "path", entryPath),
                     key,
                     arrayKey,
                     booleanOrNull(value(value, "ignoreUpdates", "ignore_updates"), entryPath + ".ignoreUpdates"),
                     booleanOrNull(value(value, "trackKeyChanges", "track_key_changes"), entryPath + ".trackKeyChanges"),
-                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed")));
+                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed"),
+                    rollup,
+                    alternatives(listOrNull(value(value, "orOn", "or_on"), entryPath + ".orOn"), entryPath + ".orOn")));
         }
         return List.copyOf(result);
+    }
+
+    /** An embed's orOn alternatives, each an object of child field to parent field; null when absent. */
+    private static List<Map<String, String>> alternatives(List<?> values, String path) {
+        if (values == null) {
+            return null;
+        }
+        if (values.isEmpty()) {
+            throw malformed(path + " must list at least one alternative");
+        }
+        List<Map<String, String>> result = new ArrayList<>(values.size());
+        for (int index = 0; index < values.size(); index++) {
+            String entryPath = path + "[" + index + "]";
+            Map<String, String> alternative = stringMap(object(values.get(index), entryPath), entryPath);
+            if (alternative.isEmpty()) {
+                throw malformed(entryPath + " must map at least one field");
+            }
+            result.add(alternative);
+        }
+        return List.copyOf(result);
+    }
+
+    /** Group names to the expression each is computed from, in the order written. */
+    private static Map<String, String> groupBy(Object raw, String path) {
+        if (raw == null) {
+            return Map.of();
+        }
+        Map<String, String> result = new LinkedHashMap<>();
+        object(raw, path).forEach((name, expression) -> result.put(name, text(expression, path + "." + name)));
+        return result;
+    }
+
+    /** Rollup fields read back from their written shape; exactly one function key per field. */
+    private static Map<String, RollupField> rollupFields(Object raw, String path) {
+        if (raw == null) {
+            return null;
+        }
+        Map<String, Object> fields = object(raw, path);
+        Map<String, RollupField> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : fields.entrySet()) {
+            String fieldPath = path + "." + entry.getKey();
+            Map<String, Object> value = object(entry.getValue(), fieldPath);
+            List<RollupFunction> functions = new ArrayList<>();
+            for (String key : value.keySet()) {
+                if (!List.of("filter", "type", "default").contains(key)) {
+                    functions.add(RollupFunction.byYaml(key).orElseThrow(
+                            () -> malformed(fieldPath + "." + key + " is not a rollup function; one of "
+                                    + RollupFunction.spellings())));
+                }
+            }
+            if (functions.size() != 1) {
+                throw malformed(fieldPath + " must name exactly one rollup function");
+            }
+            RollupFunction function = functions.getFirst();
+            Object argument = value.get(function.yaml());
+            if (function == RollupFunction.FIRST || function == RollupFunction.LAST) {
+                Map<String, Object> pick = object(argument, fieldPath + "." + function.yaml());
+                Object by = pick.get("by");
+                List<String> order = by instanceof String single ? List.of(single)
+                        : stringsOrNull(by, fieldPath + "." + function.yaml() + ".by");
+                if (order == null || order.isEmpty()) {
+                    throw malformed(fieldPath + "." + function.yaml() + ".by is required");
+                }
+                argument = new RollupPick(requiredText(pick, "value", fieldPath + "." + function.yaml()), order);
+            } else if (!(argument instanceof String) && !(function == RollupFunction.COUNT
+                    && Boolean.TRUE.equals(argument))) {
+                throw malformed(fieldPath + "." + function.yaml() + " must be an expression"
+                        + (function == RollupFunction.COUNT ? " or true" : ""));
+            }
+            RollupResultType type = value.get("type") == null ? null
+                    : enumValue(value.get("type"), RollupResultType.values(), RollupResultType::yaml,
+                            fieldPath + ".type");
+            result.put(entry.getKey(), RollupField.of(function, argument,
+                    textOrNull(value.get("filter"), fieldPath + ".filter"), type, value.get("default")));
+        }
+        return result;
     }
 
     private static ViewBlock view(Map<String, Object> value) {
@@ -560,13 +837,22 @@ public final class PipelineRepresentation {
         FromRef from = fromRef(value(value, "from"), path + ".from");
         String id = textOrNull(value.get("id"), path + ".id");
         if (use != null) {
+            if (value.get("execution") != null) {
+                throw malformed(path + ".execution belongs to the view definition a use: reference names; "
+                        + "set it there");
+            }
             return new ViewBlock.Use(id, use, from);
         }
         return new ViewBlock.Inline(
                 id == null ? "view" : id,
                 from,
                 textOrNull(value(value, "primary_key", "primaryKey"), path + ".primary_key"),
-                storage(objectOrNull(value.get("storage"), path + ".storage")));
+                storage(objectOrNull(value.get("storage"), path + ".storage")),
+                enumValue(value(value, "write_mode", "writeMode"), WriteMode.values(), WriteMode::yaml,
+                        path + ".writeMode"),
+                enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
+                        path + ".onFullLoad"),
+                execution(value.get("execution"), path + ".execution"));
     }
 
     private static ServeBlock serve(Map<String, Object> value) {
@@ -597,15 +883,17 @@ public final class PipelineRepresentation {
         for (int index = 0; index < values.size(); index++) {
             Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
             requireNoOptions(value, path + "[" + index + "]");
+            String id = textOrNull(value.get("id"), path + ".id");
             result.add(new SyncElement(
-                    textOrNull(value.get("id"), path + ".id"),
+                    id == null ? "sync_" + (index + 1) : id,
                     requiredText(value, "source", path),
                     enumValue(value(value, "write_mode", "writeMode"), WriteMode.values(), WriteMode::yaml,
                             path + ".writeMode"),
                     rename(objectOrNull(value.get("rename"), path + ".rename")),
                     enumValue(value.get("ddl"), DdlPolicy.values(), DdlPolicy::yaml, path + ".ddl"),
                     enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
-                            path + ".onFullLoad")));
+                            path + ".onFullLoad"),
+                    execution(value.get("execution"), path + "[" + index + "].execution")));
         }
         return List.copyOf(result);
     }
@@ -941,7 +1229,7 @@ public final class PipelineRepresentation {
          * empty map would arrive in the transform body.
          */
         private static final java.util.Set<String> STEP_META = java.util.Set.of(
-                "id", "from", "type", "use", "options", "experimental", "body");
+                "id", "from", "type", "use", "options", "experimental", "body", "execution");
 
         private SetOf() {
         }

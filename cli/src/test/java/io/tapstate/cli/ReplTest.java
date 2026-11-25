@@ -1,13 +1,22 @@
 package io.tapstate.cli;
 
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URI;
@@ -55,6 +64,20 @@ class ReplTest {
             UUID.fromString("018f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2");
     private static final UUID TEST_AUTH_REF =
             UUID.fromString("5c199643-04da-4f72-9831-3a77e3590eed");
+
+    private static byte[] completeConnectorJar() {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (JarOutputStream jar = new JarOutputStream(bytes)) {
+                jar.putNextEntry(new JarEntry("connector.txt"));
+                jar.write("connector".getBytes());
+                jar.closeEntry();
+            }
+            return bytes.toByteArray();
+        } catch (IOException failed) {
+            throw new AssertionError("could not create the connector jar fixture", failed);
+        }
+    }
 
     private static ResolvedContext.Named namedContext(URI seed) {
         return new ResolvedContext.Named(
@@ -172,6 +195,7 @@ class ReplTest {
         /** The canned connected-verb outcomes (used when the target base is healthy) and their call logs. */
         ApplyOutcome applyOutcome = new ApplyOutcome.Unreachable();
         GetOutcome getOutcome = new GetOutcome.Unreachable();
+        ConnectionSettingsOutcome connectionSettingsOutcome;
         DeleteOutcome deleteOutcome = new DeleteOutcome.Unreachable();
         /** Every removal asked for, as {@code credential@base/id#hash} — the hash is what the tests pin. */
         final List<String> deleteCalls = new ArrayList<>();
@@ -180,13 +204,19 @@ class ReplTest {
         ConnectionTestResultOutcome testResultOutcome = new ConnectionTestResultOutcome.Unreachable();
         ConnectionDiscoverSchemaOutcome discoverSchemaOutcome = new ConnectionDiscoverSchemaOutcome.Unreachable();
         ConnectionSchemaOutcome schemaOutcome = new ConnectionSchemaOutcome.Unreachable();
+        Optional<ConnectorRegisterOutcome> downloadOutcome = Optional.empty();
+        final List<String> downloadCalls = new ArrayList<>();
         ConnectorRegisterOutcome registerOutcome = new ConnectorRegisterOutcome.Unreachable();
         /** Per-artifact register outcomes keyed by artifact byte length (for batch/directory tests); falls back to {@link #registerOutcome}. */
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
+        java.util.function.IntConsumer beforeRegisterResult = ignored -> { };
         ConnectorListOutcome connectorListOutcome = new ConnectorListOutcome.Unreachable();
         /** The canned derived-schema answer, and every call as {@code read|accept credential@base/id}. */
         DerivedSchemaOutcome derivedSchemaOutcome = new DerivedSchemaOutcome.Unreachable();
         final List<String> derivedSchemaCalls = new ArrayList<>();
+        /** One answer per page asked for, in order; the last one stays. */
+        final java.util.ArrayDeque<AggregateCheckOutcome> aggregateOutcomes = new java.util.ArrayDeque<>();
+        final List<String> aggregateCalls = new ArrayList<>();
         LifecycleOutcome lifecycleOutcome = new LifecycleOutcome.Unreachable();
         /**
          * Per-verb outcomes, falling back to {@link #lifecycleOutcome}. A composed verb drives
@@ -195,6 +225,23 @@ class ReplTest {
          * what "the definition changed under the run" looks like from here.
          */
         final Map<String, LifecycleOutcome> lifecycleOutcomeByVerb = new HashMap<>();
+        /**
+         * What successive starts answer, in order; the last one sticks. Empty, a start is the lifecycle verb
+         * it always was, answered from {@link #lifecycleOutcomeByVerb} with no start checks in it -- which is
+         * what a server released before start checks answers.
+         */
+        final Deque<StartAttempt> startAttempts = new ArrayDeque<>();
+        /** Every start sent, as {@code <pipeline> [<finding>=<action>, ...]}, plus {@code ifMatch=<hash>} when set. */
+        final List<String> startCalls = new ArrayList<>();
+        /**
+         * Answers each start from the answers it carries, the way a server with start checks does; when set it
+         * decides every start a healthy member gets, and {@link #startAttempts} is not read.
+         */
+        java.util.function.Function<List<StartDecision>, StartAttempt> startResponder;
+        /** What a read of the start checks answers, by intent; an intent with none is a server without them. */
+        final Map<String, StartChecksOutcome> startChecksByIntent = new HashMap<>();
+        /** Every read of the start checks, as {@code <intent> <pipeline>}. */
+        final List<String> startCheckReads = new ArrayList<>();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
         /**
          * The states successive status reads answer, in order; the last one sticks. A single value
@@ -218,6 +265,7 @@ class ReplTest {
         /** The coded reason carried alongside every emitted watch state, when a test needs one. */
         String watchFailureCode;
         String watchFailureMessage;
+        Map<String, Object> watchDiagnostic = Map.of();
         List<List<RemoteLogLine>> followBatches = List.of();
         final List<String> applyCalls = new ArrayList<>();
         /** The drafts each apply carried, kept whole: what reaches the wire is the thing under test. */
@@ -420,6 +468,20 @@ class ReplTest {
         }
 
         @Override
+        public ConnectionSettingsOutcome connectionSettings(URI baseUrl, String credential, String id) {
+            if (!healthy.contains(baseUrl)) return new ConnectionSettingsOutcome.Unreachable();
+            if (connectionSettingsOutcome != null) return connectionSettingsOutcome;
+            // Legacy fixtures already carry the complete Source. The production transport instead
+            // obtains the protected config from the dedicated Source endpoint.
+            if (getOutcome instanceof GetOutcome.Found found
+                    && new io.tapstate.core.dsl.DslParser().parse(found.artifact().canonicalForm())
+                    instanceof io.tapstate.core.model.SourceResource source) {
+                return new ConnectionSettingsOutcome.Found(source.connector(), source.config());
+            }
+            return new ConnectionSettingsOutcome.Unreachable();
+        }
+
+        @Override
         public DeleteOutcome delete(URI baseUrl, String credential, String id, String expectedContentHash) {
             deleteCalls.add(credential + "@" + baseUrl + "/" + id + "#" + expectedContentHash);
             return healthy.contains(baseUrl) ? deleteOutcome : new DeleteOutcome.Unreachable();
@@ -459,8 +521,15 @@ class ReplTest {
         }
 
         @Override
+        public Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String id) {
+            downloadCalls.add(id);
+            return downloadOutcome;
+        }
+
+        @Override
         public ConnectorRegisterOutcome register(URI baseUrl, String credential, byte[] artifact) {
             registerCalls.add(credential + "@" + baseUrl + " x" + artifact.length);
+            beforeRegisterResult.accept(artifact.length);
             if (!healthy.contains(baseUrl)) {
                 return new ConnectorRegisterOutcome.Unreachable();
             }
@@ -483,6 +552,33 @@ class ReplTest {
         }
 
         @Override
+        public StartAttempt start(URI baseUrl, String credential, String pipelineId, List<StartDecision> decisions,
+                String ifMatch) {
+            startCalls.add(pipelineId + " " + decisions.stream().map(d -> d.finding() + "=" + d.action()).toList()
+                    + (ifMatch == null ? "" : " ifMatch=" + ifMatch));
+            if (!healthy.contains(baseUrl) || (startResponder == null && startAttempts.isEmpty())) {
+                // the lifecycle verb records the call; a member that is down refuses the connection, so
+                // nothing reached it and the start may be sent to another
+                StartAttempt answer = ControlPlaneClient.super.start(baseUrl, credential, pipelineId, decisions, ifMatch);
+                return healthy.contains(baseUrl) ? answer : new StartAttempt.Unreachable(false);
+            }
+            lifecycleCalls.add(credential + "@" + baseUrl + " start " + pipelineId);
+            if (startResponder != null) {
+                return startResponder.apply(decisions);
+            }
+            return startAttempts.size() == 1 ? startAttempts.peek() : startAttempts.poll();
+        }
+
+        @Override
+        public StartChecksOutcome startChecks(URI baseUrl, String credential, String pipelineId, String intent) {
+            startCheckReads.add(intent + " " + pipelineId);
+            if (!healthy.contains(baseUrl)) {
+                return new StartChecksOutcome.Unreachable();
+            }
+            return startChecksByIntent.getOrDefault(intent, new StartChecksOutcome.NotSupported());
+        }
+
+        @Override
         public StatusOutcome status(URI baseUrl, String credential, String pipelineId) {
             statusCalls.add(credential + "@" + baseUrl + "/" + pipelineId);
             if (!healthy.contains(baseUrl)) {
@@ -494,6 +590,17 @@ class ReplTest {
             // The last one sticks rather than draining: a wait polls an unknown number of times, and a
             // queue that empties would answer the next poll with something nobody scripted.
             return statusOutcomes.size() == 1 ? statusOutcomes.peek() : statusOutcomes.poll();
+        }
+
+        @Override
+        public AggregateCheckOutcome aggregateCheck(URI baseUrl, String credential, String pipelineId,
+                String step, boolean repair, Map<String, String> group, String after) {
+            aggregateCalls.add((repair ? "repair " : "check ") + pipelineId + "/" + step + " group=" + group
+                    + " after=" + after);
+            if (!healthy.contains(baseUrl) || aggregateOutcomes.isEmpty()) {
+                return new AggregateCheckOutcome.Unreachable();
+            }
+            return aggregateOutcomes.size() == 1 ? aggregateOutcomes.peek() : aggregateOutcomes.poll();
         }
 
         @Override
@@ -603,7 +710,7 @@ class ReplTest {
                 if (stop.getAsBoolean()) {
                     return null;
                 }
-                sink.state(pipelineId, state, watchFailureCode, watchFailureMessage);
+                sink.state(new StatusOutcome.Found(pipelineId, state, watchFailureCode, watchFailureMessage, null, Map.of(), watchDiagnostic));
             }
             endOfAttach();
             return streamRefusalCode;
@@ -847,7 +954,7 @@ class ReplTest {
 
         h.repl().dispatch("desc kfk2my");
         int afterMiss = h.sink().toString().length();
-        assertThat(h.sink().toString()).contains("cli.resource-not-found");   // absent from base
+        assertThat(h.sink().toString()).contains("TS0330017");   // absent from base
 
         h.repl().dispatch("cd ws");
         h.repl().dispatch("desc kfk2my");
@@ -885,7 +992,7 @@ class ReplTest {
         assertThat(out).contains(buildVersion());
         // The control group. Without a matched pair, an implementation that warns unconditionally
         // passes the mismatch test just as well, and the warning would then mean nothing.
-        assertThat(out).doesNotContain("cli.version-mismatch");
+        assertThat(out).doesNotContain("TS0330060");
     }
 
     @Test
@@ -900,7 +1007,7 @@ class ReplTest {
         assertThat(h.repl().session().isConnected()).isTrue();
 
         String out = h.sink().toString();
-        assertThat(out).contains("cli.version-mismatch");
+        assertThat(out).contains("TS0330060");
         // Both numbers, because "they differ" without saying how is a sentence nobody can act on.
         assertThat(out).contains(buildVersion()).contains("9.9.9");
     }
@@ -966,7 +1073,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("ls")).isTrue();
         String diagnostic = h.sink().toString().substring(mark);
 
-        assertThat(diagnostic).contains("cli.not-authenticated");
+        assertThat(diagnostic).contains("TS0330021");
         // The pair the session is actually running, not the offline default: a stamp that said "not
         // connected" from inside a live session would be worse than none, because it reads as fact.
         assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
@@ -989,7 +1096,7 @@ class ReplTest {
         h.repl().dispatch(List.of("data-browser", "views.order_state.find()"));
         String diagnostic = h.sink().toString().substring(mark);
 
-        assertThat(diagnostic).contains("cli.not-authenticated");
+        assertThat(diagnostic).contains("TS0330021");
         assertThat(diagnostic).contains("cli " + buildVersion()).contains("server 9.9.9");
     }
 
@@ -1124,7 +1231,7 @@ class ReplTest {
         assertThat(h.repl().session().isConnected()).isFalse();
         assertThat(h.repl().prompt()).isEqualTo("tapstate(offline:tap-work)> ");
         assertThat(h.sink().toString())
-                .contains("cli.connect-failed")
+                .contains("TS0330018")
                 .contains("http://node1:7900")
                 .contains("http://node2:7900");
     }
@@ -1280,7 +1387,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("login alice")).isTrue();
         assertThat(h.repl().session().isAuthenticated()).isFalse();
         // the not-connected state is a coded cli.* diagnostic naming the login verb, not a bare string
-        assertThat(h.sink().toString()).contains("cli.not-connected").contains("login");
+        assertThat(h.sink().toString()).contains("TS0330020").contains("login");
         assertThat(client.loginCalls).isEmpty();
     }
 
@@ -1757,7 +1864,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("views.order_state.find()")).isTrue();
 
-        assertThat(h.sink().toString().substring(mark)).contains("cli.not-connected");
+        assertThat(h.sink().toString().substring(mark)).contains("TS0330020");
         assertThat(client.dataBrowserCalls).isEmpty();
     }
 
@@ -1914,7 +2021,7 @@ class ReplTest {
 
         client.tokenListOutcome = new TokenListOutcome.Unreachable();
         assertThat(h.repl().dispatch("token list")).isTrue();
-        assertThat(h.sink().toString().substring(mark)).contains("request failed");
+        assertThat(h.sink().toString().substring(mark)).contains("TS0330061");
         assertThat(client.tokenCalls).containsExactly(
                 "list jwt-tok@http://node1:7900", "list jwt-tok@http://node1:7900");
     }
@@ -1930,14 +2037,40 @@ class ReplTest {
     void getWhileAuthenticatedFetchesTheArtifactFromTheServer() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
-                new RemoteArtifact("src_kfk", "source", "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
+                new RemoteArtifact("src_kfk", "source",
+                        "version: tapstate/v1\nkind: source\nid: src_kfk\nconnector: kafka\n"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get src_kfk")).isTrue();
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("kind: source").contains("src_kfk");
+        assertThat(out).doesNotContain("cannot be applied as-is");
         // the credential travels to the current landing node
         assertThat(client.getCalls).containsExactly("jwt-tok@http://node1:7900/src_kfk");
+    }
+
+    @Test
+    void getWarnsThatARedactedSourceCannotBeAppliedAsIs() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact(
+                "atlas", "source",
+                "version: tapstate/v1\nkind: source\nid: atlas\n"
+                        + "config: { uri: 'mongodb+srv://<redacted>@cluster.example/test' }\n"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("get atlas")).isTrue();
+
+        String output = h.sink().toString().substring(mark);
+        assertThat(output).contains("mongodb+srv://<redacted>@cluster.example/test")
+                .contains("cannot be applied as-is", "provide complete settings")
+                .doesNotContain("sentinel-secret");
+
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("atlas", "source", "<redacted-source>"));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("get atlas")).isTrue();
+        assertThat(h.sink().toString().substring(mark))
+                .contains("<redacted-source>", "cannot be applied as-is");
     }
 
     /**
@@ -1958,7 +2091,7 @@ class ReplTest {
             h.repl().dispatch(verb);
             assertThat(h.sink().toString().substring(mark))
                     .as(verb + " is projected as a connected verb, so a connected session must route it")
-                    .doesNotContain("cli.not-connected");
+                    .doesNotContain("TS0330020");
         }
     }
 
@@ -2077,7 +2210,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("delete nope -o json")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("\"code\": \"artifact.not-found\"").contains("nope");
+        assertThat(out).contains("\"code\": \"TS0240001\"").contains("nope");
         assertThat(client.deleteCalls).isEmpty();
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
     }
@@ -2238,14 +2371,15 @@ class ReplTest {
         assertThat(out).doesNotContain("stop null");
     }
 
-    @Test
-    void aPartlyExecutedRemovalSaysTheResourceIsGoneAndNamesTheResidueInsteadOfInvitingARetry() {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0240006", "artifact.reclaim-incomplete"})
+    void aPartlyExecutedRemovalSaysTheResourceIsGoneAndNamesTheResidueInsteadOfInvitingARetry(String code) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         // The one failure on this verb that is not a refusal: the artifact is destroyed and some of its
         // bookkeeping is not. Rendered like the refusals above, the operator retries — which can only
         // answer artifact.not-found — and the residue that does need clearing is never mentioned.
         client.deleteOutcome = new DeleteOutcome.Rejected(
-                "artifact.reclaim-incomplete", "Artifact 'kfk2my' was removed, but bookkeeping was left.",
+                code, "Artifact 'kfk2my' was removed, but bookkeeping was left.",
                 Map.of("id", "kfk2my", "reason", "step-failed",
                         "residue", List.of("desired", "mining-chain-consumer")));
         Harness h = onlineSession(Path.of("tap-work"), client);
@@ -2258,14 +2392,15 @@ class ReplTest {
         assertThat(out).contains("desired").contains("mining-chain-consumer");
     }
 
-    @Test
-    void aRemovalThatStoppedBecauseThePipelineCameBackUpSaysToStopItBeforeClearingAnything() {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0240006", "artifact.reclaim-incomplete"})
+    void aRemovalThatStoppedBecauseThePipelineCameBackUpSaysToStopItBeforeClearingAnything(String code) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         // The other way a removal ends incomplete: nothing was cleared, deliberately, because the
         // pipeline was started while the removal ran. "Clear the listed records by hand" is the wrong
         // next step here — deleting the checkpoint of a running job discards its fencing epoch.
         client.deleteOutcome = new DeleteOutcome.Rejected(
-                "artifact.reclaim-incomplete", "Artifact 'kfk2my' was removed, but bookkeeping was left.",
+                code, "Artifact 'kfk2my' was removed, but bookkeeping was left.",
                 Map.of("id", "kfk2my", "reason", "pipeline-live",
                         "residue", List.of("mining-chain-consumer", "desired", "state", "observation")));
         Harness h = onlineSession(Path.of("tap-work"), client);
@@ -2324,7 +2459,7 @@ class ReplTest {
         h.repl().dispatch("connect node1:7900");   // connected, never logged in
         assertThat(h.repl().dispatch("get x")).isTrue();
         // the not-authenticated state is a coded cli.* diagnostic naming the verb, not a bare string
-        assertThat(h.sink().toString()).contains("cli.not-authenticated").contains("get");
+        assertThat(h.sink().toString()).contains("TS0330021").contains("get");
         assertThat(client.getCalls).isEmpty();
     }
 
@@ -2338,7 +2473,7 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         // rendered like every other coded diagnostic: an `error: <code>` header, the catalog message,
         // and the solution hint — proving it goes through the shared renderer, not a hand-rolled string
-        assertThat(out).contains("error:").contains("cli.not-authenticated");
+        assertThat(out).contains("error:").contains("TS0330021");
         assertThat(out).contains("apply");        // the {verb} placeholder is bound to the verb name
         assertThat(out).containsIgnoringCase("login");   // the solution points at the recovery verb
         assertThat(client.applyCalls).isEmpty();
@@ -2683,7 +2818,7 @@ class ReplTest {
     void aRefusedApplyShowsTheRemedyAndNotOnlyWhatWentWrong(@TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.applyOutcome = new ApplyOutcome.Rejected("dsl.upsert-needs-key",
+        client.applyOutcome = new ApplyOutcome.Rejected("TS0010023",
                 "The sync at serve.sync upserts table `events` of source `mydb`, but that table declares "
                         + "no key, so no write can be matched to the row it belongs to.",
                 Map.of("table", "events", "source", "mydb", "path", "serve.sync"));
@@ -2693,7 +2828,7 @@ class ReplTest {
         h.repl().dispatch("apply");
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("dsl.upsert-needs-key").contains("declares no key");
+        assertThat(out).contains("TS0010023").contains("declares no key");
         assertThat(out)
                 .as("the catalog's solution for the code, with its parameters filled in")
                 .contains("Give `events` a primary key")
@@ -2755,6 +2890,44 @@ class ReplTest {
     }
 
     @Test
+    void probesUseDedicatedSettingsWhenTheGenericSourceHasNoConfig() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("my-mongo", "source", """
+                version: tapstate/v1
+                kind: source
+                id: my-mongo
+                connector: mongodb
+                """));
+        client.connectionSettingsOutcome = new ConnectionSettingsOutcome.Found(
+                "mongodb", Map.of("uri", "mongodb://<redacted>@db.example/rows", "isUri", true));
+        client.testOutcome = passedReport();
+        client.discoverSchemaOutcome = new ConnectionDiscoverSchemaOutcome.Discovered(
+                new ConnectionSchema("my-mongo", "mongodb", List.of(), 1752000000000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().dispatch("test my-mongo");
+        h.repl().dispatch("discover-schema my-mongo");
+        assertThat(client.testCalls).hasSize(1);
+        assertThat(client.discoverSchemaCalls).hasSize(1);
+        assertThat(client.testCalls.getFirst()).contains("db.example/rows");
+        assertThat(client.discoverSchemaCalls.getFirst()).contains("db.example/rows");
+        assertThat(h.sink().toString()).doesNotContain("db.example/rows");
+    }
+
+    @Test
+    void aRefusedDedicatedSettingsReadNeverRunsAProbe() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = storedConnection();
+        client.connectionSettingsOutcome = new ConnectionSettingsOutcome.Rejected(
+                "control.forbidden", "Protected Source read refused");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().dispatch("test my-mongo");
+        h.repl().dispatch("discover-schema my-mongo");
+        assertThat(client.testCalls).isEmpty();
+        assertThat(client.discoverSchemaCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("control.forbidden", "Protected Source read refused");
+    }
+
+    @Test
     void testOnANonSourceIdReportsNotATestableConnectionAndDoesNotProbe() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.getOutcome = new GetOutcome.Found(
@@ -2802,7 +2975,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("test x")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-authenticated").contains("test");
+        assertThat(h.sink().toString()).contains("TS0330021").contains("test");
         assertThat(client.getCalls).isEmpty();
         assertThat(client.testCalls).isEmpty();
     }
@@ -2831,8 +3004,26 @@ class ReplTest {
 
         // A busy server is not a gone server: the timeout carries its own code and names the landing node.
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("cli.request-timed-out").contains("node1:7900");
+        assertThat(out).contains("TS0330019").contains("node1:7900");
         assertThat(out).doesNotContain("unreachable");
+    }
+
+    @Test
+    void aRefusedConnectionTestKeepsTheDiagnosticAndLegacyParametersInJson() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = storedConnection();
+        var diagnostic = Map.<String, Object>of("cause", Map.of("message", "Peer reset"));
+        var params = Map.<String, Object>of("connector", "mongodb");
+        client.testOutcome = new ConnectionTestOutcome.Rejected(
+                "TS0060001", "Unable to run the test", params, diagnostic);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("test my-mongo -o json");
+
+        assertThat(io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark)))
+                .isEqualTo(Map.of("code", "TS0060001", "message", "Unable to run the test",
+                        "params", params, "diagnostic", diagnostic));
     }
 
     @Test
@@ -2841,7 +3032,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("test my-mongo")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-connected").contains("test");
+        assertThat(h.sink().toString()).contains("TS0330020").contains("test");
     }
 
     // --- connection test result: `test-result <id>` reads back the connection's latest stored result ---
@@ -2889,6 +3080,42 @@ class ReplTest {
     }
 
     @Test
+    void testResultShowsSiblingCausesWithoutChangingTheRecordedOutcome() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, Object> diagnostic = Map.of(
+                "code", "TS0060001",
+                "causes", List.of(
+                        Map.of("code", "PDK43001", "message", "Credentials refused", "references",
+                                List.of(Map.of("type", "connection", "id", "my-mongo"))),
+                        Map.of("message", "TLS was not accepted",
+                                "cause", Map.of("message", "Peer closed the connection"), "truncated", true)));
+        client.testResultOutcome = new ConnectionTestResultOutcome.Found(new ConnectionReport(
+                "my-mongo", "mongodb", "FAILED",
+                List.of(new ConnectionReport.Check("Login", "FAILED", "auth failed", null, null,
+                        null, diagnostic)), 1752000000000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("test-result my-mongo");
+        String output = h.sink().toString().substring(mark);
+        assertThat(output.lines().toList()).containsSubsequence(
+                "          TS0060001",
+                "            PDK43001 Credentials refused",
+                "            connection: my-mongo",
+                "            TLS was not accepted",
+                "              Peer closed the connection",
+                "            [Diagnostic truncated]");
+        assertThat(output).contains("FAILED", "auth failed");
+
+        mark = h.sink().toString().length();
+        h.repl().dispatch("test-result my-mongo -o json");
+        var report = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark));
+        var check = (Map<?, ?>) ((List<?>) report.get("checks")).getFirst();
+        assertThat(check.get("diagnostic")).isEqualTo(diagnostic);
+        assertThat(client.testCalls).isEmpty();
+    }
+
+    @Test
     void testResultForANeverTestedConnectionReportsNotTestedYet() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.testResultOutcome = new ConnectionTestResultOutcome.Absent();
@@ -2922,7 +3149,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("test-result x")).isTrue();
 
         // the not-authenticated state is a coded cli.* diagnostic naming the verb, not a bare string
-        assertThat(h.sink().toString()).contains("cli.not-authenticated").contains("test-result");
+        assertThat(h.sink().toString()).contains("TS0330021").contains("test-result");
         assertThat(client.testResultCalls).isEmpty();
     }
 
@@ -2944,7 +3171,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("test-result my-mongo")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-connected").contains("test-result");
+        assertThat(h.sink().toString()).contains("TS0330020").contains("test-result");
     }
 
     // --- schema discovery: `discover-schema <id>` discovers a stored connection's source model ---
@@ -3055,7 +3282,7 @@ class ReplTest {
 
         // Discovery drives a live round-trip to the remote database; a slow answer must not read as "gone".
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("cli.request-timed-out").contains("node1:7900");
+        assertThat(out).contains("TS0330019").contains("node1:7900");
         assertThat(out).doesNotContain("unreachable");
     }
 
@@ -3065,7 +3292,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("discover-schema my-mongo")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-connected").contains("discover-schema");
+        assertThat(h.sink().toString()).contains("TS0330020").contains("discover-schema");
     }
 
     // --- register: local paths upload directly; published ids download, then upload ---------------
@@ -3088,6 +3315,191 @@ class ReplTest {
     }
 
     @Test
+    void registerDownloadsPublishedAtlasAndEnterpriseConnectorsById(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("enterprise", "hash-abc", "2.0.9", true));
+        Harness h = onlineSession(workdir, client);
+        List<URI> fetched = new ArrayList<>();
+        byte[] jar = completeConnectorJar();
+        h.repl().connectorFetcher((from, expected) -> {
+            fetched.add(from);
+            return PublishedConnectorArtifacts.Fetched.verified(jar);
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register mongodb-atlas")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().dispatch("register oracle")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+
+        assertThat(fetched).containsExactly(
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/mongodb-atlas-connector.jar"),
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/oracle-connector.jar"),
+                URI.create("https://github.com/tapstate/tapstate/releases/download/connectors-preview/sqlserver-connector.jar"));
+        assertThat(client.registerCalls).containsExactly(
+                "jwt-tok@http://node1:7900 x" + jar.length,
+                "jwt-tok@http://node1:7900 x" + jar.length,
+                "jwt-tok@http://node1:7900 x" + jar.length);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("downloading mongodb-atlas-connector.jar from github.com")
+                .contains("downloading oracle-connector.jar from github.com")
+                .contains("downloading sqlserver-connector.jar from github.com")
+                .contains("uploading mongodb-atlas-connector.jar (" + jar.length + " B)")
+                .contains("uploading oracle-connector.jar (" + jar.length + " B)")
+                .contains("uploading sqlserver-connector.jar (" + jar.length + " B)");
+    }
+
+    @Test
+    void registerPublishedAtlasFromPublicReleaseWhenEnabled(@TempDir Path workdir) {
+        assumeTrue(Boolean.getBoolean("tapstate.it.published-connectors"),
+                "requires the live public connector release");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("mongodb-atlas", "hash-atlas", "2.0.5-SNAPSHOT", true));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register mongodb-atlas")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x19764088");
+        assertThat(h.sink().toString())
+                .contains("downloading mongodb-atlas-connector.jar from github.com")
+                .contains("uploading mongodb-atlas-connector.jar")
+                .contains("registered  mongodb-atlas  hash-atlas");
+    }
+
+    @Test
+    void registerPublishedAwsRdsMysqlFromPublicReleaseWhenEnabled(@TempDir Path workdir) {
+        assumeTrue(Boolean.getBoolean("tapstate.it.published-connectors"),
+                "requires the live public connector release");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("aws-rds-mysql", "hash-rds", "2.0.5-SNAPSHOT", true));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register aws-rds-mysql")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x47043627");
+        assertThat(h.sink().toString())
+                .contains("downloading aws-rds-mysql-connector.jar from github.com")
+                .contains("uploading aws-rds-mysql-connector.jar")
+                .contains("registered  aws-rds-mysql  hash-rds");
+    }
+
+    @Test
+    void registerDownloadsFromTheConfiguredMirrorWithoutPollutingJson(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("sqlserver", "hash-sql", "2.0.9", true));
+        Harness h = onlineSession(workdir, client,
+                Map.of("TAPSTATE_CONNECTORS_URL", "https://mirror.example/connectors"));
+        List<URI> fetched = new ArrayList<>();
+        byte[] jar = completeConnectorJar();
+        h.repl().connectorFetcher((from, expected) -> {
+            fetched.add(from);
+            return PublishedConnectorArtifacts.Fetched.verified(jar);
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register sqlserver -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(fetched).containsExactly(
+                URI.create("https://mirror.example/connectors/sqlserver-connector.jar"));
+        assertThat(out).contains("\"connectorId\"").contains("\"sqlserver\"")
+                .doesNotContain("downloading", "uploading");
+    }
+
+    @Test
+    void anExistingFileNamedLikeAConnectorIdWinsOverTheDownload(@TempDir Path workdir) throws Exception {
+        Files.write(workdir.resolve("oracle"), new byte[] {1, 2, 3, 4});
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcome = new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("local", "hash-local", "1.0", true));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher((from, expected) -> {
+            throw new AssertionError("a local file must not reach the release downloader");
+        });
+
+        assertThat(h.repl().dispatch("register oracle")).isTrue();
+
+        assertThat(client.registerCalls).containsExactly("jwt-tok@http://node1:7900 x4");
+        assertThat(h.sink().toString()).contains("uploading oracle (4 B)").doesNotContain("downloading");
+    }
+
+    @Test
+    void aFailedPublishedDownloadIsCodedAndNeverUploaded(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher((from, expected) -> {
+            throw new IOException("HTTP 404");
+        });
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register oracle -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(out).contains("\"error\"").contains("TS0330015")
+                .contains("oracle").contains("HTTP 404")
+                .doesNotContain("uploading");
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void aSuccessfulErrorPageCannotBeUploadedAsAConnector(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(workdir, client);
+        h.repl().connectorFetcher((from, expected) ->
+                PublishedConnectorArtifacts.Fetched.unverified("not a jar".getBytes()));
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register sqlserver")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(out).contains("TS0330015")
+                .contains("length does not match the published asset");
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void aTruncatedSuccessfulResponseIsCodedAndNeverUploaded(@TempDir Path workdir) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/connector.jar", exchange -> {
+            exchange.sendResponseHeaders(200, 100);
+            exchange.getResponseBody().write(new byte[] {(byte) 'P', (byte) 'K', 3, 4, 9});
+            exchange.close();
+        });
+        server.start();
+        try {
+            URI truncated = URI.create(
+                    "http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
+            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+            Harness h = onlineSession(workdir, client);
+            PublishedConnectorArtifacts.Fetcher http = PublishedConnectorArtifacts.Fetcher.http();
+            h.repl().connectorFetcher((ignored, expected) -> http.fetch(
+                    truncated, new PublishedConnectorArtifacts.Artifact(100, "unused-after-truncation")));
+            int mark = h.sink().toString().length();
+
+            assertThat(h.repl().dispatch("register oracle")).isTrue();
+
+            String out = h.sink().toString().substring(mark);
+            assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+            assertThat(out).contains("TS0330015").contains("truncated")
+                    .doesNotContain("uploading");
+            assertThat(client.registerCalls).isEmpty();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+
     void registerRendersATimedOutOutcomeAsACodedDiagnosticDistinctFromUnreachable(@TempDir Path workdir)
             throws Exception {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
@@ -3100,7 +3512,7 @@ class ReplTest {
 
         // A timeout is a distinct, coded outcome — it must not be reported as the server being unreachable.
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("cli.request-timed-out").contains("node1:7900");
+        assertThat(out).contains("TS0330019").contains("node1:7900");
         assertThat(out).doesNotContain("unreachable");
     }
 
@@ -3151,15 +3563,33 @@ class ReplTest {
                 .contains("newlyRegistered:");
     }
 
-    @Test
-    void registerForAMissingFileReportsCannotReadAndDoesNotCallTheServer(@TempDir Path workdir) {
+    @ParameterizedTest
+    @ValueSource(strings = {"nope.jar", "nope.JAR"})
+    void registerForAMissingFileReportsCannotReadAndDoesNotCallTheServer(String name, @TempDir Path workdir) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.downloadOutcome = Optional.of(new ConnectorRegisterOutcome.Rejected("TS0380001", "Catalog refusal"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
-        assertThat(h.repl().dispatch("register nope.jar")).isTrue();
+        assertThat(h.repl().dispatch("register " + name)).isTrue();
 
-        assertThat(h.sink().toString().substring(mark)).contains("register:").containsIgnoringCase("cannot read");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(h.sink().toString().substring(mark)).contains("register: cannot read", name);
+        assertThat(client.downloadCalls).isEmpty();
+        assertThat(client.registerCalls).isEmpty();
+    }
+
+    @Test
+    void registerWithAConnectorIdUsesTheServerCatalog(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.downloadOutcome = Optional.of(new ConnectorRegisterOutcome.Registered(
+                new RegisteredConnector("mysql", "hash-mysql", "2.11.0", true)));
+        Harness h = onlineSession(workdir, client);
+
+        assertThat(h.repl().dispatch("register mysql")).isTrue();
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+        assertThat(client.downloadCalls).containsExactly("mysql");
         assertThat(client.registerCalls).isEmpty();
     }
 
@@ -3180,13 +3610,13 @@ class ReplTest {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Rejected(
-                "connector.registration-conflict", "A different artifact already holds that id.");
+                "TS0060006", "A different artifact already holds that id.");
         Harness h = onlineSession(workdir, client);
 
         h.repl().dispatch("register orders.jar");
 
         assertThat(h.sink().toString())
-                .contains("connector.registration-conflict").contains("A different artifact already holds that id.");
+                .contains("TS0060006").contains("A different artifact already holds that id.");
     }
 
     @Test
@@ -3194,7 +3624,7 @@ class ReplTest {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Rejected(
-                "connector.registration-conflict", "A different artifact already holds that id.");
+                "TS0060006", "A different artifact already holds that id.");
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3202,7 +3632,7 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("\"error\"")
-                .contains("\"code\"").contains("connector.registration-conflict")
+                .contains("\"code\"").contains("TS0060006")
                 .contains("\"message\"").contains("A different artifact already holds that id.");
     }
 
@@ -3211,14 +3641,14 @@ class ReplTest {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "The artifact spec is not valid JSON.");
+                "TS0060017", "The artifact spec is not valid JSON.");
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("register orders.jar -o yaml")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("error:").contains("code:").contains("connector.spec-invalid")
+        assertThat(out).contains("error:").contains("code:").contains("TS0060017")
                 .contains("message:").contains("The artifact spec is not valid JSON.");
     }
 
@@ -3235,7 +3665,7 @@ class ReplTest {
         client.registerOutcomeByLength.put(2, new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("billing", "h2", "1.0", false)));
         client.registerOutcomeByLength.put(3, new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "The artifact spec is not valid JSON."));
+                "TS0060017", "The artifact spec is not valid JSON."));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3244,7 +3674,7 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("orders").contains("billing")
                 .contains("already registered")
-                .contains("connector.spec-invalid")
+                .contains("TS0060017")
                 .contains("3 artifacts");
         // only the three jars were uploaded; the .txt was skipped
         assertThat(client.registerCalls).hasSize(3);
@@ -3259,7 +3689,7 @@ class ReplTest {
         client.registerOutcomeByLength.put(1, new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("orders", "h1", "1.0", true)));
         client.registerOutcomeByLength.put(3, new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "bad spec"));
+                "TS0060017", "bad spec"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3269,7 +3699,7 @@ class ReplTest {
         assertThat(out).contains("\"artifacts\"").contains("\"summary\"")
                 .contains("\"artifact\"").contains("orders.jar").contains("broken.jar")
                 .contains("\"connectorId\"").contains("orders")
-                .contains("\"error\"").contains("connector.spec-invalid")
+                .contains("\"error\"").contains("TS0060017")
                 .contains("\"total\"");
     }
 
@@ -3318,8 +3748,32 @@ class ReplTest {
         // The machine surface must carry the code, not a prose sentence a caller would have to match on.
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("b-slow.jar")
-                .contains("\"error\"").contains("cli.request-timed-out")
+                .contains("\"error\"").contains("TS0330019").contains("node1:7900")
                 .contains("\"timedOut\"");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"json", "yaml"})
+    void batchTimeoutRetainsItsServerAfterTheNextArtifactDisconnects(String format, @TempDir Path workdir)
+            throws Exception {
+        Path dir = Files.createDirectory(workdir.resolve("connectors"));
+        Files.write(dir.resolve("a-slow.jar"), new byte[] {1});
+        Files.write(dir.resolve("b-offline.jar"), new byte[] {1, 2});
+        Files.write(dir.resolve("c-unattempted.jar"), new byte[] {1, 2, 3});
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.registerOutcomeByLength.put(1, new ConnectorRegisterOutcome.TimedOut());
+        Harness h = onlineSession(workdir, client);
+        client.beforeRegisterResult = size -> { if (size == 2) client.setHealthy(); };
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("register connectors -o " + format)).isTrue();
+
+        assertThat(client.registerCalls).hasSize(2);
+        assertThat(h.repl().session().isConnected()).isFalse();
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("a-slow.jar", "b-offline.jar", "TS0330019",
+                "node1:7900", "timedOut", "unreachable", "notAttempted")
+                .doesNotContain("c-unattempted.jar");
     }
 
     @Test
@@ -3331,7 +3785,7 @@ class ReplTest {
         client.registerOutcomeByLength.put(1, new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("orders", "h1", "1.0", true)));
         client.registerOutcomeByLength.put(3, new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "bad spec"));
+                "TS0060017", "bad spec"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3341,7 +3795,7 @@ class ReplTest {
         assertThat(out).contains("artifacts:").contains("summary:")
                 .contains("artifact:").contains("orders.jar").contains("broken.jar")
                 .contains("connectorId:").contains("orders")
-                .contains("error:").contains("connector.spec-invalid")
+                .contains("error:").contains("TS0060017")
                 .contains("total:");
     }
 
@@ -3462,7 +3916,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("register orders.jar")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-authenticated").contains("register");
+        assertThat(h.sink().toString()).contains("TS0330021").contains("register");
         assertThat(client.registerCalls).isEmpty();
     }
 
@@ -3472,7 +3926,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("register orders.jar")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-connected").contains("register");
+        assertThat(h.sink().toString()).contains("TS0330020").contains("register");
     }
 
     // --- schema read-back: `schema <id> [table]` reads the stored model without discovering ---
@@ -3646,7 +4100,7 @@ class ReplTest {
 
         assertThat(h.repl().dispatch("schema my-mongo")).isTrue();
 
-        assertThat(h.sink().toString()).contains("cli.not-connected").contains("schema");
+        assertThat(h.sink().toString()).contains("TS0330020").contains("schema");
     }
 
     // --- server-as-truth: a connected read verb sources the server store, never the local workspace ---
@@ -3704,6 +4158,46 @@ class ReplTest {
     }
 
     @Test
+    void applyDoesNotRetryAnAmbiguousWriteAfterFailover(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        URI node = URI.create("http://node1:7900");
+        FakeControlPlane client = new FakeControlPlane(node);
+        client.applyOutcome = new ApplyOutcome.Unreachable();
+        Harness h = onlineSession(base, client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark)).contains("reconnected to node1:7900", "TS0330061");
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(h.repl().session().landingNode()).isEqualTo(node);
+    }
+
+    @Test
+    void applyReportsTheOriginalTargetAfterFailoverToAnotherNode(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        URI first = URI.create("http://node1:7900");
+        URI second = URI.create("http://node2:7900");
+        FakeControlPlane client = new FakeControlPlane(second);
+        SplitHarness h = splitStreamHarness(base, client);
+        h.repl().session().connect(List.of(first, second), first);
+        h.repl().session().authenticate("jwt-tok", "alice", null, List.of(first, second));
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
+        assertThat(client.probed).containsExactly(first, second);
+        assertThat(h.repl().session().landingNode()).isEqualTo(second);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.out().toString()).contains("reconnected to node2:7900");
+        assertThat(h.err().toString().strip())
+                .contains("TS0330061", "node1:7900", "Check the current resource state")
+                .doesNotContain("node2:7900");
+    }
+
+    @Test
     void applyRendersTheServerWarningsOnStderrAndStillSucceeds(@TempDir Path base) throws Exception {
         // Any catalogued code serves as the stand-in: what is under test is that the CLI renders a
         // server-sent code from its own bundled catalog, message and solution alike, and that the note
@@ -3712,7 +4206,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.applyOutcome = new ApplyOutcome.Applied(
                 List.of(new ApplyOutcome.Item("src_kfk", "source", "CREATED")),
-                List.of(new ApplyOutcome.Warning("cli.artifact-exists", Map.of("path", "source/src_kfk.tap.yml"))));
+                List.of(new ApplyOutcome.Warning("TS0330001", Map.of("path", "source/src_kfk.tap.yml"))));
         SplitHarness h = onlineSplitStreamSession(base, client);
 
         assertThat(h.repl().dispatch("apply")).isTrue();
@@ -3723,7 +4217,7 @@ class ReplTest {
                 .doesNotContain("warning:");
         assertThat(h.err().toString())
                 .contains("warning:")
-                .contains("cli.artifact-exists")
+                .contains("TS0330001")
                 .as("the params are substituted into the catalogued message, not printed raw")
                 .contains("An artifact already exists at source/src_kfk.tap.yml.")
                 .as("the catalogued next-step hint rides along")
@@ -3733,14 +4227,31 @@ class ReplTest {
                 .isEqualTo(Cli.EXIT_OK);
     }
 
-    @Test
-    void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(@TempDir Path base) throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0270001", "schema.column-name-reads-as-a-path"})
+    void documentKeyWarningKeepsAppliedArtifactsAndSuccessfulExit(String code, @TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.applyOutcome = new ApplyOutcome.Applied(
+                List.of(new ApplyOutcome.Item("src_kfk", "source", "CREATED")),
+                List.of(new ApplyOutcome.Warning(code, Map.of("pipeline", "orders", "source", "input",
+                        "table", "sales", "column", "price.usd", "target", "output"))));
+        SplitHarness h = onlineSplitStreamSession(base, client);
+        assertThat(h.repl().dispatch("apply")).isTrue();
+        assertThat(h.out().toString()).contains("created", "src_kfk").doesNotContain("warning:");
+        assertThat(h.err().toString()).contains("warning:", code, "price.usd", "sales", "output", "escaped", "no index");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0210016", "control.schema-derivation-incomplete"})
+    void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(String code, @TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.applyOutcome = new ApplyOutcome.Applied(
                 List.of(new ApplyOutcome.Item("kfk2my", "pipeline", "CREATED")),
-                List.of(new ApplyOutcome.Warning("control.schema-derivation-incomplete", Map.of(
-                        "pipeline", "kfk2my", "causeCode", "io.store-unavailable",
+                List.of(new ApplyOutcome.Warning(code, Map.of(
+                        "pipeline", "kfk2my", "causeCode", "TS0480001",
                         "causeParams", Map.of("detail", "test outage")))));
         SplitHarness h = onlineSplitStreamSession(base, client);
 
@@ -3748,7 +4259,7 @@ class ReplTest {
 
         assertThat(h.out().toString()).contains("created").contains("kfk2my").doesNotContain("warning:");
         assertThat(h.err().toString()).contains("warning:").contains("artifacts were applied")
-                .contains("kfk2my").contains("io.store-unavailable").contains("test outage")
+                .contains("kfk2my").contains("TS0480001").contains("test outage")
                 .contains("partially refreshed").contains("apply again").contains("Stop the pipeline");
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
     }
@@ -3822,7 +4333,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("apply --if-match " + "e".repeat(64))).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("error:").contains("cli.if-match-needs-one-resource");
+        assertThat(out).contains("error:").contains("TS0330027");
         assertThat(out).contains("3");
         assertThat(client.applyCalls).isEmpty();
     }
@@ -3874,7 +4385,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("apply")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("dsl.undefined-variable").contains("MONGO_URI").contains("tgt.tap.yml");
+        assertThat(out).contains("TS0010018").contains("MONGO_URI").contains("tgt.tap.yml");
         // nothing left the client: a reference that cannot be resolved is not the server's problem to
         // discover, and a literal ${...} on the wire would surface as a connector failure far from here
         assertThat(client.applyCalls).isEmpty();
@@ -3916,11 +4427,11 @@ class ReplTest {
     void applyRenderingAServerRejectionShowsTheCodeAndMessage(@TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.applyOutcome = new ApplyOutcome.Rejected("dsl.illegal-value", "Not a known kind.");
+        client.applyOutcome = new ApplyOutcome.Rejected("TS0010009", "Not a known kind.");
         Harness h = onlineSession(base, client);
         int mark = h.sink().toString().length();
         h.repl().dispatch("apply");
-        assertThat(h.sink().toString().substring(mark)).contains("dsl.illegal-value").contains("Not a known kind.");
+        assertThat(h.sink().toString().substring(mark)).contains("TS0010009").contains("Not a known kind.");
     }
 
     @Test
@@ -3952,14 +4463,14 @@ class ReplTest {
     void applyWhileOfflineFallsThroughToTheConnectionRequiredNotice() {
         Harness h = harness();   // offline: apply is a connected verb, so the offline notice fires
         assertThat(h.repl().dispatch("apply")).isTrue();
-        assertThat(h.sink().toString()).contains("cli.not-connected");
+        assertThat(h.sink().toString()).contains("TS0330020");
     }
 
     @Test
     void getWhileOfflineFallsThroughToTheConnectionRequiredNotice() {
         Harness h = harness();   // offline: get is a connected verb, discoverable rather than unknown
         assertThat(h.repl().dispatch("get x")).isTrue();
-        assertThat(h.sink().toString()).contains("cli.not-connected");
+        assertThat(h.sink().toString()).contains("TS0330020");
     }
 
     // --- pipeline lifecycle verbs route online to POST /api/pipelines/{id}:{verb} ------------------
@@ -3993,6 +4504,23 @@ class ReplTest {
         assertThat(client.lifecycleCalls).containsExactly(
                 "jwt-tok@http://node1:7900 pause pl1",
                 "jwt-tok@http://node1:7900 resume pl1");
+    }
+
+    @Test
+    void restartDoesNotStartOrPauseWhenAggregateStatusHasNoRuntimeObservation() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.NoObservation();
+        client.explainOutcome = new ExplainOutcome.Rejected(
+                "TS0400001", "No observation is available for pipeline pl1.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("restart pl1");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
+        assertThat(h.sink().toString())
+                .contains("TS0400001")
+                .contains("No observation is available for pipeline pl1.");
     }
 
     @Test
@@ -4043,15 +4571,16 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("running restart again picks it up");
     }
 
-    @Test
-    void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0280002", "lifecycle.incompatible-revision"})
+    void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks(String code) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
         client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
         // The pause goes through; the resume is refused because the definition moved under the run.
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
         client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
-                "lifecycle.incompatible-revision", "rev-old is not rev-new."));
+                code, "rev-old is not rev-new."));
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         h.repl().dispatch("restart pl1");
@@ -4171,7 +4700,7 @@ class ReplTest {
     @Test
     void restartOnAFailedPipelineCarriesOnFromWhereItGotTo() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008", "its job died");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
@@ -4184,6 +4713,284 @@ class ReplTest {
         assertThat(client.lifecycleCalls).containsExactly(
                 "jwt-tok@http://node1:7900 stop pl1 purgeState=false",
                 "jwt-tok@http://node1:7900 start pl1");
+    }
+
+    // ---- start checks: every verb that ends in a start asks them the same way ---------------------
+
+    /**
+     * A server whose start checks ask one question, about the rows already in orders: a start that carries
+     * an answer goes ahead, and one that does not is stopped to ask -- which is how the server decides it.
+     */
+    private static void asksAboutOrders(FakeControlPlane client) {
+        Map<String, Object> report = StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders"));
+        client.startChecksByIntent.put("start", new StartChecksOutcome.Found(StartChecks.parse(report)));
+        client.startChecksByIntent.put("rerun", new StartChecksOutcome.Found(StartChecks.parse(StartCheckReports
+                .withIntent(StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders")),
+                        "RERUN"))));
+        client.startResponder = decisions -> decisions.isEmpty() ? StartCheckReports.stoppedBy(report)
+                : StartCheckReports.started(report, List.of(), List.of());
+    }
+
+    /** The commands a refusal printed for answering it, in the order printed. */
+    private static List<String> answeringCommands(String output) {
+        String marker = "Answer them on the command line: ";
+        int at = output.indexOf(marker);
+        assertThat(at).as("the line that prints the commands, in:%n%s", output).isNotNegative();
+        return List.of(output.substring(at + marker.length()).lines().findFirst().orElseThrow().split(" \\| "));
+    }
+
+    @Test
+    void everyCommandAStartWithNobodyToAskPrintsStartsThePipelineWhenRunAsPrinted() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("start pl1");
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString()).contains("TS0330028");
+        List<String> commands = answeringCommands(h.sink().toString());
+        assertThat(commands).containsExactly("tapstate start pl1 --decide target-not-empty=clear",
+                "tapstate start pl1 --decide target-not-empty=keep", "tapstate start pl1 -y");
+        // Run as printed: each one starts the pipeline, with the answer it names.
+        for (String command : commands) {
+            client.startCalls.clear();
+            h.repl().dispatch(command.substring("tapstate ".length()));
+            assertThat(h.repl().lastExitCode()).as(command).isZero();
+            assertThat(client.startCalls).as(command).last().asString().contains(
+                    "target-not-empty/warehouse/orders=" + (command.endsWith("=clear") ? "clear" : "keep"));
+        }
+    }
+
+    @Test
+    void aStartThatGotNoAnswerIsNotSentToAnotherMember() {
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.startAttempts.add(new StartAttempt.Unreachable(true));
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
+        h.repl().dispatch("login alice");
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("start pl1");
+
+        // It may have gone ahead on the member that got it; sent to another, it is a second start.
+        assertThat(client.startCalls).hasSize(1);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("TS0330034").contains("tapstate status pl1")
+                .doesNotContain("reconnected");
+    }
+
+    @Test
+    void aDecideAgainstAServerWithoutStartChecksNeverSendsTheStart() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("start pl1 --decide target-not-empty=clear");
+
+        // Such a server would start it and drop the answer, keeping the rows the answer said to clear.
+        assertThat(client.startCheckReads).containsExactly("start pl1");
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("TS0330029");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-y", "--yes", "--non-interactive"})
+    void startTakesEverySpellingOfDoNotAsk(String flag) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("start pl1 " + flag);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.startCalls).containsExactly("pl1 []",
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
+    }
+
+    @Test
+    void aStartPrintingADocumentNeverAsksEvenAtATerminal() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("start pl1 -o json");
+
+        assertThat(prompter.offered).isEmpty();
+        assertThat(client.startCalls).containsExactly("pl1 []");
+        assertThat(h.sink().toString()).contains("\"code\"").contains(StartCheckReports.NEEDS_CONFIRMATION);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @Test
+    void checksOnlyReadsTheChecksAndStartsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("start pl1 --checks-only");
+
+        assertThat(client.startCheckReads).containsExactly("start pl1");
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("orders on warehouse already holds 5 rows.");
+        // a start would be asked, so this is not a green light for a script
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"start pl1 --checks-only -y", "start pl1 --decide target-not-empty",
+            "start pl1 --decide =clear", "start pl1 --bogus"})
+    void aStartLineThatCannotBeReadIsAUsageErrorAndCallsNothing(String line) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch(line);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.startCheckReads).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @Test
+    void aRerunAsksItsStartChecksBeforeStoppingAndACancelThereStopsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();   // nothing typed: the last option, cancel
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(client.startCheckReads).containsExactly("rerun pl1");
+        assertThat(prompter.offered).hasSize(1);
+        assertThat(prompter.offered.getFirst().getLast()).isEqualTo("cancel");
+        // the clearing question is never reached, and nothing was stopped
+        assertThat(prompter.questions).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void aRerunAnsweredAtATerminalStopsThenStartsWithThoseAnswers() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("keep  Keep the rows already in orders", "yes");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true", "jwt-tok@http://node1:7900 start pl1");
+        assertThat(client.startCalls).containsExactly(
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
+        assertThat(prompter.questions).containsExactly("Clear pl1? Type yes to go ahead");
+    }
+
+    @Test
+    void aRerunWithNobodyToAskPrintsTheRerunCommandsAndStopsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(answeringCommands(h.sink().toString())).containsExactly(
+                "tapstate restart pl1 --rerun --decide target-not-empty=clear",
+                "tapstate restart pl1 --rerun --decide target-not-empty=keep", "tapstate restart pl1 --rerun -y");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"409", "412"})
+    void aRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind(String status) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.startChecksByIntent.put("rerun", new StartChecksOutcome.Found(StartChecks.parse(StartCheckReports
+                .withIntent(StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders")),
+                        "RERUN"))));
+        client.lifecycleOutcomeByVerb.put("stop", new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc"));
+        // Between the questions and the start something changed: the target now refuses the start, or the
+        // definition moved under the answers.
+        client.startAttempts.add(status.equals("409")
+                ? new StartAttempt.Stopped("lifecycle.start-blocked", Map.of("pipeline", "pl1"), "pl1 cannot start",
+                        StartChecks.parse(StartCheckReports.report("BLOCKED", StartCheckReports.blocked("orders"))))
+                : new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"), "pl1 changed",
+                        List.of()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true", "jwt-tok@http://node1:7900 start pl1");
+        assertThat(h.sink().toString())
+                .contains(status.equals("409") ? "lifecycle.start-blocked" : "pipeline.version-conflict")
+                // a report that changed since the questions were asked is shown: it is why the start refused
+                .contains(status.equals("409") ? "and on_full_load is fail." : "pl1 changed")
+                .contains("restart: pl1 was stopped and its state cleared, but it has not been started")
+                .contains("Start it with: tapstate start pl1");
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void aRestartThatLandsOnAStartAsksItsStartChecksToo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.statusOutcome = new StatusOutcome.Found("pl1", "STOPPED");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1");
+
+        assertThat(client.startCalls).containsExactly("pl1 []");
+        assertThat(h.sink().toString()).contains("TS0330028");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @Test
+    void aRestartWithoutAggregateObservationKeepsItsAnswersWhenExplanationFindsTheState() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.statusOutcome = new StatusOutcome.NoObservation();
+        client.explainOutcome = noMatch("pl1", "STOPPED", 0L);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --decide target-not-empty=keep");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.startCalls).last().isEqualTo(
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-y", "--yes", "--non-interactive"})
+    void aRestartOfAFailedPipelineAnswersItsStartChecksWhenToldNotToAsk(String flag) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008", "its job died");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 " + flag);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.lifecycleCalls).first().isEqualTo("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+        assertThat(client.startCalls).containsExactly("pl1 []",
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
     }
 
     @Test
@@ -4261,6 +5068,23 @@ class ReplTest {
                 List.of("Whether the source has changes waiting is not measured."), null, null);
     }
 
+    /** {@code answer} beside the plan of a run on three members: a source held to one, a sink three per member. */
+    private static ExplainOutcome.Found planned(ExplainOutcome.Found answer) {
+        return new ExplainOutcome.Found(answer.pipelineId(), answer.state(), answer.kind(), answer.message(),
+                answer.observedAt(), answer.observedAgeMillis(), answer.freshness(), answer.evidence(),
+                answer.cannotSay(), answer.next(), answer.pending(),
+                new ExplainOutcome.Plan(3L, 7L, 11L, List.of("m1", "m2", "m3"), List.of(
+                        new ExplainOutcome.PlanNode("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                                List.of("requested-one", "source-reads-not-split"), 1024, 0L),
+                        new ExplainOutcome.PlanNode("orders_sink", 8, "explicit", "native", 3, 3, 9,
+                                List.of("rounded-up"), 512, 50L,
+                                new ExplainOutcome.PlanResources(9, "isolated", 9, 9_216L, 175_104L),
+                                new ExplainOutcome.PlanChange(8, List.of("members-changed", "capability-changed")))),
+                        "2026-09-17T09:58:00Z",
+                        new ExplainOutcome.PlanReplaced(6L, List.of("m1", "m2", "m3", "m4"), "2026-09-17T09:40:00Z")),
+                List.of("m5"));
+    }
+
     private static ExplainOutcome.Found stale(String id, String state, long ageMillis) {
         return new ExplainOutcome.Found(id, state, "OBSERVATION_STALE",
                 "The latest observation is 4m12s old, so the publisher may have stopped.",
@@ -4293,7 +5117,7 @@ class ReplTest {
 
     private static ExplainOutcome.Found codedFailure(String id, String message) {
         Map<String, Object> failure = new java.util.LinkedHashMap<>();
-        failure.put("code", "engine.job-failed");
+        failure.put("code", "TS0440008");
         failure.put("params", Map.of("pipeline", id, "cause", "the sink rejected the batch"));
         failure.put("message", message);
         return new ExplainOutcome.Found(id, "FAILED", "CODED_FAILURE",
@@ -4619,7 +5443,7 @@ class ReplTest {
     void startWhileOfflineFallsThroughToTheConnectionRequiredNotice() {
         Harness h = harness();   // offline: start is a connected verb, discoverable rather than unknown
         assertThat(h.repl().dispatch("start pl1")).isTrue();
-        assertThat(h.sink().toString()).contains("cli.not-connected");
+        assertThat(h.sink().toString()).contains("TS0330020");
     }
 
     @Test
@@ -4726,6 +5550,103 @@ class ReplTest {
         assertThat(client.derivedSchemaCalls).isEmpty();
     }
 
+    private static AggregateCheckOutcome.Finding differing(String region, String... fields) {
+        Map<String, String> group = new java.util.LinkedHashMap<>();
+        group.put("region", region);
+        return new AggregateCheckOutcome.Finding(group, "mismatch", List.of(fields), null, null);
+    }
+
+    @Test
+    void aggregateWalksEveryPageAndSaysWhatTheCheckDidNotLookAt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(32, List.of(differing("EU", "revenue")), "c1", 0, 0));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(5, List.of(), null, 2, 1));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region")).isTrue();
+
+        assertThat(client.aggregateCalls).containsExactly(
+                "check pl1/by_region group=null after=null", "check pl1/by_region group=null after=c1");
+        String printed = h.sink().toString().substring(mark);
+        assertThat(printed).contains("37 groups compared").contains("1 differs").contains("region=EU")
+                .contains("revenue").contains("2 input events not applied");
+        // A clean line read as "the view matches the source" would be believed for something the check
+        // never read.
+        assertThat(printed).contains("does not read the source or the target");
+    }
+
+    @Test
+    void aggregateWithRepairRoutesToTheRepairAndNotToTheCheck() {
+        // A --repair that reached the check would print the same groups and change nothing.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1, List.of(differing("EU", "revenue")), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region=EU --repair")).isTrue();
+
+        assertThat(client.aggregateCalls).containsExactly("repair pl1/by_region group={region=EU} after=null");
+        assertThat(h.sink().toString().substring(mark)).contains("written again").contains("rewritten: revenue");
+    }
+
+    @Test
+    void aGroupNameWithNoValueAsksForTheNullOfThatColumn() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1, List.of(), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region,year=2026")).isTrue();
+
+        assertThat(client.aggregateCalls).containsExactly(
+                "check pl1/by_region group={region=null, year=2026} after=null");
+    }
+
+    @Test
+    void aGroupTooLargeToDecideIsNotPrintedAsMatching() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, String> group = new java.util.LinkedHashMap<>();
+        group.put("region", "EU");
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1,
+                List.of(new AggregateCheckOutcome.Finding(group, "inconclusive", List.of(), null, null)), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region=EU")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("too large to decide")
+                .doesNotContain("matches its rows");
+    }
+
+    @Test
+    void aGroupTheStepDoesNotHoldIsSaidToBeAbsentAndNotCompared() {
+        // Printed as "1 group compared, 0 differ", a name the step does not hold read as a clean group.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, String> group = new java.util.LinkedHashMap<>();
+        group.put("region", "XX");
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1,
+                List.of(new AggregateCheckOutcome.Finding(group, "absent", List.of(), null, null)), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region=XX --repair")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("holds no group region=XX")
+                .contains("nothing was written or sent").doesNotContain("written again").doesNotContain("matches its rows");
+    }
+
+    @Test
+    void aggregateRefusesAnArgumentItDoesNotKnow() {
+        // A misspelt --repair must not become a check reported as done.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1, List.of(), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --repiar")).isTrue();
+
+        assertThat(client.aggregateCalls).isEmpty();
+    }
+
     @Test
     void statusWhileAuthenticatedRoutesToTheServerAndPrintsTheState() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
@@ -4743,7 +5664,7 @@ class ReplTest {
         // A bare "failed" sends the user hunting through logs. The reason arrives coded with its arguments,
         // so the CLI renders it from the bundled catalog the same way it renders every other coded message.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008",
                 "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
         client.explainOutcome = codedFailure(
                 "pl1", "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
@@ -4755,7 +5676,7 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("failed");
         // Assert the code, not the prose: the code is the stable identity, and only this path can emit it.
-        assertThat(out).contains("engine.job-failed");
+        assertThat(out).contains("TS0440008");
         assertThat(out).contains("the sink rejected the batch");
     }
 
@@ -4765,7 +5686,7 @@ class ReplTest {
         // state line above it. A caller separating the streams (status pl1 > out.txt 2> err.txt) must see
         // both in out.txt; the merged single-sink harness the other status tests use cannot tell this apart.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008",
                 "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
         client.explainOutcome = codedFailure(
                 "pl1", "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
@@ -4777,7 +5698,7 @@ class ReplTest {
 
         String stdout = h.out().toString().substring(outMark);
         String stderr = h.err().toString().substring(errMark);
-        assertThat(stdout).contains("failed").contains("engine.job-failed").contains("the sink rejected the batch");
+        assertThat(stdout).contains("failed").contains("TS0440008").contains("the sink rejected the batch");
         assertThat(stderr).isEmpty();
     }
 
@@ -4877,15 +5798,26 @@ class ReplTest {
     void positionRendersACodedRefusalRatherThanReportingSuccess() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.positionOutcome = new PositionOutcome.Rejected(
-                "position.write-back-while-live", "Chain shop@mysql-1 is still being read by: orders_sync.");
+                "TS0410001", "Chain shop@mysql-1 is still being read by: orders_sync.");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("position pl1")).isTrue();
 
         assertThat(h.sink().toString().substring(mark))
-                .contains("position.write-back-while-live")
+                .contains("TS0410001")
                 .contains("still being read by");
+    }
+
+    @Test
+    void anAggregateStepsLineSaysWhatIsNotKnownRatherThanLeavingItOut() {
+        // A line with no estimate and no count on it would read as a step that costs nothing.
+        assertThat(Repl.aggregateLine(new ExplainOutcome.Aggregate("by_region", 3, List.of("most"), 1_000L, 3_000L, 2_400L)))
+                .isEqualTo("  aggregate  by_region: up to 3 state entries per input row (2, and 1 each for most);"
+                        + " about 3000 for 1000 input rows; 2400 stored at the last count");
+        assertThat(Repl.aggregateLine(new ExplainOutcome.Aggregate("by_region", 2, List.of(), null, null, null)))
+                .isEqualTo("  aggregate  by_region: up to 2 state entries per input row;"
+                        + " input size unknown, so no estimate; not counted yet");
     }
 
     @Test
@@ -4907,6 +5839,75 @@ class ReplTest {
         assertThat(client.statusCalls).isEmpty();
         assertThat(client.metricsCalls).isEmpty();
         assertThat(client.snapshotCalls).isEmpty();
+    }
+
+    @Test
+    void statusAndExplainRenderCapturedRuntimeBranchesWithoutReinterpretingThePrimary() {
+        for (String command : List.of("status pl1", "explain pl1")) {
+            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+            Map<String, Object> diagnostic = Map.of("message", "captured owner", "truncated", true,
+                    "causes", List.of(Map.of("code", "28000", "message", "first cause"),
+                            Map.of("code", "08006", "message", "second cause")),
+                    "references", List.of(Map.of("type", "pipeline-node", "pipelineId", "pl1", "id", "sink")));
+            client.explainOutcome = new ExplainOutcome.Found("pl1", "FAILED", "CODED_FAILURE",
+                    "safe primary", null, 0L, "FRESH", List.of(new ExplainOutcome.Evidence("status", "failure",
+                            Map.of("code", "historic.failure", "params", Map.of(), "diagnostic", diagnostic))),
+                    List.of(), null, null);
+            SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
+            int mark = h.out().toString().length();
+            int errMark = h.err().toString().length();
+            assertThat(h.repl().dispatch(command)).isTrue();
+            assertThat(h.out().toString().substring(mark)).contains("safe primary", "historic.failure",
+                    "28000 first cause", "08006 second cause", "pipeline-node: pl1/sink", "[Diagnostic truncated]");
+            assertThat(h.err().toString().substring(errMark)).isEmpty();
+        }
+    }
+
+    @Test
+    void explainShowsHowWideEachNodeOfTheRunWasPlannedAndWhy() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.explainOutcome = planned(noMatch("pl1", "RUNNING", 2_000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("explain pl1");
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out)
+                .contains("  planned    2026-09-17T09:58:00Z on m1, m2, m3 (execution 7, claim 3, topology 11)\n")
+                .contains("  width      orders_src  1 in all (one processor for the cluster), requested 1"
+                        + " (node-default) -- requested-one, source-reads-not-split; batch 1024 records, 0ms wait\n")
+                .contains("  replaced   execution 6 planned 2026-09-17T09:40:00Z on m1, m2, m3, m4\n")
+                .contains("  width      orders_sink  9 in all (3 per member on 3 members), requested 8 (explicit)"
+                        + " -- rounded-up; batch 512 records, 50ms wait; was 8 (members-changed, capability-changed)\n")
+                .contains("  awaiting   m5 -- joined after this run was planned; given no part of it until a rebalance\n")
+                .contains("  resources  orders_sink  9 writers, 9 isolated connectors;"
+                        + " at most 9216 records buffered and 175104 queued\n");
+        // Only a sink holds connectors and batches that are worked out; a source says nothing of them.
+        assertThat(out).doesNotContain("resources  orders_src");
+    }
+
+    @Test
+    void statusShowsTheRunsPlanUnderTheAnswerAndLeavesOutGenerationsTheRunDoesNotHave() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.Found("pl1", "RUNNING", null, null, 2_000L);
+        ExplainOutcome.Found answer = noMatch("pl1", "RUNNING", 2_000L);
+        client.explainOutcome = new ExplainOutcome.Found(answer.pipelineId(), answer.state(), answer.kind(),
+                answer.message(), answer.observedAt(), answer.observedAgeMillis(), answer.freshness(),
+                answer.evidence(), answer.cannotSay(), answer.next(), answer.pending(),
+                new ExplainOutcome.Plan(null, null, null, List.of("local"), List.of(new ExplainOutcome.PlanNode(
+                        "orders_sink", 4, "node-default", "native", 1, 4, 4, List.of(), 1024, 0L)),
+                        "2026-09-17T09:58:00Z"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("status pl1");
+
+        String out = h.sink().toString().substring(mark);
+        // A run on one member is fenced by nothing: no generation is printed rather than a made-up zero.
+        assertThat(out).contains("  planned    2026-09-17T09:58:00Z on local\n")
+                .contains("  width      orders_sink  4 in all (4 per member on 1 member), requested 4"
+                        + " (node-default); batch 1024 records, 0ms wait\n");
     }
 
     @Test
@@ -4951,7 +5952,7 @@ class ReplTest {
 
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(h.sink().toString().substring(mark))
-                .contains("control.malformed-request")
+                .contains("TS0210001")
                 .contains("history requires both --from and --to");
         assertThat(client.historyCalls).isEmpty();
     }
@@ -4960,13 +5961,13 @@ class ReplTest {
     void metricsWhileAuthenticatedPrintsEachStat() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found(
-                "pl1", Map.of("recordCount", 42L, "errors.engine.job-failed", 2L));
+                "pl1", Map.of("recordCount", 42L, "errors.TS0440008", 2L));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("recordCount").contains("42")
-                .contains("errors.engine.job-failed");
+                .contains("errors.TS0440008");
         assertThat(client.metricsCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
     }
 
@@ -5020,7 +6021,7 @@ class ReplTest {
                 + "AApzb3J0U3RyaW5ndAASTGphdmEvbGFuZy9TdHJpbmc7TAAMc291cmNlT2Zmc2V0cQB+AAJ4cHBwcA==";
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of("recordCount", 6L),
-                Map.of("orders", serializedPosition, "accounts", serializedPosition),
+                Map.of("orders", serializedPosition, "accounts", serializedPosition, "archive", "rO0ABA=="),
                 List.of("sourceHeadPosition"));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -5028,7 +6029,8 @@ class ReplTest {
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected");
+        assertThat(out).contains("recordCount  6", "sourceHeadPosition  not collected",
+                "targetAckedPosition.archive  rO0ABA==");
         assertThat(out).containsPattern("targetAckedPosition.orders  opaque position fingerprint [0-9a-f]{16}")
                 .containsPattern("targetAckedPosition.accounts  opaque position fingerprint [0-9a-f]{16}");
         assertThat(out).as("text metrics must not expose an opaque serialized connector object")
@@ -5046,6 +6048,12 @@ class ReplTest {
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String first = h.sink().toString().substring(mark);
+
+        String projectedPosition = "opaque-v1:" + CanonicalHash.ofText(firstPosition);
+        client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", projectedPosition));
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("metrics pl1")).isTrue();
+        assertThat(h.sink().toString().substring(mark)).isEqualTo(first);
 
         client.metricsOutcome = new MetricsOutcome.Found("pl1", Map.of(), Map.of("orders", nextPosition));
         mark = h.sink().toString().length();
@@ -5152,6 +6160,22 @@ class ReplTest {
     }
 
     @Test
+    void snapshotSaysOfEachTableWhetherItsLoadLandedOrIsStillLanding() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of(
+                "orders", new RemoteTableSnapshot(10, 10L, 100, true),
+                "items", new RemoteTableSnapshot(4, 9L, 44, false),
+                "events", new RemoteTableSnapshot(5, null, null, null)));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("snapshot pl1");
+        List<String> lines = h.sink().toString().substring(mark).lines().toList();
+        assertThat(lines).contains("orders  10/10 (100%)  landed", "items  4/9 (44%)  landing");
+        // A server that does not say is not read as either.
+        assertThat(lines).contains("events  5/?");
+    }
+
+    @Test
     void snapshotWithNoTablesPrintsABenignNoSnapshotLine() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.snapshotOutcome = new SnapshotOutcome.Found("pl1", Map.of());
@@ -5174,6 +6198,17 @@ class ReplTest {
         assertThat(out).contains("submitted job").contains("INFO").contains("slow tick").contains("WARN");
         // oldest to newest
         assertThat(out.indexOf("submitted job")).isLessThan(out.indexOf("slow tick"));
+    }
+
+    @Test
+    void logsShowsTheCapturedCauseAndItsSafeOriginalDetail() {
+        var client = new FakeControlPlane(URI.create("http://node1:7900"));
+        var diagnostic = Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        client.logsOutcome = new LogsOutcome.Found("pl1", List.of(new RemoteLogLine(1L, "WARN", "safe failure", diagnostic)));
+        var h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("logs pl1");
+        assertThat(h.sink().toString().substring(mark)).contains("safe failure", "28000", "access denied");
     }
 
     @Test
@@ -5330,13 +6365,44 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out)
-                .as("nothing in the plan pins a vertex's parallelism yet; a reader given a number here "
-                        + "would read it as what was asked for")
+                .as("a vertex its run's plan names no target for asked for nothing; a reader given a "
+                        + "number here would read it as what was asked for")
                 .doesNotContain("requested").doesNotContain("computedLocal");
         assertThat(out)
                 .as("what is measured is published, so the two can be compared once there is something "
                         + "to compare")
                 .contains("effective").contains("executionId");
+    }
+
+    @Test
+    void clusterSaysHowManyRowsAreQueuedIntoAVertexAndWhichWriterIsBehind() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 7L, List.of(
+                new RemoteClusterMember("node-a", "uuid-a", "boot-a", "[127.0.0.1]:5701",
+                        "https://a.example:8443", "ACTIVE")),
+                List.of(new RemotePipeline("orders",
+                        new RemoteClaim("orders", "node-a", "boot-a", 3L, 7L, true),
+                        List.of(), "2026-09-19T08:30:00Z", List.of("uuid-a"), List.of(),
+                        List.of(new RemoteVertex("serve-orders", 4, 2, 2, "exec-1", List.of(
+                                new RemoteProcessor(0, 0, "uuid-a", "node-a", 3L, Map.of(), Map.of()),
+                                new RemoteProcessor(1, 1, "uuid-a", "node-a", 4L, Map.of("shop", 40L),
+                                        Map.of("shop", 1200L), Map.of("shop.orders", 30L),
+                                        Map.of("orders", 512L))))))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("cluster")).isTrue();
+        assertThat(h.repl().dispatch("cluster -o json")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).as("the rows queued into the vertex's processors between them")
+                .contains("serve-orders  node-a  backlog 7");
+        assertThat(out).as("and per processor, on the machine surface, which of them is behind and on what")
+                .contains("\"localIndex\": 1").contains("\"backlog\": 4")
+                .contains("\"frontierGaps\": {").contains("\"shop\": 40")
+                .contains("\"frontierStalledMillis\": {").contains("\"shop\": 1200")
+                .contains("\"queuedByStream\": {").contains("\"shop.orders\": 30")
+                .contains("\"inFlightByTable\": {").contains("\"orders\": 512");
     }
 
     @Test
@@ -5459,7 +6525,7 @@ class ReplTest {
 
         assertThat(client.watchCalls).hasSize(3);
         assertThat(h.sink().toString().substring(mark))
-                .contains("no cluster member is serving this stream");
+                .contains("TS0330063");
     }
 
     @Test
@@ -5486,7 +6552,7 @@ class ReplTest {
         assertThat(out)
                 .as("every attach was answered with the member's window, so a member is serving this "
                         + "follow; it only had nothing new to say")
-                .doesNotContain("no cluster member is serving this stream");
+                .doesNotContain("TS0330063");
         assertThat(client.followCalls)
                 .as("it carried on across every drop until the user stopped it")
                 .hasSize(7);
@@ -5512,7 +6578,7 @@ class ReplTest {
 
         assertThat(client.followCalls).hasSize(3);
         assertThat(h.sink().toString().substring(mark))
-                .contains("no cluster member is serving this stream");
+                .contains("TS0330063");
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
     }
 
@@ -5545,7 +6611,7 @@ class ReplTest {
         // the watcher must render it right there rather than needing a separate poll.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.watchStates = List.of("FAILED");
-        client.watchFailureCode = "engine.job-failed";
+        client.watchFailureCode = "TS0440008";
         client.watchFailureMessage = "Pipeline pl1 stopped because its job failed: the sink rejected the batch.";
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -5554,15 +6620,30 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("failed");
-        assertThat(out).contains("engine.job-failed");
+        assertThat(out).contains("TS0440008");
         assertThat(out).contains("the sink rejected the batch");
+    }
+
+    @Test
+    void statusWatchPreservesCapturedCausesReferencesAndTruncation() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.watchStates = List.of("FAILED");
+        client.watchFailureCode = "TS0060027";
+        client.watchFailureMessage = "The sink refused the write.";
+        client.watchDiagnostic = Map.of("cause", Map.of("code", "28000", "message", "captured authentication refusal"),
+                "references", List.of(Map.of("type", "pipeline-node", "id", "sink", "pipelineId", "pl1")), "truncated", true);
+        SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
+        int mark = h.out().toString().length();
+        assertThat(h.repl().dispatch("status pl1 --watch")).isTrue();
+        assertThat(h.out().toString().substring(mark)).contains("28000", "captured authentication refusal", "pl1/sink", "[Diagnostic truncated]");
+        assertThat(h.err().toString()).isEmpty();
     }
 
     @Test
     void statusWatchPrintsTheFailureReasonToStdoutNotStderr() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.watchStates = List.of("FAILED");
-        client.watchFailureCode = "engine.job-failed";
+        client.watchFailureCode = "TS0440008";
         client.watchFailureMessage = "Pipeline pl1 stopped because its job failed: the sink rejected the batch.";
         SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
         int outMark = h.out().toString().length();
@@ -5572,7 +6653,7 @@ class ReplTest {
 
         String stdout = h.out().toString().substring(outMark);
         String stderr = h.err().toString().substring(errMark);
-        assertThat(stdout).contains("failed").contains("engine.job-failed").contains("the sink rejected the batch");
+        assertThat(stdout).contains("failed").contains("TS0440008").contains("the sink rejected the batch");
         assertThat(stderr).isEmpty();
     }
 
@@ -5649,13 +6730,13 @@ class ReplTest {
     void aReadVerbRejectionShowsTheCodeAndMessageAndDoesNotFailOver() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Rejected(
-                "monitor.no-observation", "No observation is available for pipeline pl1.");
+                "TS0400001", "No observation is available for pipeline pl1.");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int probesBefore = client.probed.size();
         int mark = h.sink().toString().length();
         h.repl().dispatch("status pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("monitor.no-observation").contains("No observation is available");
+        assertThat(out).contains("TS0400001").contains("No observation is available");
         // a coded refusal is not a transport failure: it must not trigger failover
         assertThat(out).doesNotContain("reconnected").doesNotContain("connection lost");
         assertThat(client.probed.size()).isEqualTo(probesBefore);
@@ -5689,7 +6770,7 @@ class ReplTest {
         for (String verb : List.of("status pl1", "metrics pl1", "snapshot pl1", "logs pl1")) {
             Harness h = harness();
             assertThat(h.repl().dispatch(verb)).isTrue();
-            assertThat(h.sink().toString()).contains("cli.not-connected");
+            assertThat(h.sink().toString()).contains("TS0330020");
         }
     }
 
@@ -5759,8 +6840,8 @@ class ReplTest {
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get x")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("connection lost");        // failover reported the loss
-        assertThat(out).doesNotContain("request failed");   // and it is not double-reported
+        assertThat(out).contains("TS0330062");              // failover reported the loss
+        assertThat(out).doesNotContain("TS0330061");         // and it is not double-reported
         assertThat(h.repl().session().isConnected()).isFalse();
     }
 
@@ -5876,7 +6957,7 @@ class ReplTest {
         assertThat(prompter.secretQuestions).isEmpty();
         assertThat(client.discovered).isEmpty();
         assertThat(client.loginCalls).isEmpty();
-        assertThat(harness.sink().toString()).contains("cli.remote-plaintext");
+        assertThat(harness.sink().toString()).contains("TS0330055");
     }
 
     @Test
@@ -5903,7 +6984,7 @@ class ReplTest {
 
         assertThat(client.probed).containsExactly(seed);
         assertThat(repl.session().isConnected()).isTrue();
-        assertThat(sink.toString()).contains("cli.not-authenticated");
+        assertThat(sink.toString()).contains("TS0330021");
     }
 
     @Test
@@ -5982,6 +7063,10 @@ class ReplTest {
         assertThat(service.login(context, "alice", "pw", false))
                 .isEqualTo(new AuthService.LoginResult.Rejected("control.auth-failed", "alice"));
 
+        client.loginOutcome = new LoginOutcome.Rejected("TS0210002", "bad credential");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Rejected("TS0210002", "alice"));
+
         client.loginOutcome = new LoginOutcome.Rejected("control.rate-limited", "try later");
         assertThat(service.login(context, "alice", "pw", false))
                 .isEqualTo(new AuthService.LoginResult.Rejected("unknown", "alice"));
@@ -6008,7 +7093,7 @@ class ReplTest {
                 "tss_alice.other");
         assertThatThrownBy(() -> service.login(context, "alice", "pw", false))
                 .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-issuer-mismatch"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330059"));
 
         client.loginOutcome = new LoginOutcome.Success("jwt-alice", now.minusSeconds(1),
                 "urn:tapstate:cluster:test-cluster", "alice", List.of("read"),
@@ -6481,7 +7566,7 @@ class ReplTest {
         assertThat(repl.lastExitCode()).isNotZero();
         assertThat(store.load(authRef, contextId)).contains(replacement);
         assertThat(client.sessionCalls).containsExactly("logout tss_s01.old-secret@" + seed);
-        assertThat(output.toString()).contains("cli.auth-logout-cache-changed")
+        assertThat(output.toString()).contains("TS0330046")
                 .doesNotContain("tss_s01.old-secret", "tss_s02.new-secret");
     }
 
@@ -6515,7 +7600,7 @@ class ReplTest {
                     List.of("read"));
             client.collectionsOutcome = new DataBrowserOutcome.Collections.Listed(List.of("orders"));
             client.findOutcome = new DataBrowserOutcome.Find.Read(List.of(), null, false);
-            client.tailRefusal = "data-browser.follow-idle";
+            client.tailRefusal = "TS0390007";
             CommandLine commandLine = Cli.newCommandLine();
             StringWriter output = new StringWriter();
             commandLine.setOut(new PrintWriter(output));
@@ -6736,7 +7821,7 @@ class ReplTest {
         assertThat(client.sessionCalls).isEmpty();
         assertThat(client.loginCalls).isEmpty();
         assertThat(client.listCalls).isEmpty();
-        assertThat(output.toString()).contains("cli.remote-plaintext")
+        assertThat(output.toString()).contains("TS0330055")
                 .doesNotContain("machine-token-secret");
     }
 
@@ -6770,7 +7855,7 @@ class ReplTest {
         assertThat(repl.lastExitCode()).isNotZero();
         assertThat(client.discovered).containsExactly(seed);
         assertThat(client.sessionCalls).isEmpty();
-        assertThat(output.toString()).contains("cli.auth-issuer-mismatch")
+        assertThat(output.toString()).contains("TS0330059")
                 .doesNotContain("tss_must-not-be-sent.secret");
     }
 
@@ -6798,7 +7883,7 @@ class ReplTest {
 
         assertThat(client.probed).containsExactly(seed);
         assertThat(repl.session().isConnected()).isTrue();
-        assertThat(sink.toString()).contains("cli.not-authenticated").doesNotContain("cli.not-connected");
+        assertThat(sink.toString()).contains("TS0330021").doesNotContain("TS0330020");
     }
 
     @Test
@@ -6817,7 +7902,7 @@ class ReplTest {
 
         assertThat(client.probed).isEmpty();
         assertThat(repl.session().isConnected()).isFalse();
-        assertThat(sink.toString()).contains("cli.context-required").doesNotContain("cli.not-connected");
+        assertThat(sink.toString()).contains("TS0330054").doesNotContain("TS0330020");
     }
 
     @Test
@@ -6942,7 +8027,7 @@ class ReplTest {
         h.repl().dispatch("watch views.order_state");
 
         String output = h.sink().toString().substring(mark);
-        assertThat(output).contains("cli.watch-needs-a-terminal");
+        assertThat(output).contains("TS0330025");
         assertThat(output).contains("tail").contains("find");
         assertThat(client.dataBrowserCalls)
                 .as("it refuses before asking, so a piped watch never opens a read it cannot render")
@@ -6976,7 +8061,7 @@ class ReplTest {
 
         h.repl().dispatch("watch views.order_state");
 
-        assertThat(h.sink().toString().substring(mark)).contains("cli.not-connected");
+        assertThat(h.sink().toString().substring(mark)).contains("TS0330020");
     }
 
     // ---- the appended view ----
@@ -7012,14 +8097,14 @@ class ReplTest {
         // field. The reader is somebody watching a screen that just stopped updating, so the code has
         // to be turned back into a sentence here; there is nowhere else it could be done.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.tailRefusal = "data-browser.follow-idle";
+        client.tailRefusal = "TS0390007";
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
         h.repl().dispatch("tail views.order_state");
 
         String output = h.sink().toString().substring(mark);
-        assertThat(output).contains("data-browser.follow-idle");
+        assertThat(output).contains("TS0390007");
         assertThat(output)
                 .as("the catalog sentence, not the literal text of a missing one")
                 .contains("no changes")
@@ -7039,7 +8124,7 @@ class ReplTest {
         h.repl().dispatch("tail views.order_state");
 
         String output = h.sink().toString().substring(mark);
-        assertThat(output).doesNotContain("cli.watch-needs-a-terminal");
+        assertThat(output).doesNotContain("TS0330025");
         assertThat(output).contains("insert");
     }
 
@@ -7089,6 +8174,9 @@ class ReplTest {
         // says "are you sure?" and nothing else trains its reader to answer yes without reading.
         assertThat(output).contains(everyKindOfStateAPipelineHolds());
         assertThat(output).contains(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        // What clearing means for the rows already written, which is the part a person reading this
+        // does not think of: the next run loads afresh and cannot see what the source deleted meanwhile.
+        assertThat(output).contains(PipelineStateInventory.KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
         assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
         // Reporting success for a thing that did not happen is how a script concludes the opposite.
         assertThat(h.repl().lastExitCode()).isNotZero();
@@ -7125,10 +8213,198 @@ class ReplTest {
         // slow one are the same thing from outside.
         assertThat(prompter.questions).isEmpty();
         String output = h.sink().toString().substring(mark);
-        assertThat(output).contains("cli.confirmation-needs-a-terminal");
+        assertThat(output).contains("TS0330026");
         // Refusing is only useful if it names both ways on: go ahead unasked, or stop without clearing.
         assertThat(output).contains("-y").contains("--keep-state");
         assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void stopWithoutATerminalReportsTheConnectedServersVersion(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:8080"));
+        client.serverVersion = "9.9.9";
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = harness(workdir, client, new ScriptedPrompter("pw"));
+        assertThat(h.repl().dispatch("connect 127.0.0.1:8080")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().dispatch("login alice")).isTrue();
+        assertThat(h.repl().lastExitCode())
+                .as("the connected test session must authenticate: %s", h.sink())
+                .isZero();
+        assertThat(h.repl().session().isAuthenticated()).isTrue();
+        String versions = "cli " + buildVersion() + ", server 9.9.9";
+        assertThat(h.repl().session().versions()).isEqualTo(versions);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("stop pl1")).isTrue();
+
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        String diagnostic = h.sink().toString().substring(mark);
+        assertThat(diagnostic).contains("TS0330026")
+                .endsWith("  (" + versions + ")" + System.lineSeparator());
+    }
+
+    private static Harness contextSession(Path home, FakeControlPlane client,
+                                          ContextResolver resolver, String explicitContext) {
+        CommandLine line = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        line.setOut(new PrintWriter(sink));
+        line.setErr(new PrintWriter(sink));
+        Repl repl = new Repl(line, home, client, new ScriptedPrompter("pw"), name -> null,
+                resolver, explicitContext, new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(Instant.parse("2026-08-17T10:00:00Z"), ZoneOffset.UTC)));
+        repl.terminalCheck(() -> true);
+        return new Harness(repl, sink);
+    }
+
+    private static Harness namedSession(Path home, FakeControlPlane client) {
+        ContextConfig config = new ContextConfig(1, null,
+                Map.of("dev", namedContext(URI.create("http://127.0.0.1:7900")).definition()), Map.of());
+        client.serverVersion = "9.9.9";
+        Harness h = contextSession(home, client, new ContextResolver(() -> config, name -> null), "dev");
+        h.repl().dispatch("auth status");
+        assertThat(h.repl().lastExitCode()).as("the named context must connect: %s", h.sink()).isZero();
+        return h;
+    }
+
+    private static void assertConnectedDiagnostic(Harness h, int mark, CliError code, int exitCode) {
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(h.repl().lastExitCode()).isEqualTo(exitCode);
+        assertThat(h.sink().toString().substring(mark)).contains(code.code())
+                .endsWith("  (cli " + buildVersion() + ", server 9.9.9)" + System.lineSeparator());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rejected", "unreachable", "issuer-mismatch"})
+    void persistentLoginRefusalsReportTheConnectedServersVersion(String outcome, @TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.loginOutcome = switch (outcome) {
+            case "rejected" -> new LoginOutcome.Rejected("control.auth-failed", "bad credential");
+            case "unreachable" -> new LoginOutcome.Unreachable();
+            default -> persistentLogin(Instant.parse("2026-08-17T10:00:00Z"),
+                    "urn:tapstate:cluster:other", "alice", "tss_s01.session-secret");
+        };
+        CliError code = switch (outcome) {
+            case "rejected" -> CliError.AUTH_LOGIN_REJECTED;
+            case "unreachable" -> CliError.AUTH_LOGIN_UNREACHABLE;
+            default -> CliError.AUTH_ISSUER_MISMATCH;
+        };
+        Harness h = namedSession(home, client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("auth login alice");
+
+        assertConnectedDiagnostic(h, mark, code, Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.repl().session().isAuthenticated()).isFalse();
+        assertThat(client.loginCalls).containsExactly("alice:pw@http://127.0.0.1:7900 persistent=true");
+    }
+
+    @Test
+    void rejectedPersistentLogoutReportsTheConnectedServersVersionAndKeepsTheSession(@TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.loginOutcome = persistentLogin(Instant.parse("2026-08-17T10:00:00Z"),
+                "urn:tapstate:cluster:test-cluster", "alice", "tss_s01.session-secret");
+        Harness h = namedSession(home, client);
+        h.repl().dispatch("auth login alice");
+        assertThat(h.repl().lastExitCode()).isZero();
+        client.logoutOutcome = new SessionLogoutOutcome.Rejected("control.auth-failed", "bad session");
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("auth logout");
+
+        assertConnectedDiagnostic(h, mark, CliError.AUTH_SESSION_REJECTED, Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.repl().session().isAuthenticated()).isTrue();
+        assertThat(AuthFileStore.underHome(home).load(TEST_AUTH_REF, TEST_CONTEXT_ID)).isPresent();
+        assertThat(client.sessionCalls).containsExactly("logout tss_s01.session-secret@http://127.0.0.1:7900");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"auth status", "auth logout"})
+    void invalidCachedAuthReportsTheConnectedServersVersion(String command, @TempDir Path home)
+            throws IOException {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.loginOutcome = persistentLogin(Instant.parse("2026-08-17T10:00:00Z"),
+                "urn:tapstate:cluster:test-cluster", "alice", "tss_s01.session-secret");
+        Harness h = namedSession(home, client);
+        h.repl().dispatch("auth login alice");
+        assertThat(h.repl().lastExitCode()).isZero();
+        Path cache = home.resolve(".tapstate/auth/" + TEST_AUTH_REF + ".json");
+        Files.writeString(cache, "invalid session record");
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command);
+
+        assertConnectedDiagnostic(h, mark, CliError.AUTH_CACHE_INVALID, Cli.EXIT_DIAGNOSTIC);
+        assertThat(Files.readString(cache)).isEqualTo("invalid session record");
+        assertThat(client.sessionCalls).isEmpty();
+    }
+
+    @Test
+    void namedAuthUsageReportsTheConnectedServersVersion(@TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        Harness h = namedSession(home, client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("auth status extra");
+
+        assertConnectedDiagnostic(h, mark, CliError.AUTH_USAGE, Cli.EXIT_USAGE);
+        assertThat(client.sessionCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"context", "auth status", "up"})
+    void connectedUsageRefusalsReportTheServersVersion(String command, @TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(home, client);
+        h.repl().dispatch("connect 127.0.0.1:7900");
+        assertThat(h.repl().lastExitCode()).isZero();
+        int mark = h.sink().toString().length();
+        CliError code = switch (command) {
+            case "context" -> CliError.CONTEXT_USAGE;
+            case "up" -> CliError.NOT_AUTHENTICATED;
+            default -> CliError.CONTEXT_REQUIRED;
+        };
+
+        h.repl().dispatch(command);
+
+        assertConnectedDiagnostic(h, mark, code,
+                command.equals("context") ? Cli.EXIT_USAGE : Cli.EXIT_VERB_UNAVAILABLE);
+        assertThat(client.loginCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @CsvSource({"auth logout --local-only,false", "auth logout --local-only,true", "get pl1,true"})
+    void contextResolutionRefusalsKeepTheOfflineVersionStamp(
+            String command, boolean missingContext, @TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane();
+        Harness h = contextSession(home, client, new ContextResolver(ContextConfig::empty, name -> null),
+                missingContext ? "missing" : null);
+
+        h.repl().dispatch(command);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(
+                missingContext ? Cli.EXIT_DIAGNOSTIC : Cli.EXIT_VERB_UNAVAILABLE);
+        assertThat(h.repl().session().isConnected()).isFalse();
+        assertThat(h.sink().toString()).contains(
+                missingContext ? CliError.CONTEXT_NOT_FOUND.code() : CliError.CONTEXT_REQUIRED.code())
+                .endsWith("  (cli " + buildVersion() + ", server not connected)" + System.lineSeparator());
+        assertThat(client.probed).isEmpty();
+    }
+
+    @Test
+    void upWithoutATargetKeepsTheOfflineVersionStamp(@TempDir Path home) {
+        Harness h = harness(home, new FakeControlPlane());
+
+        h.repl().dispatch("up");
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_VERB_UNAVAILABLE);
+        assertThat(h.sink().toString()).contains(CliError.NOT_CONNECTED.code())
+                .endsWith("  (cli " + buildVersion() + ", server not connected)" + System.lineSeparator());
     }
 
     @Test
@@ -7219,6 +8495,7 @@ class ReplTest {
         // The one sentence that turns on the answer: saying it here would promise a re-read that is not
         // going to happen, and this is the path whose whole point is that it does not.
         assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(output).doesNotContain(PipelineStateInventory.KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
         assertThat(h.repl().lastExitCode()).isZero();
     }
 
@@ -7240,7 +8517,7 @@ class ReplTest {
     @Test
     void theVerbsThatClearNothingAskNothing() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008", "its job died");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);
@@ -7280,6 +8557,7 @@ class ReplTest {
         assertThat(output).contains(everyKindOfStateAPipelineHolds());
         assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
         assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(output).doesNotContain(PipelineStateInventory.KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
     }
 
 }

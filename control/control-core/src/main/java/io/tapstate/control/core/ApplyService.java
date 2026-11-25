@@ -21,6 +21,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
@@ -45,8 +46,10 @@ import java.util.function.Supplier;
  * schema store — an observation of what discovery found, never the config truth layer, which apply is
  * the one writer of. Typed online writes additionally read the artifact truth layer so validation can
  * include only the relevant dependency/referrer closure; offline {@link #plan} keeps the historical
- * contract that the submitted batch itself is the closure. A draft carrying a precondition also reads
- * its stored version to report a stale edit before the atomic write check; a pipeline reads back the srs
+ * contract that the submitted batch itself is the closure. A partial Source draft also reads the
+ * stored Source and retains omitted top-level fields, including its connector config; an explicitly
+ * supplied config replaces the whole config map. A draft carrying a precondition reads its stored
+ * version to report a stale edit before the atomic write check; a pipeline reads back the srs
  * switches it has already recorded so that an unedited file re-applies as a no-op.
  * {@link #apply} runs a plan and then upserts each artifact into the store by its id, skipping the
  * write when the stored artifact's content hash is unchanged (a no-op).
@@ -71,21 +74,29 @@ import java.util.function.Supplier;
  * updated artifacts — as one atomic batch, so a mid-batch write failure rolls the whole batch back and
  * no partial batch is stored, matching the validation-failure guarantee on the write side.
  *
- * <p>A declared version is enforced <em>inside</em> that batch write, not only compared beforehand.
- * The comparison in {@link #plan} is what produces the diagnostic an author can read; it is not what
- * makes the edit safe, because validation runs between it and the write and a second author lands in
- * that window. Handing the declared versions to the store makes the comparison and the write one
+ * <p>A declared version, or the version a partial Source copied omitted fields from, is enforced
+ * <em>inside</em> that batch write, not only compared beforehand. The comparison in {@link #plan}
+ * produces a diagnostic an author can read; it is not what makes the edit safe, because validation
+ * runs between it and the write and a second author lands in that window. Handing these versions
+ * to the store makes the comparison and the write one
  * indivisible operation, so the losing author is refused with {@code artifact.version-conflict}
  * rather than silently overwriting the winner.
  */
 public final class ApplyService {
 
+    private static boolean storeMarked(SourceResource source) {
+        return source.metadata() != null && "true".equals(source.metadata().labels().get("store"));
+    }
+
     private final Supplier<TapstateCatalog> catalog;
+    private final java.util.function.Function<String, ConnectorDetail> connectorDetail;
     private final ArtifactStore store;
     private final AuditGate auditGate;
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
     private final SchemaDerivation derivation;
+    private final ResourceAttributionPolicy attribution;
+    private final StateDatabasePolicy stateDatabasePolicy;
 
     /**
      * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
@@ -93,19 +104,68 @@ public final class ApplyService {
      * only the other one would be a guard in name.
      */
     private final LivePipelines live;
+    private final DeploymentProfile deploymentProfile;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
+    private static final Set<String> SOURCE_PATCH_FIELDS = Set.of(
+            "metadata", "config", "mode", "tables", "srs", "execution", "experimental");
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation) {
-        this(catalog, store, auditGate, schemas, advisories, derivation, null);
+        this(catalog, store, auditGate, schemas, advisories, derivation, null,
+                ResourceAttributionPolicy.onPrem());
     }
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live,
+                ResourceAttributionPolicy.onPrem());
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            DeploymentProfile deploymentProfile) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live,
+                ResourceAttributionPolicy.onPrem(), StateDatabasePolicy.ON_PREM, deploymentProfile);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                StateDatabasePolicy.ON_PREM);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                stateDatabasePolicy, stateDatabasePolicy == StateDatabasePolicy.CLOUD
+                        ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
+            DeploymentProfile deploymentProfile) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                stateDatabasePolicy, deploymentProfile, id -> null);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
+            DeploymentProfile deploymentProfile, java.util.function.Function<String, ConnectorDetail> connectorDetail) {
         this.live = live;
+        this.connectorDetail = Objects.requireNonNull(connectorDetail, "connectorDetail");
+        this.deploymentProfile = Objects.requireNonNull(deploymentProfile, "deploymentProfile");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -118,6 +178,8 @@ public final class ApplyService {
         // exactly like one whose pipelines were all up to date, and the case this exists for is the one
         // where nothing was written either.
         this.derivation = Objects.requireNonNull(derivation, "derivation");
+        this.attribution = Objects.requireNonNull(attribution, "attribution");
+        this.stateDatabasePolicy = Objects.requireNonNull(stateDatabasePolicy, "stateDatabasePolicy");
     }
 
     /**
@@ -130,16 +192,44 @@ public final class ApplyService {
      * is not going anywhere.
      */
     public ApplyPlan plan(List<ArtifactDraft> drafts) {
+        return planCandidateWorkspace(drafts).plan();
+    }
+
+    /**
+     * Validates and canonicalizes the candidate workspace without writing it. The prepared artifacts in
+     * {@link CandidateWorkspacePlan#plan()} are the submitted resources; {@link CandidateWorkspacePlan#resources()}
+     * also retains the stored resources that completed their reference closure.
+     */
+    public CandidateWorkspacePlan planCandidateWorkspace(List<ArtifactDraft> drafts) {
+        return planCandidateWorkspace(drafts, ValidationScope.OFFLINE);
+    }
+
+    /**
+     * Validates a preview candidate against its persisted dependency closure without writing it. A
+     * Pipeline draft commonly references Sources already created through the typed Source API; those
+     * stored resources must participate in preview compilation even when the request carries only the
+     * unsaved Pipeline candidate.
+     */
+    public CandidateWorkspacePlan planPreviewWorkspace(List<ArtifactDraft> drafts) {
+        return planCandidateWorkspace(drafts, ValidationScope.ONLINE_SOURCE);
+    }
+
+    private CandidateWorkspacePlan planCandidateWorkspace(List<ArtifactDraft> drafts, ValidationScope scope) {
         Objects.requireNonNull(drafts, "drafts");
         List<Resource> resources = new ArrayList<>();
+        List<Set<String>> declaredFields = new ArrayList<>();
         for (ArtifactDraft draft : drafts) {
-            resources.add(parse(draft));
+            DslParser.ParsedResource parsed = parseWithDeclaredFields(draft);
+            resources.add(parsed.resource());
+            declaredFields.add(parsed.declaredFields());
         }
         // Preconditions are judged once every draft has parsed, so a malformed document is reported as
         // malformed rather than as a version conflict, and before the batch is validated, so an author
         // editing a version that has moved on is told that instead of being handed diagnostics about
         // content they are about to rewrite. Each one declared is kept under the id it was declared
         // against: this is the only point at which a draft and the id it parses to are both in hand.
+        // A partial Source also carries the version of the stored fields it copied, unless the caller
+        // supplied an explicit version, so concurrent changes cannot be overwritten by that copy.
         Map<String, String> preconditions = new LinkedHashMap<>();
         for (int index = 0; index < drafts.size(); index++) {
             ArtifactDraft draft = drafts.get(index);
@@ -148,8 +238,52 @@ public final class ApplyService {
             if (draft.expectedContentHash() != null) {
                 preconditions.put(parsed.id(), draft.expectedContentHash());
             }
+            if (parsed instanceof SourceResource source) {
+                MergedSource merged = mergeSource(source, declaredFields.get(index));
+                resources.set(index, merged.resource());
+                if (merged.storedHash() != null && draft.expectedContentHash() == null) {
+                    preconditions.put(source.id(), merged.storedHash());
+                }
+            }
         }
-        return planResources(resources, preconditions, ValidationScope.OFFLINE);
+        if (scope == ValidationScope.ONLINE_SOURCE && resources.size() == 1
+                && resources.getFirst() instanceof PipelineResource pipeline) {
+            // A standalone Pipeline preview can use the same persisted dependencies as draft compilation.
+            var inventory = store.draftPublicationInventory(pipeline);
+            if (inventory.isPresent()) {
+                return planResourcesAndWorkspace(resources, preconditions, scope,
+                        publicationReads(pipeline, inventory.orElseThrow(), true));
+            }
+        }
+        return planResourcesAndWorkspace(resources, preconditions, scope);
+    }
+
+    private MergedSource mergeSource(SourceResource submitted, Set<String> fields) {
+        if (fields.containsAll(SOURCE_PATCH_FIELDS)) {
+            return new MergedSource(submitted, null);
+        }
+        Resource found = store.get(submitted.id()).orElse(null);
+        if (!(found instanceof SourceResource existing)) {
+            return new MergedSource(submitted, null);
+        }
+        if (!existing.connector().equals(submitted.connector()) && !fields.contains("config")) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "changing a Source connector requires an explicit config"), null);
+        }
+        SourceResource merged = new SourceResource(
+                submitted.id(),
+                fields.contains("metadata") ? submitted.metadata() : existing.metadata(),
+                submitted.connector(),
+                fields.contains("config") ? submitted.config() : existing.config(),
+                fields.contains("mode") ? submitted.mode() : existing.mode(),
+                fields.contains("tables") ? submitted.tables() : existing.tables(),
+                fields.contains("srs") ? submitted.srs() : existing.srs(),
+                fields.contains("execution") ? submitted.execution() : existing.execution(),
+                fields.contains("experimental") ? submitted.experimental() : existing.experimental());
+        return new MergedSource(merged, storedHash(existing));
+    }
+
+    private record MergedSource(SourceResource resource, String storedHash) {
     }
 
     /**
@@ -159,11 +293,42 @@ public final class ApplyService {
      */
     private ApplyPlan planResources(
             List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        return planResourcesAndWorkspace(submitted, preconditions, validationScope).plan();
+    }
+
+    private CandidateWorkspacePlan planResourcesAndWorkspace(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        return planResourcesAndWorkspace(submitted, preconditions, validationScope, null);
+    }
+
+    private record PublicationReads(ArtifactStore.ReadableInventory inventory, Resource previous,
+            Optional<String> managedSource, Map<String, Optional<DiscoveredSourceModel>> models) {}
+
+    private CandidateWorkspacePlan planResourcesAndWorkspace(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope,
+            PublicationReads publication) {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
+        for (Resource resource : submitted) {
+            if (resource instanceof SourceResource source
+                    && SourceReadProjection.containsDisplayMarker(source)) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "redacted Source settings cannot be applied; provide complete credentials"),
+                        null);
+            }
+        }
+        (publication == null ? store.managedDefaultSourceId() : publication.managedSource()).ifPresent(managed -> {
+            for (Resource resource : submitted) {
+                if (resource instanceof PipelineResource pipeline && pipeline.sourceIds().contains(managed)
+                        || resource instanceof SourceResource source && storeMarked(source))
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "the managed default target is not an authored input source"), null);
+            }
+        });
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
-        List<Resource> storedResources = ReadableArtifactInventory.list(store);
+        List<Resource> storedResources = publication == null ? ReadableArtifactInventory.list(store)
+                : publication.inventory().resources();
         List<Resource> candidate = new ArrayList<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
@@ -171,8 +336,22 @@ public final class ApplyService {
             }
         }
         candidate.addAll(submitted);
-        TapstateCatalog liveCatalog = catalog.get();
+        List<SourceResource> markedStores = candidate.stream()
+                .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
+                .filter(source -> source.metadata() != null
+                        && "true".equals(source.metadata().labels().get("store"))).toList();
+        if (markedStores.size() > 1 || markedStores.stream().anyMatch(source ->
+                deploymentProfile != DeploymentProfile.CLOUD
+                        || !"mongodb-atlas".equals(source.connector())
+                        || source.mode() != null || source.tables() != null)) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "Cloud allows exactly one MongoDB Atlas state store without capture settings"),
+                    null);
+        }
+        TapstateCatalog liveCatalog = publication == null ? catalog.get()
+                : publication.inventory().connectorCatalog().orElseGet(catalog);
         List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
+        stateDatabasePolicy.validate(validationResources);
         Workspace workspace = Workspace.of(validationResources, liveCatalog);
         if (validationScope == ValidationScope.ONLINE_SOURCE) {
             for (Resource resource : submitted) {
@@ -183,15 +362,18 @@ public final class ApplyService {
         }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources, publication);
         RowExpressionTypeRules.validate(validationResources, discovered);
         WriteKeyRules.validate(validationResources, discovered);
         // Judged over the submitted resources and resolved against the whole candidate workspace.
         // The two differ on both sides here: the typed path's validation set is a reference closure
         // that reaches stored referrers, which must not be refused for an edit they were pulled into,
         // and a write target is a connection document normally filed by an earlier batch, which has
-        // to be resolvable or every sync whose target was not resubmitted would pass unjudged.
-        TargetConnectorRules.validate(submitted, candidate);
+        // to be resolvable or every sync whose target was not resubmitted would pass unjudged. The
+        // stored set is what tells a source whose connector the batch changes from one it only edits:
+        // a stored referrer is judged for the first, on the elements writing to it, and never the second.
+        TargetConnectorRules.validate(submitted, candidate, storedResources, liveCatalog,
+                deploymentProfile == DeploymentProfile.CLOUD);
         List<Resource> validated = List.copyOf(workspace.resources());
         Map<String, String> workspacePreconditions = new LinkedHashMap<>();
         for (Resource resource : validated) {
@@ -207,15 +389,53 @@ public final class ApplyService {
                 batchSources.put(source.id(), source);
             }
         }
+        Set<String> replacedConnectors = submitted.stream()
+                .filter(resource -> resource instanceof SourceResource source
+                        && connectorChanged(storedResources, source))
+                .map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        for (Resource resource : candidate) {
+            if (!(resource instanceof PipelineResource pipeline)) {
+                continue;
+            }
+            boolean submittedPipeline = submittedIds.contains(pipeline.id());
+            for (SourceRef ref : pipeline.sources()) {
+                if (!ref.nodeConfig().isEmpty() && (submittedPipeline || replacedConnectors.contains(ref.id()))) {
+                    SourceNodeConfigRules.validate(batchSources.get(ref.id()), ref.nodeConfig(), connectorDetail);
+                    if (!submittedPipeline && !workspacePreconditions.containsKey(pipeline.id())) {
+                        workspacePreconditions.put(pipeline.id(), storedHash(pipeline));
+                    }
+                }
+            }
+        }
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource submittedResource : submitted) {
             Resource resource = validatedById.get(submittedResource.id());
             Resource recorded = resource instanceof PipelineResource pipeline
-                    ? withOwnSrsSwitches(pipeline, batchSources) : resource;
+                    ? withOwnSrsSwitches(pipeline, batchSources, publication == null
+                            ? store.get(pipeline.id()).orElse(null) : publication.previous()) : resource;
             String canonicalForm = writer.write(recorded);
             prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
-        return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
+        Map<String, Resource> candidateById = new LinkedHashMap<>();
+        candidate.forEach(resource -> candidateById.put(resource.id(), resource));
+        prepared.forEach(artifact -> candidateById.put(artifact.id(), artifact.resource()));
+        ApplyPlan plan = new ApplyPlan(
+                prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
+        return new CandidateWorkspacePlan(plan, List.copyOf(candidateById.values()));
+    }
+
+    private static boolean connectorChanged(List<Resource> stored, SourceResource replacement) {
+        SourceResource previous = storedSource(stored, replacement.id());
+        return previous != null && !previous.connector().equals(replacement.connector());
+    }
+
+    void validateDraftSourceNodeConfigs(Map<String, String> inputs, Map<String, Map<String, Object>> configs) {
+        configs.forEach((id, config) -> {
+            String sourceId = inputs.get(id);
+            SourceResource source = sourceId == null ? null : store.get(sourceId).filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast).orElse(null);
+            SourceNodeConfigRules.validate(source, config, connectorDetail);
+        });
     }
 
     /**
@@ -237,24 +457,28 @@ public final class ApplyService {
      * materialize again, one revision per apply on a file nobody touched.
      */
     private PipelineResource withOwnSrsSwitches(
-            PipelineResource pipeline, Map<String, SourceResource> batchSources) {
-        Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
-        if (store.get(pipeline.id()).orElse(null) instanceof PipelineResource stored) {
+            PipelineResource pipeline, Map<String, SourceResource> batchSources, Resource existing) {
+        Map<String, SourceRef.Spec> previousBindings = new LinkedHashMap<>();
+        Map<String, Boolean> previousSources = new LinkedHashMap<>();
+        if (existing instanceof PipelineResource stored) {
             for (SourceRef ref : stored.sources()) {
                 if (ref instanceof SourceRef.Spec spec) {
-                    alreadyRecorded.put(spec.id(), spec.srs());
+                    previousBindings.put(spec.binding(), spec);
+                    previousSources.putIfAbsent(spec.id(), spec.srs());
                 }
             }
         }
         List<SourceRef> refs = new ArrayList<>();
         boolean anyRecorded = false;
         for (SourceRef ref : pipeline.sources()) {
-            if (ref instanceof SourceRef.Spec) {
+            if (ref instanceof SourceRef.Spec spec && spec.srs() != null) {
                 refs.add(ref);
                 anyRecorded = true;
                 continue;
             }
-            Boolean own = alreadyRecorded.get(ref.id());
+            SourceRef.Spec previous = previousBindings.get(ref.binding());
+            Boolean own = previous != null && previous.id().equals(ref.id())
+                    ? previous.srs() : previousSources.get(ref.id());
             if (own == null) {
                 // The source is read from the batch alone, because the batch is the closure: a pipeline
                 // referencing a source that is not in it is refused before this runs. A reference left
@@ -263,7 +487,7 @@ public final class ApplyService {
                 SourceResource declaring = batchSources.get(ref.id());
                 own = declaring == null ? null : declaring.srsEnabled();
             }
-            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own));
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own, ref.nodeConfig(), ref.alias()));
             anyRecorded |= own != null;
         }
         return anyRecorded
@@ -348,7 +572,16 @@ public final class ApplyService {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(resource, "resource");
         Objects.requireNonNull(operation, "operation");
-        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        Resource existing = store.get(resource.id()).orElse(null);
+        Resource attributed = attribution.attribute(principal, resource, existing);
+        if (attributed instanceof SourceResource source
+                && (storeMarked(source)
+                    || existing instanceof SourceResource stored && storeMarked(stored))
+                && operation != ControlOperations.STATE_STORE_CONNECT) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the state store must be configured through its dedicated setup API"), null);
+        }
+        ApplyPlan plan = planResources(List.of(attributed), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
             ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
@@ -380,6 +613,9 @@ public final class ApplyService {
         final ApplyPlan planned;
         try {
             planned = plan(drafts);
+            for (PreparedArtifact artifact : planned.artifacts()) {
+                attribution.validate(artifact.resource(), store.get(artifact.id()).orElse(null));
+            }
         } catch (TapstateException diagnostic) {
             return new ArtifactValidationResult(
                     false,
@@ -392,6 +628,106 @@ public final class ApplyService {
             outcomes.add(outcome(prepared));
         }
         return new ArtifactValidationResult(true, outcomes, List.of(), planned.warnings());
+    }
+
+    /** Validates one typed resource against the stored workspace without writing or auditing it. */
+    public ArtifactValidationResult validateTyped(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        final ApplyPlan planned;
+        try {
+            planned = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        } catch (TapstateException diagnostic) {
+            return new ArtifactValidationResult(false, List.of(),
+                    List.of(new ValidationDiagnostic(diagnostic.code().code(), diagnostic.args())), List.of());
+        }
+        List<ArtifactOutcome> outcomes = planned.artifacts().stream().map(this::outcome).toList();
+        return new ArtifactValidationResult(true, outcomes, List.of(), planned.warnings());
+    }
+
+    /** Validates and materializes one typed resource against the stored workspace without writing it. */
+    public Resource prepareTyped(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        if (resource instanceof PipelineResource pipeline) {
+            return planResourcesAndWorkspace(List.of(pipeline), Map.of(), ValidationScope.ONLINE_SOURCE,
+                    capturePublicationReads(pipeline)).plan().artifacts().getFirst().resource();
+        }
+        return planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE)
+                .artifacts().getFirst().resource();
+    }
+
+    /** Validates a Pipeline draft for publication, including the same live-buffering guard as artifact writes. */
+    public ApplyPlan planDraftPublication(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        Resource prepared = plan.artifacts().getFirst().resource();
+        if (live != null && prepared instanceof PipelineResource replacement) {
+            ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
+            live.refuseBufferingChangeWhileLive(storedPipeline(inventory.resources(), replacement.id()), replacement);
+        }
+        return plan;
+    }
+
+    /** Prepares a publication with the verified publisher's server-managed resource attribution. */
+    public ApplyPlan planDraftPublication(String principal, Resource resource) {
+        return captureDraftPublication(principal, resource).plan();
+    }
+
+    record DraftPublicationPlan(ApplyPlan plan, SchemaDerivation.PublishedInputs inputs) {}
+
+    DraftPublicationPlan captureDraftPublication(String principal, Resource resource) {
+        Objects.requireNonNull(principal, "principal");
+        Objects.requireNonNull(resource, "resource");
+        var reads = capturePublicationReads(resource);
+        var previous = Optional.ofNullable(reads.previous());
+        var planned = planResourcesAndWorkspace(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE, reads);
+        var plan = planned.plan();
+        var prepared = plan.artifacts().getFirst();
+        if (live != null && prepared.resource() instanceof PipelineResource replacement) {
+            live.refuseBufferingChangeWhileLive(
+                    previous.filter(PipelineResource.class::isInstance).map(PipelineResource.class::cast).orElse(null),
+                    replacement);
+        }
+        Resource attributed = attribution.attribute(principal, prepared.resource(), previous.orElse(null));
+        var publishedPlan = new ApplyPlan(List.of(new PreparedArtifact(attributed, writer.write(attributed), CanonicalHash.of(attributed))),
+                plan.warnings(), plan.preconditions(), plan.workspacePreconditions());
+        var definitions = new LinkedHashMap<String, Resource>();
+        for (Resource value : planned.resources()) {
+            if (plan.workspacePreconditions().containsKey(value.id())) definitions.put(value.id(), value);
+        }
+        definitions.put(attributed.id(), attributed);
+        return new DraftPublicationPlan(publishedPlan,
+                new SchemaDerivation.PublishedInputs(definitions, reads.models(), reads.managedSource()));
+    }
+
+    /** Preview and publication validate the same captured dependency closure. */
+    private PublicationReads capturePublicationReads(Resource resource) {
+        var dependencySlice = resource instanceof PipelineResource pipeline
+                ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
+        var inventory = dependencySlice.orElseGet(store::readableInventory);
+        return publicationReads(resource, inventory, dependencySlice.isPresent());
+    }
+
+    private PublicationReads publicationReads(
+            Resource resource, ArtifactStore.ReadableInventory inventory, boolean includesPrevious) {
+        var previous = includesPrevious || inventory.exactLookupIds().contains(resource.id())
+                ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
+                : store.get(resource.id());
+        return new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),
+                new LinkedHashMap<>());
+    }
+
+    /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
+    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId,
+            SchemaDerivation.PublishedInputs inputs, long stateGeneration) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        try {
+            derivation.derivePublishedDraft(pipelineId, inputs, stateGeneration);
+            return List.of();
+        } catch (TapstateException failure) {
+            return List.of(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
+                    Map.of("pipeline", pipelineId, "causeCode", failure.code().code(),
+                            "causeParams", failure.args())));
+        }
     }
 
     /**
@@ -410,11 +746,12 @@ public final class ApplyService {
      */
     public ApplyResult apply(String principal, List<ArtifactDraft> drafts) {
         Objects.requireNonNull(principal, "principal");
-        ApplyPlan plan = plan(drafts);
+        AttributedPlan attributed = attributedWithSnapshots(principal, plan(drafts));
+        ApplyPlan plan = attributed.plan();
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
-        Map<String, String> enforced = new LinkedHashMap<>();
+        Map<String, String> enforced = new LinkedHashMap<>(plan.workspacePreconditions());
         // Read once for the refusal below, and only when there is a reading to judge against.
         ReadableArtifactInventory.Snapshot inventory = live == null
                 ? null : ReadableArtifactInventory.scan(store);
@@ -422,6 +759,13 @@ public final class ApplyService {
         List<String> unreadablePipelineIds = inventory == null
                 ? List.of() : inventory.unreadablePipelineIds();
         for (PreparedArtifact prepared : plan.artifacts()) {
+            if (prepared.resource() instanceof SourceResource source
+                    && (storeMarked(source)
+                        || store.get(source.id()).filter(SourceResource.class::isInstance)
+                                .map(SourceResource.class::cast).map(ApplyService::storeMarked).orElse(false))) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "artifact apply cannot change the state store"), null);
+            }
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
                 if (live != null && prepared.resource() instanceof SourceResource replacement) {
@@ -445,14 +789,24 @@ public final class ApplyService {
         // The changed set is audited per artifact, then written as one atomic batch: all of it lands or,
         // on a write failure, none does.
         //
-        // The declared versions are handed to the write rather than only to plan(). plan()'s comparison
+        // The explicit or implicit versions are handed to the write rather than only to plan(). plan()'s comparison
         // happens before a whole workspace validation and a schema-store read, so a second author
         // editing the same id inside that window passes the same comparison and both writes land — the
         // first author's edit is gone, and nothing anywhere reports it. Passing them here makes the
         // comparison and the write one store operation, which is the only form of the check that
         // survives a concurrent writer.
         ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
-            String conflicted = store.saveAll(toWrite, enforced).orElse(null);
+            String conflicted;
+            if (toWrite.isEmpty()) {
+                return new ApplyResult(outcomes, plan.warnings());
+            }
+            if (attribution.requiresSnapshotFence()) {
+                List<ArtifactWrite> writes = new ArrayList<>(toWrite.stream().map(attributed::write).toList());
+                writes.set(0, writes.getFirst().guardedBy(enforced));
+                conflicted = store.writeAll(writes).refusedId();
+            } else {
+                conflicted = store.saveAll(toWrite, enforced).orElse(null);
+            }
             if (conflicted != null) {
                 throw new TapstateException(ArtifactError.VERSION_CONFLICT, Map.of("id", conflicted), null);
             }
@@ -479,6 +833,33 @@ public final class ApplyService {
         return new ApplyResult(result.outcomes(), warnings);
     }
 
+    private AttributedPlan attributedWithSnapshots(String principal, ApplyPlan planned) {
+        List<PreparedArtifact> attributed = new ArrayList<>();
+        Map<String, String> existingHashes = new LinkedHashMap<>();
+        Set<String> absentIds = new LinkedHashSet<>();
+        for (PreparedArtifact prepared : planned.artifacts()) {
+            Resource existing = store.get(prepared.id()).orElse(null);
+            Resource resource = attribution.attribute(principal, prepared.resource(), existing);
+            if (attribution.requiresSnapshotFence()) {
+                if (existing == null) absentIds.add(prepared.id());
+                else existingHashes.put(prepared.id(), storedHash(existing));
+            }
+            attributed.add(new PreparedArtifact(resource, writer.write(resource), CanonicalHash.of(resource)));
+        }
+        return new AttributedPlan(new ApplyPlan(
+                attributed, planned.warnings(), planned.preconditions(), planned.workspacePreconditions()),
+                Map.copyOf(existingHashes), Set.copyOf(absentIds));
+    }
+
+    private record AttributedPlan(ApplyPlan plan, Map<String, String> existingHashes, Set<String> absentIds) {
+        ArtifactWrite write(Resource resource) {
+            // The same read that supplied attribution chooses the atomic write intent. A concurrent
+            // create or delete/recreate must not let an unconditional upsert install stale provenance.
+            return absentIds.contains(resource.id()) ? ArtifactWrite.createOnly(resource)
+                    : ArtifactWrite.replaceOnly(resource, Objects.requireNonNull(existingHashes.get(resource.id())));
+        }
+    }
+
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {
         return stored.stream()
                 .filter(PipelineResource.class::isInstance)
@@ -502,7 +883,7 @@ public final class ApplyService {
         ONLINE_SOURCE
     }
 
-    private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources) {
+    private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources, PublicationReads publication) {
         Map<String, List<DiscoveredTable>> bySource = new LinkedHashMap<>();
         if (resources.stream().noneMatch(PipelineResource.class::isInstance)) {
             return bySource;
@@ -511,7 +892,9 @@ public final class ApplyService {
             if (!(resource instanceof SourceResource source)) {
                 continue;
             }
-            schemas.get(source.id())
+            var observed = publication == null ? schemas.get(source.id())
+                    : publication.models().computeIfAbsent(source.id(), schemas::get);
+            observed
                     .filter(discovered -> discovered.connectorId().equals(source.connector()))
                     .ifPresent(discovered -> {
                         List<DiscoveredTable> tables = new ArrayList<>();
@@ -558,9 +941,9 @@ public final class ApplyService {
         }
     }
 
-    private Resource parse(ArtifactDraft draft) {
+    private DslParser.ParsedResource parseWithDeclaredFields(ArtifactDraft draft) {
         try {
-            return parser.parse(draft.content());
+            return parser.parseWithDeclaredFields(draft.content());
         } catch (DslException e) {
             throw draft.source() != null ? e.withSource(draft.source()) : e;
         }

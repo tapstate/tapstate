@@ -16,6 +16,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -123,18 +124,17 @@ class NestFrontierDoesNotOutrunDeferredEventsIT {
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("deferred_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("deferred_target_" + suffix);
             Map<String, Object> mysqlConfig = mysqlConfig(mysql);
 
-            try (MongoEndpoints mongo = new MongoEndpoints()) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
                 // Both readings outlive the run that took them: the failure message after the restart is
                 // only legible beside the two positions that made the restart meaningful.
                 String heldAt;
                 String movedTo;
-                try (ServerHandle server = tier.launch(storeUri)) {
+                try (ServerHandle server = tier.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
 
                     control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -204,11 +204,11 @@ class NestFrontierDoesNotOutrunDeferredEventsIT {
 
                 // The restart. What comes back has never seen this pipeline and reads the same store; the
                 // source resumes above the deferred change, so nothing will replay it.
-                try (ServerHandle restarted = tier.launch(storeUri)) {
+                Instant restartStartedAt = Instant.now();
+                try (ServerHandle restarted = tier.launch(storage)) {
                     ControlPlane control = new ControlPlane(restarted.baseUrl());
-                    // Log in rather than bootstrap: the admin lives in the store, so it outlived the
-                    // server that created it and the bootstrap channel is closed.
-                    control.login("e2e", "e2e-password");
+                    // The restarted server reopens the same prepared installation.
+                    storage.loginAndAwaitBusiness(control);
 
                     await(() -> control.state(pipelineId).filter(PipelineState.RUNNING::equals).isPresent());
 
@@ -252,9 +252,14 @@ class NestFrontierDoesNotOutrunDeferredEventsIT {
                     assertThat(element.get("sku"))
                             .as("the payload the held change carried, not a shell rebuilt from its key")
                             .isEqualTo(DEFERRED_SKU);
-                    assertThat(control.errorCount(pipelineId))
+                    long errors = Await.answered(
+                            "an error count for pipeline " + pipelineId + " observed after restart at " + restartStartedAt,
+                            () -> control.observedAt(pipelineId)
+                                    .filter(observedAt -> observedAt.isAfter(restartStartedAt))
+                                    .flatMap(observedAt -> control.errorCount(pipelineId)));
+                    assertThat(errors)
                             .as("nothing here is an error: the run held a change, restarted, and placed it")
-                            .contains(0L);
+                            .isZero();
                 }
             }
         }

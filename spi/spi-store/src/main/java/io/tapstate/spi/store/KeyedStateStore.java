@@ -19,6 +19,8 @@ import java.util.Optional;
  * is the warm-up this layer exists to avoid. The absence is the contract: an implementation must not add
  * a listing method, and a caller must never need one. Dropping a namespace whole is the one bulk
  * operation, and it names the namespace rather than the keys in it, so it needs no listing either.
+ * The separate {@link NestReleaseStore} facet may page only explicitly marked unfinished handoffs;
+ * it does not expose ordinary keys or change this opaque state's load contract.
  *
  * <p>The value is bytes and stays bytes. What is inside is the running operator's business and changes
  * with it; an implementation that looked in would become a second place that has to agree about the
@@ -74,6 +76,16 @@ public interface KeyedStateStore {
      * so a write that is still in flight is a write that a crash loses with nothing reporting it.
      */
     void save(String namespace, String key, byte[] state);
+
+    /**
+     * Persists states under the named keys, with the same durability as {@link #save}. Success means
+     * every write was acknowledged. This does not promise cross-key atomicity: on failure some keys
+     * may already be written, and callers must not advance their input positions. The default keeps
+     * older backends compatible; remote backends can override it with a bounded bulk operation.
+     */
+    default void saveAll(String namespace, Map<String, byte[]> states) {
+        states.forEach((key, state) -> save(namespace, key, state));
+    }
 
     /**
      * Stores {@code state} under {@code key} only if the key holds nothing, and says what was already

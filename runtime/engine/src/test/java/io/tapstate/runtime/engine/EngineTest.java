@@ -139,6 +139,19 @@ class EngineTest {
                 .isTrue();
     }
 
+    @Test void originalRunDoesNotBecomeTerminalUntilProcessorCloseActuallyReturns() throws Exception {
+        CloseHeldProcessor.entered=new CountDownLatch(1);CloseHeldProcessor.release=new CountDownLatch(1);
+        var dag=new DAG();dag.newVertex("held-close",ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of((SupplierEx<Processor>) CloseHeldProcessor::new)));
+        var engine=new Engine(member);var identity=new TestRunIdentity("cache-a",1,"boot-a",1,1);
+        var original=engine.submitRun("held-close",dag,Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity);
+        try {
+            awaitStatus(member.getJet().getJob("held-close"),JobStatus.RUNNING);original.cancel();
+            assertThat(CloseHeldProcessor.entered.await(10,TimeUnit.SECONDS)).isTrue();
+            assertThat(original.awaitTerminal(Duration.ofMillis(200))).isFalse();
+        } finally {CloseHeldProcessor.release.countDown();}
+        assertThat(original.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+    }
+
     @Test
     void awaitTerminal_says_yes_for_a_pipeline_that_has_no_job_at_all() {
         // Nothing was ever submitted, so there is nothing still writing: a caller waiting to clear up after
@@ -230,7 +243,7 @@ class EngineTest {
         assertThat(engine.failureOf("orders-pipe"))
                 .get()
                 .isInstanceOfSatisfying(TapstateException.class, coded -> {
-                    assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                    assertThat(coded.code().code()).isEqualTo("TS0440009");
                     assertThat(coded.args()).containsEntry("pipeline", "orders-pipe");
                     assertThat(coded.getCause()).isSameAs(error);
                 });
@@ -278,7 +291,7 @@ class EngineTest {
         assertThat(engine.failureOf("orders-pipe"))
                 .get()
                 .isInstanceOfSatisfying(TapstateException.class, coded ->
-                        assertThat(coded.code().code()).isEqualTo("engine.out-of-memory"));
+                        assertThat(coded.code().code()).isEqualTo("TS0440009"));
     }
 
     @Test
@@ -304,7 +317,7 @@ class EngineTest {
             assertThat(engine.failureOf("orders-pipe"))
                     .get()
                     .isInstanceOfSatisfying(TapstateException.class, coded -> {
-                        assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                        assertThat(coded.code().code()).isEqualTo("TS0440009");
                         assertThat(coded.getCause()).isSameAs(escaping.error());
                     });
             assertThat(engine.hasLiveJob("orders-pipe")).isFalse();
@@ -359,6 +372,81 @@ class EngineTest {
     }
 
     @Test
+    void scopedRunIdentitySurvivesSubmissionAndOldHandlesLeaveTheNewExecutionRunning() {
+        Engine engine = new Engine(member);
+        var firstIdentity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        var nextIdentity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 2);
+        var first = engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), firstIdentity);
+        awaitStatus(member.getJet().getJob("scoped-pipe"), JobStatus.RUNNING);
+        assertThat((Object) member.getJet().getJob("scoped-pipe").getConfig().getArgument(Engine.RUN_IDENTITY_ARGUMENT)).isEqualTo(firstIdentity);
+        assertThat(engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), firstIdentity).jobId()).isEqualTo(first.jobId());
+        assertThatThrownBy(() -> engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), nextIdentity))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        first.cancel(); assertThat(first.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+        var next = engine.submitRun("scoped-pipe", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), nextIdentity);
+        awaitStatus(member.getJet().getJob("scoped-pipe"), JobStatus.RUNNING);
+        assertThat(next.jobId()).isNotEqualTo(first.jobId());
+        first.cancel(); assertThat(first.awaitTerminal(Duration.ZERO)).isTrue();
+        assertThatThrownBy(first::suspend).isInstanceOf(TapstateException.class);
+        assertThat(next.isCarryingAJob()).isTrue();
+        assertThat(engine.findRun("scoped-pipe", firstIdentity)).isEmpty();
+        assertThat(engine.findRun("scoped-pipe", nextIdentity)).isPresent();
+    }
+
+    @Test
+    void aScopedSinkFailureIsCapturedUnderItsActualJobAndNeverReadOrClearedThroughTheBareId() {
+        Engine engine = new Engine(member); var identity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        var run = engine.submitRun("scoped-failed", failingSinkDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), identity);
+        awaitStatus(member.getJet().getJob("scoped-failed"), JobStatus.FAILED);
+        var registry = JobFailureRegistry.of(member);
+        assertThat(registry.existing("scoped-failed", run.jobId(), identity).get()).get().isInstanceOf(TapstateException.class);
+        assertThat(registry.get("scoped-failed")).isEmpty();
+        registry.record("scoped-failed", new IllegalStateException("legacy")); registry.clear("scoped-failed");
+        assertThat(run.failure()).get().isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code().code()).isEqualTo("test.sink-write-failed"));
+        run.cancel(); assertThat(registry.existing("scoped-failed", run.jobId(), identity).get()).isEmpty();
+    }
+
+    @Test
+    void originalOperatorManifestsSurviveRealJobSerializationAndCannotBeReplacedOnAnActiveRun() {
+        var engine = new Engine(member); var identity = new TestRunIdentity("cache-a",1,"boot-a",1,1);
+        var scope = new io.tapstate.spi.store.PipelineIntentScope("cluster",1,"cache-a","operator-run",1);
+        var place = new io.tapstate.spi.store.OperatorPlacement(scope,"cache",io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_FACTS,"join","root","facts");
+        var original = new OperatorRunManifest("operator-run",identity,List.of(new OperatorMapBinding(place,identity,"1".repeat(64))));
+        var run = engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original);
+        awaitStatus(member.getJet().getJob("operator-run"),JobStatus.RUNNING);
+        assertThat(run.operatorManifest()).isEqualTo(original); assertThat(engine.operatorManifests()).containsExactly(original);
+        var captured = engine.captureRun("operator-run").orElseThrow();
+        assertThat(captured.jobId()).isEqualTo(run.jobId()); assertThat(captured.operatorManifest()).isEqualTo(original);
+        assertThat(engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),original).jobId()).isEqualTo(run.jobId());
+        var changed = new OperatorRunManifest("operator-run",identity,List.of());
+        assertThatThrownBy(() -> engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),changed))
+                .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThatThrownBy(() -> engine.submitRun("operator-run",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity)).isInstanceOf(TapstateException.class);
+        assertThat(run.operatorManifest()).isEqualTo(original); assertThat(run.isCarryingAJob()).isTrue();
+        run.cancel(); assertThat(run.awaitTerminal(Duration.ofSeconds(10))).isTrue(); assertThat(engine.operatorManifests()).isEmpty();
+        var nextIdentity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 2);
+        var nextManifest = new OperatorRunManifest("operator-run", nextIdentity, List.of());
+        var next = engine.submitRun("operator-run", foreverDag(), Map.of(), io.tapstate.runtime.engine.nest.NestSettings.defaults(), nextManifest);
+        awaitStatus(member.getJet().getJob("operator-run"), JobStatus.RUNNING);
+        captured.cancel(); assertThat(captured.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+        assertThat(captured.operatorManifest()).isEqualTo(original); assertThat(next.isCarryingAJob()).isTrue();
+        next.cancel(); assertThat(next.awaitTerminal(Duration.ofSeconds(10))).isTrue();
+    }
+
+    @Test
+    void aMissingManifestOnAScopedJobCannotBeReconstructedFromItsNameOrIdentity() {
+        var engine = new Engine(member); var identity = new TestRunIdentity("cache-a",1,"boot-a",1,1);
+        var run = engine.submitRun("missing-manifest",foreverDag(),Map.of(),io.tapstate.runtime.engine.nest.NestSettings.defaults(),identity);
+        awaitStatus(member.getJet().getJob("missing-manifest"),JobStatus.RUNNING);
+        assertThatThrownBy(run::operatorManifest).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThatThrownBy(engine::operatorManifests).isInstanceOf(TapstateException.class);
+        run.cancel(); assertThat(run.awaitTerminal(Duration.ofSeconds(10))).isTrue(); assertThat(engine.operatorManifests()).isEmpty();
+    }
+
+    private record TestRunIdentity(String incarnation, long stateGeneration, String boot, long claim, long execution) implements java.io.Serializable {}
+
+    @Test
     void submit_is_idempotent_and_does_not_start_a_second_job() {
         Engine engine = new Engine(member);
         engine.submit("orders-pipe", foreverDag());
@@ -383,7 +471,7 @@ class EngineTest {
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> {
                     io.tapstate.core.common.TapstateException coded = (io.tapstate.core.common.TapstateException) e;
-                    assertThat(coded.code().code()).isEqualTo("engine.no-such-job");
+                    assertThat(coded.code().code()).isEqualTo("TS0440001");
                     assertThat(coded.args()).containsEntry("pipeline", "ghost");
                 });
     }
@@ -404,7 +492,7 @@ class EngineTest {
         assertThatThrownBy(() -> engine.resume("ghost"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> assertThat(((io.tapstate.core.common.TapstateException) e).code().code())
-                        .isEqualTo("engine.no-such-job"));
+                        .isEqualTo("TS0440001"));
     }
 
     @Test
@@ -465,7 +553,7 @@ class EngineTest {
         assertThatThrownBy(() -> engine.suspend("orders-pipe"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> assertThat(((io.tapstate.core.common.TapstateException) e).code().code())
-                        .isEqualTo("engine.no-such-job"));
+                        .isEqualTo("TS0440001"));
     }
 
     @Test
@@ -480,7 +568,7 @@ class EngineTest {
         assertThatThrownBy(() -> engine.resume("orders-pipe"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .satisfies(e -> assertThat(((io.tapstate.core.common.TapstateException) e).code().code())
-                        .isEqualTo("engine.no-such-job"));
+                        .isEqualTo("TS0440001"));
     }
 
     @Test
@@ -564,6 +652,53 @@ class EngineTest {
         // The job is running and its statistics are being collected; it simply has no frontier of this
         // shape. Absence has to survive that, or "not measured" and "measured at zero" become one answer.
         assertThat(engine.frontierGaps("orders-pipe")).isEmpty();
+    }
+
+    @Test
+    void an_empty_frontier_reading_clears_previously_published_gap_and_stall() {
+        Engine engine = new Engine(member);
+        DAG dag = new DAG();
+        dag.newVertex("serve.out", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) ClearingFrontierSource::new)));
+        engine.submit("orders-pipe", dag);
+        awaitFrontierGaps(engine, "orders-pipe", Map.of("orders", 7L));
+        assertThat(engine.frontierStalls("orders-pipe")).containsEntry("orders", 7L);
+
+        member.getUserContext().put(ClearingFrontierSource.CLEAR, true);
+        awaitFrontierGaps(engine, "orders-pipe", Map.of("orders", 0L));
+        assertThat(engine.frontierStalls("orders-pipe")).containsEntry("orders", 0L);
+    }
+
+    /** Lets the test replace a positive reading with an empty one on the actual job thread. */
+    private static final class ClearingFrontierSource extends AbstractProcessor {
+        private static final String CLEAR = "clear-frontier-readings";
+        private final JetFrontierGauge gauge = new JetFrontierGauge();
+        private HazelcastInstance instance;
+
+        @Override
+        protected void init(Processor.Context context) {
+            instance = context.hazelcastInstance();
+        }
+
+        @Override
+        public boolean isCooperative() {
+            return false;
+        }
+
+        @Override
+        public boolean complete() {
+            Map<String, Long> reading = instance.getUserContext().containsKey(CLEAR)
+                    ? Map.of() : Map.of("orders", 7L);
+            gauge.trailing(reading);
+            gauge.pinned(reading);
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return true;
+            }
+            return false;
+        }
     }
 
     /**
@@ -842,6 +977,18 @@ class EngineTest {
         }
     }
 
+    private static final class CloseHeldProcessor extends AbstractProcessor {
+        static volatile CountDownLatch entered,release;
+        @Override public boolean complete(){return false;}
+        @Override public void close() throws Exception {
+            entered.countDown();boolean interrupted=false;
+            try {
+                for(;;)try {if(!release.await(15,TimeUnit.SECONDS))throw new AssertionError("close was not released");return;}
+                    catch(InterruptedException stopping){interrupted=true;}
+            } finally {if(interrupted)Thread.currentThread().interrupt();}
+        }
+    }
+
     /** Emits nothing and never signals completion; a stand-in for an unbounded source. */
     private static final class ForeverSource extends AbstractProcessor {
         @Override
@@ -933,7 +1080,7 @@ class EngineTest {
     private static void refusedForWantOfMemory(ThrowingCallable operation) {
         assertThatThrownBy(operation)
                 .isInstanceOfSatisfying(TapstateException.class, coded -> {
-                    assertThat(coded.code().code()).isEqualTo("engine.out-of-memory");
+                    assertThat(coded.code().code()).isEqualTo("TS0440009");
                     assertThat(coded.args()).containsEntry("pipeline", "orders-pipe");
                 });
     }

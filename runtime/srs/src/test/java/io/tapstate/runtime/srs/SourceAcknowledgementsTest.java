@@ -1,0 +1,373 @@
+package io.tapstate.runtime.srs;
+
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.store.DurableSourceRead;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SrsMeta;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * What a tail's source is told it may release: the chain's durable source read offset, read on its own, and
+ * nothing any one writer of it says on the way.
+ */
+class SourceAcknowledgementsTest {
+
+    private static final String CHAIN = "chain-acknowledged";
+
+    private CountingMeta meta;
+    private RecordingTail tail;
+    private final CaptureHealth health = new CaptureHealth();
+    private final SourceAcknowledgements acknowledgements = new SourceAcknowledgements();
+    private Subscription followed;
+
+    @BeforeEach
+    void seedTheChain() {
+        meta = new CountingMeta();
+        meta.create(CHAIN, null);
+        meta.openEpoch(CHAIN);
+        tail = new RecordingTail();
+    }
+
+    @AfterEach
+    void stopFollowing() {
+        if (followed != null) {
+            followed.close();
+        }
+        acknowledgements.close();
+    }
+
+    @Test void failedOriginalTailCloseIsRetriedWithoutResumingAcknowledgements() {
+        var closes=new java.util.concurrent.atomic.AtomicInteger();var failure=new IllegalStateException("original close is still pending");
+        var tail=new Subscription() {
+            @Override public void close(){if(closes.incrementAndGet()==1)throw failure;}
+        };
+        var followed=acknowledgements.follow(meta,CHAIN,tail,new CaptureHealth(),false);
+        org.assertj.core.api.Assertions.assertThatThrownBy(followed::close).isSameAs(failure);
+        followed.close();followed.close();assertThat(closes).hasValue(2);
+    }
+
+    @Test void closingAFollowedTailTwiceClosesTheUnderlyingSourceOnlyOnce() {
+        var closes = new AtomicInteger();
+        followed = acknowledgements.follow(meta, CHAIN, new Subscription() {
+            @Override public void close() { closes.incrementAndGet(); }
+        }, health, false);
+        followed.close();
+        followed.close();
+        assertThat(closes).hasValue(1);
+    }
+
+    @Test void nativeAcknowledgementsUseOnlyTheOriginalEpochAndNeverLaterCaptureHistory() {
+        var current = new java.util.concurrent.atomic.AtomicReference<>(nativeState(3,"original"));
+        var chains = new NativeChains(() -> Optional.of(current.get()));
+        followed = acknowledgements.follow(chains,CHAIN,3,tail,health,() -> {});
+        assertThat(tail.told).containsExactly("original");
+        current.set(nativeState(4,"later")); handOver();
+        assertThat(tail.told).containsExactly("original");
+        assertThat(health.consecutiveAcknowledgeFailures()).isEqualTo(1);
+        assertThat(health.failure()).isEmpty();
+    }
+
+    @Test void revocationDuringNativeCheckpointReadCannotReachTheOriginalSource() {
+        var active = new AtomicBoolean(true);
+        var chains = new NativeChains(() -> { active.set(false); return Optional.of(nativeState(3,"late")); });
+        followed = acknowledgements.follow(chains,CHAIN,3,tail,health,() -> {
+            if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+        });
+        assertThat(tail.told).isEmpty(); assertThat(health.consecutiveAcknowledgeFailures()).isEqualTo(1);
+        followed.close(); handOver(); assertThat(tail.told).isEmpty();
+    }
+
+    @Test void awaitingTheFirstCheckpointDefersTheReadButStillAcknowledgesTheCurrentEpoch() {
+        var reads = new AtomicInteger();
+        var chains = new NativeChains(() -> {
+            reads.incrementAndGet();
+            return Optional.of(nativeState(3, "first"));
+        });
+        followed = acknowledgements.follow(chains, CHAIN, 3, tail, health, () -> {}, true);
+        assertThat(reads).hasValue(0);
+        assertThat(tail.told).isEmpty();
+        handOver();
+        assertThat(tail.told).containsExactly("first");
+    }
+
+    private record NativeChains(java.util.function.Supplier<Optional<io.tapstate.spi.store.SrsChainState>> read) implements io.tapstate.spi.store.SrsChainStore {
+        @Override public Optional<io.tapstate.spi.store.SrsChainState> load(String chain) { assertThat(chain).isEqualTo(CHAIN); return read.get(); }
+        @Override public io.tapstate.spi.store.SrsChainStore guardedBy(Runnable guard) { throw new AssertionError(); }
+        @Override public io.tapstate.spi.store.SrsChainState prepare(String c,String r,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public io.tapstate.spi.store.SrsChainState requestTables(String c,java.util.Set<String> t,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public java.util.OptionalLong openEpoch(String c,long e,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public boolean publishServingTables(String c,long e,java.util.Set<String> t,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public Optional<io.tapstate.spi.store.SrsChainState> checkpoint(String c,long r,io.tapstate.spi.store.SrsCaptureCheckpoint p,io.tapstate.spi.store.WorkloadClaimFence f) { throw new AssertionError(); }
+    }
+
+    private static io.tapstate.spi.store.SrsChainState nativeState(long epoch,String token) {
+        var model = new io.tapstate.spi.store.SrsModelKey(CHAIN,"table","cache",epoch,0);
+        var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(epoch,1),token),
+                Map.of("table",new io.tapstate.spi.store.SrsTableCheckpoint(model,1)));
+        return new io.tapstate.spi.store.SrsChainState(CHAIN,"capture",null,epoch,java.util.Set.of("table"),java.util.Set.of("table"),1,checkpoint,java.time.Instant.EPOCH,0,0);
+    }
+
+    /**
+     * A tail is told the position it starts from as soon as it is followed, and after that every position the
+     * chain comes to hold -- once each, whoever moved it there. A tail told nothing until its first change
+     * lands would leave a source that restarted behind an earlier release holding its whole log meanwhile.
+     */
+    @Test
+    void aTailIsToldWhereItStartsAndThenEveryNewDurablePositionOnce() {
+        meta.advanceSourceReadOffset(CHAIN, at(-1, "t0"));
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+        assertThat(tail.told).containsExactly("t0");
+
+        handOver();
+        assertThat(tail.told).as("unchanged, so not told again").containsExactly("t0");
+
+        meta.advanceSourceReadOffset(CHAIN, at(4, "t4"));
+        handOver();
+        meta.rewindSourceReadOffset(CHAIN, "set-by-hand");
+        handOver();
+        assertThat(tail.told).containsExactly("t0", "t4", "set-by-hand");
+    }
+
+    /**
+     * The position is read with the durable read and only that: a record the store could still roll back must
+     * never be told to a source, which would have let go of what the rolled-back record asks for again.
+     */
+    @Test
+    void thePositionIsReadDurablyAndNeverOffTheWholeRecord() {
+        meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
+        int recordReads = meta.recordReads.get();
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+        handOver();
+
+        // At least the two asked for here; the process-wide schedule may add one of its own meanwhile.
+        assertThat(meta.durableReads.get()).isGreaterThanOrEqualTo(2);
+        assertThat(meta.recordReads.get()).isEqualTo(recordReads);
+        assertThat(tail.told).containsExactly("t2");
+    }
+
+    /** A chain with no position yet tells the source nothing; there is nothing it may release. */
+    @Test
+    void aChainWithNoPositionTellsNothing() {
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+        handOver();
+
+        assertThat(tail.told).isEmpty();
+    }
+
+    /**
+     * A capture whose rings write through is told only a write-through checkpoint: an offset on its chain that
+     * is not one was bounded by something else, and this capture does not resume from it. A tail that does not
+     * write through -- a direct channel -- is told the same offset, because there it is the resume point.
+     */
+    @Test
+    void aWriteThroughCaptureIsToldOnlyAWriteThroughCheckpoint() {
+        meta.advanceSourceReadOffset(CHAIN, at(3, "bounded-by-confirmations"));
+        meta.writtenThrough.set(false);
+        RecordingTail direct = new RecordingTail();
+        Subscription followedDirect = acknowledgements.follow(meta, CHAIN, direct, health, false);
+        try {
+            followed = acknowledgements.follow(meta, CHAIN, tail, health, true);
+            assertThat(tail.told).as("not a write-through checkpoint").isEmpty();
+            assertThat(direct.told).containsExactly("bounded-by-confirmations");
+
+            meta.advanceSourceReadOffset(CHAIN, at(5, "checkpointed"));
+            meta.writtenThrough.set(true);
+            handOver();
+            assertThat(tail.told).containsExactly("checkpointed");
+        } finally {
+            followedDirect.close();
+        }
+    }
+
+    /**
+     * A read that fails is counted on the run's health as a failed acknowledgement and never fails the run --
+     * every pipeline reading the capture would fail with it, over a release that is only late.
+     */
+    @Test
+    void aReadThatFailsIsCountedAndNeverFailsTheRun() {
+        meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
+        meta.failDurableReads.set(true);
+
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+        handOver();
+
+        assertThat(health.consecutiveAcknowledgeFailures()).isGreaterThanOrEqualTo(2);
+        assertThat(health.lastAcknowledgeFailureCode()).contains(IoError.STORE_UNAVAILABLE.code());
+        assertThat(health.failure()).isEmpty();
+        assertThat(tail.told).isEmpty();
+
+        meta.failDurableReads.set(false);
+        handOver();
+        assertThat(tail.told).containsExactly("t2");
+    }
+
+    /**
+     * A read that fails is also said -- the health readings are not where anybody watching the source looks --
+     * but at most once a minute for a tail, however often the schedule finds it failing.
+     */
+    @Test
+    void aReadThatFailsIsSaidAtMostOnceAMinute() {
+        java.util.logging.Logger log = java.util.logging.Logger.getLogger(SourceAcknowledgements.class.getName());
+        List<LogRecord> said = new CopyOnWriteArrayList<>();
+        Handler listening = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                said.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        log.addHandler(listening);
+        try {
+            meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
+            meta.failDurableReads.set(true);
+
+            followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+            handOver();
+            handOver();
+
+            assertThat(said).filteredOn(record -> record.getLevel() == Level.WARNING)
+                    .singleElement()
+                    .satisfies(record -> assertThat(record.getMessage())
+                            .contains(CHAIN).contains(IoError.STORE_UNAVAILABLE.code()));
+        } finally {
+            log.removeHandler(listening);
+        }
+    }
+
+    /** Once the tail is closed nothing more is read for it, and the tail itself is closed. */
+    @Test
+    void closingStopsTheFollowingAndTheTail() {
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed.close();
+        meta.advanceSourceReadOffset(CHAIN, at(9, "t9"));
+        handOver();
+
+        assertThat(tail.closed).isTrue();
+        assertThat(tail.told).isEmpty();
+    }
+
+    /**
+     * Closing the unit that followed a tail ends every read made for it, and the thread that made them. A
+     * process that runs one server after another would otherwise go on reading, every interval, for tails whose
+     * servers are gone, through stores that are closed.
+     */
+    @Test
+    void closingTheUnitEndsItsReadsAndTheirThread() throws Exception {
+        SourceAcknowledgements unit = new SourceAcknowledgements();
+        unit.follow(meta, CHAIN, tail, health, false);
+        assertThat(meta.durableReads).as("the read made as the tail was followed").hasValue(1);
+
+        unit.close();
+        long deadline = System.nanoTime() + SourceAcknowledgements.INTERVAL.toNanos() + TimeUnit.SECONDS.toNanos(1);
+        while (System.nanoTime() < deadline) {
+            Thread.sleep(100);
+        }
+
+        assertThat(meta.durableReads).as("nothing read once the unit is closed").hasValue(1);
+        assertThat(unit.stopped()).as("and the thread that read for it has stopped").isTrue();
+    }
+
+    /**
+     * The schedule reads on a thread of its own, not the thread the source hands its changes over on, which
+     * must not wait on the store.
+     */
+    @Test
+    void theScheduledReadsRunOnAThreadOfTheirOwn() throws Exception {
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
+        meta.advanceSourceReadOffset(CHAIN, at(3, "t3"));
+
+        long deadline = System.nanoTime()
+                + SourceAcknowledgements.INTERVAL.toNanos() + TimeUnit.SECONDS.toNanos(5);
+        while (tail.told.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+
+        assertThat(tail.told).containsExactly("t3");
+        assertThat(tail.threads).containsExactly("tapstate-source-acknowledge");
+    }
+
+    private void handOver() {
+        ((SourceAcknowledgements.Followed) followed).handOverQuietly();
+    }
+
+    private static ChainPosition at(long seq, String token) {
+        return new ChainPosition(new SourceOrder(1, seq), token);
+    }
+
+    /** A subscription that records what it is told, and on which thread. */
+    private static final class RecordingTail implements Subscription {
+        final List<String> told = new CopyOnWriteArrayList<>();
+        final List<String> threads = new CopyOnWriteArrayList<>();
+        volatile boolean closed;
+
+        @Override
+        public void acknowledge(SourcePosition durable) {
+            told.add(durable.token());
+            threads.add(Thread.currentThread().getName());
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+    }
+
+    /** The run unit's in-memory store, counting how the source read offset is read. */
+    private static final class CountingMeta extends CaptureRunUnitTest.InMemoryMeta {
+        final AtomicInteger durableReads = new AtomicInteger();
+        final AtomicInteger recordReads = new AtomicInteger();
+        final AtomicBoolean failDurableReads = new AtomicBoolean();
+        final AtomicBoolean writtenThrough = new AtomicBoolean();
+        private String rewound;
+
+        @Override
+        public synchronized Optional<SrsMeta> read(String miningChainId) {
+            recordReads.incrementAndGet();
+            return super.read(miningChainId);
+        }
+
+        @Override
+        public Optional<DurableSourceRead> durableSourceRead(String miningChainId) {
+            durableReads.incrementAndGet();
+            if (failDurableReads.get()) {
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "not now"), null);
+            }
+            if (rewound != null) {
+                return Optional.of(new DurableSourceRead(new ChainPosition(null, rewound), false));
+            }
+            return super.read(miningChainId).map(SrsMeta::sourceRead)
+                    .map(position -> new DurableSourceRead(position, writtenThrough.get()));
+        }
+
+        @Override
+        public void rewindSourceReadOffset(String miningChainId, String token) {
+            rewound = token;
+        }
+    }
+}

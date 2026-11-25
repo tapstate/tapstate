@@ -7,6 +7,7 @@ import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
+import io.tapstate.control.core.ConnectionTestReport;
 import io.tapstate.control.core.ConnectionTestService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
@@ -28,6 +29,7 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactMutation;
@@ -35,6 +37,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConnectionTestResult;
+import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.runtime.probe.SchemaDiscoveryProbe;
@@ -111,6 +114,58 @@ class SourceApiTest {
     }
 
     @Test
+    void creatingASourceWithSpacesReturnsAnEncodedUsableLocation() throws Exception {
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON).body(sourceJson("atlas source", "location"))
+                .exchange((req, res) -> ResponseEntity.status(res.getStatusCode()).headers(res.getHeaders())
+                        .body(res.bodyTo(String.class)));
+        assertThat(context.getBean(InMemoryArtifactStore.class).get("atlas source")).isPresent();
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getHeaders().getLocation().toASCIIString()).isEqualTo("/api/sources/atlas%20source");
+        String body = request("reader").get()
+                .uri(java.net.URI.create("http://127.0.0.1:" + port).resolve(created.getHeaders().getLocation()))
+                .retrieve().body(String.class);
+        assertThat(JSON.readTree(body).path("id").asText()).isEqualTo("atlas source");
+        assertThat(body).doesNotContain(SECRET);
+    }
+
+    @Test
+    void sourceHttpPreservesUnboundedAndEmptyTableSelectionScopes() throws Exception {
+        for (boolean explicitlyEmpty : List.of(false, true)) {
+            String id = explicitlyEmpty ? "empty_scope" : "open_scope";
+            Map<String, Object> input = new LinkedHashMap<>(Map.of(
+                    "id", id, "connector", "mysql", "mode", "cdc",
+                    "config", Map.of("host", "localhost", "port", 3306,
+                            "database", "orders", "username", "app", "password", SECRET)));
+            if (explicitlyEmpty) input.put("tables", List.of());
+            ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                    .contentType(MediaType.APPLICATION_JSON).body(input).retrieve().toEntity(String.class);
+            SourceResource stored = (SourceResource) context.getBean(InMemoryArtifactStore.class)
+                    .get(id).orElseThrow();
+            if (explicitlyEmpty) assertThat(stored.tables()).isEmpty();
+            else assertThat(stored.tables()).isNull();
+
+            ResponseEntity<String> fetched = request("reader").get().uri("/api/sources/" + id)
+                    .retrieve().toEntity(String.class);
+            for (String response : List.of(created.getBody(), fetched.getBody())) {
+                JsonNode body = JSON.readTree(response);
+                assertThat(body.has("tables")).as("the declared table-scope discriminator stays present").isTrue();
+                if (explicitlyEmpty) assertThat(body.path("tables").isArray() && body.path("tables").isEmpty()).isTrue();
+                else assertThat(body.path("tables").isNull()).isTrue();
+                assertThat(response).doesNotContain(SECRET);
+            }
+            assertThat(fetched.getHeaders().getETag()).isEqualTo(created.getHeaders().getETag());
+        }
+        JsonNode listed = JSON.readTree(request("reader").get().uri("/api/sources")
+                .retrieve().body(String.class));
+        for (JsonNode source : listed.path("items")) {
+            assertThat(source.has("tables")).isTrue();
+            if ("open_scope".equals(source.path("id").asText())) assertThat(source.path("tables").isNull()).isTrue();
+            else assertThat(source.path("tables").isArray() && source.path("tables").isEmpty()).isTrue();
+        }
+    }
+
+    @Test
     void sourceSchemaContainsOnlyTablesTheSourceSelects() throws Exception {
         create("orders", "before");
         context.getBean(InMemorySchemaStore.class).save(new DiscoveredSourceModel(
@@ -153,6 +208,81 @@ class SourceApiTest {
     }
 
     @Test
+    void atlasUriUserInfoIsNotReturnedButAReadModifyWriteAndConnectionTestKeepIt() throws Exception {
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test?retryWrites=true";
+        String display = "mongodb+srv://<redacted>@cluster.example/test?retryWrites=true";
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas", "connector", "mongodb-atlas", "mode", "snapshot",
+                        "config", Map.of("isUri", true, "uri", uri)))
+                .retrieve().toEntity(String.class);
+
+        assertThat(created.getBody()).contains(display).doesNotContain("alice", "pa%40ss");
+        String listed = request("reader").get().uri("/api/sources").retrieve().body(String.class);
+        assertThat(listed).contains(display).doesNotContain("alice", "pa%40ss");
+        JsonNode saved = JSON.readTree(request("reader").get().uri("/api/sources/atlas")
+                .retrieve().body(String.class));
+        Map<String, Object> redactedConfig = JSON.convertValue(saved.path("config"), Map.class);
+
+        ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/atlas")
+                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas", "connector", "mongodb-atlas", "mode", "snapshot",
+                        "config", redactedConfig,
+                        "metadata", Map.of("description", "updated")))
+                .retrieve().toEntity(String.class);
+        assertThat(replaced.getBody()).contains(display).doesNotContain("alice", "pa%40ss");
+        SourceResource persisted = (SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("atlas").orElseThrow();
+        assertThat(persisted.config()).containsEntry("uri", uri);
+
+        request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas", "connectorId", "mongodb-atlas", "settings", redactedConfig))
+                .retrieve().toBodilessEntity();
+        assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
+                .containsEntry("uri", uri);
+    }
+
+    @Test
+    void managedViewsMongoUriDoesNotExposeStoreCredentialsAndCanBeResubmitted() throws Exception {
+        String uri = "mongodb://state:managed-secret@db.example/metadata?replicaSet=rs0";
+        String display = "mongodb://<redacted>@db.example/metadata?replicaSet=rs0";
+        context.getBean(InMemoryArtifactStore.class).save(new SourceResource(
+                "views", null, "mongodb", Map.of("isUri", true, "uri", uri),
+                null, null, null, null));
+
+        ResponseEntity<String> got = request("reader").get().uri("/api/sources/views")
+                .retrieve().toEntity(String.class);
+        assertThat(got.getBody()).contains(display).doesNotContain("state:managed-secret");
+        assertThat(request("reader").get().uri("/api/sources").retrieve().body(String.class))
+                .contains(display).doesNotContain("state:managed-secret");
+
+        Map<String, Object> redactedConfig = JSON.convertValue(
+                JSON.readTree(got.getBody()).path("config"), Map.class);
+        ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/views")
+                .header(HttpHeaders.IF_MATCH, got.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "views", "connector", "mongodb", "config", redactedConfig,
+                        "metadata", Map.of("description", "updated")))
+                .retrieve().toEntity(String.class);
+        assertThat(replaced.getBody()).contains(display).doesNotContain("state:managed-secret");
+        SourceResource persisted = (SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("views").orElseThrow();
+        assertThat(persisted.config()).containsEntry("uri", uri);
+    }
+
+    @Test
+    void typedSourceWritesCannotPersistASecretDisplayMarker() {
+        assertError(request("writer").post().uri("/api/sources")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(Map.of("id", "masked", "connector", "mysql",
+                                "config", Map.of("host", "db.example", "password", "<redacted>"))),
+                HttpStatus.BAD_REQUEST, "TS0210001");
+        assertThat(context.getBean(InMemoryArtifactStore.class).get("masked")).isEmpty();
+    }
+
+    @Test
     void aSavedSourceCanBeTestedOverRestWithoutPostingSettings() {
         create("mysql-test", "saved");
 
@@ -163,6 +293,99 @@ class SourceApiTest {
 
         assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
                 .containsEntry("password", SECRET);
+    }
+
+    @Test
+    void awsRdsMysqlSourceRestoresOmittedSecretForTestAndDiscoveryWithoutReturningIt() throws Exception {
+        String password = "rds-password-sentinel";
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql", "mode", "cdc",
+                        "config", Map.of("host", "db.example", "port", 3306, "database", "orders",
+                                "username", "reader", "password", password)))
+                .retrieve().toEntity(String.class);
+
+        assertThat(created.getBody()).doesNotContain(password);
+        JsonNode saved = JSON.readTree(request("reader").get().uri("/api/sources/rds-source")
+                .retrieve().body(String.class));
+        assertThat(saved.path("connector").asText()).isEqualTo("aws-rds-mysql");
+        assertThat(saved.path("mode").asText()).isEqualTo("cdc");
+        assertThat(saved.path("config").has("password")).isFalse();
+        assertThat(saved.path("configuredSecrets").get(0).asText()).isEqualTo("password");
+        assertThat(request("reader").get().uri("/api/sources").retrieve().body(String.class))
+                .doesNotContain(password);
+        Map<String, Object> safeSettings = JSON.convertValue(saved.path("config"), Map.class);
+
+        ConnectionTestReport passed = request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connectorId", "aws-rds-mysql",
+                        "settings", safeSettings))
+                .retrieve().body(ConnectionTestReport.class);
+        assertThat(passed.outcome()).isEqualTo(ConnectionTestReport.Outcome.PASSED);
+        assertThat(context.getBean(RecordingConnectionProbe.class).captured().settings())
+                .containsEntry("port", 3306).containsEntry("password", password);
+
+        SchemaReport schema = request("writer").post().uri("/api/connections:discover-schema")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connectorId", "aws-rds-mysql",
+                        "settings", safeSettings))
+                .retrieve().body(SchemaReport.class);
+        assertThat(schema.connectorId()).isEqualTo("aws-rds-mysql");
+        assertThat(schema.tables()).extracting(SchemaReport.Table::name).containsExactly("orders");
+        assertThat(context.getBean(RecordingSchemaDiscoveryProbe.class).captured().settings())
+                .containsEntry("port", 3306).containsEntry("password", password);
+
+        context.getBean(RecordingConnectionProbe.class).failNext();
+        ResponseEntity<String> failed = request("writer").post().uri("/api/connections:test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connectorId", "aws-rds-mysql",
+                        "settings", safeSettings))
+                .retrieve().toEntity(String.class);
+        assertThat(failed.getBody()).contains("FAILED", "28000", "Login denied")
+                .doesNotContain(password);
+    }
+
+    @Test
+    void awsRdsMysqlSourceCanPreserveReplaceAndClearItsPassword() {
+        Map<String, Object> safeConfig = Map.of("host", "db.example", "port", 3306,
+                "database", "orders", "username", "reader");
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql",
+                        "config", Map.of("host", "db.example", "port", 3306, "database", "orders",
+                                "username", "reader", "password", "original-secret")))
+                .retrieve().toEntity(String.class);
+
+        ResponseEntity<String> preserved = request("writer").put().uri("/api/sources/rds-source")
+                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql", "config", safeConfig,
+                        "metadata", Map.of("description", "updated")))
+                .retrieve().toEntity(String.class);
+        assertThat(preserved.getBody()).doesNotContain("original-secret");
+        assertThat(((SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("rds-source").orElseThrow()).config()).containsEntry("password", "original-secret");
+
+        ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/rds-source")
+                .header(HttpHeaders.IF_MATCH, preserved.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql",
+                        "config", Map.of("host", "db.example", "port", 3306, "database", "orders",
+                                "username", "reader", "password", "replacement-secret")))
+                .retrieve().toEntity(String.class);
+        assertThat(replaced.getBody()).doesNotContain("original-secret", "replacement-secret");
+        assertThat(((SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("rds-source").orElseThrow()).config()).containsEntry("password", "replacement-secret");
+
+        ResponseEntity<String> cleared = request("writer").put().uri("/api/sources/rds-source")
+                .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "rds-source", "connector", "aws-rds-mysql",
+                        "config", safeConfig, "clearSecrets", List.of("password")))
+                .retrieve().toEntity(String.class);
+        assertThat(cleared.getBody()).doesNotContain("original-secret", "replacement-secret");
+        assertThat(((SourceResource) context.getBean(InMemoryArtifactStore.class)
+                .get("rds-source").orElseThrow()).config()).doesNotContainKey("password");
     }
 
     @Test
@@ -215,25 +438,46 @@ class SourceApiTest {
     }
 
     @Test
+    void draftReturnsOnlyCallerSuppliedConfigWhenTheSourceAlreadyExists() throws Exception {
+        String storedSecret = "stored-only-secret";
+        InMemoryArtifactStore artifacts = context.getBean(InMemoryArtifactStore.class);
+        artifacts.save(new SourceResource("orders", null, "mysql",
+                Map.of("host", "localhost", "port", 3306, "database", "orders",
+                        "username", "app", "password", storedSecret),
+                null, null, null, null));
+
+        ResponseEntity<String> drafted = request("reader")
+                .post().uri("/api/sources:draft")
+                .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "draft"))
+                .retrieve().toEntity(String.class);
+
+        String yaml = JSON.readTree(drafted.getBody()).path("yaml").asText();
+        assertThat(yaml).contains("password: " + SECRET).doesNotContain(storedSecret);
+        SourceResource stored = (SourceResource) artifacts.get("orders").orElseThrow();
+        assertThat(stored.config()).containsEntry("password", storedSecret);
+        assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
+    }
+
+    @Test
     void replaceRequiresOneStrongQuotedEtagAndDeleteUsesTheNewVersion() throws Exception {
         String etag = create("orders", "before").getHeaders().getETag();
 
         assertError(request("writer").delete().uri("/api/sources/orders"),
-                HttpStatus.PRECONDITION_REQUIRED, "source.precondition-required");
+                HttpStatus.PRECONDITION_REQUIRED, "TS0220004");
 
         for (String malformed : List.of("", etag.substring(1, etag.length() - 1), "W/" + etag,
                 "*", etag + ", " + etag, "\"short\"")) {
             ApiError error = put("orders", sourceJson("orders", "after"), malformed);
-            assertThat(error.code()).isEqualTo("source.precondition-required");
+            assertThat(error.code()).isEqualTo("TS0220004");
         }
 
         ApiError stale = put("orders", sourceJson("orders", "after"), "\"" + "0".repeat(64) + "\"");
-        assertThat(stale.code()).isEqualTo("source.version-conflict");
+        assertThat(stale.code()).isEqualTo("TS0220005");
 
         assertError(request("writer").put().uri("/api/sources/missing")
                         .header(HttpHeaders.IF_MATCH, "\"" + "0".repeat(64) + "\"")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("missing", "after")),
-                HttpStatus.NOT_FOUND, "source.not-found");
+                HttpStatus.NOT_FOUND, "TS0220001");
 
         ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/orders")
                 .header(HttpHeaders.IF_MATCH, etag).contentType(MediaType.APPLICATION_JSON)
@@ -247,7 +491,7 @@ class SourceApiTest {
                 .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
                 .exchange((req, res) -> res.getStatusCode());
         assertThat(deleted).isEqualTo(HttpStatus.NO_CONTENT);
-        assertError(request("reader").get().uri("/api/sources/orders"), HttpStatus.NOT_FOUND, "source.not-found");
+        assertError(request("reader").get().uri("/api/sources/orders"), HttpStatus.NOT_FOUND, "TS0220001");
     }
 
     @Test
@@ -268,7 +512,7 @@ class SourceApiTest {
             assertThat(outcomes).extracting(RaceResult::status)
                     .containsExactlyInAnyOrder(HttpStatus.OK, HttpStatus.PRECONDITION_FAILED);
             assertThat(outcomes).filteredOn(result -> result.status() == HttpStatus.PRECONDITION_FAILED)
-                    .singleElement().extracting(RaceResult::code).isEqualTo("source.version-conflict");
+                    .singleElement().extracting(RaceResult::code).isEqualTo("TS0220005");
             String winner = outcomes.stream()
                     .filter(result -> result.status() == HttpStatus.OK)
                     .findFirst().orElseThrow().description();
@@ -297,7 +541,7 @@ class SourceApiTest {
             assertThat(outcomes).extracting(RaceResult::status)
                     .containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.CONFLICT);
             assertThat(outcomes).filteredOn(result -> result.status() == HttpStatus.CONFLICT)
-                    .singleElement().extracting(RaceResult::code).isEqualTo("source.already-exists");
+                    .singleElement().extracting(RaceResult::code).isEqualTo("TS0220002");
             String winner = outcomes.stream()
                     .filter(result -> result.status() == HttpStatus.CREATED)
                     .findFirst().orElseThrow().description();
@@ -313,28 +557,28 @@ class SourceApiTest {
         ResponseEntity<String> created = create("orders", "before");
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "again")),
-                HttpStatus.CONFLICT, "source.already-exists");
+                HttpStatus.CONFLICT, "TS0220002");
 
         assertError(request("writer").put().uri("/api/sources/orders")
                         .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("other", "after")),
-                HttpStatus.BAD_REQUEST, "source.id-mismatch");
+                HttpStatus.BAD_REQUEST, "TS0220003");
 
         for (String field : List.of("configuredSecrets", "contentHash", "unknownField")) {
             String body = sourceJson("bad", "bad").replaceFirst("\\}$", ",\"" + field + "\":[]}");
             assertError(request("writer").post().uri("/api/sources")
                             .contentType(MediaType.APPLICATION_JSON).body(body),
-                    HttpStatus.BAD_REQUEST, "control.malformed-request");
+                    HttpStatus.BAD_REQUEST, "TS0210001");
         }
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body("{\"id\":"),
-                HttpStatus.BAD_REQUEST, "control.malformed-request");
+                HttpStatus.BAD_REQUEST, "TS0210001");
 
         context.getBean(InMemoryArtifactStore.class).save(
                 new PipelineResource("pipeline", null, List.of(SourceRef.bare("orders")), null, null, null, null, null));
         assertError(request("writer").delete().uri("/api/sources/orders")
                         .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag()),
-                HttpStatus.CONFLICT, "source.in-use");
+                HttpStatus.CONFLICT, "TS0220006");
     }
 
     @Test
@@ -349,7 +593,7 @@ class SourceApiTest {
             assertThat(body).doesNotContain(required);
             assertError(request("writer").post().uri("/api/sources")
                             .contentType(MediaType.APPLICATION_JSON).body(body),
-                    HttpStatus.BAD_REQUEST, "control.malformed-request");
+                    HttpStatus.BAD_REQUEST, "TS0210001");
         }
     }
 
@@ -370,7 +614,7 @@ class SourceApiTest {
 
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(body),
-                HttpStatus.BAD_REQUEST, "control.malformed-request");
+                HttpStatus.BAD_REQUEST, "TS0210001");
     }
 
     @Test
@@ -380,24 +624,24 @@ class SourceApiTest {
 
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(missingDatabase),
-                HttpStatus.BAD_REQUEST, "dsl.config-required");
+                HttpStatus.BAD_REQUEST, "TS0010015");
         assertThat(context.getBean(InMemoryArtifactStore.class).get("missing-config")).isEmpty();
     }
 
     @Test
     void authenticationScopesAndAuditGateProtectEveryOperation() {
         assertError(RestClient.create(base()).get().uri("/api/sources"),
-                HttpStatus.UNAUTHORIZED, "control.unauthenticated");
+                HttpStatus.UNAUTHORIZED, "TS0210003");
         assertError(request("invalid").get().uri("/api/sources"),
-                HttpStatus.UNAUTHORIZED, "control.unauthenticated");
+                HttpStatus.UNAUTHORIZED, "TS0210003");
         assertError(request("reader").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "before")),
-                HttpStatus.FORBIDDEN, "control.forbidden");
+                HttpStatus.FORBIDDEN, "TS0210004");
 
         context.getBean(RecordingAuditStore.class).fail = true;
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "before")),
-                HttpStatus.INTERNAL_SERVER_ERROR, "control.audit-blocked");
+                HttpStatus.INTERNAL_SERVER_ERROR, "TS0210015");
         assertThat(context.getBean(InMemoryArtifactStore.class).get("orders")).isEmpty();
     }
 
@@ -598,6 +842,9 @@ class SourceApiTest {
             return new TokenService(store, secrets, clock);
         }
         @Bean TokenSigner tokenSigner() { return new FixedSigner(); }
+        @Bean CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
+        }
         @Bean JsonMapperBuilderCustomizer sourceJsonContract() {
             return new ControlHttpFace().sourceJsonContract();
         }
@@ -701,9 +948,15 @@ class SourceApiTest {
 
     private static final class RecordingConnectionProbe implements ConnectionProbe {
         private ConnectionConfig captured;
+        private boolean failNext;
 
         void clear() {
             captured = null;
+            failNext = false;
+        }
+
+        void failNext() {
+            failNext = true;
         }
 
         ConnectionConfig captured() {
@@ -713,6 +966,13 @@ class SourceApiTest {
         @Override
         public ConnectionTestResult probe(ConnectionConfig config) {
             captured = config;
+            if (failNext) {
+                failNext = false;
+                return new ConnectionTestResult(config.id(), config.connectorId(),
+                        ConnectionTestResult.Outcome.FAILED,
+                        List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                                "Login denied", "bad credentials", "check username/password", "28000")), 1L);
+            }
             return new ConnectionTestResult(
                     config.id(), config.connectorId(), ConnectionTestResult.Outcome.PASSED, List.of(), 1L);
         }

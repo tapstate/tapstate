@@ -1,23 +1,26 @@
 package io.tapstate.adapters.mongostore.migration;
 
+import io.tapstate.adapters.mongostore.SharedMongoCase;
+
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
+import io.tapstate.adapters.mongostore.MongoArtifactStore;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -36,7 +39,6 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class V2StructuredArtifactsIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private static final DslParser PARSER = new DslParser();
 
@@ -121,15 +123,20 @@ class V2StructuredArtifactsIT {
               schema: public
             """;
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(V2StructuredArtifactsIT.class);
 
     private static MongoClient client;
 
-    @AfterAll
-    static void closeClient() {
-        if (client != null) {
-            client.close();
+    @AfterEach
+    void closeClient() {
+        try {
+            if (client != null) {
+                client.close();
+            }
+        } finally {
+            client = null;
         }
     }
 
@@ -236,9 +243,15 @@ class V2StructuredArtifactsIT {
         assertThat(source).isNotNull();
         assertThat(pipeline.getEmbedded(List.of("body", "view", "schema"), Object.class)).isNull();
         assertThat(view.getEmbedded(List.of("body", "schema"), Object.class)).isNull();
-        assertThat(source.getEmbedded(List.of("body", "config", "schema"), String.class))
+        MongoArtifactStore currentStore = new MongoArtifactStore(client, artifacts,
+                new SourceConfigKeyringStore(database).loadExistingCipher());
+        SourceResource migratedSource = (SourceResource) currentStore.get("orders_src").orElseThrow();
+        assertThat(migratedSource.config().get("schema"))
                 .as("schema is connector-owned below config, not a retired view policy")
                 .isEqualTo("public");
+        assertThat(source.get("body", Document.class).get("config"))
+                .as("the later Source-config changeset ran after the structured migration")
+                .isInstanceOf(String.class);
         assertThat(List.of(pipeline, view, source))
                 .allSatisfy(document -> assertThat(document.get("canonical")).isNull());
         // Installed to whatever this build supports: the assertion is that startup ran the whole
@@ -258,7 +271,7 @@ class V2StructuredArtifactsIT {
                 .as("dropping is for a field this build retired; nothing here can invent a key nobody "
                         + "wrote, so this one is still refused -- but with what an operator acts on")
                 .hasMessageContaining("hr")
-                .hasMessageContaining("dsl.missing-field")
+                .hasMessageContaining("TS0010004")
                 .hasMessageContaining("primary_key");
         assertThat(thrown.getCause())
                 .as("the position and the stack survive the bare throw the runner re-codes")
@@ -321,7 +334,7 @@ class V2StructuredArtifactsIT {
         if (client == null) {
             client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
         }
-        MongoDatabase database = client.getDatabase(name);
+        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
         database.drop();
         return database;
     }

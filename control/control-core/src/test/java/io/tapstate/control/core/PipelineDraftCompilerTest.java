@@ -1,0 +1,1301 @@
+package io.tapstate.control.core;
+
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RenameSpec;
+import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TableRename;
+import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.canonical.CanonicalWriter;
+import io.tapstate.spi.store.PipelineDraft;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class PipelineDraftCompilerTest {
+
+    private final PipelineDraftCompiler compiler = new PipelineDraftCompiler();
+
+    @Test
+    void compilesWizardTreeWithStableAliasesAndRecursiveShapes() {
+        PipelineDraft draft = wizardDraft();
+
+        PipelineResource compiled = compiler.compile(draft);
+        Step.Inline nest = (Step.Inline) compiled.transforms().stream()
+                .filter(Step.Inline.class::isInstance)
+                .map(Step.Inline.class::cast)
+                .filter(step -> step.body() instanceof TransformBody.Nest)
+                .findFirst()
+                .orElseThrow();
+        TransformBody.Nest body = (TransformBody.Nest) nest.body();
+
+        assertThat(nest.id()).isEqualTo("customer-orders__nest");
+        assertThat(body.root().from()).isEqualTo("orders");
+        assertThat(body.root().embed()).extracting(Embed::from).containsExactly("policy");
+        Embed policy = body.root().embed().getFirst();
+        assertThat(policy.as()).isEqualTo(EmbedAs.OBJECT);
+        assertThat(policy.path()).isEqualTo("policy");
+        assertThat(policy.embed()).extracting(Embed::from).containsExactly("claim");
+        assertThat(policy.embed().getFirst().as()).isEqualTo(EmbedAs.ARRAY);
+        assertThat(policy.embed().getFirst().path()).isEqualTo("claims");
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("policy", FromRef.literal("policy__pre"))
+                .containsEntry("claim", FromRef.literal("crm.claims"));
+        assertThat(compiled.serve()).isEqualTo(new ServeBlock.Inline(
+                "atlas", io.tapstate.core.model.FromRef.literal("only-active"),
+                List.of(new io.tapstate.core.model.SyncElement(
+                        "atlas_customer_orders", "atlas", io.tapstate.core.model.WriteMode.UPSERT,
+                        new RenameSpec(Map.of("orders", "customer_orders"), null, null, null), null)), null, null));
+    }
+
+    @Test
+    void compilesIndependentOverridesForWizardTablesOfTheSameSource() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft configured = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(), wizard.output(),
+                        Map.of("orders", Map.of("preImage", true), "policy", Map.of("preImage", false))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(configured);
+
+        assertThat(compiled.sourceIds()).containsExactly("crm", "crm", "crm");
+        assertThat(compiled.sourceBindings()).doesNotHaveDuplicates();
+        var root = compiled.sources().get(0);
+        var policy = compiled.sources().get(1);
+        assertThat(root.nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", true));
+        assertThat(policy.nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
+        assertThat(compiled.sources().get(2).nodeConfig()).isEmpty();
+        var nest = compiled.transforms().stream().filter(step -> step.id().endsWith("__nest")).findFirst().orElseThrow();
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("orders", FromRef.literal(root.binding() + ".orders"));
+        var policyStep = compiled.transforms().stream().filter(step -> step.id().equals("policy__pre")).findFirst().orElseThrow();
+        assertThat(policyStep.from()).isEqualTo(FromClause.list(FromRef.literal(policy.binding() + ".policies")));
+    }
+
+    @Test
+    void reportsAnUnselectedRelatedSourceAtValidationAndPublication() {
+        var template = wizardDraft();
+        var wizard = template.wizard();
+        var relation = wizard.related().getFirst();
+        var missingSource = new PipelineDraft.Related(relation.id(), relation.parentId(), null,
+                relation.table(), relation.relation(), relation.preTransforms());
+        var incomplete = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(wizard.root(), List.of(missingSource), wizard.transforms(), wizard.output()),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compileCandidate(incomplete))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("wizard field must be non-blank: related source");
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class).hasMessage("wizard field must be non-blank: related source");
+    }
+
+    @Test
+    void compileIsAStableCanonicalFixedPoint() {
+        PipelineDraft draft = wizardDraft();
+        CanonicalWriter writer = new CanonicalWriter();
+
+        String first = writer.write(compiler.compile(draft));
+        String second = writer.write(compiler.compile(draft));
+
+        assertThat(first).isEqualTo(second);
+        assertThat(CanonicalHash.ofText(first)).hasSize(64).isEqualTo(CanonicalHash.ofText(second));
+    }
+
+    @Test
+    void compilesFlatRelationsAsPathlessNestEmbedsAndRoundTripsDsl() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related flatProfile = new PipelineDraft.Related(
+                "profile", "orders", "crm", "profiles",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("customer_id", "customer_id")),
+                        PipelineDraft.Shape.FLAT, null, List.of("id"), List.of()),
+                List.of(new PipelineDraft.Transform("normalize-profile", "map", Map.of("name", "$full_name"))));
+        PipelineDraft flatDraft = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(flatProfile), List.of(), wizard.output()),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(flatDraft);
+        Step.Inline nest = compiled.transforms().stream()
+                .filter(Step.Inline.class::isInstance)
+                .map(Step.Inline.class::cast)
+                .filter(step -> step.body() instanceof TransformBody.Nest)
+                .findFirst()
+                .orElseThrow();
+        Embed embed = ((TransformBody.Nest) nest.body()).root().embed().getFirst();
+        String canonical = new CanonicalWriter().write(compiled);
+
+        assertThat(embed.as()).isEqualTo(EmbedAs.FLAT);
+        assertThat(embed.path()).isNull();
+        assertThat(embed.arrayKey()).isNull();
+        assertThat(embed.key()).containsExactly("id");
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("profile", FromRef.literal("profile__pre"));
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesARollupOnlyRelationIntoAPathlessRollupEmbed() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        Map<String, Object> rollup = new java.util.LinkedHashMap<>();
+        rollup.put("item_count", Map.of("count", true));
+        rollup.put("total", Map.of("sum", "$amount", "default", 0));
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"), rollup), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        PipelineResource compiled = compiler.compile(draft);
+        Embed embed = nestRoot(compiled).embed().getFirst();
+        String canonical = new CanonicalWriter().write(compiled);
+
+        assertThat(embed.as()).isEqualTo(EmbedAs.ROLLUP);
+        assertThat(embed.path()).isNull();
+        assertThat(embed.arrayKey()).containsExactly("id");
+        assertThat(embed.rollup()).containsOnlyKeys("item_count", "total");
+        assertThat(embed.rollup().get("item_count").count()).isEqualTo(true);
+        assertThat(embed.rollup().get("total").sum()).isEqualTo("$amount");
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesRollupFieldsBesideAnArrayRelation() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ARRAY, "items", List.of(), List.of("id"),
+                        Map.of("latest", Map.of("last", Map.of("value", "$sku", "by", "$created_at")))),
+                List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        Embed embed = nestRoot(compiler.compile(draft)).embed().getFirst();
+
+        assertThat(embed.as()).isEqualTo(EmbedAs.ARRAY);
+        assertThat(embed.path()).isEqualTo("items");
+        assertThat(embed.rollup()).containsOnlyKeys("latest");
+        assertThat(embed.rollup().get("latest").last().value()).isEqualTo("$sku");
+    }
+
+    @Test
+    void tracksKeyChangesOnRelationsThatKeepRowsUnlessTurnedOff() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        List<PipelineDraft.FieldPair> on = List.of(new PipelineDraft.FieldPair("order_id", "id"));
+        Map<String, Object> rollup = Map.of("n", Map.of("count", true));
+        List<PipelineDraft.Related> related = List.of(
+                new PipelineDraft.Related("rolled", "orders", "crm", "items",
+                        new PipelineDraft.Relation(on, PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"),
+                                rollup), List.of()),
+                new PipelineDraft.Related("listed", "orders", "crm", "lines",
+                        new PipelineDraft.Relation(on, PipelineDraft.Shape.ARRAY, "lines", List.of(), List.of("id"),
+                                null, false), List.of()),
+                new PipelineDraft.Related("profile", "orders", "crm", "profiles",
+                        new PipelineDraft.Relation(on, PipelineDraft.Shape.OBJECT, "profile", List.of(), List.of()),
+                        List.of()));
+        PipelineDraft draft = withWizard(template, wizard.root(), related, List.of(), wizard.output());
+
+        List<Embed> embeds = nestRoot(compiler.compile(draft)).embed();
+
+        assertThat(embeds).extracting(Embed::from).containsExactly("rolled", "listed", "profile");
+        assertThat(embeds.get(0).trackKeyChanges()).isTrue();
+        assertThat(embeds.get(1).trackKeyChanges()).isNull();
+        assertThat(embeds.get(2).trackKeyChanges()).isNull();
+    }
+
+    @Test
+    void rejectsARollupOnlyRelationWithoutFields() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"), null), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        assertThatThrownBy(() -> compiler.compile(draft)).hasMessageContaining("rollup");
+    }
+
+    @Test
+    void rejectsAMalformedRollupFieldWhenCompiling() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"),
+                        Map.of("bad", Map.of("median", "amount"))), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        assertThatThrownBy(() -> compiler.compile(draft)).isInstanceOf(RuntimeException.class);
+    }
+
+    private static io.tapstate.core.model.NestRoot nestRoot(PipelineResource compiled) {
+        Step.Inline nest = compiled.transforms().stream()
+                .filter(Step.Inline.class::isInstance)
+                .map(Step.Inline.class::cast)
+                .filter(step -> step.body() instanceof TransformBody.Nest)
+                .findFirst()
+                .orElseThrow();
+        return ((TransformBody.Nest) nest.body()).root();
+    }
+
+    @Test
+    void rejectsDuplicateChildFieldsInOneAssociation() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related duplicate = new PipelineDraft.Related("duplicate", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(
+                        new PipelineDraft.FieldPair("order_id", "id"),
+                        new PipelineDraft.FieldPair("order_id", "tenant_id")),
+                        PipelineDraft.Shape.ARRAY, "items", List.of(), List.of("id")), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(duplicate), List.of(), wizard.output());
+
+        assertCompileFails(draft, "related association contains duplicate child field: order_id");
+    }
+
+    @Test
+    void compilesSourceTransformsWithoutInventingAnEmptyNest() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft sourceOnly = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(),
+                        List.of(new PipelineDraft.Transform("active-orders", "filter", Map.of("expr", "active == true"))),
+                        new PipelineDraft.Output("atlas", Map.of("sourceId", "atlas", "table", "orders_archive"))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(sourceOnly);
+
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
+        assertThat(compiled.sourceIds()).containsExactly("crm");
+        Step.Inline filter = (Step.Inline) compiled.transforms().getFirst();
+        assertThat(((io.tapstate.core.model.FromClause.Flow) filter.from()).refs())
+                .containsExactly(io.tapstate.core.model.FromRef.literal("crm.orders"));
+        assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
+        assertThat(((io.tapstate.core.model.FromClause.Flow) ((ServeBlock.Inline) compiled.serve()).from()).refs())
+                .containsExactly(io.tapstate.core.model.FromRef.literal("active-orders"));
+        assertThat(((ServeBlock.Inline) compiled.serve()).sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void compilesWizardJavaScriptAndUnwindAcrossBranchAndPipelineSteps() {
+        PipelineDraft template = wizardDraft();
+        String script = "function process(record, ctx) { return record; }";
+        PipelineDraft.Root root = new PipelineDraft.Root("orders", "crm", "orders", List.of("id"),
+                List.of(new PipelineDraft.Transform("normalize", "js", Map.of("script", script))));
+        PipelineDraft draft = withWizard(template, root, List.of(),
+                List.of(new PipelineDraft.Transform("expand-items", "unwind", Map.of(
+                        "path", "items", "include_array_index", "item_index",
+                        "preserve_null_and_empty_arrays", true, "element_key", "item_id"))),
+                template.wizard().output());
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("orders__pre", "expand-items");
+        assertThat(((Step.Inline) compiled.transforms().get(0)).body()).isEqualTo(new TransformBody.Js(script));
+        assertThat(((Step.Inline) compiled.transforms().get(1)).body()).isEqualTo(
+                new TransformBody.Unwind("items", "item_index", true, "item_id", null));
+        assertThat(new CanonicalWriter().write(new DslParser().parse(new CanonicalWriter().write(compiled))))
+                .isEqualTo(new CanonicalWriter().write(compiled));
+    }
+
+    @Test
+    void rejectsIncompleteWizardJavaScriptAndUnwindBeforePublication() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+
+        assertCompileFails(withWizard(template, root, List.of(),
+                List.of(new PipelineDraft.Transform("script", "js", Map.of("script", " "))),
+                template.wizard().output()), "script");
+        assertCompileFails(withWizard(template, root, List.of(),
+                List.of(new PipelineDraft.Transform("expand", "unwind", Map.of("path", " "))),
+                template.wizard().output()), "path");
+    }
+
+    @Test
+    void compilesComputedMapValuesAsDslExpressionsInsteadOfLiterals() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft draft = withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("project-fields", "map", Map.of(
+                        "display_name", "=1 + 1",
+                        "source_name", "$name",
+                        "removed", false,
+                        "region", "north"))),
+                template.wizard().output());
+
+        PipelineResource compiled = compiler.compile(draft);
+        Step.Inline map = (Step.Inline) compiled.transforms().getFirst();
+        Map<String, FieldRule> fields = ((TransformBody.MapProjection) map.body()).fields();
+        String canonical = new CanonicalWriter().write(compiled);
+
+        assertThat(fields)
+                .containsEntry("display_name", FieldRule.computed("1 + 1"))
+                .containsEntry("source_name", FieldRule.rename("name"))
+                .containsEntry("removed", FieldRule.drop())
+                .containsEntry("region", FieldRule.literal("north"));
+        assertThat(canonical).contains("display_name: \"=1 + 1\"");
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+        assertThatThrownBy(() -> compiler.compile(withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("empty-expression", "map", Map.of("display_name", "="))),
+                template.wizard().output())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("computed map expression must be non-blank: display_name");
+    }
+
+    @Test
+    void compilesOnPremWizardOutputToTheExistingGenericServeSyncShape() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft draft = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(),
+                        List.of(new PipelineDraft.Transform("keep-active", "filter", Map.of("expr", "active == true"))),
+                        new PipelineDraft.Output("source", Map.of(
+                                "sourceId", "warehouse", "table", "orders_archive", "writeMode", "append"))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        assertThat(serve.id()).isEqualTo("target");
+        assertThat(serve.sync().getFirst().source()).isEqualTo("warehouse");
+        assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("keep-active");
+    }
+
+    @Test
+    void compilesTheK2WizardShapeWithTheTargetModelsUnqualifiedRenameKey() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft draft = new PipelineDraft("k2", template.schemaVersion(), template.revision(),
+                PipelineDraft.Mode.WIZARD, "k2", "", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("root", "mysql", "AA_0716", List.of("ID"), List.of()),
+                        List.of(), List.of(),
+                        new PipelineDraft.Output("source", Map.of(
+                                "sourceId", "mongo", "table", "k2", "writeMode", "upsert"))),
+                null, null, null, template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(draft);
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs())
+                .containsExactly(FromRef.literal("mysql.AA_0716"));
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("AA_0716", "k2"), null, null, null));
+        assertThat(TableRename.apply("AA_0716", serve.sync().getFirst().rename())).isEqualTo("k2");
+        PipelineResource roundTripped = (PipelineResource) new DslParser().parse(new CanonicalWriter().write(compiled));
+        assertThat(((ServeBlock.Inline) roundTripped.serve()).sync().getFirst().rename())
+                .isEqualTo(serve.sync().getFirst().rename());
+    }
+
+    @Test
+    void refusesWizardCompilationWithoutAnOutput() {
+        PipelineDraft complete = wizardDraft();
+        PipelineDraft.Wizard wizard = complete.wizard();
+        PipelineDraft incomplete = new PipelineDraft(
+                complete.pipelineId(), complete.schemaVersion(), complete.revision(), complete.mode(),
+                complete.name(), complete.description(), complete.graph(),
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(), null),
+                complete.baseArtifactHash(), complete.publishedDraftRevision(), complete.publishedArtifactHash(),
+                complete.createdAt(), complete.updatedAt(), complete.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("wizard output is required for publication");
+    }
+
+    @Test
+    void refusesUnsupportedWizardOutputKinds() {
+        PipelineDraft complete = wizardDraft();
+        PipelineDraft.Wizard wizard = complete.wizard();
+        PipelineDraft incomplete = new PipelineDraft(
+                complete.pipelineId(), complete.schemaVersion(), complete.revision(), complete.mode(),
+                complete.name(), complete.description(), complete.graph(),
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(),
+                        new PipelineDraft.Output("kafka", Map.of("sourceId", "kafka", "table", "orders"))),
+                complete.baseArtifactHash(), complete.publishedDraftRevision(), complete.publishedArtifactHash(),
+                complete.createdAt(), complete.updatedAt(), complete.updatedBy());
+
+        assertThatThrownBy(() -> compiler.compile(incomplete))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unsupported wizard output: kafka");
+    }
+
+    @Test
+    void scopesGraphSelectorsToSeparatelyConfiguredSameSourceNodes() {
+        var graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("input-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("input-items", "source", "crm", "/items_.*/", Map.of(), Map.of()),
+                new PipelineDraft.Node("combined", "union", null, null,
+                        Map.of("from", List.of("orders", "/items_.*/")), Map.of())),
+                List.of(new PipelineDraft.Edge("root-edge", "input-orders", "combined"),
+                        new PipelineDraft.Edge("items-edge", "input-items", "combined")),
+                new PipelineDraft.Viewport(0, 0, 1),
+                Map.of("input-orders", Map.of("preImage", true), "input-items", Map.of("preImage", false)));
+
+        var pipeline = compiler.compile(dagDraft(graph));
+        var orders = pipeline.sources().get(0);
+        var items = pipeline.sources().get(1);
+        assertThat(orders.binding()).isNotEqualTo(items.binding());
+        assertThat(orders.nodeConfig()).containsEntry("preImage", true);
+        assertThat(items.nodeConfig()).containsEntry("preImage", false);
+        assertThat(((FromClause.Flow) pipeline.transforms().getFirst().from()).refs())
+                .containsExactly(FromRef.literal(orders.binding() + ".orders"),
+                        FromRef.regex(java.util.regex.Pattern.quote(items.binding()) + "\\.items_.*"));
+    }
+
+    @Test
+    void compilesCanvasGraphIntoViewAndTargetPublication() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("active-orders", "filter", null, null,
+                        Map.of("expr", "active == true"), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null, Map.of(), Map.of("viewId", "orders_view")),
+                new PipelineDraft.Node("warehouse-orders", "target", "warehouse", "orders_archive",
+                        Map.of("writeMode", "append"), Map.of())),
+                List.of(
+                        new PipelineDraft.Edge("source-to-filter", "source-orders", "active-orders"),
+                        new PipelineDraft.Edge("filter-to-view", "active-orders", "orders-view"),
+                        new PipelineDraft.Edge("filter-to-target", "active-orders", "warehouse-orders")),
+                new PipelineDraft.Viewport(0, 0, 1), Map.of("source-orders", Map.of("preImage", false)));
+        PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
+                "Orders", "", graph, null, null, null, null,
+                java.time.Instant.parse("2026-09-21T00:00:00Z"),
+                java.time.Instant.parse("2026-09-21T00:00:00Z"), "test");
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm");
+        assertThat(compiled.sources().getFirst().nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
+        assertThat(compiled.view()).isEqualTo(new ViewBlock.Inline(
+                "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null));
+        assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        assertThat(serve.id()).isNotEqualTo(serve.sync().getFirst().id());
+        assertThat(serve.sync().getFirst().id()).isEqualTo("warehouse-orders");
+        assertThat(serve.sync()).extracting(sync -> sync.source()).containsExactly("warehouse");
+        assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void aTargetOrViewNodesFullLoadPolicyIsPublishedWithIt() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null,
+                        Map.of("primaryKey", "id", "writeMode", "append", "onFullLoad", "clear"),
+                        Map.of("viewId", "orders_view")),
+                new PipelineDraft.Node("warehouse-orders", "target", "warehouse", "orders",
+                        Map.of("onFullLoad", "fail"), Map.of())),
+                List.of(
+                        new PipelineDraft.Edge("source-to-view", "source-orders", "orders-view"),
+                        new PipelineDraft.Edge("source-to-target", "source-orders", "warehouse-orders")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+
+        ViewBlock.Inline view = (ViewBlock.Inline) compiled.view();
+        assertThat(view.writeMode()).isEqualTo(io.tapstate.core.model.WriteMode.APPEND);
+        assertThat(view.onFullLoad()).isEqualTo(io.tapstate.core.model.OnFullLoad.CLEAR);
+        assertThat(((ServeBlock.Inline) compiled.serve()).sync().getFirst().onFullLoad())
+                .isEqualTo(io.tapstate.core.model.OnFullLoad.FAIL);
+        String canonical = new CanonicalWriter().write(compiled);
+        assertThat(canonical).contains("on_full_load: clear").contains("on_full_load: fail");
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void aWizardOutputsFullLoadPolicyIsPublishedWithIt() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft draft = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(), List.of(),
+                        new PipelineDraft.Output("source", Map.of(
+                                "sourceId", "warehouse", "table", "orders", "onFullLoad", "clear"))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        assertThat(((ServeBlock.Inline) compiler.compile(draft).serve()).sync().getFirst().onFullLoad())
+                .isEqualTo(io.tapstate.core.model.OnFullLoad.CLEAR);
+    }
+
+    @Test
+    void aNodeThatSaysNothingAboutTheFullLoadPublishesWhatItAlwaysDid() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null, Map.of("primaryKey", "id"),
+                        Map.of("viewId", "orders_view"))),
+                List.of(new PipelineDraft.Edge("source-to-view", "source-orders", "orders-view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ViewBlock.Inline view = (ViewBlock.Inline) compiler.compile(dagDraft(graph)).view();
+
+        assertThat(view).isEqualTo(new ViewBlock.Inline("orders_view", FromRef.literal("crm.orders"), "id", null));
+    }
+
+    @Test
+    void anUnknownFullLoadPolicyIsRefusedRatherThanPublishedAsKeepingRows() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("warehouse-orders", "target", "warehouse", "orders",
+                        Map.of("onFullLoad", "truncate"), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source-orders", "warehouse-orders")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThatThrownBy(() -> compiler.compile(dagDraft(graph)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unsupported full-load policy: warehouse-orders");
+    }
+
+    @Test
+    void compilesDirectDagSourceToTargetWithDistinctIdsAndTargetTableRename() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("draft:source:1", "source", "mysql", "ai_fulfillment_orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("draft:target:1", "target", "mongo", "p1_view_1", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "draft:source:1", "draft:target:1")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+
+        assertThat(serve.id()).isEqualTo("draft:target:1__serve");
+        assertThat(serve.sync().getFirst().id()).isEqualTo("draft:target:1");
+        assertThat(TableRename.apply("ai_fulfillment_orders", serve.sync().getFirst().rename()))
+                .isEqualTo("p1_view_1");
+        String canonical = new CanonicalWriter().write(compiled);
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesDagTransformEditorsIntoTypedDslAndUsesConfiguredStepIds() {
+        Map<String, Object> nestBody = Map.of("root", Map.of(
+                "from", "orders",
+                "key", List.of("id"),
+                "embed", List.of(Map.of(
+                        "from", "items",
+                        "on", Map.of("order_id", "id"),
+                        "as", "array",
+                        "path", "items"))));
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders-source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("archive-source", "source", "mysql", "archive_orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("customers-source", "source", "mysql", "customers", Map.of(), Map.of()),
+                new PipelineDraft.Node("items-source", "source", "mysql", "order_items", Map.of(), Map.of()),
+                new PipelineDraft.Node("draft:transform:map", "map", null, null,
+                        Map.of("fields", Map.of("customer_id", Map.of("sourceField", "customerId"),
+                                "obsolete", false)), Map.of("stepId", "normalize_orders")),
+                new PipelineDraft.Node("draft:transform:filter", "filter", null, null,
+                        Map.of("expr", "after.active == true"), Map.of("stepId", "active_orders")),
+                new PipelineDraft.Node("draft:transform:js", "js", null, null,
+                        Map.of("script", "function process(record) { return record; }"),
+                        Map.of("stepId", "scripted_orders")),
+                new PipelineDraft.Node("draft:transform:union", "union", null, null,
+                        Map.of("from", List.of("mysql.orders", "mysql.archive_orders")),
+                        Map.of("stepId", "all_orders")),
+                new PipelineDraft.Node("draft:transform:join", "join", null, null,
+                        Map.of("from", Map.of("o", "mysql.orders", "c", "mysql.customers"),
+                                "engine", "builtin", "sql", "SELECT o.id AS id FROM o LEFT JOIN c ON o.customer_id = c.id"),
+                        Map.of("stepId", "joined_orders")),
+                new PipelineDraft.Node("draft:transform:nest", "nest", null, null,
+                        Map.of("from", Map.of("orders", "mysql.orders", "items", "mysql.order_items"),
+                                "root", nestBody.get("root")), Map.of("stepId", "customer_document")),
+                new PipelineDraft.Node("draft:transform:unwind", "unwind", null, null,
+                        Map.of("path", "items", "includeArrayIndex", "item_index",
+                                "preserveNullAndEmptyArrays", true), Map.of("stepId", "expanded_orders"))),
+                List.of(
+                        new PipelineDraft.Edge("orders-to-map", "orders-source", "draft:transform:map"),
+                        new PipelineDraft.Edge("map-to-filter", "draft:transform:map", "draft:transform:filter"),
+                        new PipelineDraft.Edge("filter-to-js", "draft:transform:filter", "draft:transform:js"),
+                        new PipelineDraft.Edge("orders-to-union", "orders-source", "draft:transform:union"),
+                        new PipelineDraft.Edge("archive-to-union", "archive-source", "draft:transform:union"),
+                        new PipelineDraft.Edge("orders-to-join", "orders-source", "draft:transform:join"),
+                        new PipelineDraft.Edge("customers-to-join", "customers-source", "draft:transform:join"),
+                        new PipelineDraft.Edge("orders-to-nest", "orders-source", "draft:transform:nest"),
+                        new PipelineDraft.Edge("items-to-nest", "items-source", "draft:transform:nest"),
+                        new PipelineDraft.Edge("orders-to-unwind", "orders-source", "draft:transform:unwind")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly(
+                "normalize_orders", "active_orders", "scripted_orders", "all_orders", "joined_orders",
+                "customer_document", "expanded_orders");
+        Step.Inline map = (Step.Inline) compiled.transforms().getFirst();
+        assertThat(((TransformBody.MapProjection) map.body()).fields())
+                .containsEntry("customer_id", FieldRule.rename("customerId"))
+                .containsEntry("obsolete", FieldRule.drop());
+        assertThat(((TransformBody.Filter) ((Step.Inline) compiled.transforms().get(1)).body()).expr())
+                .isEqualTo("after.active == true");
+        assertThat(((TransformBody.Js) ((Step.Inline) compiled.transforms().get(2)).body()).script())
+                .isEqualTo("function process(record) { return record; }");
+        Step.Inline union = (Step.Inline) compiled.transforms().get(3);
+        assertThat(union.body()).isInstanceOf(TransformBody.Union.class);
+        assertThat(((FromClause.Flow) union.from()).refs()).containsExactly(
+                FromRef.literal("mysql.orders"), FromRef.literal("mysql.archive_orders"));
+        Step.Inline join = (Step.Inline) compiled.transforms().get(4);
+        assertThat(join.body()).isEqualTo(new TransformBody.Join(
+                io.tapstate.core.model.JoinEngine.BUILTIN,
+                "SELECT o.id AS id FROM o LEFT JOIN c ON o.customer_id = c.id"));
+        assertThat(((FromClause.Aliases) join.from()).aliases())
+                .containsEntry("o", FromRef.literal("mysql.orders"))
+                .containsEntry("c", FromRef.literal("mysql.customers"));
+        Step.Inline nest = (Step.Inline) compiled.transforms().get(5);
+        assertThat(((TransformBody.Nest) nest.body()).root().from()).isEqualTo("orders");
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("orders", FromRef.literal("mysql.orders"))
+                .containsEntry("items", FromRef.literal("mysql.order_items"));
+        TransformBody.Unwind unwind = (TransformBody.Unwind) ((Step.Inline) compiled.transforms().get(6)).body();
+        assertThat(unwind.path()).isEqualTo("items");
+        assertThat(unwind.includeArrayIndex()).isEqualTo("item_index");
+        assertThat(unwind.preserveNullAndEmptyArrays()).isTrue();
+
+        String canonical = new CanonicalWriter().write(compiled);
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesRegexAndMultipleSelectedTablesFromOneSourceNode() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders_.*",
+                        Map.of("tables", List.of(
+                                Map.of("table", "orders_.*", "tableKind", "regex"),
+                                Map.of("table", "archive_orders"))), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs()).containsExactly(
+                FromRef.regex("\\Qmysql\\E\\.orders_.*"), FromRef.literal("mysql.archive_orders"));
+        String canonical = new CanonicalWriter().write(compiler.compile(dagDraft(graph)));
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void removesWholeTableRegexAnchorsBeforeAddingTheSourcePrefix() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "^orders_\\d+$",
+                        Map.of("tables", List.of(Map.of("table", "^orders_\\d+$", "tableKind", "regex"))),
+                        Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs())
+                .containsExactly(FromRef.regex("\\Qmysql\\E\\.orders_\\d+"));
+    }
+
+    @Test
+    void scopesEveryRegexAlternativeToTheSelectedSource() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "crm", "orders|users",
+                        Map.of("tableKind", "regex", "tables", List.of(
+                                Map.of("table", "orders|users", "tableKind", "regex"),
+                                Map.of("table", "^orders$|^users$", "tableKind", "regex"))), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+        List<FromRef> refs = ((FromClause.Flow) serve.from()).refs();
+        assertThat(refs).hasSize(2);
+        for (FromRef ref : refs) {
+            String regex = ((FromRef.Regex) ref).pattern();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("crm.orders").matches()).isTrue();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("crm.users").matches()).isTrue();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("users").matches()).isFalse();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("other.users").matches()).isFalse();
+        }
+    }
+
+    @Test
+    void rejectsExplicitNullMapLiteralAsMalformedDraft() {
+        Map<String, Object> literal = new java.util.LinkedHashMap<>();
+        literal.put("value", null);
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("map", "map", null, null,
+                        Map.of("fields", Map.of("deleted_at", literal)), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-map", "source", "map"),
+                        new PipelineDraft.Edge("map-target", "map", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThatThrownBy(() -> compiler.compile(dagDraft(graph)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("deleted_at");
+    }
+
+    @Test
+    void targetRenameAfterATransformUsesTheUnderlyingSourceTableName() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("map-node", "map", null, null,
+                        Map.of("fields", Map.of("id", "$order_id"),
+                                "experimental", Map.of("field-mode", "permissive")),
+                        Map.of("stepId", "normalized")),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-map", "source", "map-node"),
+                        new PipelineDraft.Edge("map-target", "map-node", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        Step.Inline map = (Step.Inline) compiled.transforms().getFirst();
+
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+        assertThat(map.experimental()).containsEntry("field-mode", "permissive");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetRenameAfterANestUsesTheConfiguredRootTable(boolean reopened) {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of("sourceAlias", "input_orders")),
+                new PipelineDraft.Node("items", "source", "mysql", "order_items", Map.of(), Map.of()),
+                new PipelineDraft.Node("nest", "nest", null, null, Map.of(
+                        "from", Map.of("orders", reopened ? "input_orders.orders" : "mysql.orders", "items", "mysql.order_items"),
+                        "root", Map.of("from", "orders", "key", List.of("id"), "embed", List.of())),
+                        Map.of("stepId", "assembled")),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("orders-nest", "orders", "nest"),
+                        new PipelineDraft.Edge("items-nest", "items", "nest"),
+                        new PipelineDraft.Edge("nest-target", "nest", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetRenameAfterAJoinUsesTheSqlFactTable(boolean reopened) {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of("sourceAlias", "input_orders")),
+                new PipelineDraft.Node("customers", "source", "mysql", "customers", Map.of(), Map.of()),
+                new PipelineDraft.Node("join", "join", null, null, Map.of(
+                        "from", Map.of("o", reopened ? "input_orders.orders" : "mysql.orders", "c", "mysql.customers"),
+                        "engine", "builtin",
+                        "sql", "SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id"),
+                        Map.of("stepId", "joined-orders")),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("orders-join", "orders", "join"),
+                        new PipelineDraft.Edge("customers-join", "customers", "join"),
+                        new PipelineDraft.Edge("join-target", "join", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void acceptsAnExplicitBindingEqualToThePhysicalSourceIdAfterAReplacement() {
+        var graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "input_orders", "orders", Map.of(),
+                        Map.of("sourceAlias", "input_orders")),
+                new PipelineDraft.Node("view", "view", null, null, Map.of("primaryKey", "id"), Map.of())),
+                List.of(new PipelineDraft.Edge("input-view", "source", "view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        var compiled = compiler.compile(dagDraft(graph));
+
+        assertThat(compiled.sources())
+                .containsExactly(SourceRef.of("input_orders", null, Map.of(), "input_orders"));
+        assertThat(((ViewBlock.Inline) compiled.view()).from()).isEqualTo(FromRef.literal("input_orders.orders"));
+    }
+
+    @Test
+    void compilesMultipleDagSourceTablesAndExplicitTargetMappings() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders",
+                        Map.of("tables", List.of(Map.of("table", "orders"),
+                                Map.of("table", "archive_orders"))), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_out",
+                        Map.of("tableMappings", List.of(
+                                Map.of("sourceTable", "orders", "targetTable", "orders_out"),
+                                Map.of("sourceTable", "archive_orders", "targetTable", "archive_out"))), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs()).containsExactly(
+                FromRef.literal("mysql.orders"), FromRef.literal("mysql.archive_orders"));
+        assertThat(serve.sync().getFirst().rename().map())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", "orders_out", "archive_orders", "archive_out"));
+    }
+
+    @Test
+    void usesGraphViewNodeIdWhenViewMetadataOmitsViewId() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-view", "source-orders", "orders-view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThat(((ViewBlock.Inline) compiler.compile(dagDraft(graph)).view()).id()).isEqualTo("orders-view");
+    }
+
+    @Test
+    void avoidsGeneratedServeIdCollisionsWithOtherGraphNodes() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("target__serve", "filter", null, null,
+                        Map.of("expr", "active == true"), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", "orders", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-filter", "source", "target__serve"),
+                        new PipelineDraft.Edge("filter-to-target", "target__serve", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+        assertThat(serve.id()).isEqualTo("target__serve_");
+        assertThat(serve.sync().getFirst().rename()).isNull();
+    }
+
+    @Test
+    void refusesAmbiguousDagTargetTableForMultipleSourceTables() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("customers", "source", "mysql", "customers", Map.of(), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", "report", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("orders-to-target", "orders", "target"),
+                        new PipelineDraft.Edge("customers-to-target", "customers", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThatThrownBy(() -> compiler.compile(dagDraft(graph)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("target table requires exactly one upstream source table: target");
+    }
+
+    @Test
+    void rejectsMalformedWizardRootsRelationsAndParentGraphs() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard base = template.wizard();
+        assertThatThrownBy(() -> compiler.compile(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("draft");
+        assertCompileFails(withWizard(template, new PipelineDraft.Root("root", " ", "orders", List.of(), List.of()),
+                List.of(), List.of(), base.output()), "wizard field must be non-blank: wizard root source");
+        assertCompileFails(withWizard(template, new PipelineDraft.Root("root", "crm", " ", List.of(), List.of()),
+                List.of(), List.of(), base.output()), "wizard field must be non-blank: wizard root table");
+
+        PipelineDraft.Related missingParent = related("child", "absent", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(missingParent), List.of(), base.output()),
+                "related table parent does not exist: absent");
+
+        PipelineDraft.Related selfParent = related("child", "child", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(selfParent), List.of(), base.output()),
+                "wizard relation cannot point to itself: child");
+
+        PipelineDraft.Related first = related("first", "second", PipelineDraft.Shape.OBJECT,
+                "first", List.of("id"), List.of(new PipelineDraft.FieldPair("id", "id")));
+        PipelineDraft.Related second = related("second", "first", PipelineDraft.Shape.OBJECT,
+                "second", List.of("id"), List.of(new PipelineDraft.FieldPair("id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(first, second), List.of(), base.output()),
+                "wizard related table cycle at: first");
+
+        PipelineDraft.Related duplicate = related("orders", "root", PipelineDraft.Shape.OBJECT,
+                "orders", List.of("id"), List.of(new PipelineDraft.FieldPair("id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(duplicate), List.of(), base.output()),
+                "duplicate wizard id: orders");
+    }
+
+    @Test
+    void rejectsIncompleteRelationShapesAndAssociationFields() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+        PipelineDraft.Related arrayWithoutKey = new PipelineDraft.Related("child", "orders", "crm", "child_table",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("parent_id", "id")),
+                        PipelineDraft.Shape.ARRAY, "child", List.of(), List.of()), List.of());
+        assertCompileFails(withWizard(template, root, List.of(arrayWithoutKey), List.of(), template.wizard().output()),
+                "array relation requires an array key");
+
+        PipelineDraft.Related flatWithoutPath = related("child", "orders", PipelineDraft.Shape.FLAT,
+                "", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        PipelineResource flatCompiled = compiler.compile(withWizard(template, root, List.of(flatWithoutPath),
+                List.of(), template.wizard().output()));
+        TransformBody.Nest flatNest = (TransformBody.Nest) ((Step.Inline) flatCompiled.transforms().getFirst()).body();
+        assertThat(flatNest.root().embed().getFirst().path()).isNull();
+
+        PipelineDraft.Related missingPath = related("child", "orders", PipelineDraft.Shape.OBJECT,
+                null, List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, root, List.of(missingPath), List.of(), template.wizard().output()),
+                "object and array relations require a target path");
+
+        PipelineDraft.Related noConditions = related("child", "orders", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of());
+        assertCompileFails(withWizard(template, root, List.of(noConditions), List.of(), template.wizard().output()),
+                "relation requires at least one association condition");
+
+        PipelineDraft.Related blankField = related("child", "orders", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of(new PipelineDraft.FieldPair(" ", "id")));
+        assertCompileFails(withWizard(template, root, List.of(blankField), List.of(), template.wizard().output()),
+                "wizard field must be non-blank: related child field");
+    }
+
+    @Test
+    void compilesWizardOutputAliasesAndRejectsUnsupportedModes() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Output aliasedOutput = new PipelineDraft.Output("source", Map.of(
+                "source", "warehouse", "destinationTable", "archive", "write_mode", "append", "syncId", "sink"));
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(withWizard(template,
+                template.wizard().root(), List.of(), List.of(), aliasedOutput)).serve();
+        assertThat(serve.sync().getFirst().id()).isEqualTo("sink");
+        assertThat(serve.sync().getFirst().source()).isEqualTo("warehouse");
+        assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
+        assertThat(serve.sync().getFirst().rename()).isNotNull();
+
+        PipelineDraft.Output invalidMode = new PipelineDraft.Output("atlas",
+                Map.of("sourceId", "atlas", "table", "archive", "writeMode", "merge"));
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(), List.of(), invalidMode),
+                "unsupported wizard output write mode: merge");
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(), List.of(),
+                new PipelineDraft.Output("source", Map.of("sourceId", "warehouse"))),
+                "wizard output requires sourceId and table");
+    }
+
+    @Test
+    void rejectsUnsupportedTransformsAndMalformedGraphNodes() {
+        PipelineDraft template = wizardDraft();
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("step", "union", Map.of())), template.wizard().output()),
+                "wizard union requires at least one additional input");
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("step", "filter", Map.of())), template.wizard().output()),
+                "transform field must be non-blank: expr");
+
+        PipelineDraft.Graph unsupported = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("unknown", "custom", null, null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("edge", "source", "unknown")), new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(unsupported), "unsupported graph node: custom");
+
+        PipelineDraft.Graph unknownEdge = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("edge", "source", "missing")), new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(unknownEdge), "graph edge references an unknown node: edge");
+
+        PipelineDraft.Graph noInput = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("filter", "filter", null, null, Map.of("expr", "active"), Map.of())),
+                List.of(), new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(noInput), "graph node requires an input: filter");
+    }
+
+    @Test
+    void compilesWizardUnionWithCurrentOutputAndAdditionalQualifiedInputs() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge-orders", "union",
+                Map.of("from", List.of("warehouse.archive_orders", "crm.priority_orders")));
+
+        PipelineResource compiled = compiler.compile(withWizard(template, template.wizard().root(),
+                template.wizard().related(), List.of(union), template.wizard().output()));
+
+        Step.Inline compiledUnion = (Step.Inline) compiled.transforms().getLast();
+        assertThat(compiledUnion.body()).isEqualTo(new TransformBody.Union());
+        assertThat(((FromClause.Flow) compiledUnion.from()).refs()).containsExactly(
+                FromRef.literal("customer-orders__nest"),
+                FromRef.literal("warehouse.archive_orders"),
+                FromRef.literal("crm.priority_orders"));
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(((ServeBlock.Inline) compiled.serve()).from()).isEqualTo(
+                FromClause.list(FromRef.literal("merge-orders")));
+    }
+
+    @Test
+    void rejectsRootPreTransformUnionInputAlreadyReadByRelatedBranch() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("dup", "union",
+                Map.of("from", List.of("crm.policies")));
+        List<PipelineDraft.Related> related = List.of(wizard.related().getFirst());
+        String duplicateMessage = "wizard union input duplicates an existing pipeline input";
+
+        assertCompileFails(withWizard(template, wizard.root(), related, List.of(union), wizard.output()),
+                duplicateMessage);
+
+        PipelineDraft.Root root = wizard.root();
+        PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(union));
+        assertCompileFails(withWizard(template, rootWithUnion, related, List.of(), wizard.output()),
+                duplicateMessage);
+    }
+
+    @Test
+    void rejectsRelatedUnionInputsReadByRootOrAnotherRelatedBranchInEitherOrder() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related policy = wizard.related().getFirst();
+        for (String input : List.of("crm.orders", "crm.claims")) {
+            PipelineDraft.Related policyWithUnion = withPreTransforms(policy, List.of(
+                    new PipelineDraft.Transform("dup", "union", Map.of("from", List.of(input)))));
+            List<PipelineDraft.Related> related = List.of(policyWithUnion, wizard.related().getLast());
+            for (List<PipelineDraft.Related> order : List.of(related, related.reversed())) {
+                assertCompileFails(withWizard(template, wizard.root(), order, List.of(), wizard.output()),
+                        "wizard union input duplicates an existing pipeline input");
+                PipelineDraft incomplete = withWizard(template, wizard.root(), order, List.of(), null);
+                assertThatThrownBy(() -> compiler.compileCandidate(incomplete))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage("wizard union input duplicates an existing pipeline input");
+            }
+        }
+    }
+
+    @Test
+    void rejectsWizardUnionInputWithWhitespacePaddedSource() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                Map.of("from", List.of(" crm.extra")));
+        PipelineDraft draft = withWizard(template, template.wizard().root(), List.of(),
+                List.of(union), template.wizard().output());
+
+        assertCompileFails(draft, "wizard union input must be a source-qualified table reference");
+    }
+
+    @Test
+    void rejectsWhitespacePaddedUnionInputsAcrossWizardBranchesAndIncompleteCandidates() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+        PipelineDraft.Related related = template.wizard().related().getFirst();
+        for (String input : List.of("crm.extra ", "\tcrm.extra", "crm.extra\t")) {
+            PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                    Map.of("from", List.of(input)));
+            PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(),
+                    root.table(), root.key(), List.of(union));
+            PipelineDraft.Related relatedWithUnion = new PipelineDraft.Related(related.id(), related.parentId(),
+                    related.sourceId(), related.table(), related.relation(), List.of(union));
+            for (PipelineDraft draft : List.of(
+                    withWizard(template, rootWithUnion, List.of(), List.of(), null),
+                    withWizard(template, root, List.of(relatedWithUnion), List.of(), null),
+                    withWizard(template, root, List.of(), List.of(union), null))) {
+                assertCompileFails(draft, "wizard union input must be a source-qualified table reference");
+                assertThatThrownBy(() -> compiler.compileCandidate(draft))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage("wizard union input must be a source-qualified table reference");
+            }
+        }
+    }
+
+    @Test
+    void rejectsAdditionalUnionInputsRepeatedAcrossBranchesAndLaterTransforms() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                Map.of("from", List.of("warehouse.archive_orders")));
+        PipelineDraft.Root root = wizard.root();
+        PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(union));
+        PipelineDraft.Related policyWithUnion = withPreTransforms(wizard.related().getFirst(), List.of(union));
+        PipelineDraft.Related claimWithUnion = withPreTransforms(wizard.related().getLast(), List.of(union));
+        List<PipelineDraft.Related> bothRelated = List.of(policyWithUnion, claimWithUnion);
+
+        for (List<PipelineDraft.Related> order : List.of(bothRelated, bothRelated.reversed())) {
+            assertCompileFails(withWizard(template, root, order, List.of(), wizard.output()),
+                    "wizard union input duplicates an existing pipeline input");
+        }
+        assertCompileFails(withWizard(template, rootWithUnion, List.of(policyWithUnion), List.of(), wizard.output()),
+                "wizard union input duplicates an existing pipeline input");
+        assertCompileFails(withWizard(template, rootWithUnion, wizard.related(), List.of(union), wizard.output()),
+                "wizard union input duplicates an existing pipeline input");
+        PipelineDraft.Root repeatedRoot = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(union, new PipelineDraft.Transform("merge-again", "union", union.fields())));
+        assertCompileFails(withWizard(template, repeatedRoot, wizard.related(), List.of(), wizard.output()),
+                "wizard union input duplicates an existing pipeline input");
+    }
+
+    @Test
+    void preservesDistinctUnionInputsAliasesAndOrderAcrossRepeatedCompilations() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Root root = wizard.root();
+        PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(new PipelineDraft.Transform("merge-orders", "union",
+                        Map.of("from", List.of("warehouse.orders")))));
+        PipelineDraft.Related policy = withPreTransforms(wizard.related().getFirst(), List.of(
+                new PipelineDraft.Transform("merge-policies", "union",
+                        Map.of("from", List.of("warehouse.policies")))));
+        PipelineDraft draft = withWizard(template, rootWithUnion, List.of(policy), List.of(
+                new PipelineDraft.Transform("merge-archive", "union",
+                        Map.of("from", List.of("warehouse.archive_orders")))), wizard.output());
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(compiled.transforms()).extracting(Step::id)
+                .containsExactly("orders__pre", "policy__pre", "customer-orders__nest", "merge-archive");
+        assertThat(((FromClause.Flow) ((Step.Inline) compiled.transforms().get(0)).from()).refs())
+                .containsExactly(FromRef.literal("crm.orders"), FromRef.literal("warehouse.orders"));
+        assertThat(((FromClause.Flow) ((Step.Inline) compiled.transforms().get(1)).from()).refs())
+                .containsExactly(FromRef.literal("crm.policies"), FromRef.literal("warehouse.policies"));
+        assertThat(((FromClause.Aliases) ((Step.Inline) compiled.transforms().get(2)).from()).aliases())
+                .containsOnlyKeys("orders", "policy")
+                .containsEntry("orders", FromRef.literal("orders__pre"))
+                .containsEntry("policy", FromRef.literal("policy__pre"));
+        assertThat(((FromClause.Flow) ((Step.Inline) compiled.transforms().get(3)).from()).refs())
+                .containsExactly(FromRef.literal("customer-orders__nest"), FromRef.literal("warehouse.archive_orders"));
+        CanonicalWriter writer = new CanonicalWriter();
+        assertThat(writer.write(compiler.compile(draft))).isEqualTo(writer.write(compiled));
+        assertThat(writer.write(compiler.compileCandidate(draft))).isEqualTo(writer.write(compiled));
+    }
+
+    @Test
+    void stillAllowsRelatedBranchesToReadTheSameBaseTableWithoutAUnion() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related policy = wizard.related().getFirst();
+        PipelineDraft.Related otherPolicy = new PipelineDraft.Related("other-policy", "orders",
+                policy.sourceId(), policy.table(), new PipelineDraft.Relation(policy.relation().on(),
+                        PipelineDraft.Shape.OBJECT, "other_policy", List.of()), List.of());
+
+        PipelineResource compiled = compiler.compile(withWizard(template, wizard.root(),
+                List.of(policy, otherPolicy), List.of(), wizard.output()));
+
+        Step.Inline nest = (Step.Inline) compiled.transforms().getLast();
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("policy", FromRef.literal("policy__pre"))
+                .containsEntry("other-policy", FromRef.literal("crm.policies"));
+    }
+
+    @Test
+    void rejectsMalformedOrDuplicateWizardUnionInputs() {
+        PipelineDraft template = wizardDraft();
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union", Map.of("from", List.of("archive")))),
+                template.wizard().output()), "wizard union input must be a source-qualified table reference");
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union",
+                        Map.of("from", List.of("warehouse.archive", "warehouse.archive")))),
+                template.wizard().output()), "wizard union inputs must be unique");
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union",
+                        Map.of("from", List.of("crm.orders")))),
+                template.wizard().output()), "wizard union input duplicates an existing pipeline input");
+    }
+
+    @Test
+    void rejectsGraphCyclesAndMultipleTerminalNodes() {
+        PipelineDraft.Graph cycle = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("filter-a", "filter", null, null, Map.of("expr", "a"), Map.of()),
+                new PipelineDraft.Node("filter-b", "filter", null, null, Map.of("expr", "b"), Map.of())),
+                List.of(new PipelineDraft.Edge("a-b", "filter-a", "filter-b"),
+                        new PipelineDraft.Edge("b-a", "filter-b", "filter-a")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(cycle), "graph contains a cycle at: filter-a");
+
+        PipelineDraft.Graph duplicateViews = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("view-a", "view", null, null, Map.of(), Map.of()),
+                new PipelineDraft.Node("view-b", "view", null, null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-a", "source", "view-a"),
+                        new PipelineDraft.Edge("source-b", "source", "view-b")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(duplicateViews), "graph has more than one view node");
+
+        PipelineDraft.Graph duplicateTargets = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("target-a", "target", "mongo", null, Map.of(), Map.of()),
+                new PipelineDraft.Node("target-b", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-a", "source", "target-a"),
+                        new PipelineDraft.Edge("source-b", "source", "target-b")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(duplicateTargets), "graph has more than one target node");
+    }
+
+    private static PipelineDraft.Related withPreTransforms(PipelineDraft.Related related,
+            List<PipelineDraft.Transform> transforms) {
+        return new PipelineDraft.Related(related.id(), related.parentId(), related.sourceId(), related.table(),
+                related.relation(), transforms);
+    }
+
+    private void assertCompileFails(PipelineDraft draft, String message) {
+        assertThatThrownBy(() -> compiler.compile(draft))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(message);
+    }
+
+    private static PipelineDraft withWizard(PipelineDraft template, PipelineDraft.Root root,
+            List<PipelineDraft.Related> related, List<PipelineDraft.Transform> transforms,
+            PipelineDraft.Output output) {
+        return new PipelineDraft(template.pipelineId(), template.schemaVersion(), template.revision(),
+                PipelineDraft.Mode.WIZARD, template.name(), template.description(), null,
+                new PipelineDraft.Wizard(root, related, transforms, output),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+    }
+
+    private static PipelineDraft.Related related(String id, String parentId, PipelineDraft.Shape shape,
+            String path, List<String> keys, List<PipelineDraft.FieldPair> conditions) {
+        return new PipelineDraft.Related(id, parentId, "crm", "child_table",
+                new PipelineDraft.Relation(conditions, shape, path, keys,
+                        shape == PipelineDraft.Shape.ARRAY ? List.of("id") : List.of()), List.of());
+    }
+
+    private static PipelineDraft dagDraft(PipelineDraft.Graph graph) {
+        return new PipelineDraft("p1", 1, 1, PipelineDraft.Mode.DAG, "p1", "", graph, null,
+                null, null, null, java.time.Instant.parse("2026-09-21T00:00:00Z"),
+                java.time.Instant.parse("2026-09-21T00:00:00Z"), "test");
+    }
+
+    private static PipelineDraft wizardDraft() {
+        PipelineDraft.Transform branchMap = new PipelineDraft.Transform(
+                "rename-policy", "map", Map.of("policy_id", "$id"));
+        PipelineDraft.Transform postFilter = new PipelineDraft.Transform(
+                "only-active", "filter", Map.of("expr", "active == true"));
+        PipelineDraft.Related policy = new PipelineDraft.Related(
+                "policy", "orders", "crm", "policies",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.OBJECT, "policy", List.of()), List.of(branchMap));
+        PipelineDraft.Related claim = new PipelineDraft.Related(
+                "claim", "policy", "crm", "claims",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("policy_id", "id")),
+                        PipelineDraft.Shape.ARRAY, "claims", List.of("claim_id")), List.of());
+        PipelineDraft.Wizard wizard = new PipelineDraft.Wizard(
+                new PipelineDraft.Root("orders", "crm", "orders", List.of("id"), List.of()),
+                List.of(policy, claim), List.of(postFilter),
+                new PipelineDraft.Output("atlas", Map.of("sourceId", "atlas", "table", "customer_orders")));
+        return new PipelineDraft("customer-orders", 1, 1, PipelineDraft.Mode.WIZARD,
+                "Customer orders", "", null, wizard, null, null, null,
+                java.time.Instant.parse("2026-09-21T00:00:00Z"),
+                java.time.Instant.parse("2026-09-21T00:00:00Z"), "test");
+    }
+}

@@ -1,8 +1,10 @@
 package io.tapstate.cli;
 
 import io.tapstate.app.Bootstrap;
+import io.tapstate.app.NativeAppStorage;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.testsupport.RequiresDocker;
+import io.tapstate.testsupport.JvmTestEnvironment;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -15,7 +17,6 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
-import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -51,7 +52,7 @@ class SessionResumePtyIT {
     private static final Duration TERMINATION_TIMEOUT = Duration.ofSeconds(5);
     private static final String SIGNED_OUT_CONNECTORS_DIAGNOSTIC = String.join(
             System.lineSeparator(),
-            "error: cli.not-authenticated",
+            "error: TS0330021",
             "  The `connectors` command needs you to sign in first.",
             "  Run `login <username>`, or start with `tapstate -c <host:port> -u <user>`.",
             "  (cli " + Cli.VERSION_NUMBER + ", server " + Cli.VERSION_NUMBER + ")",
@@ -177,8 +178,7 @@ class SessionResumePtyIT {
             throws Exception {
         Path home = Files.createDirectory(testRoot.resolve("home"));
         Path workspace = Files.createDirectory(testRoot.resolve("orders"));
-        URI seed = startServer();
-        bootstrap(seed);
+        URI seed = startServer(testRoot);
 
         ProcessResult contextSetup = runInPty(home, workspace, false,
                 "1\ndev\n" + seed + "\n\n\n", "context");
@@ -237,28 +237,19 @@ class SessionResumePtyIT {
         assertScriptOutputIsClean(signedOut);
     }
 
-    private URI startServer() {
-        String database = "session_resume_" + Long.toUnsignedString(System.nanoTime(), 16);
-        server = new SpringApplicationBuilder(Bootstrap.class)
-                .properties(
-                        "server.address=127.0.0.1",
-                        "server.port=0",
-                        "tapstate.store.mongo.enabled=true",
-                        "tapstate.store.mongo.uri=" + MONGO.getReplicaSetUrl(database),
-                        "tapstate.store.mongo.server-selection-timeout=5s")
-                .run("--server.address=127.0.0.1", "--server.port=0");
+    private URI startServer(Path root) {
+        var storage = NativeAppStorage.createOnPremWithAdmin(MONGO, "session_resume", USERNAME, PASSWORD);
+        server = new SpringApplicationBuilder(Bootstrap.class).environment(NativeAppStorage.isolatedEnvironment())
+                .run("--server.address=127.0.0.1", "--server.port=0", "--SDK_STATUS_SENDER_ENABLED=false",
+                        "--tapstate.store.mongo.uri=" + storage.configurationUri(),
+                        "--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0",
+                        "--tapstate.hz.jet.cooperative-thread-count=2",
+                        "--tapstate.connectors.plugins-dir=" + root.resolve("plugins"),
+                        "--tapstate.connectors.seed-dir=" + root.resolve("no-optional-seeds"),
+                        "--tapstate.store.mongo.server-selection-timeout=5s");
+        NativeAppStorage.awaitBusiness(server);
         int port = ((WebServerApplicationContext) server).getWebServer().getPort();
         return URI.create("http://127.0.0.1:" + port);
-    }
-
-    private static void bootstrap(URI seed) {
-        HttpStatusCode status = RestClient.create(seed.toString())
-                .post()
-                .uri("/auth/bootstrap")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("username", USERNAME, "password", PASSWORD))
-                .exchange((request, response) -> response.getStatusCode());
-        assertThat(status).isEqualTo(HttpStatus.NO_CONTENT);
     }
 
     private static HttpStatusCode exchange(URI seed, String sessionToken) {
@@ -322,7 +313,7 @@ class SessionResumePtyIT {
     private static ProcessBuilder process(List<String> command, Path workspace) {
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.environment().remove("TAPSTATE_PASSWORD");
-        builder.environment().put("TAPSTATE_WORKDIR", workspace.toString());
+        JvmTestEnvironment.configure(builder, Map.of("TAPSTATE_WORKDIR", workspace.toString()));
         return builder;
     }
 
@@ -330,6 +321,7 @@ class SessionResumePtyIT {
         String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx384m", "-XX:ActiveProcessorCount=2",
                 "-Duser.home=" + home,
                 "-cp", classpath,
                 Cli.class.getName()));

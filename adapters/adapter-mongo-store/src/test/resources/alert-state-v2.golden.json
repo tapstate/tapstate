@@ -1,0 +1,183 @@
+{
+  "head": {
+    "_id": {
+      "authorityId": "org-a",
+      "clusterId": "cluster-a",
+      "resourceKind": "pipeline",
+      "resourceId": "orders",
+      "resourceIncarnation": "resource-1",
+      "typeId": "pipeline.failed",
+      "qualifier": "rule-a"
+    },
+    "formatVersion": 2,
+    "recordRevision": {
+      "$numberLong": "3"
+    },
+    "enabled": true,
+    "status": "FIRING",
+    "quality": "VALID",
+    "lastSequence": {
+      "$numberLong": "1"
+    },
+    "lastObservedAt": "2026-10-27T00:00:00.123456789Z",
+    "pendingSince": null,
+    "recoverySince": null,
+    "episodeSequence": {
+      "$numberLong": "1"
+    },
+    "episodeNumber": {
+      "$numberLong": "1"
+    },
+    "evaluationBinding": {
+      "ruleRevision": {
+        "$numberLong": "1"
+      },
+      "generation": {
+        "$numberLong": "2"
+      },
+      "producerIncarnation": "producer-1",
+      "triggerNanos": {
+        "$numberLong": "0"
+      },
+      "resolveNanos": {
+        "$numberLong": "0"
+      },
+      "maxAgeNanos": {
+        "$numberLong": "15000000000"
+      },
+      "maxGapNanos": {
+        "$numberLong": "10000000000"
+      }
+    },
+    "deployment": "ON_PREM",
+    "owner": {
+      "generation": {
+        "$numberLong": "0"
+      },
+      "ownerId": null,
+      "leaseUntil": null
+    },
+    "retiredAt": null,
+    "summariesHandedOff": false,
+    "cleanupAt": null,
+    "severityRank": 1,
+    "recentSecondOrder": {
+      "$numberLong": "-1793059200"
+    },
+    "recentNanoOrder": -123456789,
+    "binding": null
+  },
+  "episode": {
+    "_id": {
+      "alarm": {
+        "authorityId": "org-a",
+        "clusterId": "cluster-a",
+        "resourceKind": "pipeline",
+        "resourceId": "orders",
+        "resourceIncarnation": "resource-1",
+        "typeId": "pipeline.failed",
+        "qualifier": "rule-a"
+      },
+      "number": {
+        "$numberLong": "1"
+      }
+    },
+    "formatVersion": 2,
+    "firedAt": "2026-10-27T00:00:00.123456789Z",
+    "severity": "MAJOR",
+    "endedAt": null,
+    "recoveredAt": null,
+    "endReason": null,
+    "originalBinding": {
+      "ruleRevision": {
+        "$numberLong": "1"
+      },
+      "generation": {
+        "$numberLong": "2"
+      },
+      "producerIncarnation": "producer-1",
+      "triggerNanos": {
+        "$numberLong": "0"
+      },
+      "resolveNanos": {
+        "$numberLong": "0"
+      },
+      "maxAgeNanos": {
+        "$numberLong": "15000000000"
+      },
+      "maxGapNanos": {
+        "$numberLong": "10000000000"
+      }
+    },
+    "policy": {
+      "policyVersion": 2,
+      "deployment": "ON_PREM",
+      "valuesNanos": {
+        "ACCEPTED_PAYLOAD": {
+          "$numberLong": "86400000000000"
+        },
+        "ACCEPTED_RESULT": {
+          "$numberLong": "604800000000000"
+        },
+        "FAILED_PAYLOAD": {
+          "$numberLong": "259200000000000"
+        },
+        "FAILED_RESULT": {
+          "$numberLong": "1209600000000000"
+        },
+        "TEST_PAYLOAD": {
+          "$numberLong": "3600000000000"
+        },
+        "TEST_ACCEPTED_RESULT": {
+          "$numberLong": "86400000000000"
+        },
+        "TEST_FAILED_RESULT": {
+          "$numberLong": "259200000000000"
+        },
+        "ENDED_EPISODE": {
+          "$numberLong": "2592000000000000"
+        },
+        "TRANSITION": {
+          "$numberLong": "1209600000000000"
+        }
+      }
+    },
+    "diagnostics": {
+      "status": "CAPTURED",
+      "first": {
+        "bindingDigest": "291cdde500d84c1bc375540a2a7840f2170ad0dcc5a27bc8560bb34a99c07cb3",
+        "episode": {
+          "$numberLong": "1"
+        },
+        "sequence": {
+          "$numberLong": "1"
+        },
+        "observedAt": "2026-10-27T00:00:00.123456789Z"
+      },
+      "latest": {
+        "bindingDigest": "291cdde500d84c1bc375540a2a7840f2170ad0dcc5a27bc8560bb34a99c07cb3",
+        "episode": {
+          "$numberLong": "1"
+        },
+        "sequence": {
+          "$numberLong": "1"
+        },
+        "observedAt": "2026-10-27T00:00:00.123456789Z"
+      },
+      "firstTrace": {
+        "text": "java.lang.Exception\n\tat app.run(App.java:42)",
+        "exceptionNodes": 1,
+        "redacted": true,
+        "truncated": false
+      },
+      "latestTrace": null,
+      "prunedAt": null
+    },
+    "summariesHandedOff": false,
+    "historyUntil": null,
+    "diagnosticUntil": null,
+    "cleanupAt": null,
+    "endedSecondOrder": null,
+    "endedNanoOrder": null
+  }
+}

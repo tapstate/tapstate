@@ -7,13 +7,12 @@ package io.tapstate.control.restapi;
  * ring may not cross: the number comes off the store, and reaching a store is the adapter ring's job.
  * The assembly root, which is allowed to see both, supplies one of these.
  *
- * <p>A run with no store configured has no implementation of this, and the version it reports is
- * absent rather than zero — a client has to be able to tell "there is no store" from "the store has
- * never been migrated", and zero is the second of those.
+ * <p>A run with no verified configuration store reports absence rather than zero. A provider may
+ * become known after same-process setup; it must not invent a version before the store is opened.
  */
 @FunctionalInterface
 public interface SystemDataVersion {
 
-    /** The version the store this process opened is at. */
-    int current();
+    /** The opened configuration store's schema version, or null when no such store is available yet. */
+    Integer current();
 }

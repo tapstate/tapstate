@@ -1,0 +1,13 @@
+{
+  "channelType": "test.sink",
+  "family": "HTTPS_JSON",
+  "transportVersion": 1,
+  "origin": "https://notify.example.test",
+  "endpointDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "authentication": "NONE",
+  "principal": null,
+  "trust": "SYSTEM",
+  "parameters": {
+    "topic": "orders"
+  }
+}

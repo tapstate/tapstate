@@ -1,0 +1,262 @@
+{
+  "TS0330001": {
+    "message": "{path} 已存在制品。",
+    "solution": "选择其他 ID 或 --out，或使用 --force 覆盖。"
+  },
+  "TS0330002": {
+    "message": "工作区的 {path} 已存在示例资源。",
+    "solution": "使用 -w 选择其他工作区，或使用 --force 覆盖其中的示例文件。"
+  },
+  "TS0330003": {
+    "message": "无法写入 {path}：{reason}",
+    "solution": "检查目录存在且可写，并确保需要目录的位置没有普通文件。本次写入的示例文件已移除，被覆盖的文件已恢复；本次创建的空目录可能仍保留。"
+  },
+  "TS0330004": {
+    "message": "无法读取工作区 {path}：{reason}",
+    "solution": "检查工作区目录及其下每个目录和 *.tap.yml 文件均可读取，再运行 tapstate up。"
+  },
+  "TS0330005": {
+    "message": "工作区 {path} 不含 Pipeline（kind: pipeline 的 *.tap.yml 文件），没有可启动的内容。",
+    "solution": "运行 tapstate new 创建 Pipeline，或使用 -w 指向包含 Pipeline 的工作区。"
+  },
+  "TS0330006": {
+    "message": "{path} 已存在，且不是 tapstate 快捷方式。",
+    "solution": "保留该文件；tapstate 无需此快捷方式也能运行。若要使用 tap 名称，请自行移除该文件，再运行 tapstate alias install。"
+  },
+  "TS0330007": {
+    "message": "在 {path} 中未找到已安装的 tapstate。",
+    "solution": "在 tapstate 安装目录运行，或将 TAPSTATE_INSTALL_DIR 设为该目录；安装器也使用此变量。"
+  },
+  "TS0330008": {
+    "message": "无法创建或移除 {path} 的 tap 快捷方式：{reason}",
+    "solution": "检查目录存在且可写，再运行 tapstate alias install。tapstate 本身无需此快捷方式也能运行。"
+  },
+  "TS0330009": {
+    "message": "无法在 Docker 中运行本地开发环境：{reason}。",
+    "solution": "安装包含 Compose v2 插件的 Docker 并确保已启动，再运行 tapstate up；也可使用 --server 将工作区指向已有服务器。"
+  },
+  "TS0330010": {
+    "message": "此工作区尚未绑定服务器，当前无法交互询问。",
+    "solution": "使用 --server <url> 指定服务器，或使用 --start-local 在 {server} 启动本地开发环境。"
+  },
+  "TS0330011": {
+    "message": "登录 {server} 需要密码，当前无法交互询问。",
+    "solution": "设置环境变量 {variable}，或通过 --server 指定已登录的服务器。"
+  },
+  "TS0330012": {
+    "message": "登录 {server} 未返回可用的持久会话。",
+    "solution": "检查服务器连接和兼容性，再运行 tapstate up。"
+  },
+  "TS0330013": {
+    "message": "目录中没有连接器 {connector}。",
+    "solution": "选择目录中的连接器 ID；交互运行 tapstate new 进行选择。"
+  },
+  "TS0330014": {
+    "message": "本版本安装的连接器为 {official}。{connector} 在目录中，但不属于此集合。",
+    "solution": "选择上面列出的连接器。受支持的集合随连接器认证完成而扩展；未列出不代表该连接器有缺陷。"
+  },
+  "TS0330015": {
+    "message": "无法下载已发布的连接器 {connector}：{reason}",
+    "solution": "检查 GitHub Releases 网络访问，或将 TAPSTATE_CONNECTORS_URL 设为提供连接器制品的 HTTPS 镜像后重试。仍可注册本地 JAR 路径。"
+  },
+  "TS0330016": {
+    "message": "制品 {path} 声明的类型为 {kind}，但位于 {dir} 目录。",
+    "solution": "将其移入 {kind} 目录，或修改声明类型使其匹配。"
+  },
+  "TS0330017": {
+    "message": "工作区中没有 ID 为 {id} 的资源。",
+    "solution": "运行 tapstate ls 查看可用资源。"
+  },
+  "TS0330018": {
+    "message": "无法访问种子地址中的任何 Tapstate 服务器：{seeds}。",
+    "solution": "检查地址正确且对应的 Tapstate 服务器正在运行，再尝试连接。"
+  },
+  "TS0330019": {
+    "message": "发往 {server} 的请求在服务器响应前超时。",
+    "solution": "服务器可能繁忙或上传较大，也可能已完成该请求。register 是幂等的，可再次执行；等待后重试，或检查服务器日志。"
+  },
+  "TS0330020": {
+    "message": "命令 {verb} 需要连接到 Tapstate 服务器。",
+    "solution": "先运行 connect <host:port>，或使用 tapstate -c <host:port> -u <user> 启动。"
+  },
+  "TS0330021": {
+    "message": "命令 {verb} 需要先登录。",
+    "solution": "运行 login <username>，或使用 tapstate -c <host:port> -u <user> 启动。"
+  },
+  "TS0330022": {
+    "message": "命令 {verb} 已预留，但尚未实现。",
+    "solution": "暂时使用其基础命令；help 列出此构建可用的命令。"
+  },
+  "TS0330023": {
+    "message": "{verb} 仅可在 Tapstate 会话中使用，不能作为单次命令运行。",
+    "solution": "不带参数启动 tapstate，在提示符输入 {verb}；help 列出会话命令。"
+  },
+  "TS0330024": {
+    "message": "MCP 辅助进程不可用：{reason}。",
+    "solution": "安装完整的 Tapstate CLI 包（包含 libexec/tapstate-mcp）后重试。"
+  },
+  "TS0330025": {
+    "message": "watch 原地重绘一行，需要终端；当前输出目标是管道或文件。",
+    "solution": "需要可传入管道的数据流时使用 tail <source>.<collection>；单次查看使用 <source>.<collection>.find(...)。"
+  },
+  "TS0330026": {
+    "message": "{verb} 会清除 Pipeline 积累的状态，但当前没有终端可供确认。",
+    "solution": "添加 -y 可免确认继续，或运行 stop <pipeline-id> --keep-state 停止并保留全部状态。"
+  },
+  "TS0330027": {
+    "message": "--if-match 指定一个版本，但此次 apply 涉及 {count} 个资源。",
+    "solution": "仅应用正在编辑的单个文件，或移除 --if-match，使此批次无条件应用。"
+  },
+  "TS0330028": {
+    "message": "{pipeline} 保持原状：有 {count} 个启动检查问题尚未回答，当前没有终端可供询问。",
+    "solution": "在命令行回答这些问题：{commands}"
+  },
+  "TS0330029": {
+    "message": "此服务器不执行启动检查，因此 {option} 无法生效；未启动任何任务。",
+    "solution": "升级服务器，或不带 {option} 启动。"
+  },
+  "TS0330030": {
+    "message": "服务器未执行启动检查便启动了 {pipeline}；其版本可能早于此客户端。",
+    "solution": "Pipeline 已启动，请查看其状态。若后续启动需要依赖启动检查，请先升级服务器。"
+  },
+  "TS0330031": {
+    "message": "--decide {decide} 不是有效答案：请使用 <check>=<action>，或用 <check>/<subject>=<action> 回答单个问题。",
+    "solution": "使用 --decide <check>=<action>，或使用 --decide <check>/<subject>=<action> 回答单个检查项。"
+  },
+  "TS0330032": {
+    "message": "无法采用 --decide {decide}：{findings} 不提供此答案。",
+    "solution": "使用各检查项提供的答案，以 --decide <check>/<subject>=<action> 分别回答。"
+  },
+  "TS0330033": {
+    "message": "--decide {decide} 回答的是拒绝启动的检查项，任何答案都不能改变拒绝结果。",
+    "solution": "查看启动检查要求修改的内容，完成修改后再启动。"
+  },
+  "TS0330034": {
+    "message": "{pipeline} 的启动请求已发往 {server}，但未及时收到响应；它可能已经启动。",
+    "solution": "再次启动前，先运行 tapstate status {pipeline} 检查状态。"
+  },
+  "TS0330035": {
+    "message": "{path} 的上下文配置不安全或无效：{reason}",
+    "solution": "修正或移除配置文件后，再运行上下文管理器。无效文件未被覆盖。"
+  },
+  "TS0330036": {
+    "message": "{path} 的上下文配置使用不受支持的结构版本 {version}。",
+    "solution": "使用兼容的 tapstate 版本，或使用支持此结构版本的发行版迁移配置。"
+  },
+  "TS0330037": {
+    "message": "上下文配置路径 {path} 不是仅所有者可访问：{reason}",
+    "solution": "恢复所有权及仅所有者权限后重试。Tapstate 不会读取或覆盖不安全的文件。"
+  },
+  "TS0330038": {
+    "message": "{path} 的认证缓存不安全或无效：{reason}",
+    "solution": "检查上下文目标后重新登录。无效的认证文件未被覆盖。"
+  },
+  "TS0330039": {
+    "message": "{path} 的认证缓存使用不受支持的结构版本 {version}。",
+    "solution": "使用兼容的 tapstate 版本，或使用此版本重新登录。"
+  },
+  "TS0330040": {
+    "message": "认证缓存路径 {path} 不是仅所有者可访问：{reason}",
+    "solution": "恢复所有权及仅所有者权限后重试。Tapstate 不会读取或覆盖不安全的认证文件。"
+  },
+  "TS0330041": {
+    "message": "服务器拒绝了 {principal} 的缓存会话：{code}。",
+    "solution": "为此上下文重新运行 tapstate auth login。"
+  },
+  "TS0330042": {
+    "message": "服务器不可达，无法交换 {principal} 的缓存会话。",
+    "solution": "检查服务器连接后重试，或重新运行 tapstate auth login。"
+  },
+  "TS0330043": {
+    "message": "上下文 {context} 的登录未返回可用的持久会话。",
+    "solution": "检查服务器连接和兼容性，再运行 tapstate auth login。"
+  },
+  "TS0330044": {
+    "message": "服务器拒绝了 {principal} 的登录：{code}。",
+    "solution": "检查用户名和密码，再运行 tapstate auth login。"
+  },
+  "TS0330045": {
+    "message": "无法撤销上下文 {context} 的远程会话；已保留本地缓存。",
+    "solution": "服务器可达后重试，或使用 tapstate auth logout --local-only 仅移除本地缓存。"
+  },
+  "TS0330046": {
+    "message": "退出登录期间，上下文 {context} 的会话发生变化；已保留较新的本地会话。",
+    "solution": "运行 tapstate auth status 检查当前会话，必要时再次退出登录。"
+  },
+  "TS0330047": {
+    "message": "存储命令无效：{reason}。",
+    "solution": "查看存储或配置帮助，仅通过本地 JSON 文件提供请求中的秘密信息。"
+  },
+  "TS0330048": {
+    "message": "认证命令无效：{reason}。",
+    "solution": "使用 tapstate auth login [username]、tapstate auth status 或 tapstate auth logout [--local-only]。"
+  },
+  "TS0330049": {
+    "message": "上下文管理器输入无效：{reason}。",
+    "solution": "在交互终端中运行 tapstate context，并选择提供的操作。"
+  },
+  "TS0330050": {
+    "message": "上下文 {name} 无效：{reason}",
+    "solution": "使用非空名称、至少一个绝对 HTTP(S) 种子地址及有效的上下文设置。"
+  },
+  "TS0330051": {
+    "message": "不存在名为 {name} 的上下文。",
+    "solution": "打开上下文管理器，选择已有上下文或创建此上下文。"
+  },
+  "TS0330052": {
+    "message": "名为 {name} 的上下文已存在。",
+    "solution": "编辑已有上下文，或选择其他名称。"
+  },
+  "TS0330053": {
+    "message": "--connect 和 --context 选择不同类型的目标，不能同时使用。",
+    "solution": "临时目标保留 --connect；已保存的上下文保留 --context。"
+  },
+  "TS0330054": {
+    "message": "命令 {verb} 需要服务器上下文，但尚未选择目标。",
+    "solution": "使用 --context、设置 TAPSTATE_CONTEXT、绑定当前这个工作区，或使用 --connect 指定临时目标。"
+  },
+  "TS0330055": {
+    "message": "服务器种子地址 {seed} 在非回环地址上使用明文 HTTP。",
+    "solution": "远程服务器请使用 HTTPS；HTTP 仅允许用于回环地址上的开发服务器。"
+  },
+  "TS0330056": {
+    "message": "服务器种子地址 {seed} 未返回匿名 Cluster 身份。",
+    "solution": "检查种子地址可达且提供 /.well-known/tapstate，再重试。"
+  },
+  "TS0330057": {
+    "message": "服务器种子地址 {seed} 返回了无效的 Cluster 身份（{reason}）。",
+    "solution": "检查 URL 指向兼容的 Tapstate 服务器，且未被其他服务替换。"
+  },
+  "TS0330058": {
+    "message": "服务器种子地址 {seed} 拒绝匿名签发者发现：{reason}",
+    "solution": "早于此 CLI 的服务器不提供 /.well-known/tapstate；升级服务器，或使用与服务器版本匹配的 CLI。"
+  },
+  "TS0330059": {
+    "message": "服务器种子地址 {seed} 报告的签发者为 {actual}，但要求的是 {expected}。",
+    "solution": "检查上下文种子地址，确认这是预期的 Cluster 后再重新登录。"
+  },
+  "TS0330060": {
+    "message": "此 CLI 版本为 {cli}，所连接服务器的版本为 {server}。",
+    "solution": "安装与服务器匹配的 CLI，或连接版本为 {cli} 的服务器；两者存在差异时，以服务器行为为准。"
+  },
+  "TS0330061": {
+    "message": "无法确认发往 {server} 的请求结果。",
+    "solution": "重试写操作前请检查资源的当前状态。必要时恢复连接；服务器可能已经完成该请求。"
+  },
+  "TS0330062": {
+    "message": "连接已断开：没有可访问的集群成员。",
+    "solution": "恢复连接后重新连接集群。上一次请求的结果可能尚未确认；重试写操作前请检查资源的当前状态。"
+  },
+  "TS0330063": {
+    "message": "连续 {attempts} 次连接均未收到任何帧即结束，已停止此数据流。",
+    "solution": "检查流端点和网络路径后重新连接。这并不表明 Pipeline 正在运行或已经失败。"
+  },
+  "TS0330064": {
+    "message": "全屏工作台需要交互式终端。",
+    "solution": "请在终端中运行 tapstate。如需通过管道或重定向输出，请运行带业务动词的命令。"
+  },
+  "TS0330065": {
+    "message": "全屏工作台无法初始化当前终端。",
+    "solution": "请使用受支持的交互式终端重试。"
+  }
+}

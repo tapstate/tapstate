@@ -2,17 +2,25 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.ConnectionTestReport;
+import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.SourceDraft;
 import io.tapstate.control.core.SourceTableView;
 import io.tapstate.control.core.SourceView;
 import io.tapstate.control.core.TokenAdminService;
 import io.tapstate.control.core.TokenService;
+import io.tapstate.control.core.ViewCatalogItem;
 import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import tools.jackson.databind.DeserializationFeature;
+
+import java.util.List;
+import java.util.Map;
 
 /**
  * The public assembly entry point for the whole HTTP control face: the path-prefix configuration, Spring
@@ -33,21 +41,36 @@ import tools.jackson.databind.DeserializationFeature;
  * by a product whose client, handler and tests all work.
  */
 @Configuration
-@Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ArtifactController.class, ConnectionController.class,
-        ConnectorController.class, DataBrowserController.class, DataBrowserStreamConfiguration.class,
+@Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ArtifactController.class, AlertController.class, ConnectionController.class,
+        ConnectorController.class, ConnectorCenterController.class, DataBrowserController.class, DataBrowserStreamConfiguration.class,
         PipelineController.class, PipelineObservationController.class, PipelineObservabilityController.class,
         PipelineLogsController.class,
         PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
-        VersionController.class, AuthController.class, IssuerDiscoveryController.class, TokenController.class,
+        VersionController.class, PdkVersionController.class, BrowserAuthController.class, AuthController.class, CloudAuthController.class, CurrentUserController.class,
+        ClusterContextController.class,
+        IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
+        ViewController.class,
+        SampleSourceController.class, SampleInstallJobController.class,
+        StateStoreController.class, StorageControlController.class,
         ConnectorIconController.class,
         PipelineViewController.class,
+        PipelineDeletionController.class,
         PipelineLayoutController.class,
+        PipelineDraftController.class,
+        AiProviderController.class, PipelineAssistantController.class, RetrySettingsController.class,
+        PipelinePreviewController.class, ValidationConfigurationController.class, ValidationReportController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
+        AggregateStepController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
+
+    @Bean
+    CurrentUserQueryService currentUserQueryService(ObjectProvider<AuthenticationMode> modes) {
+        return new CurrentUserQueryService(modes.getIfAvailable(() -> AuthenticationMode.ON_PREM));
+    }
 
     @Bean
     TokenAdminService tokenAdminService(TokenService tokens, AuditGate auditGate) {
@@ -58,13 +81,32 @@ public class ControlHttpFace {
     JsonMapperBuilderCustomizer sourceJsonContract() {
         return builder -> builder
                 .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-                .addMixIn(SourceView.class, NonNullSourceJson.class)
+                .addMixIn(SourceView.class, SourceScopeJson.class)
                 .addMixIn(SourceTableView.class, NonNullSourceJson.class)
-                .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class);
+                .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class)
+                .addMixIn(ConnectionTestReport.Check.class, ConnectionTestCheckJson.class)
+                .addMixIn(ViewCatalogItem.Freshness.class, ViewFreshnessJson.class);
+    }
+
+    private abstract static class ViewFreshnessJson {
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        abstract String aggregation();
+    }
+
+    private abstract static class ConnectionTestCheckJson {
+        @JsonInclude(JsonInclude.Include.NON_EMPTY)
+        abstract Map<String, Object> diagnostic();
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private abstract static class NonNullSourceJson {
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private abstract static class SourceScopeJson {
+        // Null leaves the connection scope open; an empty list explicitly selects no tables.
+        @JsonInclude(JsonInclude.Include.ALWAYS)
+        abstract List<SourceTableView> tables();
     }
 
 }

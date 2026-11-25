@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
@@ -20,7 +21,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -145,6 +148,13 @@ public final class CdcPhase {
             CaptureStart start,
             Map<String, TableRoute> routes,
             CaptureHealth health) {
+        return run(port, config, start, routes, health, CaptureObservation.none());
+    }
+
+    /** Installs an optional observer on this physical opening without changing the source port. */
+    public static Subscription run(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start");
@@ -154,8 +164,9 @@ public final class CdcPhase {
         // The last position actually persisted, for the life of this subscription. It is what lets a run
         // that resolves the same frontier as the one before it write nothing: see writeBatch.
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)));
+        return observation.start(health.recording(
+                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)),
+                listener -> port.cdc(config, start, listener));
     }
 
     /**
@@ -179,6 +190,44 @@ public final class CdcPhase {
             Objects.requireNonNull(consumers, "consumers");
             Objects.requireNonNull(trimThrough, "trimThrough");
         }
+    }
+
+    /**
+     * One physical capture whose rings write through to recoverable SRS before admitting a change.
+     * Its database checkpoint belongs to the complete source batch, independent of table confirmations.
+     */
+    public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder) {
+        return runDurable(port, config, start, routes, health, batchOrder, CaptureObservation.none());
+    }
+
+    /** The observer sits outside health recording, so source errors reach both components. */
+    public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder, CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
+        Map<String, TableRoute> selected = Map.copyOf(routes);
+        List<String> servedTables = List.copyOf(selected.keySet());
+        CdcChain physical = selected.values().iterator().next().chain();
+        AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
+        return observation.start(health.recording(new CaptureStartedListener() {
+            @Override
+            public void onStart(SourcePosition position) {
+                if (physical.meta().read(physical.miningChainId()).orElseThrow().sourceRead() == null) {
+                    physical.meta().advanceCaptureCheckpoint(physical.miningChainId(),
+                            new ChainPosition(SourceOrder.snapshotRow(physical.epoch()), position.token()),
+                            servedTables);
+                }
+            }
+
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                writeBatch(events, position, selected::get, lastWritten, true);
+                position.ifPresent(token -> physical.meta().advanceCaptureCheckpoint(
+                        physical.miningChainId(), new ChainPosition(
+                                new SourceOrder(physical.epoch(), batchOrder.incrementAndGet()), token.token()),
+                        servedTables));
+            }
+        }), listener -> port.cdc(config, start, listener));
     }
 
     /**
@@ -216,6 +265,11 @@ public final class CdcPhase {
             Optional<SourcePosition> position,
             Function<String, TableRoute> routes,
             AtomicReference<ChainPosition> lastWritten) {
+        writeBatch(events, position, routes, lastWritten, false);
+    }
+
+    private static void writeBatch(List<Envelope> events, Optional<SourcePosition> position,
+            Function<String, TableRoute> routes, AtomicReference<ChainPosition> lastWritten, boolean durable) {
         if (events.isEmpty()) {
             // The source handed over only events that carry no change -- a heartbeat and its like. There is
             // nothing to write, and nothing has been read past, so the offset does not move either.
@@ -236,13 +290,13 @@ public final class CdcPhase {
             SourcePosition pos = i == last ? position.orElse(null) : null;
             byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
                     pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
-                    route.chain().captureFence()));
+                    route.chain().captureFence(), route.chain().epoch()));
         }
         String closingTable = events.get(last).src();
         long closingSeq = -1;
         Collection<ConsumerOffset> closingOffsets = List.of();
         for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
-            Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue());
+            Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue(), durable);
             if (entry.getKey().equals(closingTable)) {
                 closingSeq = admitted.lastSeq();
                 // The cursors the admission read, rather than a second reading of them. They are the same
@@ -250,6 +304,9 @@ public final class CdcPhase {
                 // advance shorter, never further, so the bound it enforces still holds.
                 closingOffsets = admitted.offsets();
             }
+        }
+        if (durable) {
+            return;
         }
         // The run is in the rings; advance the durable read offset to the position that closes it, clamped
         // so it never passes the slowest consumer's sink-acked position -- a change only ever in the
@@ -292,9 +349,18 @@ public final class CdcPhase {
      * whole capture would stop with nothing thrown -- the source asks for a bounded batch, but what a
      * connector hands over is the connector's to decide.
      */
-    private static Admitted admit(TableRoute route, String table, List<SrsItem> items) {
-        SrsWriteGate gate = route.chain().gate();
-        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table), Integer.MAX_VALUE);
+    private static Admitted admit(TableRoute route, String table, List<SrsItem> items, boolean durable) {
+        return admit(route.chain().gate(), route.consumers(), table, items, durable, () -> {});
+    }
+
+    /** Uses the same bounded ring admission path for a native durable capture without legacy metadata. */
+    static long admitDurable(SrsWriteGate gate, String table, List<SrsItem> items, Runnable requireActive) {
+        return admit(gate, List::of, table, items, true, requireActive).lastSeq();
+    }
+
+    private static Admitted admit(SrsWriteGate gate, Supplier<Collection<ConsumerOffset>> consumers,
+                                   String table, List<SrsItem> items, boolean durable, Runnable requireActive) {
+        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table, requireActive), Integer.MAX_VALUE);
         long lastSeq = -1;
         Collection<ConsumerOffset> offsets = List.of();
         for (int from = 0; from < items.size(); from += capacity) {
@@ -304,11 +370,15 @@ public final class CdcPhase {
                 // Re-read on every attempt, not once for the run: this is the only thing that can tell a
                 // parked write that a consumer has moved, so a bound hoisted out of the loop would park
                 // for ever waiting for room it could no longer see being freed.
-                offsets = route.consumers().get();
+                requireActive.run();
+                offsets = consumers.get();
                 OptionalLong appended;
                 try {
-                    appended = gate.appendAll(piece, headroomBound(offsets, table));
+                    requireActive.run();
+                    appended = gate.appendAll(piece, durable ? Long.MAX_VALUE : headroomBound(offsets, table));
+                    requireActive.run();
                 } catch (RingWriteRefusedException refused) {
+                    requireActive.run();
                     // The cluster refused, not the headroom: nothing was written, and what refused clears
                     // itself as the members' verdicts converge. Waiting here is what pauses the source
                     // read, which is the same answer a full ring already gets.
@@ -320,6 +390,9 @@ public final class CdcPhase {
                     break;
                 }
                 LockSupport.parkNanos(BACKPRESSURE_PARK_NANOS);
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new CancellationException("the cdc write was interrupted while it waited for headroom");
+                }
             }
         }
         return new Admitted(lastSeq, offsets);
@@ -332,11 +405,14 @@ public final class CdcPhase {
      * capture on precisely the refusal the wait exists to absorb -- and would do so before a single change
      * had been offered, which is the moment just after a cluster forms.
      */
-    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table) {
+    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table, Runnable requireActive) {
         OptionalLong refusedUntil = OptionalLong.empty();
         while (true) {
+            requireActive.run();
             try {
-                return gate.capacity();
+                long capacity = gate.capacity();
+                requireActive.run();
+                return capacity;
             } catch (RingWriteRefusedException refused) {
                 refusedUntil = OptionalLong.of(waitOutTheRefusal(refused, refusedUntil, table));
             }

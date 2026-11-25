@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.MapConfig;
+import com.hazelcast.config.MapStoreConfig;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
@@ -14,13 +15,17 @@ import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.SharedSinkConnectors;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
+import io.tapstate.runtime.engine.FiniteEnvelopeSourceProcessor;
 import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
+import io.tapstate.runtime.engine.join.JoinUpdate;
+import io.tapstate.runtime.engine.join.JoinUpdateSerializer;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -33,6 +38,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -47,8 +53,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -69,6 +75,11 @@ import java.util.regex.Pattern;
 @EnableConfigurationProperties({HazelcastProperties.class, ControlEndpointProperties.class})
 @Import(ClusterMembershipConfiguration.class)
 class HazelcastConfiguration {
+    private ObjectProvider<MemberStorage> nativeStorage;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    void memberStorage(ObjectProvider<MemberStorage> providers) { nativeStorage = providers; }
+
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
 
@@ -77,6 +88,8 @@ class HazelcastConfiguration {
      * its lease began, and so where a lease this member cannot renew is timed from.
      */
     static final String NODE_SESSION_ASKED_AT_CONTEXT_KEY = "tapstate.cluster.node-session.asked-at";
+
+    static final String NODE_SESSION_LEASE_CONTEXT_KEY = "tapstate.cluster.node-session.lease";
     private static final Logger LOG = LoggerFactory.getLogger(HazelcastConfiguration.class);
 
     /** A single port, or an inclusive range, in the form the library itself accepts. */
@@ -98,144 +111,236 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ClusterMembershipGate membershipGate) {
-        ClusterMemberPreflight.Identity identity =
-                ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
-        warnAboutClusterProfile(clusterProperties);
-        WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
-        long sessionAskedAt = System.nanoTime();
-        if (identity != null) {
-            identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
-                    clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
-        }
-        Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
-        if (identity != null) {
-            identify(config, identity);
-            configureClusterProtection(config, membershipGate);
-        }
-        HazelcastInstance member;
-        try {
-            member = startMember(() -> Hazelcast.newHazelcastInstance(config));
-        } catch (RuntimeException startupFailure) {
-            if (identity != null && claimStore != null) {
-                claimStore.release(identity.nodeSession());
-            }
-            throw startupFailure;
-        }
-        if (identity != null) {
-            // What the rings and maps of this member will answer when work reaches them. Asked rather
-            // than assumed, because the library caches its answer and recomputes it on its own schedule:
-            // admitting work this member's data plane is still refusing produces a run that reaches
-            // RUNNING and then dies on its first write.
-            membershipGate.observeDataPlane(() -> dataPlaneAdmitsWork(member));
-            member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
-            member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
-            member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
-            member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
-            member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
-            member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
-            member.getUserContext().put(
-                    io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
-                    ClusterMembershipGate.PROTECTION_NAME);
-        }
-        // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
-        // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
-        // pipelines the member carried, and the process's liveness reads it to report the process broken.
-        MemberOutOfMemory.watch(member);
-        // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
-        // Jet source and resolved member-side -- can reach it through the user context and publish durable
-        // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
-        if (srsMetaStore != null) {
-            member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
-        }
-        // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
-        // rings already reach it through their own configuration; this is the same store, reached the way
-        // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
-        // and nothing is cut -- because nothing was written down either.
-        if (srsLogStore != null) {
-            member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
-        }
-        // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
-        // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
-        // provisioner (mongo disabled) binds nothing, and the member is then not sink-capable: a sink open
-        // fails loudly rather than silently dropping writes.
-        if (connectorProvisioner != null) {
-            member.getUserContext().put(
-                    PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
-        }
-        // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
-        // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live
-        // store does not survive the crossing, so the node travels and the store is picked up where the
-        // connector is actually opened. The read side needs no such indirection -- it opens its connector in
-        // the process that holds the store -- which is why only the write side reaches through here. A run
-        // with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes for the life
-        // of the open, exactly as it did before there was anywhere to file them.
-        if (nestStateStore != null) {
-            member.getUserContext().put(
-                    PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY, nestStateStore);
-        }
-        // Bind the snapshot buffer onto the member so a source vertex -- resolved member-side by the ring name
-        // it carries -- can drain this ring's snapshot rows and emit them ahead of the cdc tail. The coordinator
-        // holds the same instance and fills it through the snapshot pass-through. A run with no buffer (mongo
-        // disabled) binds nothing, and a source then emits no snapshot ahead of the tail.
-        if (snapshotBuffer != null) {
-            member.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, snapshotBuffer);
-        }
-        // Bind the layer behind the nest state maps onto the member, so a store named in a map's
-        // configuration -- and built by the substrate on whichever member runs that map -- can reach it.
-        // The configuration carries the name and not the instance because a configuration added once the
-        // member is running is written down and broadcast, and a live store does not survive that. A run
-        // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
-        if (operatorStateStores != null) {
-            NestStateMapStoreFactory.bindTo(member, operatorStateStores);
-        } else if (nestStateStore != null) {
-            NestStateMapStoreFactory.bindTo(member, nestStateStore);
-        }
-        if (nestStateStore != null) {
-            // The same layer, bound again under the join's own key. One key shared between them would
-            // read as tidier and would make "these two are told about different layers" impossible to
-            // say - which is a thing a deployment may one day want to say, and a thing neither of them
-            // could then express without the other noticing.
-            JoinStateMapStoreFactory.bindTo(member, nestStateStore);
-        }
-        if (operatorStateStores != null) {
-            makeNestCapable(member, operatorStateStores, nestSettings);
-        } else {
-            makeNestCapable(member, nestStateStore, nestSettings);
-        }
-        makeJoinCapable(member, nestStateStore);
-        // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
-        // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
-        // reached through a handle that does not survive being written into a graph. A run with no store
-        // (mongo disabled) binds nothing, and a nest vertex then refuses to start rather than running on
-        // with nowhere to put what it cannot assemble -- which is the failure this channel exists to stop.
-        if (operatorStateStores != null) {
-            DurableNestDeadLetter.bindTo(member, operatorStateStores);
-        } else if (nestDeadLetterStore != null) {
-            DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
-        }
-        return member;
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts,
+            ObjectProvider<ClusterMembershipStore> membershipStores) {
+        return hazelcastMember(properties, clusterProperties, controlProperties, srsMetaStore,
+                connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings, nestDeadLetterStore,
+                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims,
+                membershipGate, bootId, storePorts, membershipStores, Hazelcast::newHazelcastInstance);
     }
 
-    /** Renews and releases the claim that was acquired before this member was created. */
+    /** The member factory controls construction without changing the storage or lease protocol. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore,
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts, Function<Config, HazelcastInstance> memberFactory) {
+        return hazelcastMember(properties, clusterProperties, controlProperties, srsMetaStore,
+                connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings, nestDeadLetterStore,
+                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims,
+                membershipGate, bootId, storePorts,
+                new org.springframework.beans.factory.support.StaticListableBeanFactory().getBeanProvider(ClusterMembershipStore.class), memberFactory);
+    }
+
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore,
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts,
+            ObjectProvider<ClusterMembershipStore> membershipStores, Function<Config, HazelcastInstance> memberFactory) {
+        ClusterMemberPreflight.Identity identity = ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
+        warnAboutClusterProfile(clusterProperties);
+        WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
+        ClusterIdentityStore identityStore = clusterIdentities.getIfAvailable();
+        if (identity == null && clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
+                && (identityStore != null || claimStore != null)) {
+            identity = ClusterMemberPreflight.singleIdentity(clusterProperties, identityStore, membershipStores.getIfAvailable());
+        }
+        long sessionAskedAt = System.nanoTime();
+        NodeSessionStartup startup = null;
+        if (identity != null) {
+            try {
+                identity = clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
+                        ? ClusterMemberPreflight.reserveExisting(identity, clusterProperties, identityStore, claimStore, bootId.value())
+                        : ClusterMemberPreflight.reserve(identity, clusterProperties, identityStore, claimStore, bootId.value());
+                if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) membershipGate.bindSingle(identity.nodeSession());
+                startup = new NodeSessionStartup(claimStore, identity.nodeSession(), sessionAskedAt,
+                        clusterProperties.getNodeSessionTtl(), clusterProperties.getNodeSessionRenewInterval());
+            } catch (RuntimeException | Error failure) {
+                if (identity.nodeSession() != null && claimStore != null) {
+                    try { claimStore.release(identity.nodeSession()); }
+                    catch (RuntimeException | Error cleanup) {
+                        if (cleanup instanceof Error fatal && !(failure instanceof Error)) { fatal.addSuppressed(failure); throw fatal; }
+                        if (cleanup != failure) failure.addSuppressed(cleanup);
+                    }
+                }
+                throw failure;
+            }
+        }
+        HazelcastInstance member;
+        var candidate = new java.util.concurrent.atomic.AtomicReference<HazelcastInstance>();
+        try {
+            Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
+            if (identity != null) {
+                identify(config, identity);
+                membershipGate.observeNodeSession(startup::isCurrent);
+                configureClusterProtection(config, membershipGate, clusterProperties.getProfile() != ClusterProperties.Profile.SINGLE);
+                config.addListenerConfig(new com.hazelcast.config.ListenerConfig(startup));
+                startup.requireCurrent();
+            } else {
+                identifyConfiguredSingleMember(config, clusterProperties, controlProperties, bootId);
+            }
+            MemberStorage storage = nativeStorage == null ? null : nativeStorage.getIfAvailable();
+            if (storage != null) {
+                if (identity == null) throw ThreeLayerStorePort.refused();
+                storage.prepare(config, identity.nodeSession(), sessionAskedAt, startup.lease());
+            }
+            member = startMember(() -> memberFactory.apply(config));
+            candidate.set(member);
+            if (startup != null) {
+                startup.handOff(member);
+                member.getUserContext().put(NODE_SESSION_LEASE_CONTEXT_KEY, startup.lease());
+            }
+            if (storage != null) storage.joined(member);
+            if (identity != null) {
+                // What the rings and maps of this member will answer when work reaches them. Asked rather
+                // than assumed, because the library caches its answer and recomputes it on its own schedule:
+                // admitting work this member's data plane is still refusing produces a run that reaches
+                // RUNNING and then dies on its first write.
+                membershipGate.observeDataPlane(() -> dataPlaneAdmitsWork(member));
+                member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
+                member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
+                member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
+                if (identity.controlUrl() != null) member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
+                member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
+                member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
+                member.getUserContext().put(
+                        io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
+                        ClusterMembershipGate.PROTECTION_NAME);
+                // What a member leaves open at the store when it goes is ended by the members left, as soon as they
+                // see it go, rather than by the store once it gives up on it. See DepartedMemberTransactions.
+                StorePort store = storePorts.getIfAvailable();
+                if (store != null) {
+                    endWhatDepartedMembersLeaveOpen(member, store);
+                }
+            }
+            // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
+            // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
+            // pipelines the member carried, and the process's liveness reads it to report the process broken.
+            MemberOutOfMemory.watch(member);
+            // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
+            // Jet source and resolved member-side -- can reach it through the user context and publish durable
+            // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
+            if (srsMetaStore != null) {
+                member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, srsMetaStore);
+            }
+            // Bind the change log too, so the capture runtime can cut it back at the durable frontier. The
+            // rings already reach it through their own configuration; this is the same store, reached the way
+            // everything else the runtime resolves member-side is reached. A run with no store binds nothing,
+            // and nothing is cut -- because nothing was written down either.
+            if (srsLogStore != null) {
+                member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, srsLogStore);
+            }
+            // Bind the connector provisioner onto the member so a sink-writer factory -- carried onto the Jet
+            // sink vertex and resolved member-side -- can reach it and open its target connector. A run with no
+            // provisioner (mongo disabled) binds nothing, and the member is then not sink-capable: a sink open
+            // fails loudly rather than silently dropping writes.
+            if (connectorProvisioner != null) {
+                member.getUserContext().put(
+                        PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY, connectorProvisioner);
+                // One table of shared sink connectors per member. Only an artifact certified to serve several writers
+                // at once ever enters it; every other artifact runs a connector per writer, as it always has.
+                member.getUserContext().put(
+                        PdkSinkWriterFactory.SHARED_SINK_CONNECTORS_USER_CONTEXT_KEY, new SharedSinkConnectors());
+            }
+            // Bind the layer a connector's own notes are kept in onto the member, for the same reason the
+            // provisioner is: the sink-writer factory crosses to whichever member runs the sink vertex and a live
+            // store does not survive the crossing, so the node travels and the store is picked up where the
+            // connector is actually opened. The read side needs no such indirection -- it opens its connector in
+            // the process that holds the store -- which is why only the write side reaches through here. A run
+            // with no store (mongo disabled) binds nothing, and a sink connector then keeps its notes for the life
+            // of the open, exactly as it did before there was anywhere to file them.
+            if (nestStateStore != null) {
+                member.getUserContext().put(
+                        PdkSinkWriterFactory.CONNECTOR_STATE_STORE_USER_CONTEXT_KEY, nestStateStore);
+            }
+            // Bind the snapshot buffer onto the member so a source vertex -- resolved member-side by the ring name
+            // it carries -- can drain this ring's snapshot rows and emit them ahead of the cdc tail. The coordinator
+            // holds the same instance and fills it through the snapshot pass-through. A run with no buffer (mongo
+            // disabled) binds nothing, and a source then emits no snapshot ahead of the tail.
+            if (snapshotBuffer != null) {
+                member.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, snapshotBuffer);
+            }
+            // Bind the layer behind the nest state maps onto the member, so a store named in a map's
+            // configuration -- and built by the substrate on whichever member runs that map -- can reach it.
+            // The configuration carries the name and not the instance because a configuration added once the
+            // member is running is written down and broadcast, and a live store does not survive that. A run
+            // with no store (mongo disabled) binds nothing, and its maps declare no store to resolve.
+            if (operatorStateStores != null) {
+                NestStateMapStoreFactory.bindTo(member, operatorStateStores);
+            } else if (nestStateStore != null) {
+                NestStateMapStoreFactory.bindTo(member, nestStateStore);
+            }
+            if (nestStateStore != null) {
+                // The same layer, bound again under the join's own key. One key shared between them would
+                // read as tidier and would make "these two are told about different layers" impossible to
+                // say - which is a thing a deployment may one day want to say, and a thing neither of them
+                // could then express without the other noticing.
+                JoinStateMapStoreFactory.bindTo(member, nestStateStore);
+            }
+            if (operatorStateStores != null) {
+                makeNestCapable(member, operatorStateStores, nestSettings);
+            } else {
+                makeNestCapable(member, nestStateStore, nestSettings);
+            }
+            makeJoinCapable(member, nestStateStore);
+            // Bind the channel behind the nest dead letters onto the member for the same reason: the channel is
+            // carried onto the vertex and resolved member-side, because somewhere durable to put a row is
+            // reached through a handle that does not survive being written into a graph. A run with no store
+            // (mongo disabled) binds nothing, and a nest vertex then refuses to start rather than running on
+            // with nowhere to put what it cannot assemble -- which is the failure this channel exists to stop.
+            if (operatorStateStores != null) {
+                DurableNestDeadLetter.bindTo(member, operatorStateStores);
+            } else if (nestDeadLetterStore != null) {
+                DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
+            }
+            return member;
+        } catch (RuntimeException | Error failure) {
+            if (startup != null) {
+                try { startup.abort(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (cleanup instanceof Error fatal && !(failure instanceof Error)) { fatal.addSuppressed(failure); throw fatal; }
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+            }
+            if (candidate.get() != null && candidate.get().getLifecycleService().isRunning()) {
+                try { candidate.get().shutdown(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (cleanup instanceof Error fatal && !(failure instanceof Error)) { fatal.addSuppressed(failure); throw fatal; }
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    /**
+     * Has what the members {@code member} sees leave the cluster left open at {@code store} ended as soon as it sees
+     * them go.
+     */
+    static void endWhatDepartedMembersLeaveOpen(HazelcastInstance member, StorePort store) {
+        member.getCluster().addMembershipListener(new DepartedMemberTransactions(store));
+    }
+
+    /** Destroys the same lease that kept the reserved identity live during member creation. */
     @Bean(destroyMethod = "close")
-    NodeSessionLease nodeSessionLease(
-            HazelcastInstance member,
-            ClusterProperties clusterProperties,
-            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+    NodeSessionLease nodeSessionLease(HazelcastInstance member) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
             return NodeSessionLease.inactive();
         }
-        WorkloadClaimStore store = workloadClaims.getIfAvailable();
-        if (store == null) {
-            throw new IllegalStateException("cluster member started without its workload-claim store");
+        if (!(member.getUserContext().get(NODE_SESSION_LEASE_CONTEXT_KEY) instanceof NodeSessionLease lease)) {
+            throw new IllegalStateException("cluster member started without its pre-start node-session lease");
         }
-        if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
-            throw new IllegalStateException("cluster member started without the time its node session was asked for");
-        }
-        return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+        return lease;
     }
 
     /** Keeps the local gate aligned with the majority-committed ACTIVE node set. */
@@ -264,7 +369,23 @@ class HazelcastConfiguration {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
                 nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
-                new ClusterMembershipGate(new ClusterProperties()));
+                new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider(), emptyProvider());
+    }
+
+    /** Direct member-admission seam for focused configuration and claim cleanup tests. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore,
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ClusterMembershipGate membershipGate) {
+        return hazelcastMember(properties, clusterProperties, controlProperties, srsMetaStore,
+                connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings, nestDeadLetterStore,
+                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims,
+                membershipGate, BootId.fresh(), emptyProvider(), emptyProvider());
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {
@@ -367,6 +488,23 @@ class HazelcastConfiguration {
                 member, JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY)));
     }
 
+    /** Publishes an explicitly configured single member without enabling distributed coordination. */
+    static void identifyConfiguredSingleMember(Config config, ClusterProperties cluster,
+            ControlEndpointProperties control, BootId bootId) {
+        if (!hasText(cluster.getNodeId())) {
+            return;
+        }
+        ClusterMemberPreflight.clusterId(cluster.getId());
+        config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, cluster.getNodeId().trim())
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, bootId.value());
+        if (hasText(control.getAdvertiseUrl())) {
+            java.net.URI url = ClusterMemberPreflight.controlUrl(control.getAdvertiseUrl(), false);
+            config.getMemberAttributeConfig().setAttribute(
+                    ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, url.toString());
+        }
+    }
+
     /**
      * Writes this node's Tapstate identity onto the member before it joins, as member attributes.
      *
@@ -380,10 +518,9 @@ class HazelcastConfiguration {
         config.setClusterName(identity.clusterId());
         config.getMemberAttributeConfig()
                 .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, identity.nodeId())
-                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,
-                        identity.nodeSession().owner().bootId())
-                .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE,
-                        identity.controlUrl().toString());
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, identity.nodeSession().owner().bootId());
+        if (identity.controlUrl() != null) config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, identity.controlUrl().toString());
         return config;
     }
 
@@ -497,6 +634,14 @@ class HazelcastConfiguration {
             }
         }
         config.getJetConfig().setEnabled(true);
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationOwnerRouter.EXECUTOR)
+                .setPoolSize(4).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationPipelineInitials.EXECUTOR)
+                .setPoolSize(4).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationPipelineInitials.LOOKUP_EXECUTOR)
+                .setPoolSize(2).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(NativeValidationCaptureRoutes.EXECUTOR)
+                .setPoolSize(2).setQueueCapacity(32).setStatisticsEnabled(true));
         Integer cooperativeThreads = properties.getJet().getCooperativeThreadCount();
         if (cooperativeThreads != null) {
             config.getJetConfig().setCooperativeThreadCount(cooperativeThreads);
@@ -517,6 +662,18 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(Envelope.class)
                 .setImplementation(new EnvelopeSerializer()));
+        // And what a join hands its projection, which carries a change inside it and would otherwise fall
+        // back to Java's serialization - which cannot write the change, on the first update routed to
+        // another member.
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(JoinUpdate.class)
+                .setImplementation(new JoinUpdateSerializer()));
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(PreviewSampleCache.Entry.class)
+                .setImplementation(new PreviewSampleCache.EntrySerializer()));
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(FiniteEnvelopeSourceProcessor.Sample.class)
+                .setImplementation(new FiniteEnvelopeSourceProcessor.SampleSerializer()));
         RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
@@ -539,6 +696,15 @@ class HazelcastConfiguration {
                     .setFactoryImplementation(new SrsLogRingbufferStoreFactory(srsLogStore)));
         }
         config.addRingBufferConfig(rings);
+        // Preview operator namespaces contain an extra dot before their generated id. DSL resource ids
+        // forbid dots, so these patterns cannot match a user's durable Nest or Join state.
+        config.addMapConfig(previewMapConfig("__preview.*", 300));
+        config.addMapConfig(previewSampleMapConfig());
+        config.addMapConfig(previewMapConfig(
+                PreviewSampleCache.INDEX_MAP_NAME, (int) PreviewSampleCache.INDEX_TTL.toSeconds())
+                .setMaxIdleSeconds(0));
+        config.addMapConfig(previewMapConfig("nest..preview_*", 300));
+        config.addMapConfig(previewMapConfig("join..preview_*", 300));
         // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
         // once the member is running, by makeNestCapable. A pattern placed in this static configuration
         // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
@@ -549,6 +715,21 @@ class HazelcastConfiguration {
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
         return config;
+    }
+
+    private static MapConfig previewMapConfig(String pattern, int ttlSeconds) {
+        return new MapConfig(pattern)
+                .setBackupCount(0)
+                .setAsyncBackupCount(0)
+                .setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setTimeToLiveSeconds(ttlSeconds)
+                .setMaxIdleSeconds(ttlSeconds)
+                .setMapStoreConfig(new MapStoreConfig().setEnabled(false));
+    }
+
+    private static MapConfig previewSampleMapConfig() {
+        return previewMapConfig(PreviewSampleCache.MAP_NAME, (int) PreviewSampleCache.TTL.toSeconds())
+                .setInMemoryFormat(InMemoryFormat.BINARY);
     }
 
     /**
@@ -564,6 +745,7 @@ class HazelcastConfiguration {
      */
     private static boolean dataPlaneAdmitsWork(HazelcastInstance member) {
         try {
+            if (!member.getLifecycleService().isRunning()) return false;
             return member.getSplitBrainProtectionService()
                     .getSplitBrainProtection(ClusterMembershipGate.PROTECTION_NAME)
                     .hasMinimumSize();
@@ -572,13 +754,15 @@ class HazelcastConfiguration {
         }
     }
 
-    static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
+    static void configureClusterProtection(Config config, ClusterMembershipGate gate) { configureClusterProtection(config, gate, true); }
+
+    private static void configureClusterProtection(Config config, ClusterMembershipGate gate, boolean replicated) {
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(
                 ClusterMembershipGate.PROTECTION_NAME, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
                 .setFunctionImplementation(gate));
         config.getRingbufferConfigs().values().forEach(ring -> {
-            ring.setBackupCount(Math.max(1, ring.getBackupCount()));
+            if (replicated) ring.setBackupCount(Math.max(1, ring.getBackupCount()));
             ring.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME);
         });
         config.getMapConfigs().values().forEach(map ->

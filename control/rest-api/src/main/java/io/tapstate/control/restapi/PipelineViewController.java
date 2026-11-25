@@ -1,7 +1,11 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.PipelineCatalogItem;
+import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineView;
 import io.tapstate.control.core.PipelineViewService;
+import io.tapstate.messages.MessageCatalog;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -10,22 +14,38 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Objects;
 
-/** Structured JSON projection of Pipeline artifacts and their current observation state. */
+/** Unified Pipeline catalog for lists, plus the artifact-backed editor projection by id. */
 @RestController
 class PipelineViewController {
 
+    private final PipelineCatalogService catalog;
     private final PipelineViewService pipelines;
+    private final MessageCatalog messages;
 
-    PipelineViewController(PipelineViewService pipelines) {
+    PipelineViewController(PipelineCatalogService catalog, PipelineViewService pipelines, MessageCatalog messages) {
+        this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.pipelines = Objects.requireNonNull(pipelines, "pipelines");
+        this.messages = Objects.requireNonNull(messages, "messages");
     }
 
-    @Verb("pipeline.list")
+    @Verb("pipeline.catalog")
     @GetMapping("/pipelines")
     PipelineList list(
             @RequestParam(name = "limit", required = false) Integer limit,
+            @RequestParam(name = "offset", required = false) Integer offset,
+            HttpServletRequest request) {
+        ListWindow.Window window = ListWindow.window(limit, offset);
+        return PipelineList.of(catalog.list(window.offset(), window.limit()), messages,
+                ApiExceptionHandler.localeFor(request));
+    }
+
+    @Verb("pipeline.list")
+    @GetMapping("/pipelines:artifacts")
+    PipelineArtifactList listArtifacts(
+            @RequestParam(name = "limit", required = false) Integer limit,
             @RequestParam(name = "offset", required = false) Integer offset) {
-        return new PipelineList(ListWindow.page(pipelines.list(), limit, offset));
+        ListWindow.Window window = ListWindow.window(limit, offset);
+        return new PipelineArtifactList(pipelines.list(window.offset(), window.limit()));
     }
 
     @Verb("pipeline.get")

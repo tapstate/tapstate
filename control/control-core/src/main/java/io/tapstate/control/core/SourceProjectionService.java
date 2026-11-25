@@ -32,22 +32,36 @@ public final class SourceProjectionService {
 
     /** Lists stored Sources in stable id order. */
     public List<SourceView> list() {
-        return artifacts.listResources().stream()
+        var inventory = artifacts.resourceInventory("source");
+        var managed = inventory.managedDefaultSourceId();
+        var renderer = inventory.connectorCatalog().map(representation::withCatalog).orElse(representation);
+        return inventory.resources().stream()
                 .filter(stored -> stored.resource() instanceof SourceResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
-                .map(this::view)
+                .map(stored -> view(stored, managed, renderer))
                 .toList();
     }
 
     /** Returns a Source typed view or the stable Source not-found diagnostic. */
     public SourceView get(String id) {
         Objects.requireNonNull(id, "id");
-        return view(requireSource(id));
+        var inventory = artifacts.resourceInventory("source", id);
+        var stored = inventory.resources().stream().findFirst()
+                .orElseThrow(() -> error(SourceError.NOT_FOUND, Map.of("id", id)));
+        var managed = inventory.managedDefaultSourceId();
+        var metadata = stored.resource().metadata();
+        if (managed.isEmpty() && metadata != null && metadata.labels().containsKey("store")) {
+            managed = artifacts.managedDefaultSourceId();
+        }
+        return view(stored, managed,
+                inventory.connectorCatalog().map(representation::withCatalog).orElse(representation));
     }
 
     /** Maps structured input, plans the full artifact workspace, then creates the Source conditionally. */
     public SourceView create(String principal, SourceInput input) {
         Objects.requireNonNull(input, "input");
+        refuseManaged(input.id());
+        refuseStoreMarker(input.metadata());
         SourceResource source = representation.toModel(input, null);
         ArtifactWriteResult result = apply.create(principal, source, ControlOperations.SOURCE_CREATE);
         throwForWriteRefusal(source.id(), result.write());
@@ -59,8 +73,12 @@ public final class SourceProjectionService {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(input, "input");
         requireMatchingId(id, input.id());
+        refuseManaged(input.id());
+        refuseStoreMarker(input.metadata());
         requirePrecondition(id, expectedContentHash);
-        SourceResource replacement = representation.toModel(input, source(requireSource(id).resource()));
+        SourceResource previous = source(requireSource(id).resource());
+        refuseStoreMarker(previous.metadata());
+        SourceResource replacement = representation.toModel(input, previous);
         ArtifactWriteResult result = apply.replace(
                 principal, replacement, expectedContentHash, ControlOperations.SOURCE_UPDATE);
         throwForWriteRefusal(id, result.write());
@@ -71,7 +89,8 @@ public final class SourceProjectionService {
     public void delete(String principal, String id, String expectedContentHash) {
         Objects.requireNonNull(id, "id");
         requirePrecondition(id, expectedContentHash);
-        requireSource(id);
+        refuseManaged(id);
+        refuseStoreMarker(source(requireSource(id).resource()).metadata());
         try {
             mutations.delete(principal, id, expectedContentHash);
         } catch (TapstateException error) {
@@ -85,8 +104,28 @@ public final class SourceProjectionService {
                 .orElseThrow(() -> error(SourceError.NOT_FOUND, Map.of("id", id)));
     }
 
-    private SourceView view(StoredResource stored) {
-        return representation.toView(source(stored.resource()), stored.contentHash());
+    private void refuseManaged(String id) {
+        if (artifacts.managedDefaultSourceId().filter(id::equals).isPresent())
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the managed default target cannot be changed through authoring"), null);
+    }
+    private SourceView view(StoredResource stored, java.util.Optional<String> managed) {
+        return view(stored, managed, representation);
+    }
+
+    private SourceView view(StoredResource stored, java.util.Optional<String> managed, SourceRepresentation renderer) {
+        var resource = source(stored.resource());
+        if (managed.isPresent()) {
+            var metadata = resource.metadata();
+            var labels = new java.util.LinkedHashMap<String,String>(metadata == null ? Map.of() : metadata.labels());
+            labels.remove("store");
+            if (managed.orElseThrow().equals(resource.id())) labels.put("store", "true");
+            var display = new io.tapstate.core.model.Metadata(labels, metadata == null ? null : metadata.description(),
+                    metadata == null ? null : metadata.cloud(), metadata == null ? null : metadata.userId());
+            resource = new SourceResource(resource.id(), display, resource.connector(), resource.config(), resource.mode(),
+                    resource.tables(), resource.srs(), resource.execution(), resource.experimental());
+        }
+        return renderer.toView(resource, stored.contentHash());
     }
 
     private static SourceResource source(Resource resource) {
@@ -143,5 +182,12 @@ public final class SourceProjectionService {
 
     private static TapstateException error(SourceError code, Map<String, Object> args) {
         return new TapstateException(code, args, null);
+    }
+
+    private static void refuseStoreMarker(io.tapstate.core.model.Metadata metadata) {
+        if (metadata != null && "true".equals(metadata.labels().get("store"))) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the state store must be configured through its dedicated setup API"), null);
+        }
     }
 }

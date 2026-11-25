@@ -29,6 +29,7 @@
     <module>adapter-mongo-store</module>
     <module>adapter-transform</module>
     <module>adapter-otel</module>
+    <module>adapter-alerting</module>
   </modules>
 
   <dependencyManagement>

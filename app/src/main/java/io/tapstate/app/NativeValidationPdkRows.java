@@ -1,0 +1,476 @@
+package io.tapstate.app;
+
+import io.tapstate.adapters.pdk.ConnectorRef;
+import io.tapstate.adapters.pdk.PdkValidationCounts;
+import io.tapstate.adapters.pdk.PdkValidationReads;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.TableRef;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.validation.*;
+import io.tapstate.runtime.engine.validation.*;
+import io.tapstate.spi.store.ConnectionConfig;
+import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.ValidationReadHandle;
+import io.tapstate.spi.store.ValidationRowCursor;
+import java.time.Clock;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.*;
+
+/** Serial direct-table ordered pairs, checked and published under the original owner. */
+final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
+    private static final System.Logger LOG=System.getLogger(NativeValidationPdkRows.class.getName());
+    private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64L*1024,8192,32);
+    private static final long LOCAL_SORT_ROW_THRESHOLD = 10_000_000;
+    static final long POSTGRES_RESULT_BYTES=PdkValidationReads.POSTGRES_RESULT_BYTES;
+    private static final long METADATA_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
+    private final NativeValidationOwnerReservations.Reservation original;
+    private final Clock clock;
+    private final String nodeId;
+    private ValidationSavedDeclarations saved;
+    private List<ValidationDirectMappings.Declared> declarations;
+    private Map<String,ConnectorRef> artifacts;
+    private final List<ValidationFullScan.Mapping> mappings;
+    private final long sortBytes;
+    private final Set<Read> reads=new HashSet<>();
+    private final AtomicInteger consumers=new AtomicInteger();
+    private final AtomicReference<ValidationLocalBudget.Reservation> working=new AtomicReference<>();
+    private final AtomicReference<ValidationOrderedMerge> active=new AtomicReference<>();
+    private final ValidationFailureLatch failure=new ValidationFailureLatch();
+    // Each latch is atomic. The next mapping replaces it only after all readers have drained.
+    @SuppressWarnings("java:S3077")
+    private volatile ValidationFailureLatch pairFailure = new ValidationFailureLatch();
+    // Publishes read metadata or cleanup handles; atomic close and exit receipts own their lifetime.
+    @SuppressWarnings("java:S3077")
+    private volatile Table current;
+    private volatile boolean closed;
+
+    private record Table(int index,PdkValidationReads.Metadata source,PdkValidationReads.Metadata target,
+                         ValidationTaskSpec.Keys keys){}
+    NativeValidationPdkRows(NativeValidationOwnerReservations.Reservation original,ValidationSavedDeclarations saved,
+            List<ValidationDirectMappings.Declared> declarations,Map<String,ConnectorRef> artifacts,Clock clock){
+        this.original=original;this.saved=saved;this.declarations=declarations;this.artifacts=artifacts;this.clock=clock;
+        nodeId=original.resources().budget().identity().owner().nodeId();
+        var mappings=new ArrayList<ValidationFullScan.Mapping>();
+        for(int index=0;index<declarations.size();index++){
+            int selected=index;var declared=declarations.get(index);requireStaticScope(saved,declared);
+            var keys=declared.mapping().keys();
+            if (!keys.deferred()) requireKeyDomains(keys);
+            mappings.add(ValidationFullScan.Mapping.paired(declared.mapping().mappingId(),guard->open(selected,guard),
+                    (observation,pair,guard)->check(selected,observation,pair,guard)));
+        }
+        this.mappings=List.copyOf(mappings);
+        sortBytes=declarations.stream().anyMatch(declared->declared.mapping().keys().deferred() || portableSort(declared.mapping().keys()))
+                ?2*ValidationSortedRows.WORK_BYTES:0;
+        long pairedBytes=0;
+        for(var declared:declarations){
+            var mapping=declared.mapping();
+            pairedBytes=Math.max(pairedBytes,Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId()),0),rowReadBytes(artifacts.get(mapping.target().sourceId()),0)));
+        }
+        // Admit driver/raw/UTF-16 and metadata windows before discovery. Business map allocation
+        // is admitted from both verified models below, before either business query can start.
+        growPaired(pairedBytes);
+    }
+    private static void requireKeyDomains(ValidationTaskSpec.Keys keys) {
+        for(int component=0;component<keys.source().size();component++){
+            var from=keys.source().get(component);var to=keys.target().get(component);
+            for(var key:List.of(from,to))if(key.domain()==ValidationKey.Kind.TEXT
+                    &&!key.logicalTypes().equals(Set.of("object-id"))&&!key.logicalTypes().equals(Set.of("text")))
+                throw unsupported("keys",String.join(".",key.path()),"key-text-domain-unavailable");
+            if((from.logicalTypes().contains("object-id")||to.logicalTypes().contains("object-id"))
+                    &&(!from.logicalTypes().equals(Set.of("object-id"))||!to.logicalTypes().equals(Set.of("object-id"))
+                        ||from.domain()!=ValidationKey.Kind.TEXT||to.domain()!=ValidationKey.Kind.TEXT))
+                throw unsupported("keys","native-object-id-domain-mismatch");
+        }
+    }
+
+    @Override public List<ValidationFullScan.Mapping> mappings(){return mappings;}
+    @Override public Throwable failure(){return failure.get();}
+
+    private ValidationOrderedMerge open(int index,Runnable guard){
+        consumers.incrementAndGet();ValidationOrderedGroups source=null,target=null;
+        try{
+            require();guard.run();var previous=active.getAndSet(null);if(previous!=null)previous.close();awaitClosed(guard);
+            if(working.get()==null){
+                var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(2L*1024*1024+sortBytes,0,0,0));
+                if(!working.compareAndSet(null,lease))lease.close();
+            }
+            var from=metadata(index,true,guard);var to=metadata(index,false,guard);
+            var mapping=declarations.get(index).mapping();
+            var keys = mapping.keys().deferred() ? resolveKeys(mapping, from.model(), to.model()) : mapping.keys();
+            requireKeyDomains(keys);
+            growPaired(Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId()),from.model().fields().size()),
+                    rowReadBytes(artifacts.get(mapping.target().sourceId()),to.model().fields().size())));
+            require();guard.run();current=new Table(index,from,to,keys);
+            boolean sortSource = portableSort(keys) && shouldSortLocally(count(mapping.source(), true, guard));
+            boolean sortTarget = portableSort(keys) && shouldSortLocally(count(mapping.target(), false, guard));
+            source=groups(index,true,guard,sortSource);target=groups(index,false,guard,sortTarget);
+            var merge=new ValidationOrderedMerge(source,target);active.set(merge);
+            require();guard.run();return merge;
+        }catch(RuntimeException|Error failed){
+            var diagnosis = rememberRead(failed, ValidationTableFailure.Side.PAIR);
+            if(source!=null)try{source.close();}catch(RuntimeException|Error cleanup){record(cleanup);}
+            if(target!=null)try{target.close();}catch(RuntimeException|Error cleanup){record(cleanup);}
+            throwFailure();
+            if (diagnosis instanceof RuntimeException runtime) throw runtime;
+            throw (Error) diagnosis;
+        }finally{consumers.decrementAndGet();releaseWorking();}
+    }
+
+    private PdkValidationReads.Metadata metadata(int index,boolean source,Runnable guard){
+        require();guard.run();awaitClosed(guard);
+        var declared=declarations.get(index);var side=source?declared.mapping().source():declared.mapping().target();
+        var keySelection=declared.mapping().keys();
+        var fields=(source?keySelection.sourcePaths():keySelection.targetPaths()).stream().map(List::getFirst).toList();
+        var read=admit(METADATA_BYTES, side(source));PdkValidationReads.MetadataRead handle=null;
+        try{
+            var resource=resource(side);var connection=connection(side,resource);
+            handle=PdkValidationReads.inspect(connection,artifact(resource),CanonicalHash.of(resource),side.table(),
+                    full()?List.of():fields,keySelection.deferred()?PdkValidationReads.ModelScope.STRUCTURAL:
+                    PdkValidationReads.ModelScope.forSavedVersion(side.modelVersion()),
+                    ()->{require();guard.run();},original.resources().queryExecutor(),
+                    original.resources().decodeExecutor(),ROW);
+            read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),handle.cleanupCompleted());read.opened();
+            require();guard.run();var observed=handle.result();
+            var expected=keySelection.deferred()?null:binding(side);
+            if(expected!=null&&!observed.binding().equals(expected)){
+                // Keep diagnostics bounded to identities/digests; never emit configuration or row values.
+                var resolved=artifact(resource);
+                LOG.log(System.Logger.Level.WARNING,io.tapstate.core.common.JsonWriter.write(Map.ofEntries(
+                        Map.entry("code",ValidationError.INVALID_CONTRACT.code()),Map.entry("event","validation-binding-mismatch"),
+                        Map.entry("mapping",declared.mapping().mappingId()),Map.entry("side",source?"source":"destination"),Map.entry("table",side.table()),
+                        Map.entry("expectedModel",expected.modelVersion()),Map.entry("observedModel",observed.binding().modelVersion()),
+                        Map.entry("expectedCodec",expected.codecBinding()),Map.entry("observedCodec",observed.binding().codecBinding()),
+                        Map.entry("artifact",resolved.contentHash()),Map.entry("configuration",CanonicalHash.of(resource)),
+                        Map.entry("specification",resolved.spec()==null?"absent":CanonicalHash.ofText(resolved.spec())))));
+                throw invalid("savedModelChanged");
+            }
+            if(source)ValidationDirectMappings.requireSourceTable(declared,observed.model());
+            for(var field:observed.model().fields()){
+                if(field.type()==io.tapstate.core.common.TapstateType.UNKNOWN)throw unsupported(side.nodeId(),side.table()+"/"+field.name(),"field-model-unknown");
+                if(PdkValidationReads.boundedPostgresPages(artifact(resource))&&(field.type()==io.tapstate.core.common.TapstateType.ARRAY||field.type()==io.tapstate.core.common.TapstateType.MAP))
+                    throw unsupported(side.nodeId(),side.table()+"/"+field.name(),"native-nested-codec-expansion-unproven");
+            }
+            return observed;
+        }catch(RuntimeException failed){throw tableFailure(failed, side(source));}
+        finally{
+            if(handle==null)read.unopened();
+            try{read.close();}finally{read.opened();}
+        }
+    }
+
+    private OptionalLong count(ValidationTaskSpec.Table table, boolean source, Runnable guard) {
+        require();
+        guard.run();
+        awaitClosed(guard);
+        var resource = resource(table);
+        var connection = new ConnectionConfig(resource.id(), resource.connector(), resource.config());
+        var connector = artifact(resource);
+        var request = new PdkValidationCounts.Request(table.table());
+        var read = admit(METADATA_BYTES, side(source));
+        try {
+            return read.count(new PdkValidationCounts(connection, connector, request, () -> { require(); guard.run(); }));
+        } finally {
+            if (read.closer == null) read.unopened();
+            try { read.close(); } finally { read.opened(); }
+        }
+    }
+
+    static boolean shouldSortLocally(OptionalLong count) {
+        return count.isPresent() && count.getAsLong() < LOCAL_SORT_ROW_THRESHOLD;
+    }
+
+    private ValidationOrderedGroups groups(int index,boolean source,Runnable guard,boolean sortLocally){
+        var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
+        var keys=keyBinding(current.keys(),source);
+        ValidationRowCursor rows=reader(index,source,guard);
+        if(sortLocally)rows=new ValidationSortedRows(rows,row->boundForSide(keys,row,source),ROW,
+                ()->{require();guard.run();},ValidationSortedRows.CHUNK_BYTES);
+        return new ValidationOrderedGroups(UUID.randomUUID().toString(),rows,row->{
+            require();guard.run();
+            var key=boundForSide(keys,row,source);
+            return new ValidationOrderedGroups.Key(key,physical(side,keys,key));
+        },ROW.bytes(),clock);
+    }
+
+    private ValidationReadHandle reader(int index,boolean source,Runnable guard){
+        require();guard.run();awaitClosed(guard);
+        var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
+        var resource=resource(side);var artifact=artifact(resource);
+        var table=current;if(table==null||table.index()!=index)throw invalid("tableSequence");
+        var keys=components(table.keys(),source);
+        var observed=source?table.source():table.target();
+        int nativeFields=observed.model().fields().size();
+        var read=admit(rowReadBytes(artifact,nativeFields), side(source));ValidationReadHandle raw=null;
+        try{
+            var connection=connection(side,resource);
+            var query=original.resources().queryExecutor();var decode=original.resources().decodeExecutor();
+            Runnable active=()->{require();guard.run();};
+            raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),observed.binding(),keys,full(),active,query,decode,2,ROW,
+                    postgres(artifact)?nativeFields:PdkValidationReads.POSTGRES_NATIVE_FIELDS);
+            var handle=raw;read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),PdkValidationReads.cleanupCompleted(handle));read.opened();require();guard.run();
+            return new ValidationReadHandle(){
+                @Override public Optional<Row> next(){
+                    require();guard.run();
+                    try { return handle.next(); }
+                    catch (RuntimeException failed) { throw tableFailure(failed, side(source)); }
+                }
+                @Override public void close(){read.close();}
+                @Override public CompletionStage<Void> workersExited(){return handle.workersExited();}
+                @Override public CompletionStage<Void> rowsReleased(){return handle.rowsReleased();}
+            };
+        }catch(RuntimeException|Error failed){
+            if(raw==null)read.unopened();try{read.close();}catch(RuntimeException|Error cleanup){record(cleanup);}
+            throwFailure();
+            if (failed instanceof RuntimeException runtime) throw tableFailure(runtime, side(source));
+            throw (Error) failed;
+        }finally{read.opened();}
+    }
+
+    private ValidationRootCheck check(int index,ValidationObservation observation,ValidationOrderedMerge.Pair ordered,Runnable guard){
+        consumers.incrementAndGet();
+        try{
+            require();guard.run();var table=current;if(table==null||table.index()!=index)throw invalid("tableSequence");
+            var mapping=declarations.get(index).mapping();
+            var generated=ValidationFieldCheck.generatedId(observation.run(),mapping.mappingId(),mapping.outputId(),
+                    artifacts.get(mapping.target().sourceId()).className().equals("io.tapdata.mongodb.MongodbConnector"),
+                    table.source().model().fields().stream().anyMatch(field->field.name().equals("_id")),
+                    java.util.stream.Stream.concat(table.keys().source().stream(),table.keys().target().stream())
+                            .anyMatch(component->component.path().getFirst().equals("_id")),
+                    value->value instanceof ValidationValues.Typed typed&&typed.logicalType().equals("object-id")&&typed.value() instanceof String);
+            return ValidationRootReader.readOrderedDirect(observation,original.spec().method(),ordered,
+                    new ValidationRootCheck.Limits(256L*1024,256,256,8,2),()->{require();guard.run();},(pair,result)->{
+                        if(full())ValidationFieldCheck.check(observation,List.of(),pair.source().working(),pair.target().working(),
+                                pair.sourceSample(),pair.targetSample(),generated,String::equals,
+                                new ValidationValueComparison.TraversalLimits(ROW,100000),result);
+                    });
+        }catch(RuntimeException failed){throw tableFailure(failed, ValidationTableFailure.Side.PAIR);}
+        finally{consumers.decrementAndGet();releaseWorking();}
+    }
+
+    private void growPaired(long pairedBytes){
+        var envelope=original.resources().budget().envelope();long needed=Math.addExact(16L*1024*1024+sortBytes,pairedBytes);
+        if(needed>envelope.bytes())original.resources().growTo(new ValidationLocalBudget.Amount(needed,envelope.workers(),envelope.connections(),envelope.reads()),1);
+    }
+    static long rowReadBytes(ConnectorRef artifact){return rowReadBytes(artifact,PdkValidationReads.POSTGRES_NATIVE_FIELDS);}
+    static long rowReadBytes(ConnectorRef artifact,int nativeFields){
+        Objects.requireNonNull(artifact);
+        if(nativeFields<0||nativeFields>PdkValidationReads.POSTGRES_NATIVE_FIELDS)throw new IllegalArgumentException("invalid native field bound");
+        // Native pages bound map cardinality even before decoding rejects an oversized row. The
+        // driver caps each query's raw payload; charge its UTF-16 expansion separately. Map entries
+        // include field/key/scalar overhead for the admitted model, independently of row validity.
+        long mapBytes=Math.multiplyExact((long)PdkValidationReads.POSTGRES_PAGE_ROWS,Math.multiplyExact((long)nativeFields,256L));
+        long nativeBytes=postgres(artifact)?Math.addExact(Math.multiplyExact(3L,POSTGRES_RESULT_BYTES),mapBytes):0L;
+        return Math.addExact(METADATA_BYTES,nativeBytes);
+    }
+    private static boolean postgres(ConnectorRef artifact){return PdkValidationReads.boundedPostgresPages(artifact);}
+    static ConnectionConfig rowConnection(SourceResource resource,ConnectorRef artifact){
+        return PdkValidationReads.boundedConnection(new ConnectionConfig(resource.id(),resource.connector(),resource.config()),artifact);
+    }
+
+    private Read admit(long bytes){ return admit(bytes, null); }
+    private Read admit(long bytes, ValidationTableFailure.Side side){
+        var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(bytes,2,1,1));
+        var read=new Read(lease, side);
+        synchronized(reads){reads.add(read);}
+        return read;
+    }
+    private final class Read {
+        private final ValidationLocalBudget.Reservation lease;
+        private final AtomicInteger settled=new AtomicInteger();
+        private final AtomicBoolean closing=new AtomicBoolean(),released=new AtomicBoolean();
+        // Publishes read metadata or cleanup handles; atomic close and exit receipts own their lifetime.
+        @SuppressWarnings("java:S3077")
+        private volatile Runnable closer;
+        private volatile boolean requested;
+        private final ValidationTableFailure.Side side;
+        Read(ValidationLocalBudget.Reservation lease, ValidationTableFailure.Side side){this.lease=lease;this.side=side;}
+        void attach(Runnable closer,CompletionStage<Void> workers,CompletionStage<Void> rows,CompletionStage<Void> cleanup){
+            this.closer=closer;
+            workers.whenComplete((ignored,error)->{stage(error);signal(1);});
+            rows.whenComplete((ignored,error)->{stage(error);signal(2);});
+            cleanup.whenComplete((ignored,error)->{if(error==null)signal(16);else NativeValidationCancellation.record(failure,error,requested);});
+            if(requested||closed)close();
+        }
+        OptionalLong count(PdkValidationCounts counter) {
+            var cleanup = new CompletableFuture<Void>();
+            try {
+                var exited = counter.callExited();
+                exited.whenComplete((ignored, error) -> {
+                    if (counter.drained()) cleanup.complete(null);
+                });
+                attach(() -> {
+                    counter.close();
+                    if (counter.drained()) cleanup.complete(null);
+                }, exited, CompletableFuture.completedFuture(null), cleanup);
+                return counter.countIfSupported();
+            } catch (RuntimeException failed) {
+                if (!counter.drained()) throw failed;
+                throw tableFailure(failed, side);
+            }
+        }
+        void opened(){signal(8);}
+        void unopened(){signal(1|2|4|16);}
+        void stage(Throwable error){
+            if(error==null)return;
+            if (side != null && error instanceof RuntimeException runtime) {
+                var classified = NativeValidationReportFailure.forTable(runtime, side);
+                if (classified instanceof ValidationPairException) {
+                    pairFailure.record(classified);
+                    return;
+                }
+            }
+            NativeValidationCancellation.record(failure,error,requested);
+        }
+        void signal(int bits){settled.getAndUpdate(value->value|bits);finish();}
+        void close(){
+            requested=true;var action=closer;if(action==null||!closing.compareAndSet(false,true))return;
+            try{action.run();settled.getAndUpdate(value->value|4);}
+            catch(RuntimeException|Error cleanup){record(cleanup);throw cleanup;}
+            finally{closing.set(false);finish();}
+        }
+        void finish(){
+            if(settled.get()!=31||closing.get()||!released.compareAndSet(false,true))return;
+            try{lease.close();synchronized(reads){reads.remove(this);}}
+            catch(RuntimeException|Error failed){released.set(false);record(failed);throw failed;}
+            releaseWorking();
+        }
+    }
+    private void awaitClosed(Runnable guard){
+        while(true){
+            require();guard.run();boolean waiting;
+            synchronized(reads){waiting=reads.stream().anyMatch(read->read.requested);}
+            if(!waiting)return;
+            java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(1));
+        }
+    }
+    @Override public void finishMapping(Runnable guard) {
+        while (true) {
+            throwFailure();
+            guard.run();
+            synchronized (reads) { if (reads.isEmpty()) break; }
+            java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(1));
+        }
+        active.set(null);
+        current = null;
+        var failed = pairFailure.get();
+        pairFailure = new ValidationFailureLatch();
+        if (failed instanceof ValidationPairException diagnosis) throw diagnosis;
+    }
+    @Override public void close(){
+        closed=true;var cleanup=new ValidationFailureLatch();var merge=active.getAndSet(null);
+        if(merge!=null)try{merge.close();}catch(RuntimeException|Error failed){cleanup.record(failed);record(failed);}
+        List<Read> closing;synchronized(reads){closing=List.copyOf(reads);}
+        for(var read:closing)try{read.close();}catch(RuntimeException|Error failed){cleanup.record(failed);record(failed);}
+        releaseWorking();
+        if(cleanup.get() instanceof Error fatal)throw fatal;if(cleanup.get() instanceof RuntimeException failed)throw failed;
+    }
+    @Override public boolean drained(){
+        releaseWorking();synchronized(reads){return closed&&consumers.get()==0&&reads.isEmpty()&&working.get()==null;}
+    }
+    private void releaseWorking(){
+        synchronized(reads){if(!closed||consumers.get()!=0||!reads.isEmpty())return;}
+        var lease=working.getAndSet(null);if(lease!=null)lease.close();
+        saved=null;declarations=List.of();artifacts=Map.of();current=null;
+    }
+    private boolean full(){return original.spec().method()==ValidationMethod.FULL_COLUMN;}
+    private SourceResource resource(ValidationTaskSpec.Table table){return StoredArtifacts.requireSource(saved.artifacts(),table.sourceId());}
+    private ConnectorRef artifact(SourceResource resource){var found=artifacts.get(resource.id());if(found==null)throw invalid("artifactScope");return found;}
+    private ConnectionConfig connection(ValidationTaskSpec.Table table,SourceResource resource){
+        var config=rowConnection(resource,artifact(resource));
+        if(table.database()!=null&&!table.database().equals(config.settings().get("database"))
+                ||table.schema()!=null&&!table.schema().equals(config.settings().get("schema")))throw invalid("physicalNamespace");
+        return config;
+    }
+    private static PdkValidationReads.Binding binding(ValidationTaskSpec.Table table){return new PdkValidationReads.Binding(table.modelVersion(),table.codecBinding());}
+    private static boolean portableSort(ValidationTaskSpec.Keys keys){
+        return keys.source().stream().anyMatch(key->key.domain()==ValidationKey.Kind.TEXT
+                &&key.logicalTypes().equals(Set.of("text")));
+    }
+    private static List<ValidationKeyBinding.Component> components(ValidationTaskSpec.Keys keys,boolean source){return source?keys.source():keys.target();}
+    private static ValidationKeyBinding keyBinding(ValidationTaskSpec.Keys keys,boolean source){
+        return new ValidationKeyBinding(source?"direct-source-key":"direct-target-key",components(keys,source),Set.of(),ROW);
+    }
+    private static ValidationTaskSpec.Keys resolveKeys(ValidationTaskSpec.Mapping mapping, SourceTable from, SourceTable to) {
+        var selected = mapping.keys();
+        var source = resolveSide(mapping.source().nodeId(), selected.sourcePaths(), from, ValidationTableFailure.Side.SOURCE);
+        var target = resolveSide(mapping.target().nodeId(), selected.targetPaths(), to, ValidationTableFailure.Side.TARGET);
+        for (int index = 0; index < source.size(); index++) {
+            var left = source.get(index);
+            var right = target.get(index);
+            if (left.domain() != right.domain() || left.numericPolicy() != right.numericPolicy())
+                throw new ValidationPairException(ValidationTableFailure.Side.PAIR,
+                        unsupported(mapping.mappingId(), left.path().getFirst(), "key-domain-mismatch"));
+        }
+        return new ValidationTaskSpec.Keys(selected.confirmationId(), source, target);
+    }
+    private static List<ValidationKeyBinding.Component> resolveSide(String node, List<List<String>> paths,
+            SourceTable model, ValidationTableFailure.Side side) {
+        var rules = ValidationKeyMetadata.describe(model);
+        var components = new ArrayList<ValidationKeyBinding.Component>();
+        for (var path : paths) {
+            var field = path.getFirst();
+            var component = rules.fields().get(field);
+            if (component == null)
+                throw new ValidationPairException(side, unsupported(node, field,
+                        rules.unavailable().getOrDefault(field, "key-field-missing")));
+            components.add(component);
+        }
+        return components;
+    }
+    private static ValidationTableFailure.Side side(boolean source) {
+        return source ? ValidationTableFailure.Side.SOURCE : ValidationTableFailure.Side.TARGET;
+    }
+    private ValidationKey boundForSide(ValidationKeyBinding binding, ValidationValues.Row row, boolean source) {
+        try { return bound(binding, row); }
+        catch (RuntimeException failed) { throw tableFailure(failed, side(source)); }
+    }
+    private static ValidationKey bound(ValidationKeyBinding binding,ValidationValues.Row row){
+        var result=binding.read(row);if(result instanceof ValidationKeyBinding.Bound bound)return bound.key();
+        throw new TapstateException(ValidationError.INCOMPATIBLE_KEY,Map.of("component",((ValidationKeyBinding.Invalid)result).problems().getFirst().component()),null);
+    }
+    private static ValidationPhysicalIdentity physical(ValidationTaskSpec.Table table,ValidationKeyBinding binding,ValidationKey key){
+        return new ValidationPhysicalIdentity(table.sourceId(),table.database(),table.schema(),table.table(),
+                binding.components().stream().map(ValidationKeyBinding.Component::path).toList(),key);
+    }
+    private static void requireStaticScope(ValidationSavedDeclarations saved,ValidationDirectMappings.Declared declared){
+        requireStaticScope(saved.mapping(declared.mapping().mappingId()),declared);
+    }
+    static void requireStaticScope(io.tapstate.core.dsl.ValidationDeclarations.Inspection inspection,ValidationDirectMappings.Declared declared){
+        var mapping=declared.mapping();
+        // This proves saved selection intent only; native existence and models are still independent reads.
+        ValidationDirectMappings.requireSourceTable(declared,new SourceTable(mapping.source().table(),List.of(),List.of(),List.of()));
+        if(inspection.routes().stream().noneMatch(route->route.table()==null))return;
+        if(declared.source().tables()==null||declared.source().tables().stream().anyMatch(selector->selector instanceof TableRef.Regex))
+            throw unsupported("from","direct.table-scope-unknown");
+        for(var selector:declared.source().tables()){
+            String name=selector instanceof TableRef.Literal literal?literal.name():((TableRef.Spec)selector).name();
+            ValidationDirectMappings.requireObservedSourceTable(declared,name);
+        }
+    }
+    private void require(){
+        throwFailure();
+        if(closed)throw cancelled();
+        original.requireReserved();
+        if(closed)throw cancelled();
+        if (pairFailure.get() instanceof ValidationPairException failed) throw failed;
+    }
+    private Throwable rememberRead(Throwable failed, ValidationTableFailure.Side side) {
+        var diagnosis = failed instanceof RuntimeException runtime ? NativeValidationReportFailure.forTable(runtime, side) : failed;
+        if (diagnosis instanceof ValidationPairException) pairFailure.record(diagnosis);
+        else record(diagnosis);
+        return diagnosis;
+    }
+    private RuntimeException tableFailure(RuntimeException failed, ValidationTableFailure.Side side) {
+        return (RuntimeException) rememberRead(failed, side);
+    }
+    private TapstateException cancelled(){return new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",nodeId),null);}
+    private void record(Throwable error){failure.record(error);ValidationFailureLatch.addContext(failure.get(),error);}
+    private void throwFailure(){if(failure.get() instanceof Error fatal)throw fatal;if(failure.get() instanceof RuntimeException failed)throw failed;}
+    private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","directRows."+field),null);}
+    private static TapstateException unsupported(String field,String rule){return unsupported("direct-full",field,rule);}
+    private static TapstateException unsupported(String node,String field,String rule){return new TapstateException(ValidationError.RULE_UNSUPPORTED,
+            Map.of("node",node,"field",field,"rule",rule),null);}
+}

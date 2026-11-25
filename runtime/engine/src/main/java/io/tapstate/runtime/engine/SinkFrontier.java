@@ -73,4 +73,11 @@ interface SinkFrontier {
      * in time and not in positions.
      */
     Map<String, Long> stalls();
+
+    /**
+     * The chain {@code bound} speaks for, or null where this frontier numbers no chains and so cannot say.
+     */
+    default String chainOf(Watermark bound) {
+        return null;
+    }
 }

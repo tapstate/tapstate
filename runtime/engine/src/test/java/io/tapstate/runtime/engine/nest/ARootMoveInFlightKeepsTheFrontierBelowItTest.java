@@ -109,6 +109,22 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
     }
 
     @Test
+    void anOwedCustomerMoveDoesNotHoldAnUnrelatedPolicyChain() throws Exception {
+        AssemblerProcessor gaining = assembler();
+        feed(gaining, ROOT_ROWS, renamed("C1", "C2"));
+        long policyBound = FrontierOrders.pack(POLICIES, at(900));
+
+        gaining.tryProcessWatermark(FROM_POLICIES, new Watermark(policyBound, AXES.axisOf(POLICIES)));
+
+        assertThat(boundsIn(drained()))
+                .as("a customer-only debt has no policy position to withhold")
+                .containsExactly(policyBound);
+        assertThat(boundsAfter(gaining, FAR_ABOVE))
+                .as("the same pending debt still holds its own customer chain")
+                .containsExactly(FrontierOrders.pack(CUSTOMERS, at(MOVED_AT)) - 1);
+    }
+
+    @Test
     void theBoundGoesPastOnceTheKeyThatWasOwedItHasTakenIt() throws Exception {
         AssemblerProcessor processor = assembler();
         givenACustomerHoldingAPolicy("C1", processor);

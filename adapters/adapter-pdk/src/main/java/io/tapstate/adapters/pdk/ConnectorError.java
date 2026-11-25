@@ -2,6 +2,8 @@ package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.ConnectorErrorDefinitions;
 
 import java.util.Set;
 
@@ -12,24 +14,28 @@ import java.util.Set;
  * connector, requires a newer PDK API than the bridge provides, or produced an event the codec could
  * not project.
  *
- * <p>These are two-segment {@code connector.<symbol>} codes and go through the full build-time gate
+ * <p>These use the allocated product module and go through the full build-time gate
  * set like any other first-party domain. They are deliberately distinct from the reserved
  * {@code connector.<connector-id>.<symbol>} namespace a connector's OWN thrown codes occupy: those
  * carry a connector-id segment, are longer by construction, and are deduped at runtime rather than at
  * build time (they come from jars the build cannot see).
  *
  * <p>Programmer errors / invariant violations stay bare and are allowed to crash — they are not
- * laundered into a {@code connector.*} code that would hide the defect. {@code placeholders()} is the
+ * laundered into a product diagnostic code that would hide the defect. {@code placeholders()} is the
  * named-argument contract: every throw site supplies a value for each name, and the build-time
  * placeholder gate checks the catalog templates against it.
  */
 public enum ConnectorError implements TapstateErrorCode {
 
+    TARGET_IDENTITY_CONFLICT(ConnectorErrorDefinitions.TARGET_IDENTITY_CONFLICT),
+    TARGET_IDENTITY_CHECK_FAILED(ConnectorErrorDefinitions.TARGET_IDENTITY_CHECK_FAILED),
+
+
     /**
      * No artifact is registered in the distribution store for this connector id, so it resolves to
      * nothing and cannot be loaded. {@code connector} is the connector id that resolved to no artifact.
      */
-    NOT_REGISTERED("connector.not-registered", Set.of("connector")),
+    NOT_REGISTERED(ConnectorErrorDefinitions.NOT_REGISTERED),
 
     /**
      * A connector id resolves to more than one registered artifact — different artifact bytes
@@ -37,7 +43,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * not supported and a silent wrong-version load is never taken. {@code connector} is the connector
      * id; {@code artifacts} lists the competing content hashes.
      */
-    AMBIGUOUS_REGISTRATION("connector.ambiguous-registration", Set.of("connector", "artifacts")),
+    AMBIGUOUS_REGISTRATION(ConnectorErrorDefinitions.AMBIGUOUS_REGISTRATION),
 
     /**
      * A different artifact is being registered under a connector id that already has one — same id,
@@ -46,7 +52,9 @@ public enum ConnectorError implements TapstateErrorCode {
      * load. {@code connector} is the connector id; {@code existing} is the content hash already
      * registered; {@code incoming} is the content hash refused.
      */
-    REGISTRATION_CONFLICT("connector.registration-conflict", Set.of("connector", "existing", "incoming")),
+    REGISTRATION_CONFLICT(ConnectorErrorDefinitions.REGISTRATION_CONFLICT),
+
+    CLOUD_UPLOAD_DISABLED(ConnectorErrorDefinitions.CLOUD_UPLOAD_DISABLED),
 
     /**
      * A runtime register names a connector outside the officially supported set, so it is refused
@@ -55,40 +63,53 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code connector} is the id the artifact declared; {@code official} lists the ids supported
      * today, so the message states the boundary rather than leaving the caller to guess it.
      */
-    NOT_OFFICIAL("connector.not-official", Set.of("connector", "official")),
+    NOT_OFFICIAL(ConnectorErrorDefinitions.NOT_OFFICIAL),
 
     /**
      * The connector jar or its classpath could not be opened / linked. {@code connector} is the
      * connector id being loaded.
      */
-    LOAD_FAILED("connector.load-failed", Set.of("connector")),
+    LOAD_FAILED(ConnectorErrorDefinitions.LOAD_FAILED),
+
+    LOCAL_ARTIFACT_UNAVAILABLE(ConnectorErrorDefinitions.LOCAL_ARTIFACT_UNAVAILABLE),
+
+    /** The persisted server trust bundle or its verification options cannot be used safely. */
+    TLS_TRUST_INVALID(ConnectorErrorDefinitions.TLS_TRUST_INVALID),
+    /** Owned temporary trust material could not be removed after its connector use. */
+    TLS_MATERIAL_CLEANUP_FAILED(ConnectorErrorDefinitions.TLS_MATERIAL_CLEANUP_FAILED),
 
     /**
      * The declared entry class is not on the connector's classpath or is not a connector.
      * {@code connector} is the connector id; {@code class} is the class name that was looked up.
      */
-    CLASS_NOT_FOUND("connector.class-not-found", Set.of("connector", "class")),
+    CLASS_NOT_FOUND(ConnectorErrorDefinitions.CLASS_NOT_FOUND),
+
+    /**
+     * A connector artifact's archive or spec resource could not be read. {@code artifact} names the
+     * unreadable artifact, since introspection may fail before its connector id is known.
+     */
+    ARTIFACT_UNREADABLE(ConnectorErrorDefinitions.ARTIFACT_UNREADABLE),
 
     /**
      * A registered artifact carries no connector entry class — no class it contains is annotated as a
      * connector. {@code artifact} names the artifact that was scanned. Self-scan raises this before a
      * connector id is known, so it is keyed by the artifact rather than by an id.
      */
-    NO_CONNECTOR_CLASS("connector.no-connector-class", Set.of("artifact")),
+    NO_CONNECTOR_CLASS(ConnectorErrorDefinitions.NO_CONNECTOR_CLASS),
 
     /**
      * A registered artifact carries more than one unrelated connector entry class, so which connector
      * it registers is ambiguous (variants that subclass a shared base are not: the most-derived wins).
      * {@code artifact} names the artifact; {@code classes} lists the competing entry classes.
      */
-    AMBIGUOUS_CONNECTOR_CLASS("connector.ambiguous-connector-class", Set.of("artifact", "classes")),
+    AMBIGUOUS_CONNECTOR_CLASS(ConnectorErrorDefinitions.AMBIGUOUS_CONNECTOR_CLASS),
 
     /**
      * A connector's {@code @TapConnectorClass} annotation names a spec resource the artifact does not
      * contain. {@code artifact} names the artifact; {@code spec} is the resource path the annotation
      * named.
      */
-    SPEC_NOT_FOUND("connector.spec-not-found", Set.of("artifact", "spec")),
+    SPEC_NOT_FOUND(ConnectorErrorDefinitions.SPEC_NOT_FOUND),
 
     /**
      * A connector's spec resource does not yield the connector's identity — it is not valid JSON, or
@@ -96,7 +117,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * refused. {@code artifact} names the artifact; {@code spec} is the spec resource path;
      * {@code detail} says what was wrong with it.
      */
-    SPEC_INVALID("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
+    SPEC_INVALID(ConnectorErrorDefinitions.SPEC_INVALID),
 
     /**
      * A connection config value cannot be converted to the type the connector's own connection form
@@ -104,8 +125,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * instead. {@code connector} is the connector id; {@code field} is the config field; {@code expected}
      * is the type its form declares; {@code value} is what the connection holds.
      */
-    CONFIG_TYPE_MISMATCH("connector.config-type-mismatch",
-            Set.of("connector", "field", "expected", "value")),
+    CONFIG_TYPE_MISMATCH(ConnectorErrorDefinitions.CONFIG_TYPE_MISMATCH),
 
     /**
      * Oracle LogMiner cannot represent an identifier longer than its documented limit, so starting CDC
@@ -113,22 +133,21 @@ public enum ConnectorError implements TapstateErrorCode {
      * is the Oracle connector id; {@code kind} is schema, table or column; {@code identifier} is the
      * refused name; {@code limit} is the supported character count.
      */
-    LOGMINER_IDENTIFIER_TOO_LONG("connector.logminer-identifier-too-long",
-            Set.of("connector", "kind", "identifier", "limit")),
+    LOGMINER_IDENTIFIER_TOO_LONG(ConnectorErrorDefinitions.LOGMINER_IDENTIFIER_TOO_LONG),
 
     /**
      * Oracle LogMiner did not finish connector initialization and schema discovery within the start
      * deadline, so its worker and connector were stopped instead of holding the reconciliation loop.
      * {@code connector} is the Oracle connector id; {@code timeout} is how long preflight was given.
      */
-    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of("connector", "timeout")),
+    LOGMINER_PREFLIGHT_TIMEOUT(ConnectorErrorDefinitions.LOGMINER_PREFLIGHT_TIMEOUT),
 
     /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
      * than silently downgraded. {@code connector} is the connector id; {@code required} is the level
      * it asked for; {@code provided} is the level the bridge provides.
      */
-    API_LEVEL_INCOMPATIBLE("connector.api-level-incompatible", Set.of("connector", "required", "provided")),
+    API_LEVEL_INCOMPATIBLE(ConnectorErrorDefinitions.API_LEVEL_INCOMPATIBLE),
 
     /**
      * The connector declares a PDK API version the Tapstate-side level registry has no row for, so the
@@ -137,19 +156,19 @@ public enum ConnectorError implements TapstateErrorCode {
      * it is API-compatible, or to use a build whose version the bridge recognizes. {@code connector} is
      * the connector id; {@code version} is the unrecognized declared PDK API version.
      */
-    API_LEVEL_UNKNOWN("connector.api-level-unknown", Set.of("connector", "version")),
+    API_LEVEL_UNKNOWN(ConnectorErrorDefinitions.API_LEVEL_UNKNOWN),
 
     /**
      * A PDK event could not be projected to or from the tapstate envelope. {@code connector} is the
      * connector id; {@code detail} is the projection failure.
      */
-    PROJECTION_FAILED("connector.projection-failed", Set.of("connector", "detail")),
+    PROJECTION_FAILED(ConnectorErrorDefinitions.PROJECTION_FAILED),
 
     /**
      * The connector failed while reading (snapshot or cdc). {@code connector} is the connector id;
      * {@code detail} is the failure the connector reported.
      */
-    CAPTURE_FAILED("connector.capture-failed", Set.of("connector", "detail")),
+    CAPTURE_FAILED(ConnectorErrorDefinitions.CAPTURE_FAILED),
 
     /**
      * The connector's own connection test could not be run to completion — the connector threw out of
@@ -157,20 +176,22 @@ public enum ConnectorError implements TapstateErrorCode {
      * FAILED result, not this code. {@code connector} is the connector id; {@code detail} is the failure
      * the connector reported.
      */
-    TEST_FAILED("connector.test-failed", Set.of("connector", "detail")),
+    TEST_TIMEOUT(ConnectorErrorDefinitions.TEST_TIMEOUT),
+
+    TEST_FAILED(ConnectorErrorDefinitions.TEST_FAILED),
 
     /**
      * The connector's schema discovery could not be run to completion — the connector threw out of
      * {@code discoverSchema}. {@code connector} is the connector id; {@code detail} is the failure the
      * connector reported.
      */
-    DISCOVER_FAILED("connector.discover-failed", Set.of("connector", "detail")),
+    DISCOVER_FAILED(ConnectorErrorDefinitions.DISCOVER_FAILED),
 
     /**
      * The connector failed while writing a batch. {@code connector} is the connector id;
      * {@code detail} is the failure the connector reported.
      */
-    WRITE_FAILED("connector.write-failed", Set.of("connector", "detail")),
+    WRITE_FAILED(ConnectorErrorDefinitions.WRITE_FAILED),
 
     /**
      * The connector failed while reading the store — it threw out of the read, or reported the failure
@@ -179,7 +200,10 @@ public enum ConnectorError implements TapstateErrorCode {
      * this one is a user looking at it, and the two fail for different reasons and reach different
      * people.
      */
-    READ_FAILED("connector.read-failed", Set.of("connector", "detail")),
+    READ_FAILED(ConnectorErrorDefinitions.READ_FAILED),
+
+    /** A snapshot cannot establish its required metadata and replay anchor before reading source rows. */
+    SNAPSHOT_PREPARATION_UNAVAILABLE(ConnectorErrorDefinitions.SNAPSHOT_PREPARATION_UNAVAILABLE),
 
     /**
      * The connector gave up part way through a read and returned as if it had not. {@code connector} is
@@ -188,7 +212,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * leaves a short answer no other signal contradicts, and a short answer is indistinguishable from a
      * small collection, so it would otherwise be handed to a caller as a complete one.
      */
-    READ_ABANDONED("connector.read-abandoned", Set.of("connector")),
+    READ_ABANDONED(ConnectorErrorDefinitions.READ_ABANDONED),
 
     /**
      * The connector registers no function for the capability this read needs, so the read cannot be
@@ -197,7 +221,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * serve a read is a property of the connector, not something the request was validated against, so
      * a user can reach it by asking to read a source whose connector does not offer it.
      */
-    CAPABILITY_MISSING("connector.capability-missing", Set.of("connector", "capability")),
+    CAPABILITY_MISSING(ConnectorErrorDefinitions.CAPABILITY_MISSING),
 
     /**
      * Every live instance of this connection stayed busy for the whole wait, so the read was refused
@@ -205,7 +229,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code timeout} is how long the read waited. A caller that sees this repeatedly is contending
      * with other reads of the same connection, not with a broken one.
      */
-    INSTANCES_BUSY("connector.instances-busy", Set.of("connector", "timeout")),
+    INSTANCES_BUSY(ConnectorErrorDefinitions.INSTANCES_BUSY),
 
     /**
      * The host already holds as many live connector instances as it allows and every one of them is
@@ -213,28 +237,28 @@ public enum ConnectorError implements TapstateErrorCode {
      * ceiling is counted in instances because each one carries its connector's own connection pool;
      * this is a host-wide condition rather than a property of the connection being read.
      */
-    INSTANCE_LIMIT_REACHED("connector.instance-limit-reached", Set.of("limit")),
+    INSTANCE_LIMIT_REACHED(ConnectorErrorDefinitions.INSTANCE_LIMIT_REACHED),
 
     /**
      * The read ran longer than the read face allows and was abandoned. {@code connector} is the
      * connector id; {@code timeout} is how long it was given. The instance it ran on is closed rather
      * than reused, because the abandoned read is still inside it.
      */
-    READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout")),
+    READ_TIMEOUT(ConnectorErrorDefinitions.READ_TIMEOUT),
 
     /**
      * A connector asked to keep a value whose type this build has no encoding for. Refused where it is
      * written rather than coerced: a value stringified on the way in reads back as text and passes for
      * what was stored, and the connector that wrote a number finds one only when it casts.
      */
-    STATE_VALUE_UNSUPPORTED("connector.state-value-unsupported", Set.of("type")),
+    STATE_VALUE_UNSUPPORTED(ConnectorErrorDefinitions.STATE_VALUE_UNSUPPORTED),
 
     /**
      * A stored connector note cannot be read back - a format or a tag from a later build, or bytes that
      * end early. Reported rather than treated as absent, because absent is what a connector reads as
      * "this is my first run", and acting on that quietly discards whatever it had recorded.
      */
-    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail")),
+    STATE_UNREADABLE(ConnectorErrorDefinitions.STATE_UNREADABLE),
 
     /**
      * A connector's own stream position could not be written down, so this source has no position to
@@ -242,7 +266,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code detail} is why the position could not be rendered. Reporting no position instead would
      * claim the source has nowhere to resume from, which is a different and untrue statement.
      */
-    POSITION_UNRENDERABLE("connector.position-unrenderable", Set.of("connector", "detail")),
+    POSITION_UNRENDERABLE(ConnectorErrorDefinitions.POSITION_UNRENDERABLE),
 
     /**
      * A recorded position could not be read back into something this connector accepts — most often its
@@ -250,28 +274,46 @@ public enum ConnectorError implements TapstateErrorCode {
      * id; {@code detail} is why it could not be read. Refusing is deliberate: starting from the present
      * instead would silently drop every change made since the position was recorded.
      */
-    POSITION_UNREADABLE("connector.position-unreadable", Set.of("connector", "detail"));
+    POSITION_UNREADABLE(ConnectorErrorDefinitions.POSITION_UNREADABLE),
 
-    private final String code;
-    private final Set<String> placeholders;
+    /**
+     * A running change stream could not tell its connector how far the source may release its change log:
+     * the durable position could not be read back into the connector's own offset, or the connector threw
+     * when it was handed one. {@code connector} is the connector id; {@code detail} is why. Reported, never
+     * fatal: the stream keeps delivering and the position is handed over again at the next interval,
+     * because what a missed release costs is the source keeping some log a while longer, and failing the
+     * stream over that would make an outage of a delay.
+     */
+    ACKNOWLEDGE_FAILED(ConnectorErrorDefinitions.ACKNOWLEDGE_FAILED),
 
-    ConnectorError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    /**
+     * A connector could not let go of what it set up on its source to read changes -- a replication slot,
+     * say -- while the state it belongs to was being cleared. {@code connector} is the connector id;
+     * {@code detail} is why; {@code resources} is what its notes named on the source, for somebody to remove
+     * there by hand. Reported, never fatal: the clearing completes, because a source that cannot be reached
+     * must not leave a pipeline that can neither keep its state nor let go of it.
+     */
+    RELEASE_FAILED(ConnectorErrorDefinitions.RELEASE_FAILED),
+
+    DISCOVERY_CONNECTION_TIMEOUT(ConnectorErrorDefinitions.DISCOVERY_CONNECTION_TIMEOUT),
+
+    DISCOVERY_AUTHENTICATION_REJECTED(ConnectorErrorDefinitions.DISCOVERY_AUTHENTICATION_REJECTED);
+
+    static final class Parameters {
+        static final String TIMEOUT = "timeout";
+        static final String CONNECTOR = "connector";
+        static final String DETAIL = "detail";
+        static final String ARTIFACT = "artifact";
+
+        private Parameters() {
+        }
     }
 
-    @Override
-    public String code() {
-        return code;
-    }
+    private final ProductErrorDefinition definition;
 
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
+    ConnectorError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

@@ -17,6 +17,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
@@ -42,6 +44,17 @@ class PdkSchemaDiscovererTest {
 
     private static ConnectionConfig config() {
         return new ConnectionConfig("conn-1", "demo", Map.of());
+    }
+
+    @Test void structureOnlyDiscoveryDoesNotRunTheRegisteredCount(@TempDir Path dir) throws Exception {
+        var ref=new ConnectorRef(List.of(Synthetic.countTracingDiscoverableSource(dir)),"synthetic.TracingCount","2.0.8",null);
+        var discovery=new PdkSchemaDiscoverer(id -> ref);var trace=dir.resolve("count-trace");
+        var input=new ConnectionConfig("source","demo",Map.of("countTrace",trace.toString()));
+        var model=discovery.discoverStructure(input);
+        assertThat(model.tables()).hasSize(1);assertThat(model.tables().getFirst().approximateRowCount()).isNull();
+        assertThat(java.nio.file.Files.exists(trace)).isFalse();
+        assertThat(discovery.discover(input).tables().getFirst().approximateRowCount()).isEqualTo(7L);
+        assertThat(java.nio.file.Files.readString(trace)).isEqualTo("counted");
     }
 
     @Test
@@ -91,6 +104,24 @@ class PdkSchemaDiscovererTest {
         SourceTable orders = model.tables().get(0);
         assertThat(orders.fields()).extracting(SourceField::name).containsExactly("id", "amount");
         assertThat(orders.fields()).extracting(SourceField::dataType).containsExactly("int", "decimal");
+    }
+
+    @Test
+    void realGateSnapshotDeclarationDoesNotBlockSchemaDiscovery(@TempDir Path dir) {
+        // Isolate the declaration that changed between the green and failing real-connector runs.
+        // This fixture reproduces admission only; it does not establish upstream binary compatibility.
+        Path jar = Synthetic.discoverableSource(dir);
+        ConnectionConfig input = new ConnectionConfig("source", "mysql", Map.of());
+        ConnectorRef lastGreen = new ConnectorRef(
+                List.of(jar), "synthetic.Discoverable", "2.0.9-SNAPSHOT", null);
+        SourceModel baseline = new PdkSchemaDiscoverer(id -> lastGreen).discover(input);
+        assertThat(baseline.tables()).extracting(SourceTable::name).containsExactly("orders");
+
+        ConnectorRef failingRun = new ConnectorRef(
+                List.of(jar), "synthetic.Discoverable", "2.0.11-SNAPSHOT", null);
+        SourceModel discovered = new PdkSchemaDiscoverer(id -> failingRun).discover(input);
+
+        assertThat(discovered).isEqualTo(baseline);
     }
 
     /** A connector declaring both of the discoverable source's column types, in its own spec's shape. */
@@ -300,6 +331,42 @@ class PdkSchemaDiscovererTest {
         // whose every table is uncounted and nothing anywhere saying why.
         assertThatThrownBy(() -> new PdkSchemaDiscoverer(connectorId -> null, Duration.ZERO))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"28P01", "28000"})
+    void typedDatabaseAuthenticationRefusalsHaveTheirOwnDiscoveryCode(String sqlState, @TempDir Path dir) {
+        SchemaDiscoverer discoverer = discoverer(Synthetic.authenticationRejectedDiscoverSource(dir, sqlState),
+                "synthetic.AuthenticationDiscover");
+        assertThatThrownBy(() -> discoverer.discover(config())).isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    var failure = (TapstateException) error;
+                    assertThat(failure.code()).isEqualTo(ConnectorError.DISCOVERY_AUTHENTICATION_REJECTED);
+                    assertThat(failure.args()).containsExactlyEntriesOf(Map.of("connector", "demo"));
+                    assertThat(failure.getCause()).hasCauseInstanceOf(java.sql.SQLException.class);
+                });
+    }
+
+    @Test
+    void aDeclaredPdkAuthenticationRefusalDoesNotDependOnADatabaseSpecificSqlState(@TempDir Path dir) {
+        var discoverer = discoverer(Synthetic.declaredAuthenticationRejectedDiscoverSource(dir),
+                "synthetic.DeclaredAuthenticationDiscover");
+        assertThatThrownBy(() -> discoverer.discover(config())).isInstanceOf(TapstateException.class)
+                .satisfies(error -> assertThat(((TapstateException) error).code())
+                        .isEqualTo(ConnectorError.DISCOVERY_AUTHENTICATION_REJECTED));
+    }
+
+    @Test
+    void passwordWordsWithoutAnAuthenticationSqlStateRemainAnUnclassifiedDiscoveryFailure(@TempDir Path dir) {
+        SchemaDiscoverer discoverer = discoverer(Synthetic.authenticationRejectedDiscoverSource(dir, "XX000"),
+                "synthetic.AuthenticationDiscover");
+        assertThatThrownBy(() -> discoverer.discover(config())).isInstanceOf(TapstateException.class)
+                .satisfies(error -> {
+                    var failure = (TapstateException) error;
+                    assertThat(failure.code()).isEqualTo(ConnectorError.DISCOVER_FAILED);
+                    assertThat(failure.args()).containsEntry("connector", "demo")
+                            .containsEntry("detail", "RuntimeException: java.sql.SQLException: password rejected marker <- SQLException: password rejected marker");
+                });
     }
 
     @Test

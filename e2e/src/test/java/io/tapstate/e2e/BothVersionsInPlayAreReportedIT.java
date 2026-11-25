@@ -1,11 +1,13 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -46,9 +48,9 @@ class BothVersionsInPlayAreReportedIT {
 
     @Test
     void theServerLineCarriesWhatTheServerItselfAnswered() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_version"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             // Read straight from the server first, so what the CLI prints is checked against a second,
             // independent reader of the same endpoint rather than against a constant this test holds.
@@ -88,7 +90,25 @@ class BothVersionsInPlayAreReportedIT {
             // The control group for the mismatch advisory. A matched pair is the case that a comparison
             // written to warn unconditionally still passes every mismatch test it has, and fails only
             // here.
-            assertThat(run.stderr()).doesNotContain("cli.version-mismatch");
+            assertThat(run.stderr()).doesNotContain("TS0330060");
+        }
+    }
+
+    @Test
+    void aConnectedStopRefusalNamesTheServersVersion(@TempDir Path home) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            String reportedByTheServer = control.version();
+            assertThat(reportedByTheServer).isNotBlank();
+
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD,
+                    List.of("-Duser.home=" + home), "-c", server.baseUrl().toString(), "-u", USER,
+                    "stop", "ship_clear");
+
+            assertThat(run.exitCode()).isEqualTo(1);
+            assertThat(run.stderr()).contains("error: TS0330026")
+                    .endsWith(", server " + reportedByTheServer + ")" + System.lineSeparator());
         }
     }
 }

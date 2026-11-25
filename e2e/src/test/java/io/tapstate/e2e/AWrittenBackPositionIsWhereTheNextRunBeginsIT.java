@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>The envelope around it is composed, and has to be. Handing the rendered document straight back is
  * refused, by name: it also carries readings, when the point was recorded among them, and a write-back
- * that names one is answered {@code position.field-not-editable}. That is the right refusal -- setting a
+ * that names one is answered {@code TS0410003}. That is the right refusal -- setting a
  * derived field is meaningless -- so what a caller round-trips is the token, inside the smallest document
  * that names a point.
  *
@@ -91,15 +91,15 @@ class AWrittenBackPositionIsWhereTheNextRunBeginsIT {
         String database = suffix + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
         String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
-        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+                ServerHandle server = tier.launch(storage)) {
 
             seed(source, database);
-            ControlPlane control = start(server, suffix, sourceUri, targetUri);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri);
 
             // The load's completion is the barrier: it says the source is being read, so a change made
             // after it is one the tail is in a position to see.
@@ -161,9 +161,9 @@ class AWrittenBackPositionIsWhereTheNextRunBeginsIT {
 
     /** Everything up to and including the start. */
     private static ControlPlane start(
-            ServerHandle server, String pipelineId, String sourceUri, String targetUri) {
+            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
         Map<String, String> resources = new LinkedHashMap<>();

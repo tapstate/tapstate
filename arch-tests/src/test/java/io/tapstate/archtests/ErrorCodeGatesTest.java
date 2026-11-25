@@ -2,10 +2,13 @@ package io.tapstate.archtests;
 
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Domain;
+import io.tapstate.core.common.RequestErrorDefinitions;
+import io.tapstate.core.common.DslErrorDefinitions;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.messages.DslDiagnosticCatalog;
+import io.tapstate.messages.RequestDiagnosticCatalog;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -64,11 +67,47 @@ class ErrorCodeGatesTest {
     /** Bundled en catalog: canonical code -> {message, [solution]} (the templates, not rendered). */
     private static Map<String, Map<String, String>> catalog;
 
+    private static Map<String, ProductErrorDefinition> productDefinitions() {
+        Map<String, ProductErrorDefinition> registered = new LinkedHashMap<>();
+        java.util.stream.Stream.of(RequestErrorDefinitions.registered(), DslErrorDefinitions.registered(),
+                io.tapstate.core.common.SourceErrorDefinitions.registered(),
+                io.tapstate.core.common.PipelineErrorDefinitions.registered(),
+                io.tapstate.core.common.ArtifactErrorDefinitions.registered(),
+                io.tapstate.core.common.PipelineDraftErrorDefinitions.registered(),
+                io.tapstate.core.common.McpErrorDefinitions.registered(),
+                io.tapstate.core.common.SchemaErrorDefinitions.registered(),
+                io.tapstate.core.common.LifecycleErrorDefinitions.registered(),
+                io.tapstate.core.common.StartCheckDefinitions.registered(),
+                io.tapstate.core.common.ValidationErrorDefinitions.registered(),
+                io.tapstate.core.common.BootErrorDefinitions.registered(),
+                io.tapstate.core.common.RoleErrorDefinitions.registered(),
+                io.tapstate.core.common.CliErrorDefinitions.registered(),
+                io.tapstate.core.common.AlertErrorDefinitions.registered(),
+                io.tapstate.core.common.CaptureErrorDefinitions.registered(),
+                io.tapstate.core.common.ActuationErrorDefinitions.registered(),
+                io.tapstate.core.common.ClusterErrorDefinitions.registered(),
+                io.tapstate.core.common.ConnectorCatalogErrorDefinitions.registered(),
+                io.tapstate.core.common.DataBrowserErrorDefinitions.registered(),
+                io.tapstate.core.common.MonitorErrorDefinitions.registered(),
+                io.tapstate.core.common.PositionErrorDefinitions.registered(),
+                io.tapstate.core.common.MigrationErrorDefinitions.registered(),
+                io.tapstate.core.common.RowValueErrorDefinitions.registered(),
+                io.tapstate.core.common.EngineErrorDefinitions.registered(),
+                io.tapstate.core.common.TransformErrorDefinitions.registered(),
+                io.tapstate.core.common.NestSizingErrorDefinitions.registered(),
+                io.tapstate.core.common.StoreErrorDefinitions.registered(),
+                io.tapstate.core.common.IoErrorDefinitions.registered(),
+                io.tapstate.core.common.NestErrorDefinitions.registered(),
+                io.tapstate.core.common.AggregateErrorDefinitions.registered(),
+                io.tapstate.core.common.ConnectorErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
+            assertThat(registered.put(definition.code(), definition)).isNull();
+        });
+        return registered;
+    }
+
     @BeforeAll
     static void scanFirstPartyCodes() {
-        JavaClasses classes = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        JavaClasses classes = ProductionClassImports.packages("io.tapstate");
         List<TapstateErrorCode> found = new ArrayList<>();
         for (JavaClass jc : classes) {
             if (jc.isEnum() && jc.isAssignableTo(TapstateErrorCode.class)) {
@@ -78,6 +117,28 @@ class ErrorCodeGatesTest {
             }
         }
         codes = found;
+    }
+
+    @Test
+    void independentlyDiscoveredDefinitionFieldsMatchTheRegisteredAndTypedContracts() throws Exception {
+        Map<String, ProductErrorDefinition> declared = new LinkedHashMap<>();
+        for (JavaClass owner : ProductionClassImports.packages("io.tapstate")) {
+            for (var field : owner.getFields()) {
+                if (!field.getRawType().isEquivalentTo(ProductErrorDefinition.class)) continue;
+                var reflected = field.reflect();
+                if (!java.lang.reflect.Modifier.isStatic(reflected.getModifiers())) continue;
+                assertThat(java.lang.reflect.Modifier.isPublic(reflected.getModifiers()))
+                        .as("definition field must be a public contract: %s", field.getFullName()).isTrue();
+                assertThat(java.lang.reflect.Modifier.isFinal(reflected.getModifiers())).isTrue();
+                var definition = (ProductErrorDefinition) reflected.get(null);
+                assertThat(definition).isNotNull();
+                assertThat(declared.put(definition.code(), definition))
+                        .as("duplicate definition field for %s", definition.code()).isNull();
+            }
+        }
+        assertThat(declared).isNotEmpty().isEqualTo(productDefinitions());
+        assertThat(codes.stream().map(TapstateErrorCode::code).collect(java.util.stream.Collectors.toSet()))
+                .containsExactlyInAnyOrderElementsOf(declared.keySet());
     }
 
     @BeforeAll
@@ -127,6 +188,13 @@ class ErrorCodeGatesTest {
     void everyCodeMatchesFormatAndRegisteredDomain() {
         for (TapstateErrorCode c : codes) {
             String code = c.code();
+            if (productDefinitions().containsKey(code)) {
+                var definition = productDefinitions().get(code);
+                assertThat(code).matches("TS" + definition.module().number() + "(?!0000)[0-9]{4}");
+                assertThat(c.placeholders()).isEqualTo(definition.parameters());
+                assertThat(c.severity()).isEqualTo(definition.severity());
+                continue;
+            }
             int dot = code.indexOf('.');
             assertThat(dot).as("code '%s' must be <domain>.<symbol>", code).isPositive();
             String domain = code.substring(0, dot);
@@ -163,6 +231,40 @@ class ErrorCodeGatesTest {
                 .distinct()
                 .sorted()
                 .filter(code -> {
+                    if (productDefinitions().containsKey(code)) {
+                        Map<String, Object> args = new LinkedHashMap<>();
+                        productDefinitions().get(code).parameters().forEach(name -> args.put(name, "fixture"));
+                        return RequestDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && DslDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.SourceDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.MutationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.McpDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.SchemaDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.LifecycleDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.StartCheckDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ValidationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.BootDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.RoleDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.CliDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.AlertDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.CaptureDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ActuationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ClusterDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ConnectorCatalogDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.DataBrowserDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.MonitorDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.PositionDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.AggregateDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.MigrationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.RowValueDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.EngineDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.TransformDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.NestSizingDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.StoreDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.IoDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.NestDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ConnectorDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
+                    }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();
                 })
@@ -174,7 +276,13 @@ class ErrorCodeGatesTest {
 
     @Test
     @DisplayName("D5-4: each catalog template's {names} match the code's declared placeholders()")
-    void catalogPlaceholdersMatchTheCodeContract() {
+    void catalogPlaceholdersMatchTheCodeContract() throws IOException {
+        Map<String, String> historical = new LinkedHashMap<>();
+        for (String line : Files.readAllLines(Path.of("src/test/resources/product-code-migrations.tsv"))) {
+            if (line.isBlank() || line.startsWith("#")) continue;
+            String[] pair = line.split("\t");
+            assertThat(historical.put(pair[0], pair[1])).isNull();
+        }
         Map<String, Set<String>> declared = new HashMap<>();
         for (TapstateErrorCode c : codes) {
             declared.put(c.code(), new TreeSet<>(c.placeholders()));
@@ -199,6 +307,12 @@ class ErrorCodeGatesTest {
                         .as("connector-diagnostic wording '%s' is rendered with no arguments, so its "
                                 + "template must carry no placeholders", code)
                         .isEmpty();
+                continue;
+            }
+            // Retained historical text is readable, but no current producer owns the retired identity.
+            if (historical.containsKey(code)) {
+                assertThat(declared).doesNotContainKey(code);
+                assertThat(used).isEqualTo(declared.get(historical.get(code)));
                 continue;
             }
             assertThat(declared)

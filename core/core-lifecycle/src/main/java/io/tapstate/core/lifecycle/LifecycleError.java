@@ -2,6 +2,8 @@ package io.tapstate.core.lifecycle;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.LifecycleErrorDefinitions;
 
 import java.util.Set;
 
@@ -17,13 +19,13 @@ import java.util.Set;
 public enum LifecycleError implements TapstateErrorCode {
 
     /** A verb rejected from the current state: {@code from} is the state, {@code verb} the attempted action. */
-    ILLEGAL_TRANSITION("lifecycle.illegal-transition", Set.of("from", "verb")),
+    ILLEGAL_TRANSITION(LifecycleErrorDefinitions.ILLEGAL_TRANSITION),
 
     /**
      * A {@code start}/{@code resume} refused because the pipeline's revision is not the latest applied
      * one: {@code requested} is the revision the action would run at, {@code latest} the newest applied.
      */
-    INCOMPATIBLE_REVISION("lifecycle.incompatible-revision", Set.of("requested", "latest")),
+    INCOMPATIBLE_REVISION(LifecycleErrorDefinitions.INCOMPATIBLE_REVISION),
 
     /**
      * A {@code stop} that did not say whether to clear what the pipeline has accumulated:
@@ -32,38 +34,57 @@ public enum LifecycleError implements TapstateErrorCode {
      * keeping makes one verb mean two things depending on how it was reached, and the difference is
      * invisible until the next run either continues or reads its whole source again.
      */
-    PURGE_STATE_NOT_STATED("lifecycle.purge-state-not-stated", Set.of("pipeline")),
+    PURGE_STATE_NOT_STATED(LifecycleErrorDefinitions.PURGE_STATE_NOT_STATED),
 
     /** A persisted editor draft that does not yet have the source and output needed for a run. */
-    PIPELINE_NOT_RUNNABLE("lifecycle.pipeline-not-runnable", Set.of("pipeline")),
+    PIPELINE_NOT_RUNNABLE(LifecycleErrorDefinitions.PIPELINE_NOT_RUNNABLE),
 
     /**
      * A lifecycle verb, or a status/metrics/snapshot read, named a pipeline that was never applied:
      * {@code pipeline} is the id the caller gave. Permanent -- unlike an applied pipeline with no
      * observation published yet, waiting will never turn this into a usable id.
      */
-    UNKNOWN_PIPELINE("lifecycle.unknown-pipeline", Set.of("pipeline"));
+    UNKNOWN_PIPELINE(LifecycleErrorDefinitions.UNKNOWN_PIPELINE),
 
-    private final String code;
-    private final Set<String> placeholders;
+    /**
+     * A {@code start} refused because at least one start check asks a question nobody has answered yet:
+     * {@code pipeline} is the pipeline, {@code count} how many questions are open, {@code check} and
+     * {@code subject} the first of them. The full set travels beside this code, as the start check
+     * report; the message alone has to be enough for a client that cannot read that report.
+     */
+    START_NEEDS_CONFIRMATION(LifecycleErrorDefinitions.START_NEEDS_CONFIRMATION),
 
-    LifecycleError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
+    /**
+     * A {@code start} refused because at least one start check refuses it outright, whatever is answered:
+     * the same arguments as {@link #START_NEEDS_CONFIRMATION}, counting the refusals.
+     */
+    START_BLOCKED(LifecycleErrorDefinitions.START_BLOCKED),
+
+    /**
+     * A {@code start} carrying a decision the start checks cannot take: {@code finding} names a question
+     * that does not offer {@code action}, the same question was answered twice, or the answer conflicts
+     * with another answer changing the same element.
+     */
+    INVALID_START_DECISION(LifecycleErrorDefinitions.INVALID_START_DECISION);
+
+    private final ProductErrorDefinition definition;
+
+    LifecycleError(ProductErrorDefinition definition) {
+        this.definition = definition;
     }
 
     @Override
     public String code() {
-        return code;
+        return definition.code();
     }
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return definition.severity();
     }
 
     @Override
     public Set<String> placeholders() {
-        return placeholders;
+        return definition.parameters();
     }
 }

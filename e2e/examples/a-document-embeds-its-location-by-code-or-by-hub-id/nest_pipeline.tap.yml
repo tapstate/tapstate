@@ -1,0 +1,23 @@
+version: tapstate/v1
+kind: pipeline
+id: wallet_documents
+source: wallet_db
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: wallet_doc
+    type: nest
+    from: { t: wallet_tran, l: location }
+    root:
+      from: t
+      key: [ id ]
+      embed:
+        - from: l
+          on: { locn_code: locn_code }
+          orOn:
+            - { hub_locn_id: hub_locn_id }
+          as: object
+          path: location
+view:
+  id: wallet_doc_state
+  from: wallet_doc
+  primary_key: id

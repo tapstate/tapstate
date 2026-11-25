@@ -1,11 +1,15 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.UnaryOperator;
+import java.util.function.Function;
 
 /**
  * The control plane's connection-test verb: it drives the target connection through the runtime probe —
@@ -22,31 +26,68 @@ import java.util.Objects;
  */
 public final class ConnectionTestService {
 
+    /** Optional runtime-local observation; it never adds fields to the persisted test report. */
+    public interface Observer {
+        Attempt begin(ConnectionConfig connection);
+        default boolean manages(ConnectionConfig connection) { return false; }
+    }
+    public interface Attempt extends AutoCloseable {
+        Attempt NONE = new Attempt() {
+            @Override public void completed(ConnectionTestResult result) {}
+            @Override public void close() {}
+        };
+        void completed(ConnectionTestResult result);
+        default java.util.OptionalLong deadlineNanos() { return java.util.OptionalLong.empty(); }
+        default ConnectionTestResult publish(ConnectionTestResult result, ConnectionTestResultStore.Publication publication) {
+            var published = publication.publish(result);
+            completed(published);
+            return published;
+        }
+        @Override void close();
+    }
+
     private final ConnectionProbe probe;
     private final ConnectionTestResultStore resultStore;
     private final AuditGate auditGate;
     private final ConnectorConfigValidator configValidator;
     private final SourceConnectionResolver sourceConnections;
-
-    public ConnectionTestService(
-            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate) {
-        this(probe, resultStore, auditGate, null);
-    }
-
-    public ConnectionTestService(
-            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator) {
-        this(probe, resultStore, auditGate, configValidator, null);
-    }
+    private final Observer observer;
+    private final UnaryOperator<String> testText;
+    private final Function<TapstateException, Map<String, Object>> describeRefusal;
+    private record Flight(ConnectionConfig connection, java.util.concurrent.CompletableFuture<ConnectionTestReport> report) {}
+    private Flight defaultFlight;
 
     public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        this(probe, resultStore, auditGate, configValidator, sourceConnections, ignored -> Attempt.NONE);
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer) {
+        this(probe, resultStore, auditGate, configValidator, sourceConnections, observer, UnaryOperator.identity());
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer,
+            UnaryOperator<String> testText) {
+        this(probe, resultStore, auditGate, configValidator, sourceConnections, observer, testText, ignored -> Map.of());
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer,
+            UnaryOperator<String> testText, Function<TapstateException, Map<String, Object>> describeRefusal) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.resultStore = Objects.requireNonNull(resultStore, "resultStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.configValidator = configValidator;
-        this.sourceConnections = sourceConnections;
+        this.sourceConnections = Objects.requireNonNull(sourceConnections, "sourceConnections");
+        this.observer = Objects.requireNonNull(observer, "observer");
+        this.testText = Objects.requireNonNull(testText, "testText");
+        this.describeRefusal = Objects.requireNonNull(describeRefusal, "describeRefusal");
     }
 
     /**
@@ -59,19 +100,55 @@ public final class ConnectionTestService {
      */
     public ConnectionTestReport test(
             String connectionId, String connectorId, Map<String, Object> settings, String principal) {
-        ConnectionConfig config = sourceConnections == null
-                ? new ConnectionConfig(connectionId, connectorId, settings)
-                : sourceConnections.resolve(connectionId, connectorId, settings);
-        if (configValidator != null) {
-            configValidator.validate(config.connectorId(), config.settings());
+        SourceConnectionResolver.ResolvedConnection resolved =
+                sourceConnections.resolveWithSecrets(connectionId, connectorId, settings);
+        ConnectionConfig config = resolved.config();
+        if (!observer.manages(config)) return execute(resolved, principal);
+        Flight captured;
+        boolean owner;
+        synchronized (this) {
+            owner = defaultFlight == null;
+            if (owner) defaultFlight = new Flight(config, new java.util.concurrent.CompletableFuture<>());
+            captured = defaultFlight;
+            if (!captured.connection().equals(config)) throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "another connection test is using different settings"), null);
         }
-        return auditGate.dispatch(
-                ControlOperations.CONNECTION_TEST,
-                new AuditContext(principal, config.id()),
-                () -> {
-                    ConnectionTestResult result = probe.probe(config);
-                    resultStore.save(result);
-                    return ConnectionTestReport.from(result);
-                });
+        if (!owner) {
+            try { return captured.report().join(); }
+            catch (java.util.concurrent.CompletionException failed) {
+                if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
+                if (failed.getCause() instanceof Error error) throw error;
+                throw failed;
+            }
+        }
+        try {
+            var report = execute(resolved, principal); captured.report().complete(report); return report;
+        } catch (RuntimeException | Error failure) { captured.report().completeExceptionally(failure); throw failure; }
+        finally { synchronized (this) { if (defaultFlight == captured) defaultFlight = null; } }
+    }
+
+    private ConnectionTestReport execute(SourceConnectionResolver.ResolvedConnection resolved, String principal) {
+        ConnectionConfig config = resolved.config();
+        List<String> secretValues = resolved.secretValues();
+        try (var attempt = observer.begin(config)) {
+            if (configValidator != null) {
+                configValidator.validate(config.connectorId(), config.settings(), resolved.catalogSnapshot());
+            }
+            return auditGate.dispatch(
+                    ControlOperations.CONNECTION_TEST,
+                    new AuditContext(principal, config.id()),
+                    () -> {
+                        var deadline = attempt.deadlineNanos();
+                        var publication = deadline.isPresent() ? null : resultStore.beginOrdinaryTest(config.id());
+                        ConnectionTestResult result = deadline.isPresent() ? probe.probeDefault(config, deadline.getAsLong()) : probe.probe(config);
+                        ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(
+                                result, secretValues, testText, resolved.sourceId());
+                        return ConnectionTestReport.from(attempt.publish(safeResult, publication));
+                    });
+        } catch (TapstateException failure) {
+            TapstateException safe = ConnectionTestResultRedactor.redact(failure, secretValues);
+            var diagnostic = ConnectionTestResultRedactor.withSource(describeRefusal.apply(safe), resolved.sourceId(), secretValues);
+            throw diagnostic.isEmpty() ? safe : new ConnectionTestRefusal(safe, diagnostic);
+        }
     }
 }

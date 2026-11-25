@@ -207,7 +207,7 @@
   ],
   "provenance": {
     "specPath": "connectors/custom-connector/src/main/resources/spec_custom.json",
-    "specContentHash": "a1b52c785b7c0caf",
+    "specContentHash": "9bdc619bdcbc9583",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

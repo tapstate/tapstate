@@ -68,6 +68,15 @@ check "a fix on an older line is not the latest"          "false" "$(answer "$di
 check "the base tag is reported, on main"                "v0.6.0" "$(answer "$dir" minor main base)"
 check "and on the older line it is that line's tag"      "v0.5.0" "$(answer "$dir" patch line-0.5 base)"
 
+# Dev builds do not create release tags. New main commits must keep the candidate version reusable.
+commit "$dir" "first dev build input"
+check "a dev build still selects the pending minor" "0.7.0" "$(answer "$dir" minor main version)"
+commit "$dir" "second dev build input"
+check "a rebuilt main reuses the same pending minor" "0.7.0" "$(answer "$dir" minor main version)"
+git -C "$dir" tag v0.7.0
+check "a formal release advances the next minor" "0.8.0" "$(answer "$dir" minor main version)"
+check "a formal release advances the next patch" "0.7.1" "$(answer "$dir" patch main version)"
+
 rm -rf "$dir"
 
 # A repository with no version tag at all has nothing to count up from. Answering 0.0.1 or 1.0.0 would

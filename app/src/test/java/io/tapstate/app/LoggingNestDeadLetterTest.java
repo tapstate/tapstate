@@ -43,10 +43,13 @@ class LoggingNestDeadLetterTest {
     private final ListAppender<ILoggingEvent> written = new ListAppender<>();
     private final HandedOver next = new HandedOver();
     private Logger logger;
+    private Level previousLevel;
 
     @BeforeEach
     void captureWhatIsWritten() {
         logger = (Logger) LoggerFactory.getLogger(LoggingNestDeadLetter.class);
+        previousLevel = logger.getLevel();
+        logger.setLevel(Level.WARN);
         written.start();
         logger.addAppender(written);
     }
@@ -55,6 +58,7 @@ class LoggingNestDeadLetterTest {
     void stopCapturing() {
         logger.detachAppender(written);
         written.stop();
+        logger.setLevel(previousLevel);
     }
 
     /**
@@ -70,7 +74,7 @@ class LoggingNestDeadLetterTest {
         ILoggingEvent event = only();
         assertThat(event.getLevel()).isEqualTo(Level.WARN);
         assertThat(event.getFormattedMessage())
-                .contains("nest.parent-absent")
+                .contains("TS0490024")
                 .contains("item")
                 .contains("items")
                 // The wait itself. Without this the line reads the same for a reference that has dangled for

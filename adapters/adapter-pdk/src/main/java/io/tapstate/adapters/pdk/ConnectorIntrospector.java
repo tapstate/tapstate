@@ -1,12 +1,13 @@
 package io.tapstate.adapters.pdk;
 
+import static io.tapstate.adapters.pdk.ConnectorError.Parameters.ARTIFACT;
+
 import io.tapstate.core.common.TapstateException;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
 
 import java.io.IOException;
 import java.lang.annotation.AnnotationFormatError;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -29,8 +30,8 @@ import java.util.stream.Collectors;
  *
  * <p>PDK types stay inside this class. A malformed artifact — no connector class, more than one
  * unrelated connector class, or a spec the annotation names but the jar omits — is refused with a coded
- * connector-domain exception keyed by the artifact; a raw I/O failure reading a staged artifact is not
- * a connector defect and surfaces as an unchecked I/O exception.
+ * connector-domain exception keyed by the artifact, including I/O failures reading the archive or its
+ * spec resource.
  */
 public final class ConnectorIntrospector {
 
@@ -43,19 +44,24 @@ public final class ConnectorIntrospector {
     private static final String CLASS_SUFFIX = ".class";
 
     /** Reads {@code classpath} (a connector jar plus any bundled deps) into the connector it declares. */
-    public IntrospectedConnector introspect(List<Path> classpath) {
+    public IntrospectedConnector introspect(List<Path> classpath) { return introspect(classpath, false); }
+
+    IntrospectedConnector introspectDefaultTest(List<Path> classpath) { return introspect(classpath, true); }
+
+    private IntrospectedConnector introspect(List<Path> classpath, boolean defaultTest) {
         String artifact = artifact(classpath);
         List<Candidate> candidates = scanForAnnotatedClasses(classpath);
         Confirmed entry;
         try (ConnectorClassLoader loader = ConnectorClassLoader.open(classpath)) {
-            entry = confirmSingleEntryClass(loader, candidates, artifact);
+            entry = confirmSingleEntryClass(loader, candidates, artifact, defaultTest);
         }
         try (JarFile jar = new JarFile(entry.jar().toFile())) {
             String spec = readSpec(jar, entry, artifact);
             String pdkApiVersion = mainAttribute(jar, PDK_API_VERSION);
             return new IntrospectedConnector(entry.className(), pdkApiVersion, entry.specPath(), spec);
         } catch (IOException e) {
-            throw new UncheckedIOException("reading connector artifact " + entry.jar(), e);
+            throw new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
+                    Map.of(ARTIFACT, entry.jar().getFileName().toString()), e);
         }
     }
 
@@ -82,20 +88,22 @@ public final class ConnectorIntrospector {
                     }
                 }
             } catch (IOException e) {
-                throw new UncheckedIOException("reading connector artifact " + jarPath, e);
+                throw new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
+                        Map.of(ARTIFACT, jarPath.getFileName().toString()), e);
             }
         }
         return candidates;
     }
 
     private static Confirmed confirmSingleEntryClass(ConnectorClassLoader loader, List<Candidate> candidates,
-                                                     String artifact) {
+                                                     String artifact, boolean defaultTest) {
         List<Confirmed> confirmed = new ArrayList<>();
         for (Candidate candidate : candidates) {
             Class<?> type;
             try {
                 type = loader.load(candidate.className());
             } catch (ClassNotFoundException | LinkageError e) {
+                if (defaultTest && e instanceof LinkageError defect) throw defect;
                 // A class the pre-filter flagged that will not load or link (e.g. a connector missing
                 // its bundled runtime) cannot be read: a load failure, not a missing connector.
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", artifact), e);
@@ -104,6 +112,7 @@ public final class ConnectorIntrospector {
             try {
                 annotation = type.getDeclaredAnnotation(TapConnectorClass.class);
             } catch (AnnotationFormatError e) {
+                if (defaultTest) throw e;
                 // The class loads but its annotation bytes are corrupt: an unreadable artifact, not a
                 // missing connector — and never an error that escapes to take the caller down.
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", artifact), e);
@@ -114,11 +123,11 @@ public final class ConnectorIntrospector {
         }
         List<Confirmed> leaves = mostDerived(confirmed);
         if (leaves.isEmpty()) {
-            throw new TapstateException(ConnectorError.NO_CONNECTOR_CLASS, Map.of("artifact", artifact), null);
+            throw new TapstateException(ConnectorError.NO_CONNECTOR_CLASS, Map.of(ARTIFACT, artifact), null);
         }
         if (leaves.size() > 1) {
             throw new TapstateException(ConnectorError.AMBIGUOUS_CONNECTOR_CLASS,
-                    Map.of("artifact", artifact, "classes", classList(leaves)), null);
+                    Map.of(ARTIFACT, artifact, "classes", classList(leaves)), null);
         }
         return leaves.get(0);
     }
@@ -143,7 +152,7 @@ public final class ConnectorIntrospector {
         JarEntry specEntry = jar.getJarEntry(entry.specPath());
         if (specEntry == null) {
             throw new TapstateException(ConnectorError.SPEC_NOT_FOUND,
-                    Map.of("artifact", artifact, "spec", entry.specPath()), null);
+                    Map.of(ARTIFACT, artifact, "spec", entry.specPath()), null);
         }
         return new String(readAll(jar, specEntry), StandardCharsets.UTF_8);
     }

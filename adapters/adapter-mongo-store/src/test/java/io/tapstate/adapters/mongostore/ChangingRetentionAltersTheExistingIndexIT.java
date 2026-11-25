@@ -7,9 +7,7 @@ import com.mongodb.client.model.IndexOptions;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Duration;
 
@@ -27,10 +25,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class ChangingRetentionAltersTheExistingIndexIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(ChangingRetentionAltersTheExistingIndexIT.class);
 
     private static Long expiryOn(MongoDatabase database) {
         for (Document index : SystemCollections.PIPELINE_RATE_HISTORY.on(database).listIndexes()) {
@@ -44,7 +42,7 @@ class ChangingRetentionAltersTheExistingIndexIT {
     @Test
     void theSecondStartWritesItsRetentionOntoTheIndexTheFirstBuilt() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoDatabase database = client.getDatabase("history_retention_it");
+            MongoDatabase database = client.getDatabase(REPLICA_SET.database("history_retention_it"));
 
             new MongoRateHistoryStore(database, SystemCollections.PIPELINE_RATE_HISTORY.on(database),
                     Duration.ofDays(15));
@@ -64,7 +62,7 @@ class ChangingRetentionAltersTheExistingIndexIT {
     @Test
     void anIndexWhoseUniquenessDiffersIsRefusedRatherThanReadAsAMatch() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoDatabase database = client.getDatabase("index_uniqueness_it");
+            MongoDatabase database = client.getDatabase(REPLICA_SET.database("index_uniqueness_it"));
             // The shape a store left by hand, or by an older build, can be in: the name is right, the keys
             // are right, and the constraint the declaration asks for is not there. Creating it
             // unconditionally used to have the server answer that; reconciling only the expiry would find

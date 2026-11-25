@@ -203,7 +203,7 @@ class ControlApiTest {
 
         assertThat(invalid.valid()).isFalse();
         assertThat(invalid.diagnostics()).singleElement()
-                .extracting("code").isEqualTo("dsl.unknown-field");
+                .extracting("code").isEqualTo("TS0010002");
         assertThat(context.getBean(ArtifactStore.class).list()).isEmpty();
         assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
     }
@@ -257,15 +257,15 @@ class ControlApiTest {
                 assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
         assertThat(context.getBean(ArtifactStore.class).get("refresh_failed")).isPresent();
         assertThat(applied.warnings()).singleElement().satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "refresh_failed")
-                    .containsEntry("causeCode", "io.store-unavailable")
+                    .containsEntry("causeCode", "TS0480001")
                     .containsEntry("causeParams", Map.of("detail", "test outage"));
         });
     }
 
     @Test
-    void getReadsBackTheAppliedArtifactAsItsCanonicalForm() {
+    void getReadsBackSourceIdentityWithoutItsConnectorConfig() {
         applyDrafts(TGT_MG);
 
         ResponseEntity<StoredArtifact> got = client().get().uri("/api/artifacts/tgt_mg")
@@ -273,7 +273,50 @@ class ControlApiTest {
 
         assertThat(got.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(got.getBody().id()).isEqualTo("tgt_mg");
-        assertThat(got.getBody().canonicalForm()).isEqualTo(offlineCanonical(TGT_MG));
+        assertThat(got.getBody().canonicalForm())
+                .contains("id: tgt_mg", "connector: mongodb")
+                .doesNotContain("config:", "10.30.0.11");
+    }
+
+    @Test
+    void secretSourceArtifactReadsOmitConfigAndCanBeReapplied() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: atlas
+                connector: mongodb-atlas
+                config: { isUri: true, uri: "mongodb+srv://probe:sentinel@cluster.example/test" }
+                """;
+        ApplyResult written = applyDrafts(original);
+        StoredArtifact got = client().get().uri("/api/artifacts/atlas")
+                .retrieve().toEntity(StoredArtifact.class).getBody();
+        ArtifactList listed = client().get().uri("/api/artifacts?kind=source")
+                .retrieve().toEntity(ArtifactList.class).getBody();
+
+        assertThat(got.canonicalForm())
+                .contains("id: atlas", "connector: mongodb-atlas")
+                .doesNotContain("config:", "probe:sentinel");
+        assertThat(listed.artifacts()).singleElement().satisfies(row ->
+                assertThat(row.canonicalForm()).isEqualTo(got.canonicalForm()));
+        assertThat(got.contentHash()).isEqualTo(written.outcomes().getFirst().contentHash());
+
+        ArtifactValidationResult validation = client().post().uri("/api/artifacts:validate")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("drafts", List.of(Map.of("content", got.canonicalForm()))))
+                .retrieve().toEntity(ArtifactValidationResult.class).getBody();
+        assertThat(validation.valid()).isTrue();
+        assertThat(validation.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED);
+
+        ApplyResult replay = client().post().uri("/api/artifacts:apply")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("drafts", List.of(Map.of("content", got.canonicalForm()))))
+                .retrieve().toEntity(ApplyResult.class).getBody();
+        assertThat(replay.outcomes()).extracting(ArtifactOutcome::change)
+                .containsExactly(ArtifactOutcome.Change.UNCHANGED);
+        assertThat(client().get().uri("/api/artifacts/atlas")
+                .retrieve().toEntity(StoredArtifact.class).getBody().contentHash())
+                .isEqualTo(got.contentHash());
     }
 
     @Test
@@ -285,9 +328,10 @@ class ControlApiTest {
         ApplyResult result = applyDraftsWithPrecondition(TGT_MG_CHANGED, current);
 
         assertThat(result.outcomes()).extracting(ArtifactOutcome::id).containsExactly("tgt_mg");
-        assertThat(client().get().uri("/api/artifacts/tgt_mg")
-                .retrieve().toEntity(StoredArtifact.class).getBody().canonicalForm())
-                .isEqualTo(offlineCanonical(TGT_MG_CHANGED));
+        StoredArtifact after = client().get().uri("/api/artifacts/tgt_mg")
+                .retrieve().toEntity(StoredArtifact.class).getBody();
+        assertThat(after.contentHash()).isEqualTo(result.outcomes().getFirst().contentHash());
+        assertThat(after.canonicalForm()).doesNotContain("config:", "10.30.0.12");
     }
 
     @Test
@@ -305,7 +349,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0240003");
         // Not merely "an error came back": the refusal has to precede the write, so the stored bytes are
         // the ones from before the call. An implementation that upserts then checks would pass a test
         // that only looked at the status.
@@ -328,7 +372,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.not-found");
+        assertThat(body.code()).isEqualTo("TS0240001");
     }
 
     @Test
@@ -360,15 +404,14 @@ class ControlApiTest {
 
     @Test
     void anApplyWithNoPreconditionKeepsOverwritingAsItAlwaysHas() {
-        // The backward-compatibility half: the field is optional, and a caller that never sends it is
-        // never refused by a check it did not ask for.
+        // A Source edit with explicit config can update the connection without a caller-declared hash.
         applyDrafts(TGT_MG);
 
-        applyDrafts(TGT_MG_CHANGED);
+        ApplyResult changed = applyDrafts(TGT_MG_CHANGED);
 
         assertThat(client().get().uri("/api/artifacts/tgt_mg")
-                .retrieve().toEntity(StoredArtifact.class).getBody().canonicalForm())
-                .isEqualTo(offlineCanonical(TGT_MG_CHANGED));
+                .retrieve().toEntity(StoredArtifact.class).getBody().contentHash())
+                .isEqualTo(changed.outcomes().getFirst().contentHash());
     }
 
     private ApplyResult applyDraftsWithPrecondition(String draft, String expectedContentHash) {
@@ -496,7 +539,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.precondition-required");
+        assertThat(body.code()).isEqualTo("TS0240002");
         assertThat(body.params()).containsEntry("id", "tgt_mg");
         assertThat(context.getBean(ArtifactStore.class).get("tgt_mg")).isPresent();
     }
@@ -518,7 +561,7 @@ class ControlApiTest {
                                 .isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
                         return response.bodyTo(ApiError.class);
                     });
-            assertThat(body.code()).as(malformed).isEqualTo("artifact.precondition-required");
+            assertThat(body.code()).as(malformed).isEqualTo("TS0240002");
         }
         assertThat(context.getBean(ArtifactStore.class).get("tgt_mg")).isPresent();
     }
@@ -536,7 +579,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0240003");
         assertThat(canonicalOf("tgt_mg")).isEqualTo(before);
     }
 
@@ -556,7 +599,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.in-use");
+        assertThat(body.code()).isEqualTo("TS0240004");
         // The caller is told who to deal with, so it needs no second query to act on the refusal.
         assertThat(body.params().get("referrers").toString()).contains("ora2my_ods");
         // Nothing cascaded and nothing was removed first: all three are still stored.
@@ -583,7 +626,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("dsl.unknown-field");
+        assertThat(body.code()).isEqualTo("TS0010002");
         assertThat(body.message()).isEqualTo("Unknown field 'snapshot_mode' at options.snapshot_mode.");
         assertThat(body.params()).containsEntry("field", "snapshot_mode");
     }
@@ -592,7 +635,7 @@ class ControlApiTest {
     void applyingWithNullDraftsIsABadRequestWithACodedBody() {
         // A structurally malformed request — an apply body with no drafts array ({} deserializes to a null
         // drafts field) — is a client-attributable, diagnosable error. It is refused at the HTTP boundary
-        // with a coded control.malformed-request (400) carrying a human reason, not a bare invariant crash
+        // with a coded TS0210001 (400) carrying a human reason, not a bare invariant crash
         // (a 500) deeper in the service.
         ApiError body = client().post().uri("/api/artifacts:apply")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -603,10 +646,10 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         // the message is rendered from the catalog with the reason substituted, not the bare code
-        assertThat(body.message()).isNotBlank().isNotEqualTo("control.malformed-request").contains("drafts");
+        assertThat(body.message()).isNotBlank().isNotEqualTo("TS0210001").contains("drafts");
     }
 
     @Test
@@ -621,7 +664,7 @@ class ControlApiTest {
                         return response.bodyTo(ApiError.class);
                     });
 
-            assertThat(body.code()).isEqualTo("control.malformed-request");
+            assertThat(body.code()).isEqualTo("TS0210001");
             assertThat(body.params()).containsKey("reason");
         }
     }
@@ -762,16 +805,16 @@ class ControlApiTest {
         assertThat(pipeline.vertices().get(0).processors())
                 .as("and the processor names the stable node as well as the engine's identity for this "
                         + "run of it, because a claim names the stable one")
-                .containsExactly(new ClusterProcessorView(
-                        0, ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b"));
+                .containsExactly(new ClusterProcessorView(0, 0,
+                        ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b", null, Map.of(), Map.of()));
         assertThat(pipeline.awaitingRebalance())
                 .as("both members were planned into this run -- one doing the pinned vertex's work and "
                         + "one holding the instance that stands in for it -- so neither is waiting on "
                         + "anything, and a member holding only a placeholder must not read as idle")
                 .isEmpty();
         assertThat(pipeline.vertices().get(0).requested())
-                .as("nothing in the plan pins a vertex's parallelism yet, and absent is not the same as "
-                        + "the one processor that happened to run")
+                .as("a run with no plan recorded asked for nothing, and absent is not the same as the one "
+                        + "processor that happened to run")
                 .isNull();
     }
 
@@ -788,7 +831,8 @@ class ControlApiTest {
                 "\"controllerClaim\"", "\"captureClaims\"", "\"claimGeneration\"",
                 "\"executionGeneration\"", "\"leased\"", "\"measuredFrom\"",
                 "\"awaitingRebalance\"", "\"vertices\"", "\"effective\"", "\"executionId\"",
-                "\"processors\"", "\"memberUuid\"");
+                "\"processors\"", "\"memberUuid\"", "\"localIndex\"", "\"frontierGaps\"",
+                "\"frontierStalledMillis\"");
     }
 
     // ---- the endpoint table is a derivation of the registry ----
@@ -968,7 +1012,8 @@ class ControlApiTest {
             };
             AuditGate auditGate = new AuditGate(record -> {
             }, Clock.systemUTC());
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         // The read-back controller is imported too, so its query service must be present for the context to
@@ -1005,7 +1050,8 @@ class ControlApiTest {
                     return Optional.empty();
                 }
             }, new AuditGate(record -> {
-            }, Clock.systemUTC()), Clock.systemUTC());
+            }, Clock.systemUTC()), Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
@@ -1040,7 +1086,7 @@ class ControlApiTest {
 
     // ---- fixtures ----
 
-    /** A source draft carrying a field outside the tapstate/v1 schema — rejected as dsl.unknown-field. */
+    /** A source draft carrying a field outside the tapstate/v1 schema — rejected as TS0010002. */
     private static final String UNKNOWN_FIELD_DRAFT = """
             version: tapstate/v1
             kind: source

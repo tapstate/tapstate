@@ -1,6 +1,8 @@
 package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAccumulator;
@@ -50,6 +52,34 @@ public final class NestStateStats {
         counters.backfillNanos.add(nanos);
     }
 
+    public void readKeys(String namespace, long keys) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.readKeys.add(keys); value.publishKeys(); }
+    }
+    public void writeKeys(String namespace, long keys) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.writeKeys.add(keys); value.publishKeys(); }
+    }
+    public void coldKeys(String namespace, long keys) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.coldKeys.add(keys); value.publishKeys(); }
+    }
+    public io.tapstate.core.lifecycle.NestKeyAccess keyAccess(String namespace) {
+        Counters counted = counters(namespace);
+        synchronized (counted) { return counted.keyAccess(); }
+    }
+
+    /** One replaceable publisher per member/namespace; remote loaders keep an idle owner current. */
+    void publishKeys(String namespace, java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> publisher) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.publisher = publisher; value.publishKeys(); }
+    }
+
+    void refreshKeys(String namespace) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.publishKeys(); }
+    }
+
     /**
      * Marks that one key of {@code namespace} was holding {@code pending} changes for something that has not
      * arrived. What is kept is the deepest ever reported rather than the last, because the last is whichever
@@ -63,13 +93,190 @@ public final class NestStateStats {
         counters(namespace).pendingHighWater.accumulate(pending);
     }
 
+    /**
+     * Counts one commit group of {@code namespace}'s state that became durable: {@code keys} keys in one store
+     * transaction, costing {@code roundTrips} store round trips and {@code nanos} from issue to acknowledgement.
+     * Called on the thread that made the commit, which is not the one that publishes it.
+     */
+    public void committed(String namespace, long keys, long roundTrips, long nanos) {
+        Counters counters = counters(namespace);
+        synchronized (counters) {
+            counters.keys.observe(keys, keys);
+            counters.roundTrips.observe(roundTrips, roundTrips);
+            counters.commitDuration.observe(nanos / 1_000_000_000.0, nanos);
+        }
+    }
+
+    /**
+     * Counts what one acknowledged commit group of {@code namespace} wrote: each key's state as stored - at a
+     * nest's root level, each document's weight - and the group's total. The largest key is kept apart, since a
+     * distribution's last bucket says only that a document passed its top bound, not how far.
+     */
+    public void wrote(String namespace, java.util.Collection<byte[]> written) {
+        Counters counters = counters(namespace);
+        long total = 0L;
+        synchronized (counters) {
+            for (byte[] state : written) {
+                if (state == null) {
+                    continue;
+                }
+                counters.documentBytes.observe(state.length, state.length);
+                counters.largestDocumentBytes.accumulate(state.length);
+                total += state.length;
+            }
+            counters.commitBytes.observe(total, total);
+        }
+    }
+
+    /** Counts one fold of a document's rollup fields at {@code namespace}'s level, and how long it took. */
+    public void folded(String namespace, long nanos) {
+        Counters counters = counters(namespace);
+        synchronized (counters) {
+            counters.foldDuration.observe(nanos / 1_000_000_000.0, nanos);
+        }
+    }
+
+    /** How much {@code namespace}'s weight readings have seen, so a publisher can tell whether they moved. */
+    long weightObservations(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        return counters == null ? 0L : counters.commitBytes.count() + counters.foldDuration.count();
+    }
+
+    /** How heavy {@code namespace}'s state has been to keep, or null while nothing has been written. */
+    public Weight weight(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        if (counters == null) return null;
+        synchronized (counters) {
+            if (counters.commitBytes.count() == 0) return null;
+            return new Weight(counters.documentBytes.count(), counters.documentBytes.read(),
+                    counters.documentBytes.sum(), counters.largestDocumentBytes.get(), counters.commitBytes.count(),
+                    counters.commitBytes.read(), counters.commitBytes.sum(), counters.foldDuration.count(),
+                    counters.foldDuration.read(), counters.foldDuration.sum(), counters.countingSinceMillis);
+        }
+    }
+
+    /**
+     * One namespace's weight as read together: bytes per written key, the largest key, bytes per commit group,
+     * and rollup folds with their nanoseconds - each a count, the bucket counts and the sum observed.
+     */
+    public record Weight(long documents, long[] documentBuckets, long documentBytes, long largestDocument,
+            long groups, long[] groupBuckets, long groupBytes, long folds, long[] foldBuckets, long foldNanos,
+            long countingSinceMillis) {
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof Weight that
+                    && documents == that.documents
+                    && Arrays.equals(documentBuckets, that.documentBuckets)
+                    && documentBytes == that.documentBytes
+                    && largestDocument == that.largestDocument
+                    && groups == that.groups
+                    && Arrays.equals(groupBuckets, that.groupBuckets)
+                    && groupBytes == that.groupBytes
+                    && folds == that.folds
+                    && Arrays.equals(foldBuckets, that.foldBuckets)
+                    && foldNanos == that.foldNanos
+                    && countingSinceMillis == that.countingSinceMillis;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Long.hashCode(documents);
+            result = 31 * result + Arrays.hashCode(documentBuckets);
+            result = 31 * result + Long.hashCode(documentBytes);
+            result = 31 * result + Long.hashCode(largestDocument);
+            result = 31 * result + Long.hashCode(groups);
+            result = 31 * result + Arrays.hashCode(groupBuckets);
+            result = 31 * result + Long.hashCode(groupBytes);
+            result = 31 * result + Long.hashCode(folds);
+            result = 31 * result + Arrays.hashCode(foldBuckets);
+            result = 31 * result + Long.hashCode(foldNanos);
+            result = 31 * result + Long.hashCode(countingSinceMillis);
+            return result;
+        }
+
+        @Override
+        public String toString() {
+            return "Weight["
+                    + "documents=" + documents
+                    + ", documentBuckets=" + Arrays.toString(documentBuckets)
+                    + ", documentBytes=" + documentBytes
+                    + ", largestDocument=" + largestDocument
+                    + ", groups=" + groups
+                    + ", groupBuckets=" + Arrays.toString(groupBuckets)
+                    + ", groupBytes=" + groupBytes
+                    + ", folds=" + folds
+                    + ", foldBuckets=" + Arrays.toString(foldBuckets)
+                    + ", foldNanos=" + foldNanos
+                    + ", countingSinceMillis=" + countingSinceMillis + "]";
+        }
+    }
+
+    long commitGroups(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        return counters == null ? 0L : counters.keys.count();
+    }
+
+    /** How {@code namespace}'s commits have gone so far, or null when it has committed nothing yet. */
+    public Commits commits(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        if (counters == null) return null;
+        synchronized (counters) {
+            if (counters.keys.count() == 0) return null;
+            return new Commits(counters.keys.count(), counters.keys.read(), counters.keys.sum(),
+                    counters.roundTrips.read(), counters.roundTrips.sum(), counters.commitDuration.read(),
+                    counters.commitDuration.sum(), counters.countingSinceMillis);
+        }
+    }
+
+    /**
+     * One namespace's commits as read together: the number of groups, then per instrument the bucket counts
+     * over its registered bounds and the sum of what was observed - keys, round trips, and nanoseconds.
+     */
+    public record Commits(long groups, long[] keyBuckets, long keySum, long[] roundTripBuckets, long roundTripSum,
+            long[] durationBuckets, long durationNanos, long countingSinceMillis) {
+
+        /** Two readings are equal when every bucket is: arrays compare by identity unless told otherwise. */
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Commits that && groups == that.groups && keySum == that.keySum
+                    && roundTripSum == that.roundTripSum && durationNanos == that.durationNanos
+                    && countingSinceMillis == that.countingSinceMillis
+                    && java.util.Arrays.equals(keyBuckets, that.keyBuckets)
+                    && java.util.Arrays.equals(roundTripBuckets, that.roundTripBuckets)
+                    && java.util.Arrays.equals(durationBuckets, that.durationBuckets);
+        }
+
+        @Override
+        public int hashCode() {
+            int hash = java.util.Objects.hash(groups, keySum, roundTripSum, durationNanos, countingSinceMillis);
+            hash = 31 * hash + java.util.Arrays.hashCode(keyBuckets);
+            hash = 31 * hash + java.util.Arrays.hashCode(roundTripBuckets);
+            return 31 * hash + java.util.Arrays.hashCode(durationBuckets);
+        }
+
+        @Override
+        public String toString() {
+            return "Commits[groups=" + groups + ", keyBuckets=" + java.util.Arrays.toString(keyBuckets)
+                    + ", keySum=" + keySum + ", roundTripBuckets=" + java.util.Arrays.toString(roundTripBuckets)
+                    + ", roundTripSum=" + roundTripSum + ", durationBuckets="
+                    + java.util.Arrays.toString(durationBuckets) + ", durationNanos=" + durationNanos
+                    + ", countingSinceMillis=" + countingSinceMillis + "]";
+        }
+    }
+
+    /** Counts {@code documents} whole documents sent from {@code namespace}'s level since the run began. */
+    public void rendered(String namespace, long documents) {
+        counters(namespace).rootsRendered.add(documents);
+    }
+
     /** How often {@code namespace} was reached for, how much of that went behind the map, at what cost. */
     public Counted counted(String namespace) {
         Counters counters = byNamespace.get(namespace);
         return counters == null
-                ? new Counted(0, 0, 0, 0)
+                ? new Counted(0, 0, 0, 0, 0, 0, 0, 0)
                 : new Counted(counters.accesses.sum(), counters.backfills.sum(), counters.backfillNanos.sum(),
-                        counters.pendingHighWater.get());
+                        counters.pendingHighWater.get(), counters.rootsRendered.sum(), counters.countingSinceMillis,
+                        counters.readKeys.sum() + counters.writeKeys.sum(), counters.coldKeys.sum());
     }
 
     /** Whether anything has been counted for {@code namespace} at all - absence being distinct from zero. */
@@ -91,7 +298,11 @@ public final class NestStateStats {
     }
 
     /** One namespace's counts, as read together. Nanoseconds, because the trips being timed are short. */
-    public record Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater) {
+    public record Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater,
+            long rootsRendered, long countingSinceMillis, long keyAccesses, long coldKeys) {
+        public Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater) {
+            this(accesses, backfills, backfillNanos, pendingHighWater, 0, 0, 0, 0);
+        }
     }
 
     /**
@@ -104,6 +315,76 @@ public final class NestStateStats {
         private final LongAdder accesses = new LongAdder();
         private final LongAdder backfills = new LongAdder();
         private final LongAdder backfillNanos = new LongAdder();
+        private final LongAdder readKeys = new LongAdder();
+        private final LongAdder writeKeys = new LongAdder();
+        private final LongAdder coldKeys = new LongAdder();
+        private java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> publisher;
+        private io.tapstate.core.lifecycle.NestKeyAccess keyAccess() {
+            return new io.tapstate.core.lifecycle.NestKeyAccess(readKeys.sum(), writeKeys.sum(), coldKeys.sum(), "local");
+        }
+        private void publishKeys() { if (publisher != null) publisher.accept(keyAccess()); }
+        private final LongAdder rootsRendered = new LongAdder();
+        private final Distribution keys = new Distribution(HistogramBounds.STATE_COMMIT_KEYS);
+        private final Distribution roundTrips = new Distribution(HistogramBounds.STATE_COMMIT_ROUND_TRIPS);
+        private final Distribution commitDuration = new Distribution(HistogramBounds.STATE_COMMIT_DURATION);
+        private final Distribution documentBytes = new Distribution(HistogramBounds.STATE_DOCUMENT_BYTES);
+        private final Distribution commitBytes = new Distribution(HistogramBounds.STATE_COMMIT_BYTES);
+        private final Distribution foldDuration = new Distribution(HistogramBounds.ROLLUP_FOLD_DURATION);
+        private final LongAccumulator largestDocumentBytes = new LongAccumulator(Math::max, 0L);
+
+        /**
+         * When these counts began, in epoch milliseconds: what a count of work done accumulates from, so a
+         * reader can tell a restart from a decrease. Fixed when the namespace is first counted on this member.
+         */
+        private final long countingSinceMillis = System.currentTimeMillis();
         private final LongAccumulator pendingHighWater = new LongAccumulator(Math::max, 0L);
+    }
+
+    /**
+     * Bucket counts over one instrument's registered bounds, and the sum of what was observed in the unit the
+     * caller keeps it in. Adders, for the reason the other counters are: written on every commit, read only
+     * when a reading is left.
+     */
+    private static final class Distribution {
+
+        private final java.util.List<Double> bounds;
+        private final LongAdder[] buckets;
+        private final LongAdder count = new LongAdder();
+        private final LongAdder sum = new LongAdder();
+
+        private Distribution(HistogramBounds instrument) {
+            this.bounds = instrument.bounds();
+            this.buckets = new LongAdder[instrument.buckets()];
+            for (int i = 0; i < buckets.length; i++) {
+                buckets[i] = new LongAdder();
+            }
+        }
+
+        /** One observation: {@code value} decides the bucket, in the bounds' unit; {@code kept} is summed. */
+        private void observe(double value, long kept) {
+            int bucket = 0;
+            while (bucket < bounds.size() && value > bounds.get(bucket)) {
+                bucket++;
+            }
+            buckets[bucket].increment();
+            count.increment();
+            sum.add(kept);
+        }
+
+        private long count() {
+            return count.sum();
+        }
+
+        private long sum() {
+            return sum.sum();
+        }
+
+        private long[] read() {
+            long[] read = new long[buckets.length];
+            for (int i = 0; i < buckets.length; i++) {
+                read[i] = buckets[i].sum();
+            }
+            return read;
+        }
     }
 }

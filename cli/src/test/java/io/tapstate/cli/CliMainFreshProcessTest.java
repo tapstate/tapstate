@@ -50,6 +50,14 @@ class CliMainFreshProcessTest {
     private static final String ISSUER = "urn:tapstate:cluster:TEST";
 
     @Test
+    void statusHelpWorksWithoutAContext(@TempDir Path home) throws Exception {
+        ProcessResult result = runCli(home, home, Map.of(), "status", "--help");
+
+        assertThat(result.exitCode()).as("status --help stderr: %s", result.stderr()).isZero();
+        assertThat(result.stdout()).contains("Usage: tapstate status", "--rate");
+    }
+
+    @Test
     void defaultInstallWithUmask022AllowsContextResolution(@TempDir Path temporary) throws Exception {
         Assumptions.assumeTrue(Files.getFileStore(temporary).supportsFileAttributeView("posix"));
         Path home = Files.createDirectory(temporary.resolve("home"));
@@ -97,16 +105,16 @@ class CliMainFreshProcessTest {
         assertThat(Files.getOwner(configDirectory)).isEqualTo(Files.getOwner(home));
         Set<PosixFilePermission> installedMode = Files.getPosixFilePermissions(configDirectory);
 
-        ProcessResult installed = runCli(home, home, Map.of(), "apply", "--help");
+        ProcessResult installed = runCli(home, home, Map.of(), "apply");
 
         // Capture the existing missing-context behavior when only the directory mode changes.
         Files.setPosixFilePermissions(configDirectory, Set.of(PosixFilePermission.OWNER_READ,
                 PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
-        ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply", "--help");
-        assertThat(ownerOnly.stderr()).contains("error: cli.context-required")
-                .doesNotContain("cli.context-config-permissions");
+        ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply");
+        assertThat(ownerOnly.stderr()).contains("error: TS0330054")
+                .doesNotContain("TS0330037");
         assertThat(installed.stderr())
-                .withFailMessage("apply --help must accept the installer-created directory (mode %s): %s",
+                .withFailMessage("apply must accept the installer-created directory (mode %s): %s",
                         installedMode, installed.stderr())
                 .isEqualTo(ownerOnly.stderr());
     }
@@ -335,17 +343,22 @@ class CliMainFreshProcessTest {
     }
 
     @Test
-    void aOneShotCommandYieldsTheStatusOfItsRefusal(@TempDir Path home) throws Exception {
+    void aPipedSessionYieldsTheStatusOfARefusedLine(@TempDir Path home) throws Exception {
         Path workspace = Files.createDirectory(home.resolve("orders"));
-        // Bare launches own the full-screen workbench. Scripts use a one-shot command instead, whose
-        // process status is the result of the command it was given.
-        ProcessResult result = runCli(home, workspace, Map.of(), "apply", "nope");
+        // The reported shape: a script pipes its lines in and reads the status the run leaves behind.
+        // `apply` is refused because no context names a server, but the verb is not the point -- any
+        // refused line is. `exit` follows it because that is how a script ends the session, and because
+        // it leaves the refusal somewhere other than the last line, which is the only place a status
+        // read off the end would find it.
+        Path script = Files.writeString(home.resolve("session.txt"), "apply nope\nexit\n");
+
+        ProcessResult result = runCli(home, workspace, Map.of(), script);
 
         assertThat(result.stderr())
-                .withFailMessage("the command was not refused, so this is not the reported run: %s", result.stderr())
-                .contains("error: cli.context-required");
+                .withFailMessage("the line was not refused, so this is not the reported run: %s", result.stderr())
+                .contains("error: TS0330054");
         assertThat(result.exitCode())
-                .withFailMessage("a refused command exited %s: stdout=%s stderr=%s",
+                .withFailMessage("a refused line left the session exiting %s: stdout=%s stderr=%s",
                         result.exitCode(), result.stdout(), result.stderr())
                 .isNotZero();
     }

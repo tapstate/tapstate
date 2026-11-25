@@ -29,19 +29,27 @@ import org.springframework.context.annotation.Import;
  */
 @Configuration
 @EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class})
-@Import(ClusterMembershipConfiguration.class)
+@Import({ClusterMembershipConfiguration.class, CloudRuntimeConfiguration.class})
 class StoreConfiguration {
 
     @Bean(destroyMethod = "close")
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    MongoConnection storeConnection(MongoProperties properties) {
+    MongoConnection storeConnection(MongoProperties properties, CloudRuntimeSettings cloud, BootId bootId) {
+        // Named for this start of the process, so the members left can end what it leaves open if it goes
+        // halfway through a write. See DepartedMemberTransactions.
         MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
-                properties.getUri(), properties.getTlsCaFile(),
-                properties.getServerSelectionTimeout()));
+                cloud.metadataUri(properties.getUri()), properties.getTlsCaFile(),
+                properties.getServerSelectionTimeout(), bootId.value()));
         // Fail fast at startup: a coded diagnostic surfaces through CodedFailureAnalyzer if the
         // store is unreachable or is not a replica-set, rather than a bare driver stack trace.
-        connection.verify();
-        return connection;
+        try {
+            connection.verify();
+            return connection;
+        } catch (RuntimeException | Error failure) {
+            // Spring cannot destroy a connection whose factory failed before returning the bean.
+            connection.close();
+            throw failure;
+        }
     }
 
     /**
@@ -52,11 +60,26 @@ class StoreConfiguration {
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     StorePort storePort(
-            MongoConnection storeConnection, MongoProperties mongo, MetricsHistoryProperties history) {
+            MongoConnection storeConnection, MongoProperties mongo, MetricsHistoryProperties history,
+            CloudRuntimeSettings cloud) {
         // The one configured bound among the stores: how long a movement sample is kept. Written onto
         // the history's expiring index as the port comes up, so a changed retention is a changed index.
         return new MongoStorePort(
-                storeConnection, mongo.getOperatorStateDatabase(), history.getRetention());
+                storeConnection, mongo.getOperatorStateDatabase(),
+                history.getRetention());
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettingsStore(MongoConnection connection) {
+        return connection.aiProviderSettings();
+    }
+
+    /** The process-local keyring view used by Source configuration encryption. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.adapters.mongostore.SourceConfigKeyringHandle sourceConfigKeyring(MongoConnection storeConnection) {
+        return storeConnection.sourceConfigKeyring();
     }
 
     /** The deployment's default and per-Nest operator-state databases over the verified store client. */

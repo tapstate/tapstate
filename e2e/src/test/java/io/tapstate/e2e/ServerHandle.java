@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import org.springframework.util.FileSystemUtils;
+
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
@@ -44,12 +46,29 @@ interface ServerHandle extends AutoCloseable {
      * the staging cache is content-addressed and reused when the file is already there, so a second run
      * of an edited connector would silently be served the first run's jar - a test that passes against
      * code that no longer exists. A fresh directory per launch cannot do either.
+     *
+     * <p>The launcher that took it hands it to {@link #discardStagingDirectory} once its launch is over.
      */
     static Path privateStagingDirectory() {
         try {
             return Files.createTempDirectory("tapstate-e2e-plugins");
         } catch (IOException e) {
             throw new UncheckedIOException("could not create a staging directory for the server", e);
+        }
+    }
+
+    /**
+     * Deletes a launch's staging directory, once nothing will stage into it again.
+     *
+     * <p>Each one holds copies of the staged connector jars, and the system temporary directory is
+     * only emptied when the machine restarts. Left behind, one per launch, they fill the disk of a
+     * machine that runs this suite repeatedly.
+     */
+    static void discardStagingDirectory(Path directory) {
+        try {
+            FileSystemUtils.deleteRecursively(directory);
+        } catch (IOException e) {
+            throw new UncheckedIOException("could not delete the server's staging directory " + directory, e);
         }
     }
 }

@@ -21,8 +21,15 @@ public record SourceDraft(
         List<SourceTableDraft> tables,
         Map<String, Object> options,
         SourceSrs srs,
+        Map<String, Object> execution,
         Map<String, Object> experimental,
         List<String> clearSecrets) {
+
+    public SourceDraft(String id, Metadata metadata, String connector, Map<String, Object> config, String mode,
+            List<SourceTableDraft> tables, Map<String, Object> options, SourceSrs srs,
+            Map<String, Object> experimental, List<String> clearSecrets) {
+        this(id, metadata, connector, config, mode, tables, options, srs, null, experimental, clearSecrets);
+    }
 
     public SourceDraft {
         Objects.requireNonNull(id, "id");
@@ -30,6 +37,7 @@ public record SourceDraft(
         config = copyJsonMap(config, false);
         tables = tables == null ? null : Collections.unmodifiableList(new ArrayList<>(tables));
         options = copyJsonMap(options, true);
+        execution = copyJsonMap(execution, true);
         experimental = copyJsonMap(experimental, true);
         clearSecrets = clearSecrets == null
                 ? List.of()

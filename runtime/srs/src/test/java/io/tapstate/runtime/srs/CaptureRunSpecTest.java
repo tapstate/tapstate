@@ -3,12 +3,17 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A run spec is a pipeline's read of one of its sources, and the connector doing that read files notes
@@ -92,5 +97,61 @@ class CaptureRunSpecTest {
     @Test
     void scopingDoesNotMoveTheChainTheRunMinesFrom() {
         assertThat(MiningChainId.of(spec(UNSCOPED).config())).isEqualTo(MiningChainId.of(UNSCOPED));
+    }
+
+    @Test
+    void directRecoveryIdentitySurvivesReadModeAndInitialStartChanges() {
+        CaptureRunSpec first = new CaptureRunSpec(UNSCOPED, ReadMode.SNAPSHOT_AND_CDC, null, false,
+                "source", "pipeline", StartFrom.latest(), null, 0L);
+        CaptureRunSpec again = new CaptureRunSpec(UNSCOPED, ReadMode.CDC_ONLY, null, false,
+                "source", "pipeline", StartFrom.earliest(), null, 0L);
+        CaptureRunSpec other = new CaptureRunSpec(UNSCOPED, ReadMode.CDC_ONLY, null, false,
+                "source", "other-pipeline", StartFrom.earliest(), null, 0L);
+
+        assertThat(first.miningChainId()).isEqualTo(again.miningChainId());
+        assertThat(first.miningChainId()).isNotEqualTo(other.miningChainId());
+        assertThat(first.miningChainId()).isNotEqualTo(MiningChainId.resolve(UNSCOPED, null));
+    }
+
+    @Test
+    void sharedSourceNodesKeepConsumptionProgressApartOnOneCapture() {
+        CaptureRunSpec root = spec(UNSCOPED, "pipeline", "root-source")
+                .withConsumerId("root-progress");
+        CaptureRunSpec mail = spec(UNSCOPED, "pipeline", "mail-source")
+                .withConsumerId("mail-progress");
+
+        assertThat(root.miningChainId()).isEqualTo(mail.miningChainId());
+        assertThat(root.consumerId()).isNotEqualTo(mail.consumerId());
+        assertThat(root.pipelineId()).isEqualTo(mail.pipelineId());
+        assertThat(root.config().node()).isEqualTo(new PipelineNode("pipeline", "root-source"));
+    }
+
+    @Test
+    void compatibilityCallersUseThePipelineConsumptionRecord() {
+        CaptureRunSpec compatible = spec(UNSCOPED);
+        CaptureRunSpec optional = new CaptureRunSpec(UNSCOPED, ReadMode.CDC_ONLY, null, true,
+                "src_a", "p1", StartFrom.earliest(), null, 0L, 0L, null, null);
+
+        assertThat(compatible.consumerId()).isEqualTo("p1");
+        assertThat(optional.consumerId()).isEqualTo("p1");
+    }
+
+    @Test
+    void addingTheCaptureFenceKeepsTheSourceConsumptionRecord() {
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster", WorkloadClaimType.CAPTURE, "capture"),
+                new WorkloadOwner("node", "boot"), 1L, 1L, 1L);
+        CaptureRunSpec original = spec(UNSCOPED).withConsumerId("source-progress");
+        CaptureRunSpec fenced = original.withCaptureFence(fence);
+
+        assertThat(fenced.consumerId()).isEqualTo("source-progress");
+        assertThat(fenced.captureFence()).isEqualTo(fence);
+        assertThat(fenced.miningChainId()).isEqualTo(original.miningChainId());
+    }
+
+    @Test
+    void aBlankSourceConsumptionIdentityIsAProgrammerError() {
+        assertThatThrownBy(() -> spec(UNSCOPED).withConsumerId(" "))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }

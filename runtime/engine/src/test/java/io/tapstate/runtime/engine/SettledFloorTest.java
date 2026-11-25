@@ -27,6 +27,28 @@ class SettledFloorTest {
     private static final ChainAxes AXES = ChainAxes.assign(List.of("orders", "lines"));
 
     @Test
+    void a_routed_writer_covers_sibling_positions_without_acknowledging_their_tokens() {
+        RecordingAck acked = new RecordingAck();
+        SettledFloor floor = SettledFloor.forRoutedWriter(AXES, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN);
+
+        floor.settled(entries("orders", 1), acked);
+        floor.bound(boundAt("orders", 3), acked);
+
+        assertThat(floor.gaps()).containsExactly(entry("orders", 0L));
+        assertThat(floor.stalls()).isEmpty();
+        assertThat(acked.calls).containsExactly("orders=w1");
+
+        // A later local row still needs the upstream bound to cover it. Accounting for siblings must
+        // neither hide that hold nor acknowledge the row before the bound reaches it.
+        floor.settled(entries("orders", 5), acked);
+        assertThat(floor.stalls()).containsOnlyKeys("orders");
+        assertThat(acked.calls).containsExactly("orders=w1");
+        floor.bound(boundAt("orders", 5), acked);
+        assertThat(floor.stalls()).isEmpty();
+        assertThat(acked.calls).containsExactly("orders=w1", "orders=w5");
+    }
+
+    @Test
     void advances_to_the_highest_settled_entry_at_or_below_the_bound() {
         RecordingAck acked = new RecordingAck();
         SettledFloor floor = new SettledFloor(AXES, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN);

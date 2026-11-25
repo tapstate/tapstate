@@ -80,7 +80,7 @@
   ],
   "provenance": {
     "specPath": "connectors/yashandb-connector/src/main/resources/yashandb-spec.json",
-    "specContentHash": "224e3f74b76132b3",
+    "specContentHash": "5b6f71ab8dabf13c",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

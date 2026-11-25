@@ -1,7 +1,14 @@
 package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.lifecycle.LoadLandings;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.io.Serializable;
+import java.util.List;
+import java.util.Map;
+import java.util.LinkedHashMap;
+import java.util.Collections;
+import java.util.Set;
 
 /**
  * Resolves, on the member it runs on, the {@link SinkAck} a sink advances its durable watermark through. It
@@ -16,6 +23,26 @@ import java.io.Serializable;
 @FunctionalInterface
 public interface SinkAckFactory extends Serializable {
 
+    /** Exact compiled writers by source stream and terminal output vertex, including zero-row writers. */
+    record RunWriters(Map<String, List<String>> byStream, Map<String, Map<String, List<String>>> byOutput) implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public RunWriters {
+            byStream = copy(byStream);
+            var outputs = new LinkedHashMap<String, Map<String, List<String>>>();
+            byOutput.forEach((output, streams) -> outputs.put(output, copy(streams)));
+            byOutput = Collections.unmodifiableMap(outputs);
+        }
+        private static Map<String, List<String>> copy(Map<String, List<String>> original) {
+            var result = new LinkedHashMap<String, List<String>>(); original.forEach((stream, writers) -> result.put(stream, List.copyOf(writers)));
+            return Collections.unmodifiableMap(result);
+        }
+    }
+    /** Actual Jet attempt, independent of the Pipeline's durable actuation/recovery coordinates. */
+    record ExecutionWriters(long jobId, long executionId, RunWriters writers) implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public ExecutionWriters { java.util.Objects.requireNonNull(writers); }
+    }
+
     /** A factory that resolves to an ack that records nothing - the default when no store is bound. */
     SinkAckFactory NONE = member -> (chain, srcpos) -> { };
 
@@ -24,4 +51,51 @@ public interface SinkAckFactory extends Serializable {
      * watermark through, bound to the store the member holds.
      */
     SinkAck resolve(HazelcastInstance member);
+
+    /**
+     * Starts the accounting one execution of the graph lands its progress under, on the member coordinating
+     * that execution and before any writer of it exists: for each chain, every writer the graph routes that
+     * chain's changes to, named as {@link SinkProcessor#writerId} names them.
+     *
+     * <p>How far a pipeline has landed a chain is the lowest of what those writers have landed, so the set
+     * comes first: progress from a writer nobody knew to wait for would be progress nobody waits on. A factory
+     * whose acks do not keep writers apart has nothing to start, which is the default.
+     */
+    default void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
+    }
+
+    /**
+     * {@link #beginRun(HazelcastInstance, Map)}, carrying the exact live workload claim the coordinating member
+     * admitted the run under, so a factory that records durably can bind the run to that claim at the store.
+     */
+    default void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain,
+            WorkloadClaimFence fence) {
+        beginRun(coordinator, writersByChain);
+    }
+
+    /** Full actual roster; older acknowledgements retain their original stream/fence behavior. */
+    default void beginRun(HazelcastInstance coordinator, RunWriters writers) { beginRun(coordinator, writers.byStream()); }
+    default void beginRun(HazelcastInstance coordinator, RunWriters writers, WorkloadClaimFence fence) { beginRun(coordinator, writers.byStream(), fence); }
+    default void beginRun(HazelcastInstance coordinator, ExecutionWriters execution) { beginRun(coordinator, execution.writers()); }
+    default void beginRun(HazelcastInstance coordinator, ExecutionWriters execution, WorkloadClaimFence fence) { beginRun(coordinator, execution.writers(), fence); }
+
+    /**
+     * Resolves, on {@code member}, how the loads a source's changes wait for stand, read from the same durable
+     * record the acks resolved here write: a load has landed once every writer named with it has recorded
+     * progress past it.
+     *
+     * <p>A factory whose acks record no writer's progress has nothing a load could be seen landing in, and
+     * answers that every load has: a change held for a record nothing writes would be held for good.
+     */
+    default LoadLandings loadLandings(HazelcastInstance member) {
+        return awaited -> List.of();
+    }
+
+    /**
+     * Source streams whose snapshot landing was durably confirmed for every writer, including in an
+     * earlier execution of this pipeline intent. Such sources can resume without another snapshot bound.
+     */
+    default Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        return Set.of();
+    }
 }

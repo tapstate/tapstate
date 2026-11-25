@@ -15,6 +15,8 @@ import io.tapstate.control.core.PipelineChains;
 import io.tapstate.control.core.PipelineExplainService;
 import io.tapstate.control.core.PipelineHistoryQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.control.core.PipelineStatus;
@@ -25,9 +27,12 @@ import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -41,6 +46,7 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SchemaVersion;
@@ -73,11 +79,15 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -98,37 +108,64 @@ import static org.assertj.core.api.Assertions.assertThat;
  * server prints, and a document sent back with most of it left out still binds. Every other case for that
  * face constructs the record in memory, where both of those are true by construction.
  *
- * <p>The original three:
- * status / metrics / snapshot, each a {@code GET} on a pipeline instance ({@code GET
- * /api/pipelines/{id}/status}). It proves the reads round-trip through the real query service (over an
- * in-memory observation store), that a read of a pipeline that has published no observation surfaces as a
- * 404 with the {@code monitor.no-observation} coded body rather than a bare 500, that the interceptor
- * guards a read like any other verb, and that the three read endpoints are a derivation of the registry.
+ * <p>Status returns a catalog projection for a known authoring draft or applied pipeline. A known
+ * transition can report a display state before it has a runtime state to report. Metrics, snapshot, and
+ * explanation still return {@code TS0400001} when runtime data is not yet available. The tests
+ * prove the reads round-trip through the real query service, that an unknown id returns the permanent coded
+ * error, that the interceptor guards a read like any other verb, and that read endpoints derive from the registry.
  * The context is booted programmatically so the module stays on the reactor's JUnit line; it imports the
  * read controller with the path configuration and the interceptor, so it exercises the guarded read path.
  */
 class PipelineObservationApiTest {
 
     private static final Instant NOW = Instant.parse("2026-07-12T12:00:00Z");
+    private static final String MYSQL_POSITION = serializedPosition("mysql-bin.000003:1544");
+    private static final String POSTGRES_POSITION = serializedPosition("0/16B6C50");
 
     /** One running pipeline with a couple of metrics and one in-progress snapshot table. */
     private static final Observation PL1 = new Observation("pl1", PipelineState.RUNNING,
             Map.of("recordCount", 42L, "errorCount", 0L),
             Map.of("orders", new TableSnapshot(10, 100L, 10)));
 
+    // A connector token that shares the Java magic and uses a different version byte.
+    private static final String HEADER_LIKE_POSITION = "rO0ABA==";
+
     /** One running pipeline whose target-acked source positions have advanced, to exercise that field. */
     private static final Observation PL_POS = new Observation("pl2", PipelineState.RUNNING,
             Map.of("recordCount", 6L, "errorCount", 0L),
             Map.of(),
-            Map.of("orders", "w7"));
+            Map.of("orders", "w7", "shipments", MYSQL_POSITION, "events", POSTGRES_POSITION,
+                    "ledger", "binlog.000017:567", "archive", HEADER_LIKE_POSITION));
+
+    private static String serializedPosition(String position) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(position);
+        } catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+        return Base64.getEncoder().encodeToString(bytes.toByteArray());
+    }
 
     /** One pipeline whose job died, to exercise the coded reason the status face carries. */
     private static final Observation PL_DEAD = new Observation("pl3", PipelineState.FAILED,
             Map.of("errorCount", 1L), Map.of(), Map.of(),
-            new ObservationFailure("engine.job-failed",
-                    Map.of("pipeline", "pl3", "cause", "the sink rejected the batch")));
+            new ObservationFailure("TS0440008",
+                    Map.of("pipeline", "pl3", "cause", "the sink rejected the batch"), Map.of("rawMessage", "safe captured cause")));
 
     private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
+
+    /**
+     * The plan pl2's run was submitted on, on three members with nothing fencing it: a source held to one
+     * processor for the cluster, and a sink worked out to three per member.
+     */
+    private static final ExecutionPlan PL_POS_PLAN = new ExecutionPlan("pl2", null, null, null,
+            List.of("m1", "m2", "m3"),
+            List.of(new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                            List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src")),
+                    new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9, List.of("rounded-up"),
+                            512, 50L, List.of("route.orders_sink", "orders_sink"))),
+            Instant.parse("2026-07-12T11:30:00Z"));
 
     /** One pipeline publishing its measured facts beside the flat map: a counter with attributes, a gauge, a distribution. */
     private static final Observation PL_FACTS = new Observation("pl4", PipelineState.RUNNING,
@@ -185,6 +222,7 @@ class PipelineObservationApiTest {
                 Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
+        context.getBean(PipelineApiTest.FakePipelineDraftStore.class).clear();
     }
 
     private RestClient client() {
@@ -208,6 +246,34 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void lifecycleConsumersReadObservedStatesWhileUiTransitionsHaveTheirOwnField() {
+        PipelineState[][] transitions = {
+                {PipelineState.STOPPED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.PAUSED},
+                {PipelineState.PAUSED, PipelineState.RUNNING},
+                {PipelineState.RUNNING, PipelineState.STOPPED}
+        };
+        String[] displays = {"STARTING", "PAUSING", "RESUMING", "STOPPING"};
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        FakeStoppedPipelines lifecycle = context.getBean(FakeStoppedPipelines.class);
+        String token = machineToken(Scope.READ);
+        for (int index = 0; index < transitions.length; index++) {
+            PipelineState observed = transitions[index][0];
+            lifecycle.intent("pl1", transitions[index][1]);
+            observations.save(new Observation("pl1", observed, Map.of(), Map.of(), Map.of(), null, NOW));
+
+            Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+            assertThat(PipelineState.valueOf((String) body.get("state"))).isEqualTo(observed);
+            assertThat(body).containsEntry("displayState", displays[index])
+                    .containsEntry("observedState", observed.name())
+                    .containsEntry("desiredState", transitions[index][1].name());
+        }
+    }
+
+    @Test
     void statusOfAFailedPipelineCarriesTheCodedReasonAndItsRenderedMessage() {
         // The code is the stable machine identity and the params are the variable data; the message is
         // rendered here, where the catalog lives, so every face prints one wording rather than each
@@ -218,7 +284,8 @@ class PipelineObservationApiTest {
 
         assertThat(body.get("state")).isEqualTo("FAILED");
         Map<?, ?> failure = (Map<?, ?>) body.get("failure");
-        assertThat(failure.get("code")).isEqualTo("engine.job-failed");
+        assertThat(failure.get("code")).isEqualTo("TS0440008");
+        assertThat(failure.get("diagnostic")).isEqualTo(Map.of("rawMessage", "safe captured cause"));
         assertThat((String) failure.get("message")).contains("the sink rejected the batch");
         assertThat((Map<String, Object>) failure.get("params"))
                 .containsEntry("cause", "the sink rejected the batch");
@@ -232,6 +299,40 @@ class PipelineObservationApiTest {
 
         // Absent, not present-and-null: a client reading this must not have to tell those apart.
         assertThat(body).doesNotContainKey("failure");
+    }
+
+    @Test
+    void statusCarriesThePlanItsRunWasSubmittedOnAndOmitsWhatTheRunDoesNotHave() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl2/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        Map<String, Object> plan = (Map<String, Object>) body.get("plan");
+        assertThat(plan.get("members")).isEqualTo(List.of("m1", "m2", "m3"));
+        assertThat(plan.get("plannedAt")).isEqualTo("2026-07-12T11:30:00Z");
+        // Nothing fences a run on a single member, so it has no generations to name: absent, not sent as zero.
+        assertThat(plan).doesNotContainKeys("claimGeneration", "executionGeneration", "topologyRevision");
+        List<?> nodes = (List<?>) plan.get("nodes");
+        assertThat(nodes).hasSize(2);
+        assertThat((Map<String, Object>) nodes.get(0)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "node", "orders_src", "requested", 1, "requestedOrigin", "node-default", "scope", "total-one",
+                "memberCount", 3, "effective", 1, "reasons", List.of("requested-one", "source-reads-not-split"),
+                "batch", Map.of("maxRecords", 1024, "maxWaitMillis", 0)));
+        assertThat((Map<String, Object>) nodes.get(1)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "node", "orders_sink", "requested", 8, "requestedOrigin", "explicit", "scope", "native",
+                "memberCount", 3, "computedLocal", 3, "effective", 9, "reasons", List.of("rounded-up"),
+                "batch", Map.of("maxRecords", 512, "maxWaitMillis", 50)));
+        // A fourth member joined after the run was planned over three: it waits for a rebalance.
+        assertThat(body.get("awaitingRebalance")).isEqualTo(List.of("m4"));
+    }
+
+    @Test
+    void statusOfAPipelineWhoseRunHasNoPlanRecordedOmitsThePlan() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING").doesNotContainKeys("plan", "awaitingRebalance");
     }
 
     @Test
@@ -302,7 +403,13 @@ class PipelineObservationApiTest {
         // A source position is a string, and the metrics map is numeric run statistics. Carrying the
         // position as a sibling rather than nested inside that map keeps every metrics cell a number,
         // so a reader never has to type-test a cell before using it.
-        assertThat(body.get("targetAckedPosition")).isEqualTo(Map.of("orders", "w7"));
+        Map<String, String> positions = (Map<String, String>) body.get("targetAckedPosition");
+        assertThat(positions).containsOnlyKeys("orders", "shipments", "events", "ledger", "archive")
+                .containsEntry("orders", "w7")
+                .containsEntry("ledger", "binlog.000017:567")
+                .containsEntry("archive", HEADER_LIKE_POSITION);
+        assertThat(positions.get("shipments")).matches("opaque-v1:[0-9a-f]{64}");
+        assertThat(positions.get("events")).matches("opaque-v1:[0-9a-f]{64}").isNotEqualTo(positions.get("shipments"));
         Map<String, Object> metrics = (Map<String, Object>) body.get("metrics");
         assertThat(metrics).doesNotContainKey("targetAckedPosition");
         assertThat(metrics.get("recordCount")).isNotNull();
@@ -357,6 +464,36 @@ class PipelineObservationApiTest {
 
         assertThat(body.pipelineId()).isEqualTo("pl1");
         assertThat(body.snapshot()).containsEntry("orders", new TableSnapshot(10, 100L, 10));
+    }
+
+    @Test
+    void explanationCarriesTheSameCapturedDiagnosticAsStatus() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl3/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        var evidence = (List<Map<String, Object>>) body.get("evidence");
+        assertThat(evidence).anySatisfy(item -> {
+            assertThat(item.get("field")).isEqualTo("failure");
+            assertThat(((Map<?, ?>) item.get("value")).get("diagnostic"))
+                    .isEqualTo(Map.of("rawMessage", "safe captured cause"));
+        });
+    }
+
+    @Test
+    void explanationLocalizesTheTypedRuntimeFailureAndKeepsCapturedEvidence() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl3/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .header("Accept-Language", "zh-CN, en;q=0.8")
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        List<Map<String, Object>> evidence = (List<Map<String, Object>>) body.get("evidence");
+        Map<?, ?> failure = (Map<?, ?>) evidence.stream().filter(item -> item.get("field").equals("failure"))
+                .findFirst().orElseThrow().get("value");
+
+        assertThat(failure.get("code")).isEqualTo("TS0440008");
+        assertThat(failure.get("params")).isEqualTo(Map.of("pipeline", "pl3", "cause", "the sink rejected the batch"));
+        assertThat((String) failure.get("message")).contains("\u56e0\u4f5c\u4e1a\u5931\u8d25", "the sink rejected the batch");
+        assertThat((String) failure.get("solution")).contains("\u67e5\u770b Pipeline \u65e5\u5fd7");
+        assertThat(failure.get("diagnostic")).isEqualTo(Map.of("rawMessage", "safe captured cause"));
     }
 
     @Test
@@ -439,7 +576,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsEntry("reason", "from is required");
     }
 
@@ -470,7 +607,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("monitor.no-observation");
+        assertThat(body.code()).isEqualTo("TS0400001");
         assertThat(body.params()).containsEntry("pipeline", "pl1");
     }
 
@@ -487,13 +624,15 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
     }
 
-    // ---- a read of a pipeline with no published observation is a 404 coded body, never a bare 500 ----
+    // ---- a known pipeline returns merged status before its first runtime observation ----
 
     @Test
     void aReadOfAPipelineThatWasNeverAppliedIsNotFoundAndSaysSo() {
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        observations.clear();
         ApiError body = client().get().uri("/api/pipelines/ghost/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .exchange((request, response) -> {
@@ -503,23 +642,91 @@ class PipelineObservationApiTest {
 
         // Never applied is permanent: a caller that read this as the transient unconverged window would
         // wait out its whole bound on what is almost always a mistyped id.
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
         assertThat(body.params()).containsEntry("pipeline", "ghost");
+        assertThat(observations.reads()).isEqualTo(1);
     }
 
     @Test
-    void aReadOfAnAppliedPipelineThatHasNotConvergedYetIsNotFoundAsTheTransientWindow() {
+    void aReadOfAnAppliedPipelineThatHasNotConvergedKeepsStateUnobservedAndShowsStarting() {
         context.getBean(FakeObservationStore.class).clear();
+        context.getBean(FakeStoppedPipelines.class).intent("pl1", PipelineState.RUNNING);
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("displayState", "STARTING")
+                .containsEntry("desiredState", "RUNNING")
+                .containsEntry("hasArtifact", true)
+                .doesNotContainKeys("state", "observedState", "observedAt", "observedAgeMillis");
+    }
+
+    @Test
+    void aCatalogStatusUsesItsCarriedObservationWithoutReadingItAgain() {
+        FakeObservationStore observations = context.getBean(FakeObservationStore.class);
+        observations.clear();
+        observations.save(PL1);
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING").containsEntry("observedState", "RUNNING");
+        assertThat(observations.reads()).isEqualTo(1);
+    }
+
+    @Test
+    void statusKeepsObservedFactsAndReturnsACodedIntentReadFailure() {
+        context.getBean(FakeStoppedPipelines.class).unreadableIntent("pl1");
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING")
+                .containsEntry("observedState", "RUNNING")
+                .containsEntry("displayState", "RUNNING")
+                .containsEntry("hasArtifact", true);
+        Object intentReadFailure = body.get("intentReadFailure");
+        assertThat(intentReadFailure).isInstanceOf(Map.class);
+        assertThat(((Map<?, ?>) intentReadFailure).get("code"))
+                .isEqualTo("TS0480004");
+    }
+
+    @Test
+    void unreadableIntentWithoutRuntimeStateReturnsACodedCheckpointFailure() {
+        context.getBean(FakeObservationStore.class).clear();
+        context.getBean(FakeStoppedPipelines.class).unreadableIntent("pl1");
 
         ApiError body = client().get().uri("/api/pipelines/pl1/status")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .exchange((request, response) -> {
-                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("monitor.no-observation");
-        assertThat(body.params()).containsEntry("pipeline", "pl1");
+        assertThat(body.code()).isEqualTo("TS0480004");
+        assertThat(body.params()).isEqualTo(Map.of("id", "pl1", "field", "checkpoint"));
+    }
+
+    @Test
+    void aReadOfADraftBeforeItsFirstRuntimeObservationReturnsDraftState() {
+        var draft = new io.tapstate.spi.store.PipelineDraft("draft-only", 1, 1,
+                io.tapstate.spi.store.PipelineDraft.Mode.DAG, "Draft", null,
+                new io.tapstate.spi.store.PipelineDraft.Graph(List.of(), List.of(),
+                        new io.tapstate.spi.store.PipelineDraft.Viewport(0, 0, 1)),
+                null, null, null, null, NOW, NOW, "test");
+        context.getBean(PipelineApiTest.FakePipelineDraftStore.class).create(draft);
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/draft-only/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("state", "NEW")
+                .containsEntry("displayState", "DRAFT")
+                .containsEntry("hasArtifact", false)
+                .doesNotContainKey("observedState");
     }
 
     // ---- the interceptor guards a read like any other verb ----
@@ -533,7 +740,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     // ---- the read endpoints are a derivation of the registry ----
@@ -599,7 +806,22 @@ class PipelineObservationApiTest {
 
         @Bean
         PipelineObservationQueryService pipelineObservationQueryService(ObservationStore observations) {
-            return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations);
+            ExecutionPlans plans = pipelineIds -> pipelineIds.contains("pl2") ? Map.of("pl2", PL_POS_PLAN) : Map.of();
+            return new PipelineObservationQueryService(new ArtifactQueryService(appliedPipelines()), observations,
+                    plans, () -> List.of("m1", "m2", "m3", "m4"));
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(PipelineObservationQueryService observations,
+                FakeStoppedPipelines lifecycle, PipelineApiTest.FakePipelineDraftStore drafts) {
+            return new PipelineCatalogService(new ArtifactQueryService(appliedPipelines()),
+                    new PipelineDraftService(drafts),
+                    lifecycle.desired(), observations);
+        }
+
+        @Bean
+        PipelineApiTest.FakePipelineDraftStore pipelineDraftStore() {
+            return new PipelineApiTest.FakePipelineDraftStore();
         }
 
         @Bean
@@ -662,6 +884,11 @@ class PipelineObservationApiTest {
         }
 
         @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
+        }
+
+        @Bean
         OperationRegistry operationRegistry() {
             return ControlOperations.registry();
         }
@@ -672,6 +899,8 @@ class PipelineObservationApiTest {
 
     /** An in-memory observation store, last write wins per pipeline id, seedable. */
     static final class FakeObservationStore implements ObservationStore {
+        private int readCount;
+
         @Override
         public void delete(String pipelineId) {
             throw new UnsupportedOperationException("removal is not exercised by this double");
@@ -681,6 +910,11 @@ class PipelineObservationApiTest {
 
         void clear() {
             byId.clear();
+            readCount = 0;
+        }
+
+        int reads() {
+            return readCount;
         }
 
         @Override
@@ -690,6 +924,7 @@ class PipelineObservationApiTest {
 
         @Override
         public Optional<Observation> read(String pipelineId) {
+            readCount++;
             return Optional.ofNullable(byId.get(pipelineId));
         }
     }
@@ -908,7 +1143,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("position.write-back-while-live");
+        assertThat(body.code()).isEqualTo("TS0410001");
         assertThat(body.message()).contains("pl2");
     }
 
@@ -923,6 +1158,16 @@ class PipelineObservationApiTest {
     static final class FakeStoppedPipelines {
 
         private final Map<String, PipelineState> actual = new LinkedHashMap<>();
+        private final Map<String, DesiredState> intents = new LinkedHashMap<>();
+        private final Set<String> unreadableIntents = new java.util.HashSet<>();
+
+        void intent(String pipelineId, PipelineState target) {
+            intents.put(pipelineId, new DesiredState(pipelineId, target, "fixture-revision"));
+        }
+
+        void unreadableIntent(String pipelineId) {
+            unreadableIntents.add(pipelineId);
+        }
 
         void running(String pipelineId) {
             actual.put(pipelineId, PipelineState.RUNNING);
@@ -930,6 +1175,8 @@ class PipelineObservationApiTest {
 
         void reset() {
             actual.clear();
+            intents.clear();
+            unreadableIntents.clear();
         }
 
         DesiredStore desired() {
@@ -941,12 +1188,16 @@ class PipelineObservationApiTest {
 
                 @Override
                 public Optional<DesiredState> read(String pipelineId) {
-                    return Optional.empty();
+                    if (unreadableIntents.contains(pipelineId)) {
+                        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                                Map.of("id", pipelineId, "field", "targetState"), null);
+                    }
+                    return Optional.ofNullable(intents.get(pipelineId));
                 }
 
                 @Override
                 public List<String> pipelineIds() {
-                    return List.of();
+                    return List.copyOf(intents.keySet());
                 }
 
                 @Override

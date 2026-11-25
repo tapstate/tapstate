@@ -89,10 +89,10 @@ public record MetricFact(String name, MetricType type, String unit, List<MetricP
                             "'" + name + "' publishes a distribution, and no bucket bounds are registered"
                                     + " for it. Bounds taken from whatever library is in the path measure"
                                     + " that library's idea of the range, not the quantity's."));
-            if (!HistogramBounds.UNIT.equals(unit)) {
+            if (!registered.unit().equals(unit)) {
                 throw new IllegalArgumentException(
                         "'" + name + "' is measured in '" + unit + "' over bounds that are given in '"
-                                + HistogramBounds.UNIT + "'; a bucket layout is only meaningful in its"
+                                + registered.unit() + "'; a bucket layout is only meaningful in its"
                                 + " own unit");
             }
             for (MetricPoint point : points) {

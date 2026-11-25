@@ -1,6 +1,13 @@
 package io.tapstate.spi.capture;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletionStage;
+
+import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.TapstateException;
 
 /**
  * One bounded snapshot round over several selected tables. Each table still has a batch of its own, so
@@ -10,9 +17,42 @@ import java.util.List;
 @FunctionalInterface
 public interface SnapshotSession extends AutoCloseable {
 
+    /** A process-local failure captured by this reader; unrelated failures retain their own attribution. */
+    default io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
+    /** A bounded close returned while its original attempt still runs; completion permits retrying only that close. */
+    final class PendingClose extends TapstateException {
+        private final transient CompletionStage<Void> completion;
+
+        public PendingClose(TapstateErrorCode code, Map<String, Object> args, Throwable cause,
+                CompletionStage<Void> completion) {
+            super(code, args, cause);
+            this.completion = Objects.requireNonNull(completion).toCompletableFuture().minimalCompletionStage();
+        }
+
+        /** A process-local notification, never authority to reopen a source or report it closed. */
+        public CompletionStage<Void> completion() {
+            if (completion == null) throw new IllegalStateException("A pending snapshot close cannot cross a process boundary");
+            return completion;
+        }
+    }
+
     /** An optional read-side capability; the existing capture port contract remains unchanged. */
     interface Provider {
         SnapshotSession snapshotSession(CaptureConfig config);
+    }
+
+    /** A session whose host must accept its actual metadata and seam before the connector reads rows. */
+    interface PreparedProvider extends Provider {
+        SnapshotSession snapshotSession(CaptureConfig config, SnapshotPreparation preparation);
+    }
+
+    /** No per-table fallback may start source reads when the caller requires preparation first. */
+    static Optional<SnapshotSession> openPrepared(CapturePort port, CaptureConfig config, SnapshotPreparation preparation) {
+        Objects.requireNonNull(port, "port"); Objects.requireNonNull(config, "config"); Objects.requireNonNull(preparation, "preparation");
+        return port instanceof PreparedProvider provider ? Optional.of(provider.snapshotSession(config, preparation)) : Optional.empty();
     }
 
     /**
@@ -24,7 +64,7 @@ public interface SnapshotSession extends AutoCloseable {
             return provider.snapshotSession(config);
         }
         return table -> port.snapshot(new CaptureConfig(
-                config.connectorId(), config.settings(), List.of(table), config.node()));
+                config.connectorId(), config.settings(), List.of(table), config.node(), config.sharedNotes(), config.nodeConfig()));
     }
 
     /** Opens the next selected table's bounded read. The caller closes the batch after draining it. */

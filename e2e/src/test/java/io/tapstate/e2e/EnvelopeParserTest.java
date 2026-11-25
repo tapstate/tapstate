@@ -18,6 +18,24 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * what holds that line, so they read the surface exactly as an author writes it.
  */
 class EnvelopeParserTest {
+    @Test
+    void aManagedTargetIsInstallationInputAndCannotAlsoBeApplied() {
+        String specification = """
+                name: managed
+                setup:
+                  managed_target: views.tap.yml
+                  apply: [src.tap.yml]
+                pipeline: p.tap.yml
+                steps: [start]
+                """;
+        var setup = EnvelopeParser.parse(specification).setup();
+        assertThat(setup.managedTarget()).isEqualTo("views.tap.yml");
+        assertThat(setup.apply()).containsExactly("src.tap.yml");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> EnvelopeParser.parse(
+                specification.replace("apply: [src.tap.yml]", "apply: [src.tap.yml, views.tap.yml]")))
+                .isInstanceOf(EnvelopeException.class);
+    }
+
 
     private static final String FIRST_EXAMPLE =
             """
@@ -579,6 +597,23 @@ class EnvelopeParserTest {
         assertThat(doc.where()).containsExactly(java.util.Map.entry("id", 1));
         assertThat(doc.expect()).containsKeys("name", "items[0].sku");
         assertThat(doc.size()).containsExactly(java.util.Map.entry("items", 2L));
+    }
+
+    /** A flag the pipeline writes is read back as a boolean; seeds and locators stay integer or string. */
+    @Test
+    void aDocMatcherAcceptsABooleanExpectation() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { is_deleted: true } } } }\n"));
+
+        Matcher.Doc doc = (Matcher.Doc) ((Step.Assertion) envelope.steps().getFirst()).matcher();
+        assertThat(doc.expect()).containsExactly(java.util.Map.entry("is_deleted", true));
+    }
+
+    @Test
+    void aDocMatcherStillRefusesAValueWiderThanABoolean() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { price: 1.5 } } } }\n")))
+                .hasMessageContaining("must be an integer, a string or a boolean");
     }
 
     /** A doc that expects nothing would hold for any document at all, including the wrong one. */

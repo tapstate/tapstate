@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 import io.tapstate.core.catalog.CatalogEntryWriter;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
@@ -32,10 +33,17 @@ final class CatalogGenerator {
 
     static GeneratedCatalog generate(List<Path> roots, String specSha, String capabilitySha,
                                      Map<String, Set<String>> bitmap) {
+        return generate(roots, specSha, capabilitySha, bitmap, source -> true);
+    }
+
+    private static GeneratedCatalog generate(List<Path> roots, String specSha, String capabilitySha,
+                                             Map<String, Set<String>> bitmap, Predicate<ConnectorSource> admitted) {
         List<Assembly> assemblies = new ArrayList<>();
         ConnectorOverlay overlay = ConnectorOverlay.load();
         for (Path root : roots) {
-            assemblies.add(CatalogAssembler.assemble(ConnectorWalker.walk(root), specSha, capabilitySha,
+            WalkResult walk = ConnectorWalker.walk(root);
+            WalkResult selected = new WalkResult(walk.sources().stream().filter(admitted).toList(), walk.exemptions());
+            assemblies.add(CatalogAssembler.assemble(selected, specSha, capabilitySha,
                     bitmap, overlay, relativePath -> read(root.resolve(relativePath))));
         }
         List<ConnectorCatalogEntry> ordered = assemblies.stream().flatMap(value -> value.entries().stream())
@@ -75,6 +83,14 @@ final class CatalogGenerator {
                 collect(reports, IngestReport::unresolvedLabelRefs),
                 collect(reports, IngestReport::exemptions));
         return new GeneratedCatalog(index, entries, ReportRenderer.render(report));
+    }
+
+    static GeneratedCatalog generateSpecOnly(List<Path> roots, String specSha, String capabilitySha,
+                                             Map<String, Set<String>> bitmap, Set<String> existingIds) {
+        // A reused bitmap cannot establish capabilities for a new connector. Catalog membership,
+        // rather than bitmap membership, also retains shipped JavaScript and sink-only entries.
+        // Filter before assembly so deferred connectors do not enter the index or ingest findings.
+        return generate(roots, specSha, capabilitySha, bitmap, source -> existingIds.contains(source.id()));
     }
 
     static String index(String specSha, String capabilitySha, List<String> ids) {

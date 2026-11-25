@@ -19,6 +19,7 @@ public record ConnectorSummary(
         List<String> modes,
         String discovery,
         boolean sink,
+        List<String> writeModes,
         boolean pushOut,
         String origin) {
 
@@ -32,6 +33,7 @@ public record ConnectorSummary(
                 entry.modes().stream().map(SourceMode::yaml).toList(),
                 entry.discovery().yaml(),
                 entry.sink().capable(),
+                entry.sink().writeSemantics().stream().map(mode -> mode.yaml()).toList(),
                 entry.pushOut(),
                 origin);
     }

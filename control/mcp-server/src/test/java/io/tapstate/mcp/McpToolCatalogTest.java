@@ -18,16 +18,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 class McpToolCatalogTest {
 
     private static final List<String> READ_TOOLS = List.of(
-            "system_version",
+            "storage_status", "storage_setup_status", "storage_recovery_status", "configuration_import_status", "system_version",
             "connector_list", "connector_get",
             "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
             "pipeline_list", "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
-            "pipeline_metrics_history", "pipeline_explain",
+            "pipeline_metrics_history", "pipeline_explain", "pipeline_start_checks",
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(
-            "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
+            "storage_test", "storage_setup_commit", "storage_setup_activate", "storage_recovery_plan", "storage_recovery_confirm", "configuration_export", "configuration_import_preflight", "configuration_import_commit", "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
             "pipeline_start", "pipeline_stop", "pipeline_pause", "pipeline_resume");
 
     /**
@@ -118,7 +118,7 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void allowWriteAddsExactlyTheEightWriteTools() {
+    void allowWriteAddsExactlyTheRegisteredWriteTools() {
         assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(concat(READ_TOOLS, WRITE_TOOLS));
     }
@@ -206,6 +206,67 @@ class McpToolCatalogTest {
             assertThat(result.structuredContent()).isInstanceOf(Map.class);
             assertThat(result.content()).isNotEmpty();
         }
+    }
+
+    /**
+     * A Source draft carrying an execution block - the batch its source reads in - is one the draft tool's own
+     * input schema describes, so a caller that checks its arguments against the advertised schema before sending
+     * them can send it: every field is declared where the schema is closed, and every value is within what is
+     * declared there. The same request out of those bounds is not, which is what shows the check reads the bounds.
+     */
+    @Test
+    void aSourceDraftCarryingAnExecutionBlockIsOneTheToolsInputSchemaDescribes() {
+        try (HttpControlClient client = new HttpControlClient()) {
+            McpOperationExecutor executor = new McpOperationExecutor(
+                    URI.create("http://127.0.0.1:1"), "token", Map.of(), client);
+            Map<?, ?> schema = (Map<?, ?>) McpToolCatalog.specifications(false, executor).stream()
+                    .filter(candidate -> candidate.tool().name().equals("source_draft"))
+                    .findFirst()
+                    .orElseThrow()
+                    .tool().inputSchema();
+
+            assertThat(violations(schema, draftWith(Map.of("parallelism", 1,
+                    "batch", Map.of("maxRecords", 512, "maxWait", "50ms"))), "")).isEmpty();
+            assertThat(violations(schema, draftWith(Map.of("parallelism", 0,
+                    "batch", Map.of("maxRecords", 65_537, "maxWait", "61s"))), ""))
+                    .containsExactlyInAnyOrder(".execution.parallelism is below 1",
+                            ".execution.batch.maxRecords is above 65536",
+                            ".execution.batch.maxWait does not match its pattern");
+        }
+    }
+
+    private static Map<String, Object> draftWith(Map<String, Object> execution) {
+        return Map.of("id", "src", "connector", "mysql", "config", Map.of("host", "h"), "execution", execution);
+    }
+
+    /** What of {@code value} the JSON schema {@code schema} turns away: undeclared fields, and values out of bounds. */
+    private static List<String> violations(Object schema, Object value, String path) {
+        Map<?, ?> declared = (Map<?, ?>) schema;
+        List<String> found = new java.util.ArrayList<>();
+        Object type = declared.get("type");
+        if ("object".equals(type)) {
+            Map<?, ?> fields = (Map<?, ?>) value;
+            Map<?, ?> properties = declared.get("properties") instanceof Map<?, ?> map ? map : Map.of();
+            fields.forEach((name, field) -> {
+                if (properties.containsKey(name)) {
+                    found.addAll(violations(properties.get(name), field, path + "." + name));
+                } else if (Boolean.FALSE.equals(declared.get("additionalProperties"))) {
+                    found.add(path + "." + name + " is not declared");
+                }
+            });
+        } else if ("integer".equals(type)) {
+            long number = ((Number) value).longValue();
+            if (declared.get("minimum") instanceof Number minimum && number < minimum.longValue()) {
+                found.add(path + " is below " + minimum);
+            }
+            if (declared.get("maximum") instanceof Number maximum && number > maximum.longValue()) {
+                found.add(path + " is above " + maximum);
+            }
+        } else if ("string".equals(type) && declared.get("pattern") instanceof String pattern
+                && !java.util.regex.Pattern.compile(pattern).matcher((String) value).find()) {
+            found.add(path + " does not match its pattern");
+        }
+        return found;
     }
 
     private static List<String> concat(List<String> left, List<String> right) {

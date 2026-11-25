@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.runtime.engine.Engine;
@@ -27,13 +28,19 @@ class RuntimeConvergenceStartupTest {
             // under the same store switch as this configuration, so it is always there; stubbed here because
             // this context is the convergence loop alone, not the data plane behind it.
             .withBean(PipelineCaptureCoordinator.class, NoOpCaptureCoordinator::new)
-            .withBean(Engine.class, () -> new Engine(mock(HazelcastInstance.class)))
+            .withBean(Engine.class, () -> {
+                var member = mock(HazelcastInstance.class);
+                when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+                return new Engine(member);
+            })
             .withBean(Clock.class, Clock::systemUTC)
             // The two the driver asks the cluster for: whether this member may act on business work at
             // all, and which pipelines are this member's to drive. Production wires both from the member
             // configuration, which this context does not bring up -- it is the convergence loop alone.
             .withBean(ClusterMembershipGate.class, () -> new ClusterMembershipGate(new ClusterProperties()))
             .withBean(PipelineActuationOwnership.class, PipelineActuationOwnership::single)
+            .withBean(ClusterProperties.class, ClusterProperties::new)
+            .withBean(NodeSessionLease.class, NodeSessionLease::inactive)
             .withBean(RebuildAdmission.class, RebuildAdmission::never)
             .withUserConfiguration(RuntimeConvergenceConfiguration.class);
 

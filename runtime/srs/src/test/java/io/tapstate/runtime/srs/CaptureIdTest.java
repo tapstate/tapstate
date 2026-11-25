@@ -13,6 +13,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CaptureIdTest {
 
     @Test
+    void onePhysicalSharedCaptureServesDifferentTableSelections() {
+        CaptureConfig root = new CaptureConfig("postgres", Map.of("host", "db.internal", "database", "crm"),
+                List.of("support_case"));
+        CaptureConfig mail = new CaptureConfig("postgres", root.settings(), List.of("emailmessage"));
+
+        assertThat(CaptureId.of(root, null))
+                .as("source nodes on one physical shared stream use one capture owner")
+                .isEqualTo(CaptureId.of(mail, null));
+    }
+
+    @Test
     void pipelineIdentityDoesNotSplitOneNormalizedSourceReadContract() {
         CaptureConfig base = new CaptureConfig("mysql", Map.of("host", "db.internal"),
                 List.of("orders", "customers"));
@@ -24,7 +35,7 @@ class CaptureIdTest {
     }
 
     @Test
-    void streamOrderIsNormalizedButADifferentReadSetIsADifferentCapture() {
+    void sharedStreamOrderAndSelectionDoNotSplitTheCapture() {
         CaptureConfig one = new CaptureConfig("mysql", Map.of("host", "db.internal"),
                 List.of("orders", "customers"));
         CaptureConfig reordered = new CaptureConfig("mysql", Map.of("host", "db.internal"),
@@ -33,16 +44,39 @@ class CaptureIdTest {
                 List.of("orders"));
 
         assertThat(CaptureId.of(one, null)).isEqualTo(CaptureId.of(reordered, null));
-        assertThat(CaptureId.of(one, null)).isNotEqualTo(CaptureId.of(narrower, null));
+        assertThat(CaptureId.of(one, null)).isEqualTo(CaptureId.of(narrower, null));
     }
 
     @Test
-    void anExplicitMiningKeyStillKeepsDistinctReadContractsApart() {
+    void anExplicitMiningKeySharesOneCaptureAcrossTableSelections() {
         CaptureConfig orders = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("orders"));
         CaptureConfig customers = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("customers"));
 
         assertThat(CaptureId.of(orders, "shared-db"))
-                .isNotEqualTo(CaptureId.of(customers, "shared-db"));
+                .isEqualTo(CaptureId.of(customers, "shared-db"));
+    }
+
+    @Test
+    void boundedReadsStillNameTheTablesTheyRead() {
+        CaptureConfig orders = new CaptureConfig("postgres", Map.of("host", "db.internal"), List.of("orders"));
+        CaptureConfig customers = new CaptureConfig("postgres", orders.settings(), List.of("customers"));
+        CaptureRunSpec first = new CaptureRunSpec(orders, ReadMode.SNAPSHOT_ONLY, null, true,
+                "source", "pipeline", StartFrom.latest(), null, 0L);
+        CaptureRunSpec second = new CaptureRunSpec(customers, ReadMode.SNAPSHOT_ONLY, null, true,
+                "source", "pipeline", StartFrom.latest(), null, 0L);
+
+        assertThat(CaptureId.of(first)).isNotEqualTo(CaptureId.of(second));
+    }
+
+    @Test
+    void twoSourceNodesReadingOneDatabaseDirectlyAreTwoCaptures() {
+        CaptureConfig config = new CaptureConfig("postgres", Map.of("database", "crm"), List.of("orders"));
+        CaptureRunSpec first = new CaptureRunSpec(config, ReadMode.CDC_ONLY, "crm", false,
+                "source-a", "pipeline", StartFrom.latest(), null, 0L);
+        CaptureRunSpec second = new CaptureRunSpec(config, ReadMode.CDC_ONLY, "crm", false,
+                "source-b", "pipeline", StartFrom.latest(), null, 0L);
+
+        assertThat(CaptureId.of(first)).isNotEqualTo(CaptureId.of(second));
     }
 
     @Test

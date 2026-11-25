@@ -5,6 +5,7 @@ import io.tapstate.spi.metrics.MetricsExport;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -49,7 +50,7 @@ class MetricsExportIsOptInTest {
     @Test
     void aPrometheusPortAloneStartsTheAdapterOnThatPort() throws IOException {
         int port;
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))) {
             port = socket.getLocalPort();
         }
         MetricsExportProperties properties = new MetricsExportProperties();

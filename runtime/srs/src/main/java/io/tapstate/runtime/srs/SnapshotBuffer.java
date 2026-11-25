@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.RowMapKeys;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -78,7 +79,7 @@ public final class SnapshotBuffer {
 
     private final ConcurrentMap<BufferKey, Queue<Envelope>> byConsumerRing = new ConcurrentHashMap<>();
 
-    /** The loads declared on this member, by the same coordinate as the rows they hand over. */
+    /** Live hand-offs, including unbounded tails with no declared load, by their row coordinates. */
     private final ConcurrentMap<BufferKey, Handoff> handoffs = new ConcurrentHashMap<>();
 
     public SnapshotBuffer() {
@@ -145,10 +146,39 @@ public final class SnapshotBuffer {
         BufferKey key = new BufferKey(pipelineId, ringName);
         Handoff handoff = handoffs.get(key);
         if (handoff == null) {
+            validate(row);
             queueOf(key).add(row);
             return;
         }
-        handoff.append(() -> queueOf(key).add(row), capacity);
+        handoff.append(() -> {
+            validate(row);
+            queueOf(key).add(row);
+        }, capacity);
+    }
+
+    /**
+     * Binds a capture callback to the current lifetime of this coordinate. A callback resumed after
+     * {@link #release} discards its row instead of creating an undeclared queue or writing into a later
+     * run's load. A coordinate with no declared snapshot still carries an unbounded tail.
+     */
+    public CaptureHandoff handoff(String pipelineId, String ringName) {
+        BufferKey key = new BufferKey(pipelineId, ringName);
+        Handoff handoff = handoffs.computeIfAbsent(key, ignored -> new Handoff(false));
+        return new CaptureHandoff() {
+            @Override
+            public void accept(Envelope row) {
+                Objects.requireNonNull(row, "row");
+                handoff.append(() -> {
+                    validate(row);
+                    queueOf(key).add(row);
+                }, capacity, true);
+            }
+
+            @Override
+            public void loaded(String table) {
+                handoff.end();
+            }
+        };
     }
 
     /**
@@ -185,7 +215,6 @@ public final class SnapshotBuffer {
      */
     public void release(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        byConsumerRing.keySet().removeIf(key -> key.pipelineId().equals(pipelineId));
         handoffs.entrySet().removeIf(entry -> {
             if (!entry.getKey().pipelineId().equals(pipelineId)) {
                 return false;
@@ -193,6 +222,8 @@ public final class SnapshotBuffer {
             entry.getValue().release();
             return true;
         });
+        // Invalidate callbacks under the same lock as enqueue before removing their queues.
+        byConsumerRing.keySet().removeIf(key -> key.pipelineId().equals(pipelineId));
     }
 
     private Queue<Envelope> queueOf(BufferKey key) {
@@ -216,22 +247,44 @@ public final class SnapshotBuffer {
     }
 
     /**
-     * One declared load: how many of its rows are waiting, and whether it has ended, been started on or been
-     * released. The rows themselves wait in the coordinate's queue, ahead of anything appended after the
+     * One live hand-off: whether it declares a load, how many of its rows are waiting, and whether it has
+     * ended, been started on or been released. The rows wait in the coordinate's queue, ahead of appends after the
      * load ended, so the load's rows are always the first ones a drain takes.
      */
+    private static void validate(Envelope row) {
+        RowMapKeys.validate(row.before(), "$/before");
+        RowMapKeys.validate(row.after(), "$/after");
+    }
+
     private static final class Handoff {
 
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition room = lock.newCondition();
+        private final boolean declared;
         private int waiting;
         private boolean ended;
         private boolean begun;
         private boolean released;
 
+        Handoff() {
+            this(true);
+        }
+
+        Handoff(boolean declared) {
+            this.declared = declared;
+            ended = !declared;
+        }
+
         void append(Runnable enqueue, int capacity) {
+            append(enqueue, capacity, false);
+        }
+
+        void append(Runnable enqueue, int capacity, boolean discardAfterRelease) {
             lock.lock();
             try {
+                if (discardAfterRelease && released) {
+                    return;
+                }
                 while (!ended && !released && waiting >= capacity) {
                     room.await();
                 }
@@ -292,7 +345,7 @@ public final class SnapshotBuffer {
         SnapshotState state() {
             lock.lock();
             try {
-                return new SnapshotState(true, begun, ended && waiting == 0);
+                return declared ? new SnapshotState(true, begun, ended && waiting == 0) : SnapshotState.UNDECLARED;
             } finally {
                 lock.unlock();
             }

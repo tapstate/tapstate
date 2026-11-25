@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.gridfs.GridFSBucket;
@@ -10,6 +11,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * Every collection this product keeps, written out one row per collection — and the only place in the
@@ -84,7 +86,8 @@ public enum SystemCollections {
      */
     CONNECTOR_ARTIFACTS(MongoStorePort.CONNECTOR_ARTIFACTS, Database.STORE, MongoConnectorRegistry.class,
             Strategy.IMMUTABLE, 0, Kind.GRIDFS_BUCKET,
-            new IndexSpec(List.of("metadata.connectorId"), false)),
+            new IndexSpec(List.of("metadata.connectorId"), false),
+            new IndexSpec(List.of("filename"), true)),
 
     /**
      * One coordination record per mining chain. Another line owns what this record means and how its
@@ -109,6 +112,12 @@ public enum SystemCollections {
      */
     PIPELINE_LAYOUTS(MongoStorePort.PIPELINE_LAYOUTS, Database.STORE, MongoPipelineLayoutStore.class,
             Strategy.MIGRATED, 0),
+
+    /** The authoring document kept independently from the artifact it compiles into. */
+    PIPELINE_DRAFTS(MongoStorePort.PIPELINE_DRAFTS, Database.STORE, MongoPipelineDraftStore.class,
+            Strategy.MIGRATED, 0,
+            new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
+            new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
 
     /**
      * The durable change log, one document per change, keyed by the ring it was written to and the
@@ -154,7 +163,154 @@ public enum SystemCollections {
     OPERATOR_STATE(MongoStorePort.OPERATOR_STATE, Database.NEST, MongoKeyedStateStore.class,
             Strategy.NEST_EXCLUDED, 0),
     NEST_DEAD_LETTERS(MongoStorePort.NEST_DEAD_LETTERS, Database.NEST, MongoNestDeadLetterStore.class,
-            Strategy.NEST_EXCLUDED, 0);
+            Strategy.NEST_EXCLUDED, 0),
+
+    // Configuration resources in the independently initialized storage layout.
+    SOURCES("sources", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("systemRole"), true, null, "system_default_target", "{\"systemRole\":\"DEFAULT_TARGET\"}")),
+    PIPELINES("pipelines", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    CONFIGURATION_VERSION("configuration_version", Database.CONFIG, MongoConfigurationArtifactStore.class,
+            Strategy.MIGRATED, 1),
+    CONFIGURATION_IMPORTS("configuration_imports", Database.CONFIG, MongoConfigurationImportStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("activeSlot"), true, null, "configuration_import_active_slot", "{\"activeSlot\":{\"$exists\":true}}"),
+            new IndexSpec(List.of("historySlot"), true, null, "configuration_import_history_slot", "{\"historySlot\":{\"$exists\":true}}")),
+    CONFIG_CLUSTER_IDENTITY("cluster_identity", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
+    SCHEMA_MIGRATIONS("schema_migrations", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
+    CLUSTER_KEYS("cluster_keys", Database.CONFIG, MongoConfigurationDomain.class, Strategy.MIGRATED, 1),
+    STORAGE_SETUP("storage_setup", Database.CONFIG, MongoConfigurationBootstrap.class, Strategy.MIGRATED, 1),
+    CONFIG_PIPELINE_LAYOUTS("pipeline_layouts", Database.CONFIG, MongoPipelineLayoutStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTE_SCOPES("pdk_note_scopes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTES("pdk_notes", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTE_MIGRATIONS("pdk_note_migrations", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1),
+    OPERATOR_GENERATIONS("operator_generations", Database.CONFIG, MongoPipelineStateMappings.class, Strategy.MIGRATED, 1),
+    STORAGE_BINDING("storage_binding", Database.CONFIG, MongoStorageBindingStore.class, Strategy.MIGRATED, 1),
+    STORAGE_RECOVERY("storage_recovery", Database.CONFIG, MongoStorageRecoveryStore.class, Strategy.MIGRATED, 1),
+    PDK_NOTE_ORIGINS("pdk_note_origins", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.bindingVersion", "_id.namespace"), true, "pdk_note_origin_scope")),
+    PDK_NOTE_CARRIES("pdk_note_carries", Database.CONFIG, MongoRequiredNoteStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.sharedBindingVersion", "_id.sharedNamespace"), false, "pdk_note_carry_target"),
+            new IndexSpec(List.of("_id.sourceBindingVersion", "_id.sourceNamespace", "_id.sourceGeneration"), false, "pdk_note_carry_source")),
+    TRANSFORM_DEFINITIONS("transform_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    VIEW_DEFINITIONS("view_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    SERVE_DEFINITIONS("serve_definitions", Database.CONFIG, MongoConfigurationArtifactStore.class, Strategy.MIGRATED, 1),
+    CONFIG_CONNECTIONS("connections", Database.CONFIG, MongoConfigurationCatalogStore.class, Strategy.MIGRATED, 1),
+    CONFIG_TOKENS("tokens", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1),
+    CONFIG_AUDIT("audit", Database.CONFIG, MongoConfigurationSecurityStores.class, Strategy.MIGRATED, 1),
+    CONFIG_USERS("users", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1),
+    OP_BOOTSTRAP("op_bootstrap", Database.CONFIG, MongoFirstAdminStore.class, Strategy.MIGRATED, 1),
+    CONFIG_PIPELINE_DRAFTS("pipeline_drafts", Database.CONFIG, MongoConfigurationDraftStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
+            new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
+    VALIDATION_TASKS("validation_tasks", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId", "_id.taskId"), false, "validation_tasks_pipeline_task")),
+    VALIDATION_REPORTS("validation_reports", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId", "_id.taskId", "admission.mode",
+                    "terminalMetadata.endedAt.seconds", "terminalMetadata.endedAt.nanos", "_id.runId"),
+                    List.of(1, 1, 1, 1, -1, -1, 1), false, "validation_reports_history")),
+    VALIDATION_DIFFERENCES("validation_differences", Database.CONFIG, MongoValidationResultStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.report"), false, "validation_differences_report"),
+            new IndexSpec(List.of("_id.report", "openVersion", "_id.rootHash"), false, "validation_differences_page")),
+    VALIDATION_RUNS("validation_runs", Database.CACHE, MongoValidationControlStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId"), false, "validation_runs_pipeline")),
+    CACHE_IDENTITY("cache_identity", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
+    CACHE_SCHEMA_MIGRATIONS("schema_migrations", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
+    OP_SESSIONS("op_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("secretHash", "issuer"), false)),
+    CLOUD_SESSIONS("cloud_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("secretHash", "issuer"), false)),
+    CLOUD_REVOCATIONS("cloud_revocations", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1),
+    PIPELINE_INTENTS("pipeline_intents", Database.CONFIG, MongoPipelineIntentStore.class, Strategy.MIGRATED, 1),
+    SRS_EVENTS("srs_events", Database.CACHE, MongoSrsLogStore.class, Strategy.MIGRATED, 1),
+    SRS_LOG_BOUNDS("srs_log_bounds", Database.CACHE, MongoSrsLogStore.class, Strategy.MIGRATED, 1),
+    CACHE_WORKLOAD_CLAIMS("workload_claims", Database.CACHE, MongoWorkloadClaimStore.class, Strategy.OWNED_ELSEWHERE, 1),
+    SRS_CHAINS("srs_chains", Database.CACHE, MongoSrsChainStore.class, Strategy.MIGRATED, 1),
+    SRS_MODELS("srs_models", Database.CACHE, MongoSrsModelStore.class, Strategy.IMMUTABLE, 1,
+            new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch", "_id.modelVersion"), true, "srs_models_ring_version")),
+    CONFIG_NEST_DEAD_LETTERS("nest_dead_letters", Database.CONFIG, MongoRequiredDeadLetterStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.clusterId", "_id.bindingVersion", "_id.pipelineId", "_id.stepId", "_id.pathId", "_id.stateGeneration", "_id.namespace", "fact.discardedAt"), false, "required_dead_letters_recent")),
+    SRS_MODEL_CONTEXTS("srs_model_contexts", Database.CACHE, MongoSrsModelStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("cacheIncarnation", "ringName", "_id.captureContext.epoch"), true, "srs_model_contexts_ring")),
+    SRS_CONSUMERS("srs_consumers", Database.CACHE, MongoSrsConsumerStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_consumers_chain"),
+            new IndexSpec(List.of("pipelineId"), false, "srs_consumers_pipeline")),
+    CACHE_SRS_CONSUMER_OFFSETS("srs_consumer_offsets", Database.CACHE, MongoSrsConsumerStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.cacheIncarnation", "_id.chain"), false, "srs_offsets_chain")),
+    DIRECT_CHANNEL_OFFSETS("direct_channel_offsets", Database.CACHE, MongoDirectChannelStore.class, Strategy.MIGRATED, 1),
+    DIRECT_BATCHES("direct_batches", Database.CACHE, MongoDirectChannelStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.channel", "_id.epoch", "_id.ordinal"), false, "direct_batches_channel_order")),
+    CACHE_PIPELINE_STATE("pipeline_state", Database.CACHE, MongoCachePipelineStateStore.class, Strategy.MIGRATED, 1),
+    CACHE_PIPELINE_OBSERVATION("pipeline_observation", Database.CACHE, MongoCachePipelineObservationStore.class, Strategy.MIGRATED, 1),
+    CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoCacheSchemaStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_ARTIFACT_HOLDINGS("connector_artifact_holdings", Database.CACHE,
+            MongoCacheConnectorArtifactHoldings.class, Strategy.OWNED_ELSEWHERE, 0),
+    CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoCacheConnectionTestResultStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoCacheConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
+            new IndexSpec(List.of("metadata.connectorId"), false)),
+    CACHE_DERIVED_SCHEMAS("derived_schemas", Database.CACHE, MongoCacheDerivedSchemaStore.class, Strategy.MIGRATED, 1),
+    CACHE_PIPELINE_RATE_HISTORY("pipeline_rate_history", Database.CACHE, MongoCacheRateHistoryStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
+            new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false)),
+    CACHE_CLUSTER_MEMBERSHIP("cluster_membership", Database.CACHE, MongoCacheClusterMembershipStore.class, Strategy.OWNED_ELSEWHERE, 1),
+    CACHE_NEST_STATE("nest_state", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement"),
+            new IndexSpec(List.of("_id.placement", "_id.key"), false, null, "nest_pending_releases", "{\"pendingRelease\":true}")),
+    CACHE_JOIN_FACTS("join_facts", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_DIMENSIONS("join_dimensions", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_INDEXES("join_indexes", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_JOIN_WRITERS("join_writers", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_AGGREGATE_STATE("aggregate_state", Database.CACHE, MongoCacheOperatorStateStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.placement"), false, "operator_placement")),
+    CACHE_NEST_SHAPES("nest_shapes", Database.CACHE, MongoCacheNestShapeStore.class, Strategy.MIGRATED, 1),
+    CACHE_OPERATOR_CLEANUP("operator_cleanup", Database.CACHE, MongoOperatorInventory.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.clusterId", "_id.bindingVersion", "_id.cacheIncarnation", "databases.database"), false, "operator_database_history")),
+
+    /** Target preparation results remain distinct from operators and necessary connector notes. */
+    CACHE_SINK_PREPARATIONS("sink_preparations",Database.CACHE,MongoSinkPreparationStore.class,Strategy.MIGRATED,1,
+            new IndexSpec(List.of("_id.scope.clusterId","_id.scope.bindingVersion","_id.scope.cacheIncarnation","_id.scope.pipelineId","_id.scope.stateGeneration"),false,"sink_preparation_scope")),
+    CAPTURE_PREPARATIONS("capture_preparations", Database.CONFIG, MongoCaptureStatePreparations.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("_id.clusterId","_id.bindingVersion","_id.capture"),false,"capture_preparation_history")),
+    CACHE_SNAPSHOT_ORDERS("snapshot_orders",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1),
+    CACHE_SNAPSHOT_COUNTS("snapshot_counts",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1,
+            new IndexSpec(List.of("_id.scope"),false,"snapshot_scope")),
+    ALERT_RULES("alert_rules", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_RECEIVERS("alert_receivers", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_SUBSCRIPTIONS("alert_subscriptions", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_SILENCES("alert_silences", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_INSTANCES("alert_instances", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "formatVersion", "status", "severityRank", "recentSecondOrder", "recentNanoOrder", "_id"), false, "alert_query_active")),
+    ALERT_EPISODES("alert_episodes", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.alarm"), false, "alert_alarm_history"),
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "formatVersion", "endReason", "endedSecondOrder", "endedNanoOrder", "_id"), false, "alert_query_ended")),
+    ALERT_TRANSITIONS("alert_transitions", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.alarm"), false, "alert_alarm_history")),
+    ALERT_NOTIFICATION_SCHEDULES("alert_notification_schedules", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "formatVersion", "nextCheckAt", "_id"), false, "alert_query_schedule_due")),
+    ALERT_DELIVERY_INTENTS("alert_delivery_intents", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "formatVersion", "nextCheckAt", "_id"), false, "alert_query_delivery_due"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "_id.purpose", "quotaMinute"), false, "alert_query_test_window")),
+    ALERT_TARGET_LIMITS("alert_target_limits", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_TEST_QUOTAS("alert_test_quotas", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_NODE_LIFECYCLES("alert_node_lifecycles", Database.CONFIG, MongoAlertNodeLifecycleStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle")),
+    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2),
+    CONFIG_RETRY_SETTINGS("retry_settings", Database.CONFIG, MongoRetrySettingsStore.class, Strategy.MIGRATED, 1);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -175,29 +331,64 @@ public enum SystemCollections {
     public enum Kind { COLLECTION, GRIDFS_BUCKET }
 
     /** Which of the two databases a row lives in. */
-    public enum Database { STORE, NEST }
+    public enum Database { STORE, NEST, CONFIG, CACHE }
 
     /**
-     * An index a query shape needs. Keys are in order and all ascending: nothing here sorts, and a
-     * descending key would only matter to a query that did.
+     * An index a query shape needs. Existing declarations default to ascending keys; ordered
+     * declarations also describe mixed-direction query sorts.
      */
-    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds) {
+    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName,
+            String partialFilterJson, List<Integer> directions) {
         public IndexSpec {
             keys = List.copyOf(keys);
+            directions = List.copyOf(directions);
+            if (directions.size() != keys.size() || directions.stream().anyMatch(value -> value != 1 && value != -1))
+                throw new IllegalArgumentException("index directions must match its keys");
             if (expireAfterSeconds != null && (expireAfterSeconds < 0 || keys.size() != 1)) {
                 throw new IllegalArgumentException("an expiring index is over one date field and a non-negative"
                         + " number of seconds: " + keys + " / " + expireAfterSeconds);
             }
+            if (declaredName != null && declaredName.isBlank()) {
+                throw new IllegalArgumentException("an explicit index name must not be blank");
+            }
+        }
+
+        public IndexSpec(List<String> keys, boolean unique, Long expiry, String name, String partial) {
+            this(keys, unique, expiry, name, partial, java.util.Collections.nCopies(keys.size(), 1));
+        }
+
+        public IndexSpec(List<String> keys, List<Integer> directions, boolean unique, String name) {
+            this(keys, unique, null, name, null, directions);
+        }
+
+        public Document keyDocument() {
+            var result = new Document();
+            for (int i = 0; i < keys.size(); i++) result.append(keys.get(i), directions.get(i));
+            return result;
+        }
+
+        public IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName) {
+            this(keys, unique, expireAfterSeconds, declaredName, null);
+        }
+
+        /** An index whose existing name is part of the persisted MongoDB contract. */
+        public IndexSpec(List<String> keys, boolean unique, String declaredName) {
+            this(keys, unique, null, declaredName);
+        }
+
+        /** An index with expiry and the conventional name derived from its keys. */
+        public IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds) {
+            this(keys, unique, expireAfterSeconds, null);
         }
 
         /** An index with no expiry, which is every index but the one the sample history expires on. */
         public IndexSpec(List<String> keys, boolean unique) {
-            this(keys, unique, null);
+            this(keys, unique, null, null);
         }
 
-        /** The index name, derived from the keys so two declarations of the same index cannot differ. */
+        /** The persisted name, or the conventional name derived from the keys. */
         public String indexName() {
-            return String.join("_", keys) + "_idx";
+            return declaredName == null ? String.join("_", keys) + "_idx" : declaredName;
         }
     }
 
@@ -240,6 +431,28 @@ public enum SystemCollections {
         return database.getCollection(collectionName);
     }
 
+    /** Controlled preparation creates an empty declared collection in its original schema transaction. */
+    void prepareCollectionOn(MongoDatabase database, com.mongodb.client.ClientSession session) {
+        if (kind != Kind.COLLECTION) throw new IllegalStateException("only plain collections have this preparation path");
+        // Schema commands cannot carry their own write concern inside a transaction. Its commit
+        // options retain the required durability; the original database handle keeps its URI policy.
+        database.withWriteConcern(WriteConcern.ACKNOWLEDGED).createCollection(session, collectionName);
+    }
+
+    /** Controlled feature preparation outside document transactions, after its operation is durable. */
+    void prepareCollectionOn(MongoDatabase database) {
+        if(kind!=Kind.COLLECTION)throw new IllegalStateException("only plain collections have this preparation path");
+        database.createCollection(collectionName);
+    }
+
+    /**
+     * A unique, uncommitted startup probe rather than a collection the product keeps.
+     * The connection uses this handle only inside transactions it always aborts.
+     */
+    static MongoCollection<Document> accessProbeOn(MongoDatabase database, UUID id) {
+        return database.getCollection("tapstate_access_probe_" + id.toString().replace("-", ""));
+    }
+
     /** The handle on this GridFS bucket — the one call to {@code GridFSBuckets.create}, for the same reason. */
     public GridFSBucket bucketOn(MongoDatabase database) {
         if (kind != Kind.GRIDFS_BUCKET) {
@@ -248,12 +461,44 @@ public enum SystemCollections {
         return GridFSBuckets.create(database, collectionName);
     }
 
+    /** Explicit schema preparation owns both GridFS physical collections before any upload. */
+    void prepareGridFsCollectionsOn(MongoDatabase database, com.mongodb.client.ClientSession session) {
+        if (kind != Kind.GRIDFS_BUCKET) throw new IllegalStateException("only GridFS buckets have two physical collections");
+        // Both physical collections use the original transaction's commit write concern.
+        var schema = database.withWriteConcern(WriteConcern.ACKNOWLEDGED);
+        for (String name : physicalNames()) schema.createCollection(session, name);
+    }
+
+    /** The chunk handle stays in this registry for indexes and exact unpublished-upload cleanup. */
+    public MongoCollection<Document> chunksOn(MongoDatabase database) {
+        if (kind != Kind.GRIDFS_BUCKET) {
+            throw new IllegalStateException(collectionName + " is a plain collection; it has no chunks");
+        }
+        return database.getCollection(physicalNames().get(1));
+    }
+
     public String collectionName() {
         return collectionName;
     }
 
+    /** The stable identity binding this declaration to its storage contract inventory. */
+    public String resourceId() {
+        return switch (this) {
+            case ALERT_RULES, ALERT_RECEIVERS, ALERT_SUBSCRIPTIONS, ALERT_SILENCES, ALERT_INSTANCES,
+                    ALERT_EPISODES, ALERT_TRANSITIONS, ALERT_NOTIFICATION_SCHEDULES, ALERT_DELIVERY_INTENTS,
+                    ALERT_TARGET_LIMITS, ALERT_TEST_QUOTAS, ALERT_NODE_LIFECYCLES -> collectionName;
+            default -> "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+        };
+    }
+
+    public Class<?> owner() { return owner; }
+
     public Database database() {
         return database;
+    }
+
+    public Kind kind() {
+        return kind;
     }
 
     public Strategy strategy() {
@@ -333,8 +578,11 @@ public enum SystemCollections {
             return "-";
         }
         return indexes.stream()
-                .map(index -> String.join("+", index.keys()) + (index.unique() ? " (unique)" : "")
-                        + (index.expireAfterSeconds() == null ? "" : " (ttl " + index.expireAfterSeconds() + "s)"))
+                .map(index -> java.util.stream.IntStream.range(0, index.keys().size())
+                        .mapToObj(i -> index.keys().get(i) + (index.directions().get(i) == -1 ? " (desc)" : ""))
+                        .collect(java.util.stream.Collectors.joining("+")) + (index.unique() ? " (unique)" : "")
+                        + (index.expireAfterSeconds() == null ? "" : " (ttl " + index.expireAfterSeconds() + "s)")
+                        + (index.partialFilterJson() == null ? "" : " (partial " + index.partialFilterJson() + ")"))
                 .reduce((a, b) -> a + ", " + b)
                 .orElseThrow();
     }

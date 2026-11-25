@@ -173,19 +173,19 @@ class TapEventValueModelTest {
 
         // A document's own fields and an array's elements are as reachable from a reader as a
         // top-level column, so they hold the same currency.
-        assertThat(env.after().get("doc")).isEqualTo(Map.of("qty", 5L));
-        assertThat(env.after().get("tags")).isEqualTo(List.of(1L, 2L));
+        assertThat(ConvertedValue.unwrap(env.after().get("doc"))).isEqualTo(Map.of("qty", 5L));
+        assertThat(ConvertedValue.unwrap(env.after().get("tags"))).isEqualTo(List.of(1L, 2L));
     }
 
     @Test
-    void aContainerWithNothingToConvertIsNotCopied() {
+    void aDefaultArrayRetainsItsKindAndLogicalContents() {
         List<String> tags = List.of("eu", "us");
 
         Envelope env = insert(row("tags", tags));
 
-        assertThat(env.after().get("tags"))
-                .as("the ordinary row must not pay a copy per nested container")
-                .isSameAs(tags);
+        assertThat(env.after().get("tags")).isInstanceOf(ConvertedValue.class);
+        assertThat(((ConvertedValue) env.after().get("tags")).valueKind()).isEqualTo("TapArrayValue");
+        assertThat(ConvertedValue.unwrap(env.after().get("tags"))).isEqualTo(tags);
     }
 
     @Test
@@ -271,10 +271,10 @@ class TapEventValueModelTest {
 
         // A key one level down is as reachable from a reader as a top-level one, and a lane that
         // stopped at the top would leave the same two-shapes problem intact everywhere but there.
-        assertThat(((Map<?, ?>) env.after().get("doc")).get("_id"))
+        assertThat(((Map<?, ?>) ((ConvertedValue) env.after().get("doc")).value()).get("_id"))
                 .isInstanceOf(ConvertedValue.class)
                 .extracting(value -> ((ConvertedValue) value).value()).isEqualTo("aa");
-        assertThat(((List<?>) env.after().get("keys")).get(0))
+        assertThat(((List<?>) ((ConvertedValue) env.after().get("keys")).value()).get(0))
                 .isInstanceOf(ConvertedValue.class)
                 .extracting(value -> ((ConvertedValue) value).value()).isEqualTo("bb");
     }
@@ -290,19 +290,18 @@ class TapEventValueModelTest {
         // ignored - a shared one, a default one, one built on the spot - both sides would agree here
         // and every case above would still pass, since they all use the one registry.
         assertThat(registered.after().get("_id")).isInstanceOf(ConvertedValue.class);
-        assertThat(none.after().get("_id")).isInstanceOf(DriverKey.class);
+        assertThat(ConvertedValue.unwrap(none.after().get("_id"))).isInstanceOf(DriverKey.class);
     }
 
     @Test
-    void aNestedContainerWithNothingToConvertIsHandedBackUncopied() {
+    void aDefaultDocumentRetainsItsKindAndLogicalContents() {
         Map<String, Object> doc = Map.of("name", "eu");
 
         Envelope env = insert(row("doc", doc));
 
-        // The row map itself is copied by the envelope, so this is where the no-copy property is
-        // observable: a full row of already-converted values must cost nothing per container. Nothing
-        // in the build measures allocation, so losing this would be silent until a large read.
-        assertThat(env.after().get("doc")).isSameAs(doc);
+        // The PDK retains container kinds even when its scalar children need no conversion.
+        assertThat(((ConvertedValue) env.after().get("doc")).valueKind()).isEqualTo("TapMapValue");
+        assertThat(ConvertedValue.unwrap(env.after().get("doc"))).isEqualTo(doc);
     }
 
     @Test
@@ -747,8 +746,8 @@ class TapEventValueModelTest {
         Envelope decoded = insert(
                 row("tags", List.of("red", "blue", "green")), codecs, Map.of("tags", "ARRAY"));
 
-        assertThat(decoded.after().get("tags"))
-                .as("the array decodes as it always did, which is what makes the count below mean anything")
+        assertThat(ConvertedValue.unwrap(decoded.after().get("tags")))
+                .as("the logical array is unchanged by its PDK container carrier")
                 .isEqualTo(List.of("red", "blue", "green"));
         assertThat(codecs.lookupsOf(String.class))
                 .as("one lookup per element, not one per element per question")
@@ -1049,8 +1048,8 @@ class TapEventValueModelTest {
         // 2026 value into January 1970 and silently leaves a plausible but wrong instant on the row.
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
         Object instant = ((ConvertedValue) decoded).value();
-        assertThat(instant).isInstanceOf(DateTime.class);
-        assertThat(((DateTime) instant).toInstant()).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(instant).isInstanceOf(Instant.class)
+                .isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
     }
 
     @Test
@@ -1065,8 +1064,7 @@ class TapEventValueModelTest {
 
         assertThat(decoded).isInstanceOf(ConvertedValue.class);
         assertThat(((ConvertedValue) decoded).value())
-                .isInstanceOf(DateTime.class)
-                .extracting(value -> ((DateTime) value).toInstant())
+                .isInstanceOf(Instant.class)
                 .isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
     }
 
@@ -1114,7 +1112,7 @@ class TapEventValueModelTest {
             // a case that watches the conversion from one that is green for its own reasons: a column
             // whose driver type nobody registered arrives as the driver's object, which is the shape
             // every one of these had before any conversion was applied at all.
-            assertThat(withoutIt).as("%s, unregistered", type.getSimpleName()).isSameAs(value);
+            assertThat(ConvertedValue.unwrap(withoutIt)).as("%s, unregistered", type.getSimpleName()).isSameAs(value);
             assertThat(withIt).as("%s, registered", type.getSimpleName()).isNotSameAs(value);
 
             values.forEach((other, otherValue) -> {

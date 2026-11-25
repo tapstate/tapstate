@@ -1,138 +1,105 @@
-# tapstate
+# Tapstate
 
-**Capture. Transform. Serve. One deployable.**
+**From fragmented database changes to one live view of the business.**
 
-Tapstate is an open-source **unified operational data engine** that turns database
-changes into live, application-ready state.
+Tapstate is an open-source, **operational data engine** that can be used to build a state layer for applications and AI agents. It captures changes from operational databases, incrementally transforms and combines them, and keeps business entities up to date.
 
-```text
-Production databases → Capture → Transform → Live state → Apps / APIs / AI agents
-```
+**Capture → Transform → Consolidate → Materialize. One deployable.**
 
-Instead of assembling CDC, streaming, stream processing, and serving infrastructure,
-Tapstate brings the source-to-state path under one product boundary.
+[**Try Tapstate in minutes**](#try-it-in-minutes)
 
-Kafka moves events. Warehouses analyze history. Tapstate turns database truth into
-live operational state.
+![Tapstate Operational State Layer: operational systems flow through CDC into Capture, Transform, Consolidate, and Materialize, maintaining live business state for Agentic AI and mission-critical applications.](docs/assets/operational-state-layer.svg)
 
-## Why Tapstate
+*Conceptual architecture: the current Alpha materializes state in MongoDB; stable state-consumption APIs and push delivery are not yet available.*
 
-![Assembled streaming stack versus Tapstate: six separate systems reduced to one deployable](docs/assets/stack-comparison.png)
+## Try it in minutes
 
-A typical operational data path chains a database, CDC, Kafka, Flink or custom jobs,
-and a serving database before an application sees anything. Tapstate collapses that
-into one deployable.
+**Requirements:** Docker with the Compose plugin, and `jq`.
 
-One data path. One operational surface.
-
-- **Capture** database changes using log-based CDC.
-- **Transform** and combine data incrementally as it changes.
-- **Serve** application-ready state to applications, APIs, automation, and AI agents.
-
-For how this compares with a streaming stack you assemble yourself, see
-[Tapstate vs. a streaming stack](https://tapstate.dev/docs/overview/vs-streaming-stack).
-
-## Try it
-
-Install the CLI, then let it walk you through the first run:
+Run this from an empty directory. The installer creates `tapstate-demo/` there and keeps everything inside it:
 
 ```sh
-curl -sSL https://install.tapstate.dev | sh
-tapstate new
-tapstate up
+curl -fsSL https://install.tapstate.dev/demo | sh
 ```
 
-`tapstate new` asks what the workspace is for, from a short catalog of outcomes: try it
-with sample data, mirror one table as it changes, assemble several tables into one
-object. It writes that workspace to disk as ordinary `.tap.yml` files you can read and
-edit, and it reaches nothing while doing so — you can author offline, with no server in
-existence. `tapstate up` asks which server to bring it up against the first time — the
-default starts a local development stack in Docker on this machine — then checks the
-server and the sources, applies the workspace, and starts the pipeline.
+It starts a local playground with MySQL, PostgreSQL, MongoDB, and Tapstate. No existing database or Atlas account is needed.
 
-To see the whole thing running before you touch a database of your own, there is a
-disposable demo: it starts MySQL, PostgreSQL, Tapstate, and MongoDB, then maintains a
-live order object assembled from both source databases. Change the source data and
-watch the state update.
+**Administrator credentials.** Nothing is preset: the installer asks you to *choose* a username (Enter accepts `admin`) and a password for the playground's first administrator, then signs in with them. Keep them. You use them to sign in to the web UI, and a re-run in the same directory asks for the same ones. To skip the prompt, set `TAPSTATE_ADMIN_USER` and `TAPSTATE_ADMIN_PASSWORD`. If you lose them, run `docker compose down -v` in `tapstate-demo/`, remove the directory, and start again.
 
-```sh
-curl -sSL https://install.tapstate.dev/demo | sh
-```
+Open **http://127.0.0.1:8080**, sign in, and explore the running pipeline. The installer also writes `tapstate-demo/tapstate-mcp.json`, an MCP configuration you can hand to an AI agent so it can manage the playground's pipelines.
 
-→ [Follow the quickstart](https://tapstate.dev/docs/overview/quickstart-online)
+**What you'll see:** MySQL orders and PostgreSQL shipments continuously assembled into live order documents in MongoDB. Change a source record and watch the consolidated state update—without re-running a join or batch job.
 
-## What it's for
+[Follow the full quickstart](https://tapstate.dev/docs/overview/quickstart) · [Explore the documentation](https://tapstate.dev/docs)
 
-Tapstate maintains fresh operational state for applications and AI:
+For a single-node installation with your own MongoDB, see the [OP server archive guide](deploy/op/README.md).
 
-- **AI agents and copilots** — give agents fresh business context grounded in operational systems
-- **Customer and account 360** — maintain a current view across systems
-- **Order and fulfillment state** — assemble live state as orders, payments, and shipments change
-- **Inventory and entitlement** — keep availability and access state current
-- **Operational data APIs** — serve application-ready state without querying multiple systems of record
-- **Core-system offloading** — move read workloads away from transactional systems
+> **Alpha preview — local evaluation only.** The bundled MongoDB has no authentication, and Tapstate users with tokens can access control-plane data through source declarations. Use non-sensitive data and do not expose the playground to untrusted networks.
 
-Tapstate focuses on workloads whose primary outcome is current operational state,
-rather than general-purpose event streaming or historical analytics.
+## Why operational state?
 
-## Alpha preview
+Enterprise AI needs three complementary kinds of context:
 
-Today you can:
+- **Knowledge (RAG):** What does the enterprise know?
+- **Agent memory:** What has the agent learned or done?
+- **Operational state:** What is true across business systems *right now*?
 
-- Capture MySQL and PostgreSQL data with initial load + CDC
-- Incrementally transform and combine data across sources
-- Materialize live state to MongoDB
-- Inspect pipeline status, metrics, and logs
+RAG and memory cannot, on their own, reconcile live orders, customers, payments, inventory, or entitlements scattered across databases. Agents and applications need a **consistent, current view of business entities**, not just access to more tools.
 
-That MongoDB ships with the install and is managed by Tapstate: you do not install it,
-supply a URI, or configure its namespaces and indexes. It is the current reference
-backing store — not a claim that Tapstate is MongoDB-only, and not a managed
-production database service.
+Tapstate focuses on that third context. The same operational state can support traditional applications, APIs, and AI workflows.
 
-Alpha is single-node and not production-ready. It does not yet provide high
-availability, durable offset resume, exactly-once guarantees, a stable State Data API,
-or push/subscription delivery.
+## Why Tapstate?
 
-**The bundled store is not a security boundary.** It runs without authentication, and
-Tapstate's own control-plane data — users, tokens, audit records, connection
-configuration, applied artifacts — shares that instance with whatever your pipelines
-write, so anyone holding a Tapstate token can read it back with an ordinary source
-declaration. Do not put data in this deployment that its own users should not see.
+For state-centric workloads, teams often assemble and operate **CDC + Kafka + Flink + a serving database** before applications can consume a consolidated business view.
 
-## Where we're going
+Tapstate shortens that path with one engine:
 
-Alpha proves the core path from database changes to maintained state.
+- **Capture** — initial load and log-based change data capture (CDC).
+- **Transform** — filter, map, join, and reshape changes incrementally.
+- **Consolidate** — assemble current business entities across tables and databases.
+- **Materialize** — maintain the latest state in MongoDB, the current reference store.
 
-Tapstate is evolving toward the complete Capture → Transform → Serve path:
 
-- Broader database support, including Oracle, SQL Server, MongoDB, DB2, and other common operational data sources
-- Production-grade durability and high availability
-- Pull and push interfaces for consuming live state
-- A broader connector ecosystem for operational systems and serving targets
+![Traditional streaming stack vs. Tapstate](docs/assets/stack-comparison.png)
 
-## Explore Tapstate
+This is a **state path**, not a universal replacement for an event stack. Kafka is valuable for event distribution; Flink is valuable for complex event processing and windowed analytics. 
 
-- [Quickstart](https://tapstate.dev/docs/overview/quickstart-online) — get Tapstate running and see live state update
-- [Concepts](https://tapstate.dev/docs/concepts/dsl) — understand sources, pipelines, resources, and the Tapstate DSL
-- [Architecture](https://tapstate.dev/docs/overview/architecture) — understand the Capture → Transform → Serve architecture
-- [Connectors](https://tapstate.dev/docs/connectors) — supported databases, capabilities, and capture modes
-- [Transforms](https://tapstate.dev/docs/reference/transforms) — reshape and assemble operational state
-- [Operations](https://tapstate.dev/docs/guides/observe-a-pipeline) — pipelines, status, metrics, logs, and runtime behavior
-- [MCP & AI](https://tapstate.dev/docs/reference/mcp) — use Tapstate with AI agents and developer tools
-- [Build & contribute](CONTRIBUTING.md) — build from source and contribute to Tapstate
-- [Security & supported versions](SECURITY.md) — report a vulnerability, and which release lines still receive fixes
+[Compare Tapstate with a streaming stack](https://tapstate.dev/docs/overview/vs-streaming-stack) · [How Nest assembles live documents](docs/nest/README.md)
 
-[tapstate.dev/docs](https://tapstate.dev/docs) is the reviewed, published documentation
-and the one to read. Pages under `docs/` in this repository are engineering drafts kept
-next to the code, useful when you are working on Tapstate itself.
+## What can you build?
 
-**For agents and retrieval tooling:** [`/llms.txt`](https://tapstate.dev/llms.txt) is a
-discovery index of the documentation, and
-[`/llms-full.txt`](https://tapstate.dev/llms-full.txt) carries the combined page
-context. Prefer them over crawling this repository — they carry the reviewed wording,
-including the line between what Alpha does today and where the product is going.
+- **AI agents and copilots:** Provide fresh, unified business facts for operational workflows.
+- **Customer 360:** Keep one up-to-date view of a customer across systems.
+- **Order and fulfillment:** Combine orders, payments, and shipments as they change.
+- **Inventory and entitlement:** Maintain current availability and access state.
+- **Operational applications:** Reuse the same consolidated state instead of rebuilding joins in every consumer.
 
-## About
+## What works today
 
-Tapstate is an Apache-2.0 open-source project from the team behind TapData, built on
-years of production CDC and real-time data movement experience.
+Tapstate is currently an **open-source Alpha preview**, not a production-ready serving platform.
+
+| Capability | Current scope |
+|---|---|
+| Sources | MySQL, PostgreSQL, Oracle, SQL Server; Db2 LUW / IBM i in preview; MongoDB |
+| Transforms | Filter, map, join (including N:1), unwind, and nest across sources |
+| State store | MongoDB (bundled locally, or bring your own MongoDB / Atlas) |
+| Management | Web UI, CLI (`.tap.yml`), and MCP for AI-assisted pipeline authoring and operations |
+| Observability | Pipeline status, metrics, and logs |
+
+**Current limitations:** No production-grade high availability, exactly-once guarantee, stable State Data API, or push/subscription delivery. Delivery is at-least-once. MCP currently manages Tapstate resources; it is **not** a general-purpose API for agents to query materialized business state.
+
+MongoDB is the current reference implementation for state storage, **not a requirement of the long-term architecture**. Other stores and state-consumption interfaces remain on the roadmap.
+
+[Connector details](https://tapstate.dev/docs/connectors) · [Storage setup](docs/storage/README.md) · [MCP integration](https://tapstate.dev/docs/reference/mcp)
+
+## Next steps
+
+- [Quickstart](https://tapstate.dev/docs/overview/quickstart) — run and modify your first pipeline.
+- [Concepts and DSL](https://tapstate.dev/docs/concepts/dsl) — understand sources, resources, and pipelines.
+- [Transforms](https://tapstate.dev/docs/reference/transforms) — model live business entities.
+- [Architecture](https://tapstate.dev/docs/overview/architecture) — understand the state path.
+- [Operate pipelines](https://tapstate.dev/docs/guides/observe-a-pipeline) — inspect health and behavior.
+- [Contribute](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+Tapstate is an **Apache-2.0** open-source project from the team behind TapData, built on years of real-time CDC and data integration experience.
+

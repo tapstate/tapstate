@@ -1,9 +1,10 @@
 package io.tapstate.control.core;
 
-import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
+import io.tapstate.core.catalog.SecretConfigPaths;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Srs;
@@ -33,12 +34,12 @@ public final class SourceRepresentation {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
     }
 
-    /** Builds a core Source while applying catalog-driven secret replacement semantics. */
+    /** Builds a core Source while applying catalog and shared transport secret replacement semantics. */
     public SourceResource toModel(SourceDraft draft, SourceResource existing) {
         return toModel(draft, existing, true);
     }
 
-    /** Builds a persistent Source from structured HTTP input and catalog-driven secret rules. */
+    /** Builds a persistent Source from structured HTTP input and catalog and shared transport secret rules. */
     public SourceResource toModel(SourceInput input, SourceResource existing) {
         Objects.requireNonNull(input, "input");
         return toModel(input.asDraft(), existing, true);
@@ -53,7 +54,7 @@ public final class SourceRepresentation {
             SourceDraft draft, SourceResource existing, boolean enforceSecretRules) {
         Objects.requireNonNull(draft, "draft");
         ConnectorCatalogEntry connector = connector(draft.connector());
-        Map<String, ConfigField> secrets = secretFields(connector);
+        Map<String, SecretConfigPaths.Path> secrets = secretFields(connector);
         if (enforceSecretRules) {
             validateSuppliedSecrets(draft, secrets);
         }
@@ -63,15 +64,26 @@ public final class SourceRepresentation {
 
         Map<String, Object> config = new LinkedHashMap<>(draft.config());
         if (existing != null && existing.connector().equals(draft.connector())) {
-            for (String secret : secrets.keySet()) {
-                if (!config.containsKey(secret)
-                        && existing.config().containsKey(secret)
-                        && existing.config().get(secret) != null) {
-                    config.put(secret, SourceDraft.copyJsonValue(existing.config().get(secret)));
+            for (SecretConfigPaths.Path secret : secrets.values()) {
+                if (!secret.contains(config) && secret.value(existing.config()) != null) {
+                    require(secret.put(config, SourceDraft.copyJsonValue(secret.value(existing.config()))),
+                            "config." + String.join(".", secret.segments().subList(0, secret.segments().size() - 1))
+                                    + " must be an object");
                 }
             }
         }
-        clearSecrets.forEach(config::remove);
+        if (isMongoConnector(draft.connector()) && config.get("uri") instanceof String uri
+                && MongoUriUserInfo.isRedactedDisplay(uri)) {
+            Object saved = existing != null && existing.connector().equals(draft.connector())
+                    ? existing.config().get("uri") : null;
+            if (!(saved instanceof String savedUri) || !uri.equals(MongoUriUserInfo.redact(savedUri))) {
+                throw malformed("a redacted URI cannot replace connection settings; provide a complete URI");
+            }
+            config.put("uri", savedUri);
+        }
+        for (String secret : clearSecrets) {
+            secrets.get(secret).remove(config);
+        }
 
         // Options are the engine's own configuration and its vocabulary is empty today, so the model
         // has nowhere to put one. Refusing here rather than dropping it silently: a draft that keeps
@@ -87,18 +99,24 @@ public final class SourceRepresentation {
                 sourceMode(draft.mode()),
                 tableModels(draft.tables()),
                 srsModel(draft.srs()),
+                PipelineRepresentation.execution(draft.execution(), "execution"),
                 SourceDraft.copyJsonMap(draft.experimental(), true));
     }
 
-    /** Builds a normalized response with every catalog secret removed. */
+    /** Builds a normalized response with every catalog and shared transport secret removed. */
     public SourceView toView(SourceResource source, String contentHash) {
         Objects.requireNonNull(source, "source");
-        Map<String, ConfigField> secrets = secretFields(connector(source.connector()));
+        Map<String, SecretConfigPaths.Path> secrets = secretFields(connector(source.connector()));
         Map<String, Object> redactedConfig = new LinkedHashMap<>(source.config());
-        secrets.keySet().forEach(redactedConfig::remove);
+        secrets.values().forEach(secret -> secret.remove(redactedConfig));
+        Object uri = redactedConfig.get("uri");
+        if (uri instanceof String value) {
+            redactedConfig.put("uri", MongoUriUserInfo.redact(value));
+        } else if (isMongoConnector(source.connector()) && uri != null) {
+            redactedConfig.put("uri", MongoUriUserInfo.REDACTED);
+        }
         List<String> configuredSecrets = secrets.keySet().stream()
-                .filter(name -> source.config().containsKey(name)
-                        && source.config().get(name) != null)
+                .filter(name -> secrets.get(name).value(source.config()) != null)
                 .sorted()
                 .toList();
 
@@ -115,8 +133,14 @@ public final class SourceRepresentation {
                 // change this slice has no business making.
                 Map.of(),
                 srsView(source.srs()),
+                PipelineRepresentation.executionValue(source.execution()),
                 source.experimental(),
                 contentHash);
+    }
+
+    /** Captured only for this list operation; subsequent operations still read the live catalog. */
+    public SourceRepresentation withCatalog(TapstateCatalog captured) {
+        return new SourceRepresentation(captured);
     }
 
     private ConnectorCatalogEntry connector(String connector) {
@@ -127,16 +151,20 @@ public final class SourceRepresentation {
         }
     }
 
-    private static Map<String, ConfigField> secretFields(ConnectorCatalogEntry connector) {
-        Map<String, ConfigField> result = new LinkedHashMap<>();
-        connector.config().stream()
-                .filter(ConfigField::secret)
-                .forEach(field -> result.put(field.name(), field));
+    private static boolean isMongoConnector(String connector) {
+        return "mongodb".equals(connector) || "mongodb-atlas".equals(connector);
+    }
+
+    private static Map<String, SecretConfigPaths.Path> secretFields(ConnectorCatalogEntry connector) {
+        Map<String, SecretConfigPaths.Path> result = new LinkedHashMap<>();
+        SecretConfigPaths.forConnector(connector).forEach(path -> result.put(path.name(), path));
+        if (isMongoConnector(connector.id())) result.put(StorageSetupService.CA_BUNDLE_FIELD,
+                SecretConfigPaths.Path.field(StorageSetupService.CA_BUNDLE_FIELD, false));
         return result;
     }
 
     private static List<String> validateClearSecrets(
-            SourceDraft draft, Map<String, ConfigField> secrets) {
+            SourceDraft draft, Map<String, SecretConfigPaths.Path> secrets) {
         Set<String> seen = new LinkedHashSet<>();
         for (String field : draft.clearSecrets()) {
             if (field == null || !secrets.containsKey(field)) {
@@ -145,7 +173,7 @@ public final class SourceRepresentation {
             if (!seen.add(field)) {
                 throw malformed("clearSecrets contains a duplicate field: " + field);
             }
-            if (draft.config().containsKey(field)) {
+            if (secrets.get(field).contains(draft.config())) {
                 throw malformed("a secret cannot be supplied and cleared in the same request: " + field);
             }
             if (secrets.get(field).required()) {
@@ -156,9 +184,9 @@ public final class SourceRepresentation {
     }
 
     private static void validateSuppliedSecrets(
-            SourceDraft draft, Map<String, ConfigField> secrets) {
+            SourceDraft draft, Map<String, SecretConfigPaths.Path> secrets) {
         for (String secret : secrets.keySet()) {
-            if (draft.config().containsKey(secret) && draft.config().get(secret) == null) {
+            if (secrets.get(secret).contains(draft.config()) && secrets.get(secret).value(draft.config()) == null) {
                 throw malformed("a supplied secret cannot be null: " + secret);
             }
         }

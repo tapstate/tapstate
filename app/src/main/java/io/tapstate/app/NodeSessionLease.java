@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,11 +9,13 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Keeps a pre-join node-session claim live and removes the member when that proof is lost.
@@ -34,16 +37,19 @@ final class NodeSessionLease implements AutoCloseable {
     private static final Duration LAPSE_CHECK = Duration.ofSeconds(1);
 
     private final WorkloadClaimStore store;
+    private final LongSupplier nanoTime;
     private final AtomicReference<WorkloadClaim> current;
     private final Duration ttl;
     private final Runnable lost;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean firstRenewal = new AtomicBoolean(true);
 
     /** When the lease the last accepted renewal bought runs out, on the monotonic clock. */
     private volatile long provenUntil;
 
     private NodeSessionLease() {
+        this.nanoTime = System::nanoTime;
         this.store = null;
         this.current = null;
         this.ttl = Duration.ZERO;
@@ -67,6 +73,12 @@ final class NodeSessionLease implements AutoCloseable {
             Duration ttl,
             Duration renewInterval,
             Runnable lost) {
+        this(store, initial, askedAt, ttl, renewInterval, lost, System::nanoTime);
+    }
+
+    NodeSessionLease(WorkloadClaimStore store, WorkloadClaim initial, long askedAt, Duration ttl, Duration renewInterval,
+                     Runnable lost, LongSupplier nanoTime) {
+        this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         this.store = Objects.requireNonNull(store, "store");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.ttl = Objects.requireNonNull(ttl, "ttl");
@@ -80,23 +92,68 @@ final class NodeSessionLease implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
-        renewer.scheduleWithFixedDelay(
-                this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
-        long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
-        renewer.scheduleWithFixedDelay(this::loseALapsedSession, lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        long adoptedAt = nanoTime.getAsLong();
+        LOG.info("Node session maintenance adopted [proof_age_ms={}, proof_remaining_ms={}, ttl_ms={}, renew_interval_ms={}].",
+                TimeUnit.NANOSECONDS.toMillis(adoptedAt - askedAt),
+                TimeUnit.NANOSECONDS.toMillis(provenUntil - adoptedAt), ttl.toMillis(), renewInterval.toMillis());
+        CountDownLatch registered = new CountDownLatch(1);
+        try {
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::renew),
+                    0, renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+            long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::loseALapsedSession),
+                    lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException | Error setupFailure) {
+            renewer.shutdownNow();
+            throw setupFailure;
+        } finally {
+            // A fast first refusal must not shut down the executor while its other task is being registered.
+            registered.countDown();
+        }
+    }
+
+    private static void afterRegistration(CountDownLatch registered, Runnable action) {
+        try {
+            registered.await();
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        action.run();
     }
 
     private void renew() {
-        if (closed.get()) {
-            return;
-        }
+        if (!active()) return;
+        long priorProofUntil = provenUntil;
         WorkloadClaim expected = current.get();
-        long askedAt = System.nanoTime();
+        long askedAt = nanoTime.getAsLong();
+        boolean first = firstRenewal.compareAndSet(true, false);
+        if (first) {
+            LOG.info("Node session first renewal started [proof_remaining_ms={}].",
+                    TimeUnit.NANOSECONDS.toMillis(priorProofUntil - askedAt));
+        }
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
+            long storeReturnedAt = nanoTime.getAsLong();
+            if (first) {
+                LOG.info("Node session first renewal store returned [elapsed_ms={}, matched={}].",
+                        TimeUnit.NANOSECONDS.toMillis(storeReturnedAt - askedAt), renewed.isPresent());
+            }
             if (renewed.isPresent()) {
-                current.set(renewed.get());
+                if (!active()) return;
+                if (nanoTime.getAsLong() - priorProofUntil >= 0) {
+                    lose("the renewal arrived after the prior proof expired", null); return;
+                }
+                WorkloadClaim accepted = renewed.get();
+                current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
+                if (first) {
+                    long completedAt = nanoTime.getAsLong();
+                    LOG.info("Node session first renewal accepted [publish_ms={}, elapsed_ms={}, proof_remaining_ms={}].",
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - storeReturnedAt),
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - askedAt),
+                            TimeUnit.NANOSECONDS.toMillis(provenUntil - completedAt));
+                }
                 return;
             }
             lose("the stored owner or generation no longer matches", null);
@@ -105,8 +162,30 @@ final class NodeSessionLease implements AutoCloseable {
         }
     }
 
+    /** Fixed input for a new controlled operation; CACHE still proves this exact live claim by a real write. */
+    Optional<WorkloadClaimFence> currentFence() {
+        if (!active()) return Optional.empty();
+        WorkloadClaimFence captured = WorkloadClaimFence.from(current.get());
+        return active() ? Optional.of(captured) : Optional.empty();
+    }
+
+    /** A non-blocking local predicate; an observed expiry is irreversible even if shutdown blocks. */
+    boolean active() {
+        if (closed.get()) return false;
+        if (nanoTime.getAsLong() - provenUntil >= 0) {
+            if (closed.compareAndSet(false, true)) {
+                renewer.execute(() -> stopAfterLoss("the original node-session proof expired", null));
+            }
+            return false;
+        }
+        return !closed.get();
+    }
+
+    /** The startup listener shares the same irreversible local proof as runtime admission. */
+    boolean isCurrent() { return active(); }
+
     private void loseALapsedSession() {
-        if (System.nanoTime() - provenUntil >= 0) {
+        if (nanoTime.getAsLong() - provenUntil >= 0) {
             lose("no renewal was accepted within the lease the last one bought", null);
         }
     }
@@ -115,6 +194,10 @@ final class NodeSessionLease implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        stopAfterLoss(reason, cause);
+    }
+
+    private void stopAfterLoss(String reason, RuntimeException cause) {
         if (cause == null) {
             LOG.error("Node session lost: {}. Shutting down the Hazelcast member.", reason);
         } else {
@@ -133,15 +216,39 @@ final class NodeSessionLease implements AutoCloseable {
 
     @Override
     public void close() {
-        if (store == null) {
-            return;
-        }
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        renewer.shutdownNow();
+        stopAndClose(() -> { });
+    }
+
+    /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
+    void stopAndClose(Runnable stop) {
+        boolean release = store != null && closed.compareAndSet(false, true);
         try {
-            store.release(current.get());
+            stop.run();
+        } finally {
+            if (release) {
+                renewer.shutdownNow();
+                releaseCurrent();
+            }
+        }
+    }
+
+    /** A library lifecycle listener cannot wait for coordination-store I/O. */
+    void closeAfterMemberStops() {
+        if (store == null || !closed.compareAndSet(false, true)) return;
+        renewer.execute(() -> {
+            try {
+                releaseCurrent();
+            } finally {
+                renewer.shutdownNow();
+            }
+        });
+        renewer.shutdown();
+    }
+
+    private void releaseCurrent() {
+        WorkloadClaim ending = current.get();
+        try {
+            store.release(ending);
         } catch (RuntimeException unavailable) {
             LOG.warn("Could not release the node session during shutdown; it will expire by lease.", unavailable);
         }

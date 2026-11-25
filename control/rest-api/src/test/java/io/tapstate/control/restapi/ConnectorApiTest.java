@@ -212,6 +212,7 @@ class ConnectorApiTest {
                 .filter(c -> c.id().equals("orders")).findFirst().orElseThrow();
         assertThat(orders.origin()).isEqualTo("registered");
         assertThat(orders.modes()).contains("snapshot");
+        assertThat(orders.writeModes()).isEmpty();
         assertThat(orders.icon()).isEqualTo("icons/orders.png");
     }
 
@@ -467,7 +468,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("connector.not-found");
+        assertThat(body.code()).isEqualTo("TS0380001");
         assertThat(body.params()).containsEntry("connector", "missing");
     }
 
@@ -484,7 +485,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "connector.register").containsEntry("required", "write");
         // A refused write must not reach the registrar at all.
         assertThat(context.getBean(FakeConnectorRegistrar.class).received()).isNull();
@@ -513,7 +514,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         assertThat(context.getBean(FakeConnectorRegistrar.class).received()).isNull();
     }
@@ -529,7 +530,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         assertThat(context.getBean(FakeConnectorRegistrar.class).received()).isNull();
     }
@@ -539,7 +540,7 @@ class ConnectorApiTest {
     @Test
     void aCodedConnectorFailureFromRegisterIsABadRequestCarryingTheConnectorCode() {
         context.getBean(FakeConnectorRegistrar.class).fails(new TapstateException(
-                new ConnectorCode("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
+                new ConnectorCode("TS0060017", Set.of("artifact", "spec", "detail")),
                 Map.of("artifact", "bad.jar", "spec", "spec.json", "detail", "the spec is not valid JSON"),
                 null));
 
@@ -552,7 +553,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("connector.spec-invalid");
+        assertThat(body.code()).isEqualTo("TS0060017");
         assertThat(body.params()).containsEntry("artifact", "bad.jar");
     }
 
@@ -596,6 +597,11 @@ class ConnectorApiTest {
         @Bean
         TokenService tokenService(TokenStore store, TokenSecrets secrets, Clock clock) {
             return new TokenService(store, secrets, clock);
+        }
+
+        @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
         }
 
         @Bean

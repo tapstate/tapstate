@@ -46,7 +46,8 @@ setup:
     shipments: { kind: postgres }
     store: { kind: mongo }
   connectors: [mysql, postgres, mongodb]
-  apply: [src_orders.tap.yml, src_shipments.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_orders.tap.yml, src_shipments.tap.yml, pipeline.tap.yml]
   discover: [src_orders, src_shipments]
 pipeline: pipeline.tap.yml
 seed:

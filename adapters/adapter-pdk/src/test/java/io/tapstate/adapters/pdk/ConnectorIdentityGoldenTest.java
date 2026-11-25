@@ -37,7 +37,7 @@ class ConnectorIdentityGoldenTest {
         return List.of(
                 new Case("a pipeline reading a source", pg.at(new PipelineNode("p-orders", "src_pg_main"))),
                 new Case("a second pipeline on the same source", pg.at(new PipelineNode("p-audit", "src_pg_main"))),
-                new Case("the write side of the same pipeline", pg.at(new PipelineNode("p-orders", "to_mongo"))),
+                new Case("the write side of the same pipeline", pg.at(new PipelineNode("p-orders", "to_mongo")), PipelineNode.Purpose.SYNC),
                 new Case("a node id carrying dots of its own", pg.at(new PipelineNode("p-orders", "src.a.b"))),
                 new Case("a read-only drive naming no node", pg));
     }
@@ -67,7 +67,8 @@ class ConnectorIdentityGoldenTest {
 
     // ---- fixtures + a small deterministic JSON renderer (test-owned, stable) ----
 
-    private record Case(String label, CaptureConfig config) {
+    private record Case(String label, CaptureConfig config, PipelineNode.Purpose purpose) {
+        Case(String label, CaptureConfig config) { this(label, config, PipelineNode.Purpose.CAPTURE); }
     }
 
     private static String render(List<Case> cases) {
@@ -84,7 +85,7 @@ class ConnectorIdentityGoldenTest {
             sb.append("      \"connectorId\": ").append(quote(c.config().connectorId())).append(",\n");
             sb.append("      \"pipelineId\": ").append(node == null ? "null" : quote(node.pipelineId())).append(",\n");
             sb.append("      \"nodeId\": ").append(node == null ? "null" : quote(node.nodeId())).append(",\n");
-            sb.append("      \"stateNamespace\": ").append(quote(ConnectorStateNamespace.of(node))).append("\n");
+            sb.append("      \"stateNamespace\": ").append(quote(ConnectorStateNamespace.of(node, c.purpose()))).append("\n");
             sb.append(i + 1 < cases.size() ? "    },\n" : "    }\n");
         }
         return sb.append("  ]\n}\n").toString();

@@ -1,10 +1,16 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.RollupResultType;
 import io.tapstate.core.model.ErrorPolicy;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -85,6 +91,9 @@ public final class DslParser {
     private static final String EXPERIMENTAL_FIELD = "experimental";
     private static final String CONNECTOR_FIELD = "connector";
     private static final String OPTIONS_FIELD = "options";
+    private static final String EXPECTED_TOKEN = "expected";
+    private static final String VALUE_TOKEN = "value";
+    private static final String SOURCE_ID_FIELD_TOKEN = "source_id_field";
     private static final String SOURCE_TOKEN = "source";
     private static final String TRANSFORMS_FIELD = "transforms";
     private static final String SERVE_TOKEN = "serve";
@@ -92,14 +101,15 @@ public final class DslParser {
     private static final String STORAGE_FIELD = "storage";
     private static final String FILTER_TOKEN = "filter";
     private static final String FORMAT_FIELD = "format";
+    private static final String EXECUTION_FIELD = "execution";
 
     static final Set<String> SOURCE_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, CONNECTOR_FIELD, "config", "mode",
-            "tables", OPTIONS_FIELD, "srs", EXPERIMENTAL_FIELD);
+            "tables", OPTIONS_FIELD, "srs", EXECUTION_FIELD, EXPERIMENTAL_FIELD);
     static final Set<String> PIPELINE_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, SOURCE_TOKEN, TRANSFORMS_FIELD, "view", SERVE_TOKEN,
             "settings", EXPERIMENTAL_FIELD);
-    static final Set<String> METADATA_KEYS = Set.of("labels", "description");
+    static final Set<String> METADATA_KEYS = Set.of("labels", "description", "cloud", "user_id");
     static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
     /**
      * The engine options a source accepts. Options are the engine's own configuration, so the key
@@ -110,15 +120,21 @@ public final class DslParser {
      */
     private static final Set<String> NO_ENGINE_OPTIONS = Set.of();
     static final Set<String> TABLE_SPEC_KEYS = Set.of("name", FILTER_TOKEN, "pk", OPTIONS_FIELD);
-    static final Set<String> STEP_BASE_KEYS = Set.of("id", "type", "from", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
-    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD);
+    static final Set<String> STEP_BASE_KEYS =
+            Set.of("id", "type", "from", OPTIONS_FIELD, EXECUTION_FIELD, EXPERIMENTAL_FIELD);
+    static final Set<String> STEP_USE_KEYS = Set.of("id", "use", "from", OPTIONS_FIELD, EXECUTION_FIELD);
     private static final Set<String> NEST_ROOT_KEYS =
             Set.of("from", "key", "mode", "trackKeyChanges", "embed");
     static final Set<String> NEST_STATE_KEYS = Set.of("database");
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
-            "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
-    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD);
+            "from", "on", "orOn", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed",
+            "rollup");
+    /** The keys that qualify a rollup field's one function rather than naming it. */
+    static final Set<String> ROLLUP_OPTION_KEYS = Set.of("filter", "type", "default");
+    static final Set<String> ROLLUP_PICK_KEYS = Set.of("value", "by");
+    private static final Set<String> VIEW_INLINE_KEYS = Set.of(
+            "id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, "write_mode", "on_full_load", EXECUTION_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
     private static final Set<String> HOT_KEYS = Set.of("ttl");
@@ -126,8 +142,13 @@ public final class DslParser {
     private static final Set<String> COLD_KEYS = Set.of("partition_by");
     private static final Set<String> SERVE_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
-    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
-    static final Set<String> SYNC_KEYS = Set.of("id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD);
+    static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs", "nodeConfig", "as");
+    static final Set<String> SYNC_KEYS = Set.of(
+            "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
+    static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
+    static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
+    private static final String SOFT_DELETE_TOKEN = "soft_delete";
+    private static final String FIELDS_TOKEN = "fields";
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
     static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
@@ -136,7 +157,8 @@ public final class DslParser {
     static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXPERIMENTAL_FIELD);
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD,
+            "write_mode", "on_full_load", EXECUTION_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "sync", "query", "push", EXPERIMENTAL_FIELD);
 
@@ -171,6 +193,20 @@ public final class DslParser {
     /** Parses one YAML document into its {@link Resource} model. */
     public Resource parse(String yaml) {
         return bind(rootMapping(yaml));
+    }
+
+    /** Parses once while retaining which top-level fields the author actually supplied. */
+    public ParsedResource parseWithDeclaredFields(String yaml) {
+        MappingNode mapping = rootMapping(yaml);
+        Set<String> fields = Set.copyOf(YamlMap.of(mapping, "").keys());
+        return new ParsedResource(bind(mapping), fields);
+    }
+
+    public record ParsedResource(Resource resource, Set<String> declaredFields) {
+        public ParsedResource {
+            Objects.requireNonNull(resource, "resource");
+            declaredFields = Set.copyOf(declaredFields);
+        }
     }
 
     /**
@@ -233,7 +269,7 @@ public final class DslParser {
         Node root = compose(yaml);
         if (!(root instanceof MappingNode mapping)) {
             throw YamlMap.error(DslError.ILLEGAL_VALUE, "", root,
-                    Map.of("value", YamlMap.nodeTypeName(root), "expected", "a mapping"));
+                    Map.of(VALUE_TOKEN, YamlMap.nodeTypeName(root), EXPECTED_TOKEN, "a mapping"));
         }
         return mapping;
     }
@@ -298,8 +334,8 @@ public final class DslParser {
             case "view" -> viewDefinition(doc);
             case SERVE_TOKEN -> serveDefinition(doc);
             case null, default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "kind", mapping,
-                    Map.of("value", kind == null ? "(absent)" : kind,
-                            "expected", "one of: source, pipeline, transform, view, serve"));
+                    Map.of(VALUE_TOKEN, kind == null ? "(absent)" : kind,
+                            EXPECTED_TOKEN, "one of: source, pipeline, transform, view, serve"));
         };
     }
 
@@ -339,6 +375,7 @@ public final class DslParser {
                 mode(m, "mode"),
                 tables(m.seq("tables")),
                 srs(m.mapping("srs")),
+                execution(m.mapping(EXECUTION_FIELD)),
                 m.freeMap(EXPERIMENTAL_FIELD));
     }
 
@@ -407,31 +444,31 @@ public final class DslParser {
 
     private static List<SourceRef> sources(YamlMap m) {
         Node n = m.node(SOURCE_TOKEN);
-        if (n instanceof ScalarNode sc) {
-            return List.of(SourceRef.bare(sc.getValue()));
+        if (n instanceof ScalarNode || n instanceof MappingNode) {
+            return List.of(sourceRef(n, SOURCE_TOKEN));
         }
         List<SourceRef> refs = new ArrayList<>();
         if (n instanceof SequenceNode seq) {
             for (Node item : seq.getValue()) {
-                refs.add(sourceRef(item));
+                refs.add(sourceRef(item, SOURCE_TOKEN + "[" + refs.size() + "]"));
             }
         }
         return refs;
     }
 
-    private static SourceRef sourceRef(Node item) {
+    private static SourceRef sourceRef(Node item, String path) {
         if (item instanceof ScalarNode sc) {
             return SourceRef.bare(sc.getValue());
         }
-        YamlMap ref = YamlMap.requireMapping(item, SOURCE_TOKEN);
+        YamlMap ref = YamlMap.requireMapping(item, path);
         ref.requireOnly(SOURCE_REF_KEYS);
         Boolean srs = boolValue(ref, "srs");
-        // An object written without the switch says exactly what a bare id says, so it normalizes
-        // to one: keeping both spellings of one state would let the same pipeline canonicalize two
-        // ways, and the materialization rule reads "has a switch" off this distinction.
-        return srs == null
-                ? SourceRef.bare(ref.requireString("id"))
-                : SourceRef.spec(ref.requireString("id"), srs);
+        String alias = ref.string("as");
+        if (alias != null && (alias.isBlank() || alias.contains("."))) {
+            throw ref.errorAt("as", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, alias, EXPECTED_TOKEN, "a non-blank alias without dots"));
+        }
+        return SourceRef.of(ref.requireString("id"), srs, ref.freeMap("nodeConfig"), alias);
     }
 
     // ---- transforms ---------------------------------------------------------------
@@ -453,7 +490,8 @@ public final class DslParser {
                 if (s.has("use")) {
                     s.requireOnly(STEP_USE_KEYS);
                     requireKnownOptions(s, NO_ENGINE_OPTIONS);
-                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n));
+                    step = Step.use(idOf(s), s.string("use"), fromFlow(s, prevId, n),
+                            execution(s.mapping(EXECUTION_FIELD)));
                 } else {
                     step = inlineStep(s, index, prevId, n);
                 }
@@ -481,17 +519,19 @@ public final class DslParser {
         boolean aliased = type.equals("nest") || type.equals("join");
         FromClause from = aliased ? fromAliases(s, at) : fromFlow(s, prevId, at);
         requireKnownOptions(s, NO_ENGINE_OPTIONS);
-        return Step.inline(id, from, body(type, s), s.freeMap(EXPERIMENTAL_FIELD));
+        return Step.inline(id, from, body(type, s), execution(s.mapping(EXECUTION_FIELD)),
+                s.freeMap(EXPERIMENTAL_FIELD));
     }
 
     private static Set<String> payloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields");
+            case "map" -> Set.of(FIELDS_TOKEN, SOFT_DELETE_TOKEN);
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
-                    "preserve_null_and_empty_arrays", "element_key", "element_type");
+                    "preserve_null_and_empty_arrays", "element_key", "element_type", SOURCE_ID_FIELD_TOKEN);
             case "union" -> Set.of();
+            case "aggregate" -> Set.of("key", "where", "groupBy", "fields");
             case "nest" -> Set.of(
                     PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
                     "state", "root");
@@ -508,9 +548,11 @@ public final class DslParser {
     static Set<String> requiredPayloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields");
+            // fields, unless soft_delete stands in for it; body() refuses a map carrying neither
+            case "map" -> Set.of();
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path");
+            case "aggregate" -> Set.of("fields");
             case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
@@ -520,8 +562,7 @@ public final class DslParser {
     private TransformBody body(String type, YamlMap s) {
         return switch (type) {
             case "js" -> new TransformBody.Js(s.requireString("script"));
-            case "map" -> new TransformBody.MapProjection(
-                    fieldRules(s.require("fields", s.mapping("fields"))));
+            case "map" -> mapProjection(s);
             case FILTER_TOKEN -> {
                 String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
@@ -532,8 +573,10 @@ public final class DslParser {
                     s.string("include_array_index"),
                     boolValue(s, "preserve_null_and_empty_arrays"),
                     s.string("element_key"),
-                    elementType(s));
+                    elementType(s),
+                    sourceIdField(s));
             case "union" -> new TransformBody.Union();
+            case "aggregate" -> aggregate(s);
             case "nest" -> new TransformBody.Nest(
                     s.string(PRIMARY_KEY_FIELD),
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
@@ -549,8 +592,32 @@ public final class DslParser {
                 yield new TransformBody.Join(engine, sql);
             }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
-                    Map.of("value", type, "expected", "a known transform type (js, map, filter, unwind, union, nest, join)"));
+                    Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, aggregate, nest, join)"));
         };
+    }
+
+    /**
+     * A map's body. {@code fields} may be left out only where {@code soft_delete} is given, since a
+     * step adding the deleted-row column is a whole step on its own. The column may not also be a
+     * declared field: two values for one column, one of them silently losing on every row, is a
+     * mistake the author should hear about where they wrote it.
+     */
+    private TransformBody.MapProjection mapProjection(YamlMap s) {
+        String softDelete = s.string(SOFT_DELETE_TOKEN);
+        YamlMap fields = s.mapping(FIELDS_TOKEN);
+        if (softDelete == null) {
+            s.require(FIELDS_TOKEN, fields);
+        } else if (softDelete.isBlank()) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, softDelete, EXPECTED_TOKEN, "a column name"));
+        }
+        Map<String, FieldRule> rules = fields == null ? Map.of() : fieldRules(fields);
+        if (softDelete != null && rules.containsKey(softDelete)) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, softDelete,
+                            EXPECTED_TOKEN, "a column not also declared under fields"));
+        }
+        return new TransformBody.MapProjection(rules, softDelete);
     }
 
     private Map<String, FieldRule> fieldRules(YamlMap fields) {
@@ -616,18 +683,212 @@ public final class DslParser {
             if (as == EmbedAs.FLAT && e.has("arrayKey")) {
                 throw e.errorAt("arrayKey", DslError.FORBIDDEN_FIELD, Map.of("field", "arrayKey"));
             }
+            if (as == EmbedAs.ROLLUP && e.has("path")) {
+                throw e.errorAt("path", DslError.FORBIDDEN_FIELD, Map.of("field", "path"));
+            }
+            if ((as == EmbedAs.OBJECT || as == EmbedAs.FLAT) && e.has("rollup")) {
+                throw e.errorAt("rollup", DslError.ROLLUP_ON_SINGLE_ROW_EMBED, Map.of("as", as.yaml()));
+            }
+            Map<String, RollupField> rollup = rollupFields(e);
+            if (as == EmbedAs.ROLLUP && (rollup == null || rollup.isEmpty())) {
+                throw e.errorAt("as", DslError.ROLLUP_LEVEL_WITHOUT_FIELDS, Map.of());
+            }
             out.add(new Embed(
                     e.requireString("from"),
                     e.require("on", stringMap(e, "on")),
                     as,
-                    as == EmbedAs.FLAT ? null : e.requireString("path"),
+                    as == EmbedAs.FLAT || as == EmbedAs.ROLLUP ? null : e.requireString("path"),
                     scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
                     boolValue(e, "trackKeyChanges"),
-                    embeds(e.seq("embed"), e.childPath("embed"))));
+                    embeds(e.seq("embed"), e.childPath("embed")),
+                    rollup,
+                    alternatives(e, "orOn")));
         }
         return out;
+    }
+
+    /**
+     * An embed's further ways of matching its child, each a mapping of child field to parent field like
+     * {@code on}. An empty list, or an alternative that maps nothing, is refused rather than read as absent:
+     * either is an author who meant to write an alternative and did not, and dropping it silently would
+     * leave the embed matching on fewer conditions than written.
+     */
+    private static List<Map<String, String>> alternatives(YamlMap owner, String key) {
+        List<Node> items = owner.seq(key);
+        if (items == null) {
+            return null;
+        }
+        String expected = "a list of non-empty mappings from child field to parent field";
+        if (items.isEmpty()) {
+            throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, "[]", EXPECTED_TOKEN, expected));
+        }
+        List<Map<String, String>> out = new ArrayList<>(items.size());
+        for (Node item : items) {
+            Object raw = YamlMap.nodeValue(item);
+            if (!(raw instanceof Map<?, ?> pairs) || pairs.isEmpty()) {
+                throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
+                        Map.of(VALUE_TOKEN, String.valueOf(raw), EXPECTED_TOKEN, expected));
+            }
+            Map<String, String> alternative = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> pair : pairs.entrySet()) {
+                if (!(pair.getValue() instanceof String parentField)) {
+                    throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
+                            Map.of(VALUE_TOKEN, String.valueOf(pair.getValue()), EXPECTED_TOKEN, "a string"));
+                }
+                alternative.put(String.valueOf(pair.getKey()), parentField);
+            }
+            out.add(alternative);
+        }
+        return out;
+    }
+
+    /**
+     * An embed's {@code rollup:} map, in the order written. Shape is all that is judged here: each field
+     * names exactly one known function, its argument is a {@code $column}, an {@code =expression} or (for a
+     * count) {@code true}, and every expression compiles over a row. Whether the expressions type-check
+     * against the level's columns and references is judged where the tree and its models are known.
+     */
+    /**
+     * Reads a {@code rollup:} map that arrives already structured, as plain maps, lists and scalars, under
+     * exactly the rules of a written embed's. {@code path} names where it sits, for diagnostics.
+     */
+    public Map<String, RollupField> rollupFieldsFromTree(Map<String, Object> rollup, String path) {
+        Objects.requireNonNull(rollup, "rollup");
+        Map<String, Object> owner = new LinkedHashMap<>();
+        owner.put("rollup", rollup);
+        return rollupFields(YamlMap.of(TreeNodes.mapping(owner, path), path));
+    }
+
+    private Map<String, RollupField> rollupFields(YamlMap embed) {
+        return rollupFields(embed, "rollup");
+    }
+
+    /**
+     * An aggregate step's payload. Shape only, as for a rollup: every expression compiles over a row,
+     * and whether it type-checks against the input's columns is judged where the input model is known.
+     */
+    private TransformBody.Aggregate aggregate(YamlMap s) {
+        List<String> key = s.has("key") ? scalarList(s.seq("key"), "key") : null;
+        if (key != null && key.isEmpty()) {
+            throw s.errorAt("key", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, "[]", EXPECTED_TOKEN, "at least one column identifying an input row"));
+        }
+        String where = s.string("where");
+        if (where != null) {
+            checkRollupExpression(s, "where", where, true);
+        }
+        Map<String, String> groupBy = new LinkedHashMap<>();
+        YamlMap groups = s.mapping("groupBy");
+        if (groups != null) {
+            for (String name : groups.keys()) {
+                groupBy.put(name, rollupExpression(groups, name));
+            }
+        }
+        Map<String, RollupField> fields = rollupFields(s, "fields");
+        if (fields.isEmpty()) {
+            throw s.errorAt("fields", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, "{}", EXPECTED_TOKEN, "at least one output field"));
+        }
+        return new TransformBody.Aggregate(key, where, groupBy, fields);
+    }
+
+    private Map<String, RollupField> rollupFields(YamlMap owner, String fieldsKey) {
+        YamlMap fields = owner.mapping(fieldsKey);
+        if (fields == null) {
+            return null;
+        }
+        Map<String, RollupField> out = new LinkedHashMap<>();
+        for (String name : fields.keys()) {
+            YamlMap f = YamlMap.requireMapping(fields.node(name), fields.childPath(name));
+            List<String> functions = new ArrayList<>();
+            for (String key : f.keys()) {
+                if (!ROLLUP_OPTION_KEYS.contains(key)) {
+                    functions.add(key);
+                }
+            }
+            if (functions.size() != 1 || RollupFunction.byYaml(functions.getFirst()).isEmpty()) {
+                throw fields.errorAt(name, DslError.ROLLUP_FUNCTION_UNKNOWN, Map.of(
+                        "field", name,
+                        "function", functions.isEmpty() ? "(none)" : String.join(", ", functions),
+                        "known", String.join(", ", RollupFunction.spellings())));
+            }
+            RollupFunction function = RollupFunction.byYaml(functions.getFirst()).orElseThrow();
+            String key = function.yaml();
+            Object argument = switch (function) {
+                case FIRST, LAST -> rollupPick(f.mapping(key));
+                case COUNT -> {
+                    Object value = YamlMap.nodeValue(f.node(key));
+                    if (Boolean.TRUE.equals(value)) {
+                        yield Boolean.TRUE;
+                    }
+                    yield rollupExpression(f, key);
+                }
+                default -> rollupExpression(f, key);
+            };
+            String filter = f.string("filter");
+            if (filter != null) {
+                checkRollupExpression(f, "filter", filter);
+            }
+            out.put(name, RollupField.of(function, argument, filter,
+                    enumByYaml(RollupResultType.values(), RollupResultType::yaml, f, "type"),
+                    f.has("default") ? YamlMap.nodeValue(f.node("default")) : null));
+        }
+        return out;
+    }
+
+    private RollupPick rollupPick(YamlMap pick) {
+        pick.requireOnly(ROLLUP_PICK_KEYS);
+        pick.requirePresent(ROLLUP_PICK_KEYS);
+        String value = rollupExpression(pick, "value");
+        List<String> by = new ArrayList<>();
+        Node byNode = pick.node("by");
+        if (byNode instanceof SequenceNode byList) {
+            for (Node item : byList.getValue()) {
+                String written = YamlMap.requireScalar(item, "by");
+                checkRollupExpression(pick, "by", written);
+                by.add(written);
+            }
+        } else {
+            by.add(rollupExpression(pick, "by"));
+        }
+        if (by.isEmpty()) {
+            throw pick.errorAt("by", DslError.ILLEGAL_VALUE,
+                    Map.of("value", "[]", "expected", "at least one ordering expression"));
+        }
+        return new RollupPick(value, by);
+    }
+
+    /** A rollup argument as written, after checking it is a {@code $column} or an {@code =expression}. */
+    private static String rollupExpression(YamlMap owner, String key) {
+        String written = owner.requireString(key);
+        checkRollupExpression(owner, key, written);
+        return written;
+    }
+
+    private static void checkRollupExpression(YamlMap owner, String key, String written) {
+        checkRollupExpression(owner, key, written, "filter".equals(key));
+    }
+
+    private static void checkRollupExpression(YamlMap owner, String key, String written, boolean predicate) {
+        if (written.startsWith("$")) {
+            String column = written.substring(1);
+            if (!RollupExpressions.isColumnName(column)) {
+                throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", written,
+                        "expected", "$<column> naming one field of the element, or =<expression>"));
+            }
+            return;
+        }
+        if (!written.startsWith("=")) {
+            throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", written,
+                    "expected", "$<column> naming one field of the element, or =<expression>"));
+        }
+        String expr = written.substring(1);
+        String detail = predicate
+                ? RollupExpressions.untypedPredicateError(expr)
+                : RollupExpressions.untypedValueError(expr);
+        failExpression(owner, key, expr, detail);
     }
 
     // ---- view / serve -------------------------------------------------------------
@@ -652,7 +913,10 @@ public final class DslParser {
                 id != null ? id : "view",
                 blockFrom(v, prevId, n),
                 v.string(PRIMARY_KEY_FIELD),
-                storage(v.mapping(STORAGE_FIELD)));
+                storage(v.mapping(STORAGE_FIELD)),
+                enumByYaml(WriteMode.values(), WriteMode::yaml, v, "write_mode"),
+                enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, v, "on_full_load"),
+                execution(v.mapping(EXECUTION_FIELD)));
     }
 
     private Storage storage(YamlMap st) {
@@ -721,7 +985,8 @@ public final class DslParser {
                     enumByYaml(WriteMode.values(), WriteMode::yaml, s, "write_mode"),
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
-                    enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load")));
+                    enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load"),
+                    execution(s.mapping(EXECUTION_FIELD))));
         }
         return out;
     }
@@ -809,7 +1074,9 @@ public final class DslParser {
             return null;
         }
         md.requireOnly(METADATA_KEYS);
-        return new Metadata(stringMap(md, "labels"), md.string("description"));
+        return new Metadata(
+                stringMap(md, "labels"), md.string("description"),
+                boolValue(md, "cloud"), md.string("user_id"));
     }
 
     // ---- definition bodies (kind: transform / view / serve) -----------------------
@@ -839,7 +1106,11 @@ public final class DslParser {
         m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
                 m.require("id", idOf(m)), metadata(m), m.string(PRIMARY_KEY_FIELD),
-                storage(m.mapping(STORAGE_FIELD)), m.freeMap(EXPERIMENTAL_FIELD));
+                storage(m.mapping(STORAGE_FIELD)),
+                enumByYaml(WriteMode.values(), WriteMode::yaml, m, "write_mode"),
+                enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, m, "on_full_load"),
+                execution(m.mapping(EXECUTION_FIELD)),
+                m.freeMap(EXPERIMENTAL_FIELD));
     }
 
     /** A reusable publish-surface definition (§8, X19): sync / query / push, no wiring. */
@@ -873,7 +1144,7 @@ public final class DslParser {
         }
         if (!(fn instanceof SequenceNode seq)) {
             throw owner.errorAt("from", DslError.ILLEGAL_VALUE,
-                    Map.of("value", YamlMap.nodeTypeName(fn), "expected", "a scalar or list for a streaming step"));
+                    Map.of(VALUE_TOKEN, YamlMap.nodeTypeName(fn), EXPECTED_TOKEN, "a scalar or list for a streaming step"));
         }
         List<FromRef> refs = new ArrayList<>();
         for (Node item : seq.getValue()) {
@@ -978,7 +1249,7 @@ public final class DslParser {
         for (Map.Entry<String, Object> e : raw.entrySet()) {
             if (!(e.getValue() instanceof String s)) {
                 throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
-                        Map.of("value", String.valueOf(e.getValue()), "expected", "a string"));
+                        Map.of(VALUE_TOKEN, String.valueOf(e.getValue()), EXPECTED_TOKEN, "a string"));
             }
             out.put(e.getKey(), s);
         }
@@ -991,12 +1262,77 @@ public final class DslParser {
             return null;
         }
         if (!(v instanceof Number num)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", v, "expected", "an integer"));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, v, EXPECTED_TOKEN, "an integer"));
         }
         if (v instanceof Long l && (l < Integer.MIN_VALUE || l > Integer.MAX_VALUE)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", l, "expected", "a 32-bit integer"));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, l, EXPECTED_TOKEN, "a 32-bit integer"));
         }
         return num.intValue();
+    }
+
+    /**
+     * How one node runs, or null where the node carries no {@code execution} block. The parallelism is
+     * the target total across the cluster, so it is a whole number and nothing else: a word such as
+     * {@code auto} is refused here rather than read as a request to guess, because a guess that changes
+     * with a restart or a resize would change how wide the node runs without anybody changing its artifact.
+     * The per-member count is worked out when a run is built and is never written, so a key naming it is
+     * refused as unknown like any other key outside the block.
+     */
+    private static ExecutionSpec execution(YamlMap e) {
+        if (e == null) {
+            return null;
+        }
+        e.requireOnly(EXECUTION_KEYS);
+        Integer parallelism = boundedIntValue(e, "parallelism", 1, ExecutionSpec.MAX_PARALLELISM);
+        BatchSpec batch = null;
+        YamlMap b = e.mapping("batch");
+        if (b != null) {
+            b.requireOnly(BATCH_KEYS);
+            Integer maxRecords = boundedIntValue(b, "max_records", 1, BatchSpec.MAX_RECORDS_LIMIT);
+            String maxWait = waitValue(b, "max_wait");
+            // A block that says nothing is read as no block, so that it reads back from the canonical
+            // form - which writes nothing for it - as the same thing it was parsed into.
+            batch = maxRecords == null && maxWait == null ? null : new BatchSpec(maxRecords, maxWait);
+        }
+        return parallelism == null && batch == null ? null : new ExecutionSpec(parallelism, batch);
+    }
+
+    /** A whole number from {@code min} to {@code max}, or null where the key is absent. */
+    private static Integer boundedIntValue(YamlMap m, String key, int min, int max) {
+        Object v = m.value(key);
+        if (v == null) {
+            return null;
+        }
+        String expected = "a whole number from " + min + " to " + max;
+        if (!(v instanceof Integer || v instanceof Long)) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, String.valueOf(v), EXPECTED_TOKEN, expected));
+        }
+        long value = ((Number) v).longValue();
+        if (value < min || value > max) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, value, EXPECTED_TOKEN, expected));
+        }
+        return (int) value;
+    }
+
+    /**
+     * A wait written as a whole number and a unit ({@code ms}, {@code s} or {@code m}), at most a minute's
+     * worth of 60s, or null where the key is absent. A bare number is refused rather than read in some unit:
+     * {@code 50} could be meant as milliseconds or as seconds, and the two differ by a factor of a thousand.
+     */
+    private static String waitValue(YamlMap m, String key) {
+        Object v = m.value(key);
+        if (v == null) {
+            return null;
+        }
+        String expected = "a duration from 0ms to 60s, such as 0ms, 50ms or 2s";
+        if (!(v instanceof String text)) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, String.valueOf(v), EXPECTED_TOKEN, expected));
+        }
+        long millis = BatchSpec.durationMillis(text);
+        if (millis < 0 || millis > BatchSpec.MAX_WAIT_LIMIT_MILLIS) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, text, EXPECTED_TOKEN, expected));
+        }
+        return text;
     }
 
     /**
@@ -1008,7 +1344,7 @@ public final class DslParser {
         Integer value = intValue(m, key);
         if (value != null && value <= 0) {
             throw m.errorAt(key, DslError.ILLEGAL_VALUE,
-                    Map.of("value", value, "expected", "a count above zero"));
+                    Map.of(VALUE_TOKEN, value, EXPECTED_TOKEN, "a count above zero"));
         }
         return value;
     }
@@ -1023,6 +1359,16 @@ public final class DslParser {
      * silently become whatever the target guessed. Kept as the string the model carries: what
      * travels downstream is the token, not the enum.
      */
+    private static String sourceIdField(YamlMap s) {
+        String field = s.string(SOURCE_ID_FIELD_TOKEN);
+        if (field != null && (field.isBlank() || field.contains(".") || field.startsWith("$")
+                || field.indexOf('\0') >= 0)) {
+            throw s.errorAt(SOURCE_ID_FIELD_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, field, EXPECTED_TOKEN, "a nonblank top-level field name without dots or a dollar prefix"));
+        }
+        return field;
+    }
+
     private static String elementType(YamlMap s) {
         TapstateType declared = enumByYaml(
                 TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), s, "element_type");
@@ -1035,7 +1381,7 @@ public final class DslParser {
             return null;
         }
         if (!(v instanceof Boolean b)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", v, "expected", "true or false"));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, v, EXPECTED_TOKEN, "true or false"));
         }
         return b;
     }
@@ -1049,7 +1395,7 @@ public final class DslParser {
         String id = m.string("id");
         if (id != null && id.indexOf('.') >= 0) {
             throw m.errorAt("id", DslError.ILLEGAL_VALUE,
-                    Map.of("value", id, "expected", "an id without '.', the reserved addressing separator (§2)"));
+                    Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, "an id without '.', the reserved addressing separator (§2)"));
         }
         // An id travels into places that write it as a line of text and read it back by splitting on
         // lines, so one carrying a newline is recorded as several and read back as names that were never
@@ -1057,7 +1403,7 @@ public final class DslParser {
         // found, and one missed is state left behind or another id's state dropped in its place.
         if (id != null && hasControlCharacter(id)) {
             throw m.errorAt("id", DslError.ILLEGAL_VALUE,
-                    Map.of("value", id, "expected", "an id without control characters"));
+                    Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, "an id without control characters"));
         }
         return id;
     }
@@ -1083,7 +1429,7 @@ public final class DslParser {
             }
         }
         throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
-                Map.of("value", raw, "expected", allowedValues(values, yaml)));
+                Map.of(VALUE_TOKEN, raw, EXPECTED_TOKEN, allowedValues(values, yaml)));
     }
 
     /** Renders an enum's accepted {@code yaml()} tokens as {@code "one of: a, b, c"} for error reporting. */

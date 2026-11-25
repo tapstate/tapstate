@@ -25,6 +25,10 @@ is an ordinary one — readable, editable, and exactly what the lower-level comm
 (`validate`, `ls`, `desc`, `apply`, `start`) operate on. The guided commands hide the
 *sequence*, never the model.
 
+Before bringing a workspace online against a server built from this checkout, complete
+[storage setup and normal sign-in](../storage/README.md). `tapstate new` still works offline;
+`tapstate up` does not replace the OP installation or Cloud storage setup procedure.
+
 ## Entry modes
 
 Four ways in, with different side effects. Help text and documentation always say which

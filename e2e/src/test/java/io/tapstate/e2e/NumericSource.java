@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 
 import org.testcontainers.containers.MySQLContainer;
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.Yaml;
 
 /**
  * The one real numeric table the two type-gate witnesses are written against, and the workspace they
@@ -86,9 +88,9 @@ final class NumericSource {
     }
 
     /** A logged-in control plane with both real connectors registered. */
-    static ControlPlane connected(ServerHandle server) {
+    static ControlPlane connected(ServerHandle server, PreparedNativeStore storage) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
         return control;
@@ -117,6 +119,37 @@ final class NumericSource {
         resources.put("tgt_numeric.tap.yml", targetYaml(targetUri));
         resources.put("pipeline.tap.yml", pipelineYaml(pipelineId, mapFields));
         return resources;
+    }
+
+    /** Source, target and a pipeline whose filter expression is the one thing that varies. */
+    static Map<String, String> filterWorkspace(
+            Map<String, Object> config, String targetUri, String pipelineId, String filterExpr) {
+        Map<String, String> resources = new LinkedHashMap<>();
+        resources.put("src_numeric.tap.yml", sourceYaml(config));
+        resources.put("tgt_numeric.tap.yml", targetYaml(targetUri));
+        resources.put("pipeline.tap.yml", filterPipelineYaml(pipelineId, filterExpr));
+        return resources;
+    }
+
+    private static String filterPipelineYaml(String pipelineId, String filterExpr) {
+        DumperOptions scalar = new DumperOptions();
+        scalar.setDefaultScalarStyle(DumperOptions.ScalarStyle.DOUBLE_QUOTED);
+        scalar.setSplitLines(false);
+        String expression = new Yaml(scalar).dump(filterExpr).stripTrailing();
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: %s
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: filtered, from: [%s], type: filter, expr: %s }
+                serve:
+                  from: filtered
+                  sync:
+                    - source: %s
+                """
+                .formatted(pipelineId, SOURCE_ID, TABLE, expression, TARGET_ID);
     }
 
     private static String sourceYaml(Map<String, Object> config) {

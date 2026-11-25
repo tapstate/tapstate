@@ -32,6 +32,30 @@ class StoreReachabilityTest {
         return new ConnectionTestResult("views", "mongodb", outcome, items, 0L);
     }
 
+    @Test void aHealthyBusinessProbeDoesNotUseTheBackgroundDiagnosticSlot(@org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Exception {
+        var jar = io.tapstate.adapters.pdk.SyntheticSinkJars.registeredStorageProbe(directory.resolve("jar"), directory.resolve("trace"), "demo", "mongodb://");
+        var entry = new io.tapstate.adapters.pdk.ConnectorIntrospector().introspect(List.of(jar));
+        var ref = new io.tapstate.adapters.pdk.ConnectorRef(List.of(jar), entry.className(), entry.pdkApiVersion(), null, entry.spec());
+        var release = new CountDownLatch(1);
+        var provisioner = new io.tapstate.adapters.pdk.ConnectorProvisioner() {
+            @Override public io.tapstate.adapters.pdk.ConnectorRef resolve(String id) { return ref; }
+            @Override public io.tapstate.adapters.pdk.ConnectorRef resolveDefaultTest(String id) {
+                while (true) try { if (!release.await(3, TimeUnit.SECONDS)) throw new AssertionError("release missing"); break; }
+                catch (InterruptedException ignored) { }
+                return ref;
+            }
+        };
+        try (var slot = new io.tapstate.adapters.pdk.PdkConnectionTester.DefaultSourceSlot(java.time.Clock.systemUTC(), Duration.ofMillis(100), Duration.ofMillis(40));
+             var tester = new io.tapstate.adapters.pdk.PdkConnectionTester(provisioner, java.time.Clock.systemUTC(), config -> config.id().equals("views"), slot)) {
+            assertThatThrownBy(() -> tester.testDefault(new io.tapstate.spi.store.ConnectionConfig("views", "demo", Map.of()),
+                    System.nanoTime() + Duration.ofMillis(100).toNanos())).isInstanceOf(TapstateException.class);
+            assertThat(tester.defaultTestAvailable()).isFalse();
+            assertThatCode(() -> StoreReachability.probing(tester, Duration.ofSeconds(2)).requireReachable("views", "demo",
+                    Map.of("uri", "mongodb://fixture/accepted", "tlsCaPem", "-----BEGIN CERTIFICATE-----fixture"))).doesNotThrowAnyException();
+            assertThat(tester.defaultTestAvailable()).isFalse();
+        } finally { release.countDown(); }
+    }
+
     @Test
     void the_default_check_asks_nothing_and_refuses_nothing() {
         // The wiring default, so it must not turn a deployment with no prober into one that cannot start.
@@ -65,7 +89,7 @@ class StoreReachabilityTest {
         assertThatThrownBy(() -> StoreReachability.probing(failing, Duration.ofSeconds(5))
                 .requireReachable("views", "mongodb", SETTINGS))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(e.code().code()).isEqualTo("TS0360023");
                     assertThat(e.args()).containsEntry("store", "views");
                     assertThat((String) e.args().get("reason")).contains("connect", "connection refused");
                 });
@@ -95,7 +119,7 @@ class StoreReachabilityTest {
         assertThatThrownBy(() -> StoreReachability.probing(throwing, Duration.ofSeconds(5))
                 .requireReachable("views", "mongodb", SETTINGS))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(e.code().code()).isEqualTo("TS0360023");
                     assertThat((String) e.args().get("reason")).contains("driver blew up");
                 });
     }
@@ -127,7 +151,7 @@ class StoreReachabilityTest {
             assertThatThrownBy(() -> StoreReachability.probing(hanging, Duration.ofMillis(150))
                     .requireReachable("views", "mongodb", SETTINGS))
                     .isInstanceOfSatisfying(TapstateException.class, e -> {
-                        assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                        assertThat(e.code().code()).isEqualTo("TS0360023");
                         assertThat((String) e.args().get("reason")).contains("150ms");
                     });
             // Bounded in fact, not only in the message: a check that returned the coded refusal only after
@@ -192,10 +216,10 @@ class StoreReachabilityTest {
         assertThatThrownBy(() -> StoreReachability.probing(throwing, Duration.ofSeconds(5))
                 .requireReachable("views", "mongodb", SETTINGS))
                 .isInstanceOfSatisfying(TapstateException.class, e -> {
-                    assertThat(e.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(e.code().code()).isEqualTo("TS0360023");
                     assertThat(e.args()).containsEntry("store", "views");
                     assertThat((String) e.args().get("reason"))
-                            .contains("actuation.view-store-is-a-capture-source");
+                            .contains("TS0360026");
                 });
     }
 

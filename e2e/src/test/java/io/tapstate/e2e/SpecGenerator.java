@@ -96,9 +96,15 @@ final class SpecGenerator {
     private static Map<String, Object> setupDef() {
         Map<String, Object> properties = new LinkedHashMap<>();
         for (String key : Vocabulary.SETUP_KEYS) {
-            // Every setup key but one is a list of names; databases is a mapping, because each store
-            // carries a kind and is referenced by the name its author gave it.
-            properties.put(key, "databases".equals(key) ? databasesDef() : stringArray(setupDescription(key)));
+            properties.put(key, switch (key) {
+                case "databases" -> databasesDef();
+                case "managed_target" -> {
+                    var target = new LinkedHashMap<String, Object>();
+                    target.put("type", "string"); target.put("minLength", 1);
+                    target.put("description", setupDescription(key)); yield target;
+                }
+                default -> stringArray(setupDescription(key));
+            });
         }
         Map<String, Object> setup = new LinkedHashMap<>();
         setup.put("type", "object");
@@ -170,9 +176,24 @@ final class SpecGenerator {
 
     /** The two scalars every store in this vocabulary spells the same way. */
     private static Map<String, Object> scalarValue() {
+        return valueOf(List.of("integer", "string"),
+                "An integer or a string; wider value types are a widening of the vocabulary.");
+    }
+
+    /**
+     * A value a document is held to: the two scalars, or a boolean. Only a doc expectation takes a
+     * boolean, since a flag a pipeline writes is read back from the document while seeds, cdc settings
+     * and locators stay on the two scalars every store spells the same way.
+     */
+    private static Map<String, Object> expectedValue() {
+        return valueOf(List.of("integer", "string", "boolean"),
+                "An integer, a string or a boolean; wider value types are a widening of the vocabulary.");
+    }
+
+    private static Map<String, Object> valueOf(List<String> types, String description) {
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("type", List.of("integer", "string"));
-        value.put("description", "An integer or a string; wider value types are a widening of the vocabulary.");
+        value.put("type", types);
+        value.put("description", description);
         return value;
     }
 
@@ -197,6 +218,11 @@ final class SpecGenerator {
                         case CDC -> keyed(keyword.word(), cdcBody());
                         case AWAIT -> keyed(keyword.word(), Map.of("$ref", "#/$defs/matcher"));
                         case ASSERT -> keyed(keyword.word(), Map.of("$ref", "#/$defs/matcher"));
+                        case START_REFUSED -> {
+                            var code = failureCodeBody();
+                            code.put("description", "Exact canonical code returned by an HTTP 409 start admission refusal.");
+                            yield keyed(keyword.word(), code);
+                        }
                     });
         }
         // The same two words again, this time carrying a source: one lifecycle word means the whole
@@ -353,7 +379,7 @@ final class SpecGenerator {
         expect.put("type", "object");
         expect.put("description", "Scalar values by path: a.b for a field of a field, items[0].sku for a "
                 + "field of a list element.");
-        expect.put("additionalProperties", scalarValue());
+        expect.put("additionalProperties", expectedValue());
 
         Map<String, Object> length = scalar("integer", "How many elements the list at this path holds.");
         length.put("minimum", 0);
@@ -432,8 +458,8 @@ final class SpecGenerator {
     private static Map<String, Object> failureCodeBody() {
         Map<String, Object> code = scalar("string",
                 "The canonical code of the failure the pipeline this specification names is expected to "
-                        + "publish, written '<domain>.<symbol>'.");
-        code.put("pattern", "^[a-z0-9]+\\.[a-z0-9-]+$");
+                        + "publish, as a canonical TS identity or historical '<domain>.<symbol>'.");
+        code.put("pattern", "^(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)$");
         return code;
     }
 
@@ -547,6 +573,7 @@ final class SpecGenerator {
             case CDC -> "Produces changes against a seeded table while the pipeline runs.";
             case AWAIT -> "Polls a matcher until it holds or the bound expires.";
             case ASSERT -> "Checks a matcher once, now.";
+            case START_REFUSED -> "Requires an HTTP 409 start admission refusal carrying the named code.";
         };
     }
 
@@ -575,6 +602,8 @@ final class SpecGenerator {
             case "databases" -> "Stores the harness provisions first, keyed by the name whose address the "
                     + "resources interpolate.";
             case "connectors" -> "Connector ids whose runtime jars are registered; idempotent by content hash.";
+            case "managed_target" -> "Source file used to prepare the installation's managed default target; "
+                    + "read for endpoint assertions and never included in setup.apply.";
             case "apply" -> "Product resource files, applied as one batch: the product resolves references "
                     + "within the submitted set. The pipeline is applied in the same batch whether or not "
                     + "it is listed here.";

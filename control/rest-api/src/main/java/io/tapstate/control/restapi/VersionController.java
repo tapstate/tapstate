@@ -6,13 +6,10 @@ import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
 
-import java.io.IOException;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 
 /**
  * What version of Tapstate this process is. Like the liveness probe it is anonymous, at the root and
@@ -35,13 +32,13 @@ import java.util.Properties;
 @Controller
 class VersionController {
 
-    private static final String VERSION = readVersion();
+    private static final String VERSION = RuntimeVersion.current();
 
     private final SystemDataVersion systemDataVersion;
 
     /**
-     * Takes the store's schema version if this run has a store. A run without one -- a substrate check,
-     * say -- has no such bean, and reports the field as absent rather than inventing a number for it.
+     * Takes the opened configuration store's schema version. A provider may still report absence
+     * while minimum startup waits for setup; neither that nor a missing provider invents a version.
      */
     VersionController(@Nullable SystemDataVersion systemDataVersion) {
         this.systemDataVersion = systemDataVersion;
@@ -66,36 +63,12 @@ class VersionController {
     }
 
     /**
-     * Reads the version the build filtered in. Every failure here is a build defect rather than
-     * anything a caller did, so each one crashes bare instead of becoming a coded diagnostic — including
-     * an unsubstituted placeholder, which is what an accidentally disabled resource filter leaves behind
-     * and is otherwise served to clients as if it were a version.
-     */
-    private static String readVersion() {
-        return versionIn(VersionController.class.getResourceAsStream("/tapstate-version.properties"));
-    }
-
-    /**
      * The reading itself, taking the stream rather than finding it, so that the shapes a broken build
      * leaves behind can be put in front of it. Package-private for that reason and no other: each
      * refusal below is reachable only from a build that is already wrong, and a guard nothing can put
      * into its failing state is a guard nobody knows still works.
      */
     static String versionIn(InputStream properties) {
-        if (properties == null) {
-            throw new IllegalStateException("tapstate-version.properties is not on the classpath");
-        }
-        try (properties) {
-            Properties parsed = new Properties();
-            parsed.load(properties);
-            String version = parsed.getProperty("version");
-            if (version == null || version.isBlank() || version.startsWith("${")) {
-                throw new IllegalStateException(
-                        "tapstate-version.properties carries no substituted version: " + version);
-            }
-            return version;
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return RuntimeVersion.versionIn(properties);
     }
 }

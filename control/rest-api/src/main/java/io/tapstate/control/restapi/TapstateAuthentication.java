@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.TapstatePrincipal;
+import io.tapstate.control.core.CredentialAuthentication;
 import org.springframework.security.authentication.AbstractAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 
@@ -12,12 +13,20 @@ import java.util.Objects;
 final class TapstateAuthentication extends AbstractAuthenticationToken {
 
     private final TapstatePrincipal principal;
+    private final CredentialAuthentication original;
 
     TapstateAuthentication(TapstatePrincipal principal) {
+        this(principal, null);
+    }
+
+    TapstateAuthentication(TapstatePrincipal principal, CredentialAuthentication original) {
         super(authoritiesFor(principal));
         this.principal = Objects.requireNonNull(principal, "principal");
+        this.original = original;
         setAuthenticated(true);
     }
+
+    CredentialAuthentication original() { return original; }
 
     @Override
     public Object getCredentials() {

@@ -6,6 +6,9 @@ import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.logging.PipelineLogLevel;
 
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+import io.tapstate.spi.store.PipelineStateMappings.LogWindow;
 
 /**
  * The pipeline logs read side. It tails the node-local log sink for one pipeline — the process's own
@@ -18,8 +21,19 @@ public final class PipelineLogQueryService {
 
     private final LogSink logs;
 
+    private final Function<String, Optional<LogWindow>> windows;
+
     public PipelineLogQueryService(LogSink logs) {
+        this(logs, null);
+    }
+
+    private PipelineLogQueryService(LogSink logs, Function<String, Optional<LogWindow>> windows) {
         this.logs = Objects.requireNonNull(logs, "logs");
+        this.windows = windows;
+    }
+
+    public static PipelineLogQueryService scoped(LogSink logs, Function<String, Optional<LogWindow>> windows) {
+        return new PipelineLogQueryService(logs, Objects.requireNonNull(windows, "windows"));
     }
 
     /** The pipeline's most recent log lines, oldest to newest; empty when it has logged nothing here. */
@@ -41,7 +55,7 @@ public final class PipelineLogQueryService {
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be positive");
         }
-        LogPage page = logs.page(pipelineId, after, limit);
+        LogPage page = page(pipelineId, after, limit);
         return new PipelineLogs(pipelineId, page.lines(), page.nextCursor(), page.truncated());
     }
 
@@ -57,4 +71,16 @@ public final class PipelineLogQueryService {
     public PipelineLogLevel level(String pipelineId) {
         return logs.level(Objects.requireNonNull(pipelineId, "pipelineId"));
     }
+    private LogPage page(String pipelineId, LogCursor after, int limit) {
+        if (windows == null) return logs.page(pipelineId, after, limit);
+        Optional<LogWindow> window = windows.apply(pipelineId);
+        for (int attempt = 0; attempt < 2 && window.isPresent(); attempt++) {
+            var original = window.orElseThrow();
+            LogPage page = logs.page(pipelineId, after, limit, original.firstGeneration(), original.lastGeneration());
+            window = windows.apply(pipelineId);
+            if (window.filter(original::equals).isPresent()) return page;
+        }
+        return new LogPage(java.util.List.of(), null, after != null);
+    }
+
 }

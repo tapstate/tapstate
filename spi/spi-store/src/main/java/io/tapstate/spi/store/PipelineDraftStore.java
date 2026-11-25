@@ -1,0 +1,80 @@
+package io.tapstate.spi.store;
+
+import java.util.List;
+import java.util.Optional;
+
+/** Persistence contract for server-owned Pipeline authoring documents. */
+public interface PipelineDraftStore {
+
+    Optional<PipelineDraft> get(String pipelineId);
+
+    List<PipelineDraft> list();
+
+    /** Metadata-only catalog read; implementations should avoid loading graph and Wizard payloads. */
+    default List<PipelineDraftSummary> listSummaries() {
+        return list().stream().map(PipelineDraftStore::summary).toList();
+    }
+
+    default List<PipelineDraftSummary> listSummaries(int offset, int limit) {
+        if (offset < 0 || limit < 1) {
+            throw new IllegalArgumentException("draft page offset must be non-negative and limit must be positive");
+        }
+        List<PipelineDraftSummary> items = listSummaries();
+        if (offset >= items.size()) return List.of();
+        int end = (int) Math.min((long) items.size(), (long) offset + limit);
+        return List.copyOf(items.subList(offset, end));
+    }
+
+    /** Reads one stable page of drafts without requiring stores to materialize every authoring document. */
+    default List<PipelineDraft> list(int offset, int limit) {
+        if (offset < 0 || limit < 1) {
+            throw new IllegalArgumentException("draft page offset must be non-negative and limit must be positive");
+        }
+        List<PipelineDraft> items = list();
+        if (offset >= items.size()) return List.of();
+        int end = (int) Math.min((long) items.size(), (long) offset + limit);
+        return List.copyOf(items.subList(offset, end));
+    }
+
+    PipelineDraftMutation create(PipelineDraft draft);
+
+    PipelineDraftMutation replace(String pipelineId, long expectedRevision, PipelineDraft replacement);
+
+    /** Changes the publication base only when the stored draft still has the base that was read. */
+    default PipelineDraftMutation rebase(String pipelineId, long expectedRevision,
+            String expectedBaseArtifactHash, PipelineDraft replacement) {
+        throw new UnsupportedOperationException("draft store does not support rebase");
+    }
+
+    PipelineDraftMutation delete(String pipelineId, long expectedRevision);
+
+    /** Atomically writes the candidate Artifact and advances the draft publication markers. */
+    PipelineDraftMutation publish(PipelineDraft.Publication publication);
+
+    record Published(PipelineDraftMutation mutation, long stateGeneration) {}
+
+    /** Native stores return the generation written by the same CONFIG transaction. */
+    default Published publishWithGeneration(PipelineDraft.Publication publication) {
+        return new Published(publish(publication), 0);
+    }
+
+    /**
+     * Atomically replaces a pipeline's definition while it is still {@code expectedArtifactHash}, and carries
+     * the change into the pipeline's draft when the draft is based on that definition. Answers
+     * {@link PipelineDraftMutation#REPLACED} when the definition was written, with or without the draft;
+     * {@link PipelineDraftMutation#ARTIFACT_CONFLICT} when the definition, or a resource it depends on, has
+     * moved -- nothing is written then.
+     *
+     * <p>A store that cannot write both in one transaction does not offer it: half of it is the split write
+     * this exists to avoid.
+     */
+    default PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+        throw new UnsupportedOperationException("this draft store cannot change a definition and its draft together");
+    }
+
+    private static PipelineDraftSummary summary(PipelineDraft draft) {
+        return new PipelineDraftSummary(draft.pipelineId(), draft.mode(), draft.name(), draft.description(),
+                draft.revision(), draft.baseArtifactHash(), draft.publishedDraftRevision(),
+                draft.publishedArtifactHash(), draft.createdAt(), draft.updatedAt(), draft.updatedBy());
+    }
+}

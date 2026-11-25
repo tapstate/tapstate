@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.CheckpointDoc;
+
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -45,10 +47,11 @@ class PipelineLifecycleServiceTest {
     private final FakeDesiredStore desired = new FakeDesiredStore();
     private final RecordingAuditStore audit = new RecordingAuditStore();
     /** Where the pipeline's fencing epoch stands, as the lifecycle service is allowed to see it. */
-    private Optional<Long> stateEpoch = Optional.of(7L);
+    private Optional<CheckpointDoc> checkpoint = Optional.of(
+            new CheckpointDoc("pl1", "RUNNING", 7L, FIXED));
     private final PipelineLifecycleService service = new PipelineLifecycleService(
             new ArtifactQueryService(artifacts), desired, new AuditGate(audit, FIXED_CLOCK),
-            pipelineId -> stateEpoch);
+            pipelineId -> checkpoint);
 
     @Test
     void startFromNewWritesRunningDesiredAtTheLatestRevision() {
@@ -62,6 +65,103 @@ class PipelineLifecycleServiceTest {
     }
 
     @Test
+    void aCompletedRunAcceptsOneExplicitStartEvenThoughItsOldIntentStillSaysRunning() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+
+        assertThat(service.startable("pl1").pipeline().id()).isEqualTo("pl1");
+        DesiredState next = service.start("alice", "pl1");
+        assertThat(next.targetState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(next.reassemble()).isTrue();
+        assertThat(next.rebuiltAtStateEpoch()).isEqualTo(8L);
+        TapstateException duplicate = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+        assertThat(duplicate.code().code()).isEqualTo("TS0280001");
+
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 10L, FIXED));
+        assertThat(service.start("alice", "pl1").rebuiltAtStateEpoch()).isEqualTo(10L);
+    }
+
+    @Test
+    void aCompletionThatOvertookAClearingStartCannotAuthorizeAnotherStartOverIt() {
+        artifacts.save(PIPELINE_V1);
+        DesiredState pending = new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), true, assemblyOf(PIPELINE_V1), true, 7L);
+        desired.save(pending);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+        assertThat(refused.code().code()).isEqualTo("TS0280001");
+        assertThat(desired.read("pl1")).contains(pending);
+    }
+
+    @Test
+    void aNaturallyCompletedRunCanBeStoppedAndRerunWithEitherRetentionChoice() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+        for (boolean purge : List.of(false, true)) {
+            desired.save(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+
+            DesiredState stopped = service.stop("alice", "pl1", purge);
+            assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+            assertThat(stopped.purgeState()).isEqualTo(purge);
+            DesiredState restarted = service.start("alice", "pl1");
+            assertThat(restarted.targetState()).isEqualTo(PipelineState.RUNNING);
+            assertThat(restarted.purgeState()).isEqualTo(purge);
+            assertThat(restarted.rebuildOwedAt(checkpoint.orElseThrow())).isTrue();
+        }
+    }
+
+    @Test
+    void anExplicitStopCanCancelAStartStillWaitingAtCompletion() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+        desired.save(new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), true, assemblyOf(PIPELINE_V1), true, 8L));
+
+        DesiredState stopped = service.stop("alice", "pl1", false);
+
+        assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(stopped.purgeState()).isFalse();
+        assertThat(stopped.reassemble()).isFalse();
+    }
+
+    @Test
+    void anAlreadyStoppedPipelineCanExplicitlyClearItsRetainedStateBeforeStartingAgain() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.stop("alice", "pl1", false);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "STOPPED", 8L, FIXED));
+
+        DesiredState clearing = service.stop("alice", "pl1", true);
+        assertThat(clearing.targetState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(clearing.purgeState()).isTrue();
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.stop("alice", "pl1", false));
+        assertThat(refused.code().code()).isEqualTo("TS0280001");
+        assertThat(desired.read("pl1")).contains(clearing);
+        assertThat(service.start("alice", "pl1").purgeState()).isTrue();
+    }
+
+    @Test
+    void anOlderCheckpointCannotConsumeANewerAcceptedStart() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 7L, FIXED));
+        DesiredState pending = new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), true, 8L);
+        desired.save(pending);
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code().code()).isEqualTo("TS0280001");
+        assertThat(desired.read("pl1")).contains(pending);
+    }
+
+    @Test
     void anIllegalTransitionIsRefusedWithACodeAndWritesNothing() {
         artifacts.save(PIPELINE_V1);
 
@@ -69,7 +169,7 @@ class PipelineLifecycleServiceTest {
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.pause("alice", "pl1"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(thrown.code().code()).isEqualTo("TS0280001");
         assertThat(thrown.args()).containsEntry("from", PipelineState.NEW).containsEntry("verb", "pause");
         assertThat(desired.read("pl1")).as("a refused verb writes no desired state").isEmpty();
         assertThat(audit.records).as("a refused verb leaves no audit record").isEmpty();
@@ -81,7 +181,7 @@ class PipelineLifecycleServiceTest {
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.start("alice", "ghost"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(thrown.code().code()).isEqualTo("TS0280005");
         assertThat(thrown.args()).containsEntry("pipeline", "ghost");
         assertThat(desired.read("ghost")).isEmpty();
         assertThat(audit.records).isEmpty();
@@ -100,7 +200,7 @@ class PipelineLifecycleServiceTest {
                 TapstateException.class, () -> service.start("alice", "blank"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.pipeline-not-runnable");
+        assertThat(thrown.code().code()).isEqualTo("TS0280004");
         assertThat(thrown.args()).containsEntry("pipeline", "blank");
         assertThat(desired.read("blank")).isEmpty();
         assertThat(audit.records).isEmpty();
@@ -117,7 +217,7 @@ class PipelineLifecycleServiceTest {
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+        assertThat(thrown.code().code()).isEqualTo("TS0280002");
         assertThat(thrown.args())
                 .containsEntry("requested", revisionOf(PIPELINE_V1))
                 .containsEntry("latest", revisionOf(PIPELINE_V2));
@@ -145,14 +245,14 @@ class PipelineLifecycleServiceTest {
     void aFailedAuditRefusesTheWriteSoNoDesiredStateIsPersisted() {
         artifacts.save(PIPELINE_V1);
         PipelineLifecycleService gated = new PipelineLifecycleService(
-                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK), pipelineId -> stateEpoch);
+                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK), pipelineId -> checkpoint);
 
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> gated.start("alice", "pl1"));
 
         assertThat(thrown).isNotNull();
         assertThat(thrown.code().code())
                 .as("no audit, no execute: a failed audit write refuses the desired-state write")
-                .isEqualTo("control.audit-blocked");
+                .isEqualTo("TS0210015");
         assertThat(desired.read("pl1")).as("the desired state is not written when its audit record could not be").isEmpty();
     }
 
@@ -320,7 +420,7 @@ class PipelineLifecycleServiceTest {
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+        assertThat(thrown.code().code()).isEqualTo("TS0280002");
     }
 
     /**
@@ -337,7 +437,7 @@ class PipelineLifecycleServiceTest {
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+        assertThat(thrown.code().code()).isEqualTo("TS0280002");
     }
 
     /** An ordinary resume, nothing edited: it carries on, and asks for no re-assembly. */
@@ -367,7 +467,7 @@ class PipelineLifecycleServiceTest {
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
 
         assertThat(thrown).isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+        assertThat(thrown.code().code()).isEqualTo("TS0280002");
     }
 
     /**
@@ -394,7 +494,7 @@ class PipelineLifecycleServiceTest {
 
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> service.resume("alice", "pl1"));
         assertThat(thrown).as("and the resume after it is still refused").isNotNull();
-        assertThat(thrown.code().code()).isEqualTo("lifecycle.incompatible-revision");
+        assertThat(thrown.code().code()).isEqualTo("TS0280002");
     }
 
     /** What an artifact's run is assembled from: the same canonical text, with whitelisted fields erased. */

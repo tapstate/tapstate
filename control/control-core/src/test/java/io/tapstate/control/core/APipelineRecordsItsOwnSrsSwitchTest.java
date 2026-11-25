@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
@@ -90,6 +91,20 @@ class APipelineRecordsItsOwnSrsSwitchTest {
         service.apply("author", List.of(draft(UNBUFFERED), draft(pipelineReading("orders_src"))));
 
         assertThat(switchOn("p1", "orders_src")).isFalse();
+    }
+
+    @Test
+    void typedPreparationMaterializesThePipelineSwitchWithoutWritingTheArtifact() {
+        service.apply("author", List.of(draft(BUFFERED)));
+
+        io.tapstate.core.model.PipelineResource prepared = (io.tapstate.core.model.PipelineResource)
+                service.prepareTyped(new DslParser().parse(pipelineReading("orders_src")));
+
+        assertThat(prepared.sources()).singleElement()
+                .isInstanceOf(io.tapstate.core.model.SourceRef.Spec.class)
+                .extracting(source -> ((io.tapstate.core.model.SourceRef.Spec) source).srs())
+                .isEqualTo(true);
+        assertThat(store.get("p1")).isEmpty();
     }
 
     // ---- row 2: first apply, the author wrote one -------------------------------------------
@@ -268,6 +283,18 @@ class APipelineRecordsItsOwnSrsSwitchTest {
                 byId.put(artifact.id(), writer.write(artifact));
             }
             saveCount += artifacts.size();
+        }
+
+        @Override
+        public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+            for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+                String canonical = byId.get(expected.getKey());
+                if (canonical == null || !CanonicalHash.of(parser.parse(canonical)).equals(expected.getValue())) {
+                    return Optional.of(expected.getKey());
+                }
+            }
+            saveAll(artifacts);
+            return Optional.empty();
         }
 
         @Override

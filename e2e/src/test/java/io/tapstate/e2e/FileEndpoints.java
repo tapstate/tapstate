@@ -237,6 +237,29 @@ final class FileEndpoints implements Endpoints {
         return Files.exists(file) ? read(file).size() : 0L;
     }
 
+    /**
+     * The rows the table holds whatever columns they carry, or none when the table is not there. {@link #count}
+     * reads this harness's own format and refuses a row in any other shape, which is what keeps a table the product
+     * wrote wrongly from being counted as right. A table written from a real source is in another shape by nature:
+     * a document store's rows carry the store's own key beside {@code id} and {@code seq}. Such a table is counted
+     * here, by its rows alone.
+     */
+    long countRows(EndpointAddress address, String table) {
+        Path file = file(address, table);
+        if (!Files.exists(file)) {
+            return 0L;
+        }
+        try {
+            List<String> lines = Files.readAllLines(file);
+            // The header names the columns; every line after it is a row.
+            return lines.subList(Math.min(1, lines.size()), lines.size()).stream()
+                    .filter(line -> !line.isBlank())
+                    .count();
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read the table at " + file, e);
+        }
+    }
+
     @Override
     public void close() {
         // Nothing is held open: every reading opens the file, reads it and closes it again.

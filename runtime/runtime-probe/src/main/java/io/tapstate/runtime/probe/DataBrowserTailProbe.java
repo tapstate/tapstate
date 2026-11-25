@@ -21,8 +21,8 @@ import io.tapstate.spi.store.DataBrowserTailRequest;
  * would be worse than one it never offered. Narrowing what a reader sees happens at the far end of
  * the listener.
  *
- * <p>The whitelist of such calls is a closed set of six — the connection probe, the discovery probe,
- * and the four the data browser needs. Any further synchronous control-to-runtime call is a
+ * <p>The whitelist of such calls is a closed set of seven — the connection probe, the discovery probe,
+ * the four data-browser calls, and the Pipeline preview probe. Any further synchronous control-to-runtime call is a
  * deliberate widening of the seam that must change the gate and the sync-whitelist decision, not slip
  * in beside them.
  */

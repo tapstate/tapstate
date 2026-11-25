@@ -10,7 +10,7 @@ import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaModifier;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
+import io.tapstate.runtime.engine.ProtectedMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -94,6 +94,7 @@ class NestStateMapGatesTest {
             putOntoNothingMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> BOUNDED_READ_MECHANISMS = boundedReadMechanisms();
+    private static final Map<String, Predicate<JavaAccess<?>>> BOUNDED_WRITE_MECHANISMS = boundedWriteMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> INDEX_MECHANISMS = indexMechanisms();
 
@@ -102,9 +103,7 @@ class NestStateMapGatesTest {
 
     @BeforeAll
     static void importClasses() {
-        productionClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        productionClasses = ProductionClassImports.packages("io.tapstate");
         fixtureClasses = new ClassFileImporter().importClasses(AVertexThatOversteps.class);
     }
 
@@ -132,6 +131,8 @@ class NestStateMapGatesTest {
                 .as("%s is no longer detected - the API it names has moved or been renamed, and this "
                         + "gate would pass over production code that uses it", mechanism)
                 .isNotEmpty());
+        BOUNDED_WRITE_MECHANISMS.forEach((mechanism, detects) ->
+                assertThat(accesses(fixtureClasses, detects, "")).as(mechanism).isNotEmpty());
         INDEX_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(fixtureClasses, detects, ""))
                 .as("%s is no longer detected - the API it names has moved or been renamed, and this "
                         + "gate would pass over production code that uses it", mechanism)
@@ -149,7 +150,7 @@ class NestStateMapGatesTest {
     }
 
     @Test
-    @DisplayName("no nest vertex reaches past the one key its event is partitioned to")
+    @DisplayName("no nest code enumerates or mutates the whole state keyspace")
     void noNestCodeSpansTheWholeStateMap() {
         WHOLE_MAP_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(productionClasses, detects, NEST))
                 .as("%s: the entry an event needs is already on this partition, and spanning the map "
@@ -177,6 +178,28 @@ class NestStateMapGatesTest {
                             + "guarding nothing at all", mechanism)
                     .isNotEmpty();
         });
+    }
+
+    @Test
+    @DisplayName("bounded independent replacement batches stay behind the state-map adapter")
+    void namedReplacementBatchesAreConfinedToTheStateStore() {
+        BOUNDED_WRITE_MECHANISMS.forEach((mechanism, detects) -> {
+            assertThat(accesses(productionClasses, detects, NEST))
+                    .as("%s may replace only a bounded caller-supplied set of independent state keys", mechanism)
+                    .isNotEmpty()
+                    .allMatch(access -> access.startsWith(THE_STORE_BEHIND_EVERY_NAMESPACE + " ->"));
+        });
+        assertThat(productionClasses.stream().flatMap(type -> type.getAccessesFromSelf().stream())
+                .filter(access -> access.getName().equals("saveAll")
+                        && access.getTargetOwner().getName().equals(NEST + "NestStore"))
+                .map(access -> access.getOriginOwner().getName()).toList())
+                .isNotEmpty().containsOnly(NEST + "LookupProcessor", NEST + "AssemblerProcessor$RootWrites",
+                        NEST + "AssemblerProcessor$ChildWrites");
+        assertThat(productionClasses.stream().flatMap(type -> type.getAccessesFromSelf().stream())
+                .filter(access -> access.getName().equals("addAll")
+                        && access.getTargetOwner().getName().equals(NEST + "NestStore"))
+                .map(access -> access.getOriginOwner().getName()).toList())
+                .isNotEmpty().containsOnly(NEST + "LookupProcessor");
     }
 
     @Test
@@ -277,6 +300,14 @@ class NestStateMapGatesTest {
         return Map.copyOf(mechanisms);
     }
 
+    /** Named replacement/union batches stay in the adapter; owned handovers keep carried writes. */
+    private static Map<String, Predicate<JavaAccess<?>>> boundedWriteMechanisms() {
+        Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
+        named(mechanisms, "replacing a handed-in set of independent keys", "setAll");
+        named(mechanisms, "unioning a handed-in set of owned keys", "executeOnKeys");
+        return Map.copyOf(mechanisms);
+    }
+
     private static Map<String, Predicate<JavaAccess<?>>> indexMechanisms() {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         mechanisms.put("indexing a map after it exists",
@@ -305,10 +336,10 @@ class NestStateMapGatesTest {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         named(mechanisms, "listing what the map holds", "keySet", "values", "entrySet", "localKeySet");
         named(mechanisms, "measuring the whole map", "size", "isEmpty");
-        named(mechanisms, "writing or removing across keys", "putAll", "setAll", "removeAll",
+        named(mechanisms, "writing or removing across keys", "putAll", "removeAll",
                 "clear", "evictAll");
         named(mechanisms, "reading across keys", "loadAll");
-        named(mechanisms, "running over more than one entry", "executeOnEntries", "executeOnKeys",
+        named(mechanisms, "running over more than one entry", "executeOnEntries",
                 "aggregate", "project", "forEach");
         return Map.copyOf(mechanisms);
     }
@@ -322,8 +353,12 @@ class NestStateMapGatesTest {
         }
     }
 
+    /**
+     * A call on a state map, made on the map itself or on the view of it that waits out the cluster refusing
+     * an operation. The view reaches the same map one operation at a time, so it answers to every ban here.
+     */
     private static boolean onMap(JavaAccess<?> access) {
-        return targets(access, IMap.class);
+        return targets(access, IMap.class) || targets(access, ProtectedMap.class);
     }
 
     private static boolean targets(JavaAccess<?> access, Class<?> owner) {

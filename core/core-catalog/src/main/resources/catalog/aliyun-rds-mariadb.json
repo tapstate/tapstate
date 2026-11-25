@@ -268,7 +268,7 @@
   ],
   "provenance": {
     "specPath": "connectors/aliyun-rds-mariadb-connector/src/main/resources/aliyun-rds-mariadb-spec.json",
-    "specContentHash": "5c15c142df2afdb3",
+    "specContentHash": "2345ca8ae9fbb29e",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

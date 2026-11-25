@@ -59,7 +59,8 @@ public record SrsMeta(
         List<SchemaVersion> schemaHistory,
         String retention,
         long epoch,
-        Instant sourceReadAt) {
+        Instant sourceReadAt,
+        boolean sourceReadDurable) {
 
     public SrsMeta {
         if (miningChainId == null || miningChainId.isBlank()) {
@@ -84,6 +85,12 @@ public record SrsMeta(
      */
     public String sourceReadOffset() {
         return sourceRead == null ? null : sourceRead.token();
+    }
+
+    /** Older records do not certify that their source checkpoint is backed by a recoverable SRS batch. */
+    public SrsMeta(String miningChainId, ChainPosition sourceRead, List<ConsumerOffset> consumerOffsets,
+            List<SchemaVersion> schemaHistory, String retention, long epoch, Instant sourceReadAt) {
+        this(miningChainId, sourceRead, consumerOffsets, schemaHistory, retention, epoch, sourceReadAt, false);
     }
 
     /**

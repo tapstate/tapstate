@@ -1,0 +1,524 @@
+package io.tapstate.app;
+
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import io.tapstate.adapters.mongostore.*;
+import io.tapstate.control.core.*;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.spi.store.*;
+import java.time.Clock;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.slf4j.LoggerFactory;
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+/** Exercises production continuation ownership; real database and HTTP boundaries have integration coverage. */
+class CloudStorageContinuationTest {
+    private static final StorageSetupScope SETUP = new StorageSetupScope("cluster", "installation", "setup", 1);
+    private static final StorageBinding CONNECTION = new StorageBinding(SETUP, StorageBinding.Mode.CLOUD, 1, "atlas-store",
+            new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://cache/cache?tls=true", "cache", "saved-cache-ca"));
+    private static final CachePreparation PREPARATION = new CachePreparation("setup", new CacheAuthScope("cluster", 1,
+            StorageBinding.Mode.CLOUD, "original-cache", 1));
+    private static final SourceResource SOURCE = new SourceResource("atlas-store", null, "mongodb-atlas",
+            Map.of("uri", "mongodb://target/master?tls=true", "tlsCaPem", "saved-master-ca"), null, null, null, null);
+
+    private static final class Fixture implements AutoCloseable {
+        final MongoConfigurationDomain configuration = mock(MongoConfigurationDomain.class);
+        final MongoCacheDomain cache = mock(MongoCacheDomain.class);
+        final StorageBindingStore bindings = mock(StorageBindingStore.class);
+        final StorageSetupStateStore states = mock(StorageSetupStateStore.class);
+        final StorageSetupService.DefaultTarget target = mock(StorageSetupService.DefaultTarget.class);
+        final FirstCacheCreation grant = mock(FirstCacheCreation.class);
+        final CloudSdkBridge bridge = mock(CloudSdkBridge.class);
+        final StorageBindingCommit committed = new StorageBindingCommit(CONNECTION, PREPARATION, Optional.of(grant));
+        final AtomicReference<StorageSetupStateStore.Phase> phase = new AtomicReference<>(StorageSetupStateStore.Phase.STORAGE_BOUND);
+        final MockedStatic<MongoConfigurationDomain> configurations = mockStatic(MongoConfigurationDomain.class);
+        final MockedStatic<MongoCacheDomain> caches = mockStatic(MongoCacheDomain.class);
+        final StorageRoot root;
+        Fixture() { this(false); }
+        Fixture(boolean configurationUnavailable) {
+            when(configuration.bindings()).thenReturn(bindings); when(configuration.setupStates()).thenReturn(states);
+            when(configuration.recoveryCommands()).thenReturn(mock(StorageRecoveryCommands.class));
+            when(configuration.databaseName()).thenReturn("config");
+            when(configuration.prepareInitialValidationSchema(eq(PREPARATION), same(cache), any()))
+                    .thenAnswer(invocation -> {
+                        invocation.<Runnable>getArgument(2).run();
+                        return new MongoConfigurationDomain.ValidationSchemaStatus("original-validation", true, 0);
+                    });
+            when(bindings.load()).thenReturn(Optional.of(CONNECTION)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
+            when(bindings.guardedBy(any())).thenReturn(bindings);
+            when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(SETUP, phase.get(), 1));
+            when(states.loadView()).thenAnswer(ignored -> new StorageSetupStateStore.View(
+                    states.load(), bindings.load(), bindings.cachePreparation()));
+            when(bindings.complete(SETUP)).thenAnswer(ignored -> { phase.set(StorageSetupStateStore.Phase.COMPLETE); return CONNECTION; });
+            var artifacts = mock(ArtifactStore.class); when(configuration.artifacts()).thenReturn(artifacts);
+            when(artifacts.get("atlas-store")).thenReturn(Optional.of(SOURCE));
+            when(cache.cloudSessions(PREPARATION.authScope())).thenReturn(mock(CloudSessionStore.class));
+            when(target.identity(any())).thenReturn(new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64)));
+            var open = configurations.when(() -> MongoConfigurationDomain.open(any(MongoConnectionSettings.class), eq("cluster")));
+            if (configurationUnavailable) open.thenThrow(StorageRuntime.unavailable()).thenReturn(configuration);
+            else open.thenReturn(configuration);
+            doThrow(StorageRuntime.unavailable()).when(bridge).claimConfiguration(anyString(), anyString());
+            caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(cache);
+            var cloud = new CloudProperties(); cloud.setBaseUrl("https://cloud.example"); cloud.setToken("fixture-token");
+            cloud.setClusterId("cluster"); cloud.setAtlasUri("mongodb://config/config");
+            root = new StorageRoot(new MongoProperties(), CloudRuntimeSettings.resolve(cloud), bridge,
+                    BootId.fresh(), new MetricsHistoryProperties(), new RandomTokenSecrets(), Clock.systemUTC(), new byte[32]);
+            // Static client boundaries are thread-local in this unit fixture; real async ownership has Mongo coverage.
+            org.springframework.test.util.ReflectionTestUtils.setField(root, "authenticationWorker", new InlineExecutor());
+        }
+        StorageRuntime.Business business() {
+            var value = mock(StorageRuntime.Business.class); when(value.available()).thenReturn(true); return value;
+        }
+        void continueWith(StorageRuntime.Business business) { root.continueCloudSetup(committed, target, ignored -> business); }
+        @Override public void close() { try { root.close(); } finally { caches.close(); configurations.close(); } }
+    }
+
+    @Test void authenticationRecoveryRepublishesTheSameAvailableCloudBusinessWithoutReassembly() {
+        try (var f = new Fixture()) {
+            var available = new java.util.concurrent.atomic.AtomicBoolean(true); var business = f.business();
+            when(business.available()).thenAnswer(ignored -> available.get()); f.continueWith(business);
+            var candidate = mock(MongoCacheDomain.class);
+            f.caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(candidate);
+            available.set(false);
+            doThrow(StorageRuntime.unavailable()).doThrow(StorageRuntime.unavailable()).doNothing().when(f.configuration)
+                    .requireAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
+            f.root.managedAuthentication();
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            available.set(true); f.root.managedAuthentication();
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+            assertThat(f.root.runtime().business()).contains(business);
+            verify(business).start(); verify(business).afterInitialReady(); verify(candidate).close();
+            verify(f.cache).prepareFirstAuth(f.grant);
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            verify(f.target, never()).test(any(), any(), any());
+        }
+    }
+
+    @Test void initialActivationNeverCallsTheDefaultTargetBeforeBusinessReadiness() {
+        try (var f = new Fixture()) {
+            doThrow(new AssertionError("default target must run only after readiness")).when(f.target).test(any(), any(), any());
+            var business = f.business();
+            f.continueWith(business);
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+            verify(f.target, never()).test(any(), any(), any());
+            verify(business).start();
+        }
+    }
+
+    @Test void initialSourceTestIsHandedOffOnlyAfterActualBusinessAvailability() {
+        try (var f = new Fixture()) {
+            var business = f.business(); var ready = new java.util.concurrent.atomic.AtomicBoolean();
+            when(business.available()).thenAnswer(ignored -> ready.get());
+            doAnswer(ignored -> {
+                assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                verify(business, never()).afterInitialReady();
+                ready.set(true); return null;
+            }).when(business).awaitAvailability();
+            doAnswer(ignored -> {
+                assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+                assertThat(f.root.runtime().businessStarted()).isTrue(); return null;
+            }).when(business).afterInitialReady();
+            f.continueWith(business);
+            verify(business).awaitAvailability(); verify(business).afterInitialReady();
+        }
+    }
+    @Test void activationHandoffReturnsWithoutWaitingAndCoalescesTheOriginalOperation() throws Exception {
+        try (var f = new Fixture()) {
+            var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+            var calls = new java.util.concurrent.atomic.AtomicInteger();
+            Runnable work = () -> {
+                calls.incrementAndGet(); entered.countDown();
+                try { if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release missing"); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            };
+            try {
+                f.root.handoffActivation(f.committed, work);
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(f.root.initialActivationPending()).isTrue();
+                f.root.handoffActivation(f.committed, work);
+                assertThat(calls).hasValue(1);
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> !f.root.initialActivationPending());
+        }
+    }
+
+    @Test void anInflightRealContinuationDoesNotBlockAnotherActivationRequest() throws Exception {
+        try (var f = new Fixture(); var requests = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            f.root.runtime().loadBound().orElseThrow();
+            var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+            var business = f.business();
+            doAnswer(ignored -> {
+                entered.countDown();
+                if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release missing");
+                return null;
+            }).when(business).awaitAvailability();
+            try {
+                f.root.handoffActivation(f.committed, () -> f.continueWith(business));
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                requests.submit(() -> f.root.handoffActivation(f.committed, () -> f.continueWith(business)))
+                        .get(1, java.util.concurrent.TimeUnit.SECONDS);
+                verify(business, times(1)).start();
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> !f.root.initialActivationPending());
+        }
+    }
+    @Test void aFailedAssemblyReportsUnavailableEvenAfterStorageCompletion() throws Exception {
+        try (var f = new Fixture()) {
+            f.root.runtime().loadBound().orElseThrow();
+            var business = f.business(); doThrow(StorageRuntime.unavailable()).when(business).start();
+            f.root.handoffActivation(f.committed, () -> f.continueWith(business));
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> !f.root.initialActivationPending());
+            var principal = mock(TapstatePrincipal.class); when(principal.credentialType()).thenReturn(CredentialType.CLOUD_SESSION);
+            when(principal.permits(any())).thenReturn(true);
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD, SETUP, PREPARATION.authScope(), principal, "organization", () -> {});
+            var snapshot = f.root.snapshot(caller, () -> {});
+            assertThat(snapshot.setupPhase()).isEqualTo("COMPLETE");
+            assertThat(snapshot.businessPhase()).isEqualTo(StorageControlDispatcher.BusinessPhase.UNAVAILABLE);
+            assertThat(snapshot.allowedActions()).contains("storage.setup.activate").doesNotContain("storage.test", "storage.setup.commit");
+        }
+    }
+
+    private static final class InlineExecutor extends java.util.concurrent.AbstractExecutorService {
+        private boolean closed;
+        @Override public void execute(Runnable task) {
+            if (closed) throw new java.util.concurrent.RejectedExecutionException();
+            task.run();
+        }
+        @Override public void shutdown() { closed = true; }
+        @Override public List<Runnable> shutdownNow() { shutdown(); return List.of(); }
+        @Override public boolean isShutdown() { return closed; }
+        @Override public boolean isTerminated() { return closed; }
+        @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
+    }
+
+    @Test void initializationMilestonesRemainReadableWhileTheOriginalBusinessStartupHoldsItsOwner() throws Exception {
+        try (var f = new Fixture(); var readers = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var principal = mock(TapstatePrincipal.class);
+            when(principal.credentialType()).thenReturn(CredentialType.CLOUD_SESSION);
+            when(principal.permits(any())).thenReturn(true);
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD, SETUP, PREPARATION.authScope(),
+                    principal, "organization", () -> {});
+            var business = f.business();
+            doAnswer(ignored -> {
+                var snapshot = readers.submit(() -> f.root.snapshot(caller, () -> {})).get(2, java.util.concurrent.TimeUnit.SECONDS);
+                assertThat(snapshot.setupPhase()).isEqualTo("COMPLETE");
+                assertThat(snapshot.businessPhase()).isEqualTo(StorageControlDispatcher.BusinessPhase.AUTH_READY);
+                assertThat(snapshot.initializationProgress().state()).isEqualTo(StorageInitializationProgress.State.RUNNING);
+                assertThat(snapshot.initializationProgress().milestones()).extracting(StorageInitializationProgress.Milestone::state)
+                        .containsExactly(StorageInitializationProgress.State.COMPLETE, StorageInitializationProgress.State.COMPLETE,
+                                StorageInitializationProgress.State.RUNNING, StorageInitializationProgress.State.PENDING);
+                assertThat(snapshot.initializationProgress().milestones().get(0).elapsedMillis()).isNull();
+                return null;
+            }).when(business).start();
+            f.continueWith(business);
+            var finished = f.root.snapshot(caller, () -> {});
+            assertThat(finished.businessPhase()).isEqualTo(StorageControlDispatcher.BusinessPhase.READY);
+            assertThat(finished.initializationProgress().state()).isEqualTo(StorageInitializationProgress.State.COMPLETE);
+            assertThat(finished.initializationProgress().milestones()).allMatch(step -> step.state() == StorageInitializationProgress.State.COMPLETE);
+        }
+    }
+
+    @Test void retainedBusinessStartupFailureIsDiagnosableWithoutExposingSensitiveDetails() {
+        try (var f = new Fixture()) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            Logger logger = (Logger) LoggerFactory.getLogger(StorageRoot.class);
+            var previousLevel = logger.getLevel();
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(logger.getLoggerContext()); events.start();
+            logger.setLevel(ch.qos.logback.classic.Level.WARN); logger.addAppender(events);
+            try {
+                f.root.loadExisting(ignored -> {
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "business-param-secret-sentinel"),
+                            new IllegalArgumentException("business-cause-secret-sentinel"));
+                });
+                assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                assertThat(f.root.runtime().businessStarted()).isFalse();
+                var progress = f.root.initializationProgress().snapshot(SETUP).orElseThrow();
+                assertThat(progress.state()).isEqualTo(StorageInitializationProgress.State.FAILED);
+                assertThat(progress.milestones().get(2).errorCode()).isEqualTo(ControlError.MALFORMED_REQUEST.code());
+                assertThat(progress.toString()).doesNotContain("secret-sentinel");
+                assertThat(events.list).singleElement().satisfies(event -> {
+                    assertThat(event.getFormattedMessage()).contains(ControlError.MALFORMED_REQUEST.code())
+                            .doesNotContain("secret-sentinel");
+                    assertThat(event.getThrowableProxy()).isNull();
+                });
+            } finally {
+                logger.detachAppender(events); events.stop(); logger.setLevel(previousLevel);
+            }
+        }
+    }
+
+    @Test void initialQuotaEvidenceCannotClassifyAnOutageAfterFormalAuthenticationRecovery() {
+        try (var f = new Fixture()) {
+            var business = f.business();
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(business).start();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+            assertThat(f.root.initializationProgress().quotaExceeded()).isTrue();
+            var next = new CachePreparation("authentication-recovery", new CacheAuthScope("cluster", 1,
+                    StorageBinding.Mode.CLOUD, "recovered-cache", 2));
+            var sessions = mock(CloudSessionStore.class);
+            when(f.cache.cloudSessions(next.authScope())).thenReturn(sessions);
+            when(f.cache.cloudSessions(eq(next.authScope()), any(MongoReadBudget.class))).thenReturn(sessions);
+            doThrow(StorageRuntime.unavailable()).when(f.cache).loadAuthScope(eq(PREPARATION.authScope()), any(MongoReadBudget.class));
+            when(f.configuration.authenticationRecoveryRequired(eq(f.cache), any())).thenReturn(true);
+            doAnswer(invocation -> { when(f.bindings.cachePreparation()).thenReturn(Optional.of(next)); return null; })
+                    .when(f.configuration).prepareAuthenticationRecovery(eq(f.cache), any());
+            f.root.managedAuthentication();
+            assertThat(f.root.runtime().current().orElseThrow().preparation().authScope()).isEqualTo(next.authScope());
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireRequestAuthenticationPublished(eq(next), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.bindings, times(1)).complete(SETUP);
+        }
+    }
+
+    @Test void aSpecificConfigAuthenticationFailureRetiresEarlierQuotaEvidence() {
+        try (var f = new Fixture(true)) {
+            var loads = new java.util.concurrent.atomic.AtomicInteger();
+            java.util.function.Supplier<MongoConfigurationDomain> loader = () -> {
+                if (loads.getAndIncrement() == 0)
+                    throw new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
+                throw new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
+            };
+            org.springframework.test.util.ReflectionTestUtils.setField(f.root, "configurationLoader", loader);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.root, "loadConfiguration");
+            assertThatThrownBy(f.root::managedAuthentication).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            assertThat(loads.get()).isGreaterThanOrEqualTo(2);
+            assertThat(f.root.runtime().configuration()).isEmpty();
+            verify(f.cache, never()).prepareFirstAuth(any());
+        }
+    }
+
+    @Test void aRecordedQuotaFailureSurvivesTheRealRootCredentialBoundaryWithoutGrantingAPrincipal() {
+        try (var f = new Fixture()) {
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            when(f.states.load()).thenThrow(StorageRuntime.unavailable());
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ControlError.STORAGE_QUOTA_EXCEEDED);
+                        assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
+                    });
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(business, never()).start(); verify(f.bindings, never()).complete(any());
+        }
+    }
+
+    @Test void aGenericFailureWithoutQuotaEvidenceAndARecoveredRuntimeDoNotClaimQuota() {
+        try (var f = new Fixture()) {
+            when(f.states.load()).thenThrow(StorageRuntime.unavailable());
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+        }
+        try (var f = new Fixture()) {
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            f.continueWith(business);
+            assertThat(f.root.initializationProgress().quotaExceeded()).isFalse();
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireRequestAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant); verify(business, times(1)).start();
+        }
+    }
+
+    @Test void quotaFailureKeepsItsOriginalStageAcrossRetryWithoutReplayingCreation() {
+        try (var f = new Fixture()) {
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);
+            doThrow(StorageRuntime.unavailable()).when(f.cache).resumeInitialAuth(eq(PREPARATION), any());
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            var progress = f.root.initializationProgress().snapshot(SETUP).orElseThrow();
+            assertThat(progress.milestones().get(1).errorCode()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED.code());
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.cache, times(1)).resumeInitialAuth(eq(PREPARATION), any());
+            verify(f.bindings, never()).complete(any()); verify(business, never()).start();
+        }
+    }
+
+    @Test void completionUsesSavedTrustClosesTemporaryAuthenticationAndStartsOnlyOneBusinessOwner() {
+        try (var f = new Fixture()) {
+            var temporary = f.root.managedAuthentication(); var business = f.business();
+            f.continueWith(business); f.continueWith(business);
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+            assertThat(f.root.runtime().businessStarted()).isTrue();
+            assertThatThrownBy(temporary.requireActive()::run).isInstanceOf(TapstateException.class);
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+            var order = inOrder(f.cache, f.configuration, f.bindings, business);
+            order.verify(f.cache).prepareFirstAuth(f.grant);
+            order.verify(f.configuration).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            order.verify(f.cache).verifyBusinessReady(PREPARATION.businessScope());
+            order.verify(f.bindings).complete(SETUP); order.verify(business).start();
+            verify(f.target, never()).test(any(), any(), any());
+            verify(business, times(1)).start(); verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.cache, never()).close();
+        }
+    }
+
+    @Test void anUnavailableDefaultTargetDoesNotBlockCacheActivation() {
+        try (var f = new Fixture()) {
+            doThrow(StorageRuntime.unavailable()).when(f.target).test(any(), any(), any());
+            var business = f.business();
+            f.continueWith(business);
+            verify(f.cache).prepareFirstAuth(f.grant); verify(f.bindings).complete(SETUP);
+            verify(f.target, never()).test(any(), any(), any());
+            assertThat(f.root.runtime().businessStarted()).isTrue();
+        }
+    }
+
+    @Test void failedComposedPreparationNeverCompletesSetupOrStartsBusiness() {
+        try (var f = new Fixture()) {
+            var business = f.business();
+            when(f.configuration.prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any()))
+                    .thenThrow(StorageRuntime.unavailable());
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.STORAGE_BOUND);
+            verify(f.bindings, never()).complete(any());
+            verify(business, never()).start();
+            verify(f.cache, never()).prepareInitialBusiness(any(), any());
+        }
+    }
+
+    @Test void failedBusinessReadinessAfterCompositionNeverCompletesSetupOrStartsBusiness() {
+        try (var f = new Fixture()) {
+            var business = f.business();
+            doThrow(StorageRuntime.unavailable()).when(f.cache)
+                    .verifyBusinessReady(PREPARATION.businessScope());
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            verify(f.configuration).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.STORAGE_BOUND);
+            verify(f.bindings, never()).complete(any());
+            verify(business, never()).start();
+        }
+    }
+
+    @Test void uncertainFirstPreparationNeverReissuesTheConsumedCreationOnRetry() {
+        try (var f = new Fixture()) {
+            doThrow(StorageRuntime.unavailable()).when(f.cache).prepareFirstAuth(f.grant);
+            doThrow(StorageRuntime.unavailable()).when(f.cache).resumeInitialAuth(eq(PREPARATION), any());
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.cache).resumeInitialAuth(eq(PREPARATION), any());
+            verify(f.bindings, never()).complete(any()); verify(business, never()).start();
+        }
+    }
+
+    @Test void reopenedSetupCanOnlyResumeRetainedCacheFacts() {
+        try (var f = new Fixture()) {
+            f.root.continueCloudSetup(new StorageBindingCommit(CONNECTION, PREPARATION, Optional.empty()), f.target, ignored -> f.business());
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).resumeInitialAuth(eq(PREPARATION), any());
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+        }
+    }
+
+    @Test void failedBusinessClosesItsOwnCandidateAndRetriesWithoutRepeatingCommittedPreparation() {
+        try (var f = new Fixture()) {
+            var failed = f.business(); doThrow(StorageRuntime.unavailable()).when(failed).start();
+            assertThatThrownBy(() -> f.continueWith(failed)).isInstanceOf(TapstateException.class);
+            verify(failed).close(); assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+            var successor = f.business(); f.continueWith(successor);
+            verify(failed, times(1)).close(); verify(f.cache, never()).close();
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            verify(f.cache, never()).prepareInitialBusiness(any(), any());
+            verify(f.target, never()).test(any(), any(), any()); verify(successor).start();
+        }
+    }
+
+    @Test void unknownCleanupKeepsTheOriginalCompletionButForbidsAnotherCandidate() {
+        try (var f = new Fixture()) {
+            var failed = f.business(); doThrow(StorageRuntime.unavailable()).when(failed).start();
+            doThrow(StorageRuntime.unavailable()).when(failed).close();
+            assertThatThrownBy(() -> f.continueWith(failed)).isInstanceOf(TapstateException.class);
+            assertThat(f.root.runtime().cleanupRequired()).isTrue();
+            assertThatThrownBy(() -> f.root.continueCloudSetup(f.committed, f.target, ignored -> {
+                throw new AssertionError("unknown old activity must prevent another assembly");
+            })).isInstanceOf(TapstateException.class);
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+            doNothing().when(failed).close();
+        }
+    }
+
+    @Test void aFailureAfterCompletionCanResumeFormalAuthenticationInTheSameProcess() {
+        try (var f = new Fixture()) {
+            var temporary = f.root.managedAuthentication(); var probe = mock(MongoCacheDomain.class);
+            f.caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(f.cache, probe);
+            doThrow(StorageRuntime.unavailable()).doNothing().when(f.configuration).requireAuthenticationPublished(PREPARATION);
+            assertThatThrownBy(() -> f.continueWith(f.business())).isInstanceOf(TapstateException.class);
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+            assertThatThrownBy(temporary.requireActive()::run).isInstanceOf(TapstateException.class);
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.bindings, times(1)).complete(SETUP);
+            verify(probe).close(); verify(f.cache, never()).close();
+        }
+    }
+
+    @Test void aDifferentCommittedScopeCannotActivateOrCloseTheCurrentOwner() {
+        try (var f = new Fixture()) {
+            var business = f.business(); f.continueWith(business);
+            var other = new CachePreparation("other-operation", new CacheAuthScope("cluster", 1, StorageBinding.Mode.CLOUD, "other-cache", 1));
+            assertThatThrownBy(() -> f.root.continueCloudSetup(new StorageBindingCommit(CONNECTION, other, Optional.empty()), f.target,
+                    ignored -> { throw new AssertionError("must not assemble a different owner"); })).isInstanceOf(TapstateException.class);
+            assertThat(f.root.runtime().businessStarted()).isTrue(); verify(business, never()).close(); verify(f.cache, never()).close();
+        }
+    }
+
+    @Test void deferredConfigurationLoadResumesItsCompletedBusinessInTheSameRoot() {
+        try (var f = new Fixture(true)) {
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var business = f.business();
+            f.root.loadExisting(ignored -> business);
+            var probe = mock(MongoCacheDomain.class);
+            f.caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(probe, f.cache);
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+            assertThat(f.root.runtime().businessStarted()).isTrue();
+            verify(business).start(); verify(probe).close();
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache, never()).prepareInitialBusiness(any(), any());
+        }
+    }
+
+    @Test void aDuplicateNodeIdentityFailsTheRetainedStartupAfterClosingItsCandidate() {
+        try (var f = new Fixture()) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var business = f.business();
+            var refusal = new TapstateException(BootError.NODE_ID_IN_USE, Map.of("nodeId", "node-a"), null);
+            doThrow(refusal).when(business).start();
+            assertThat(catchThrowable(() -> f.root.loadExisting(ignored -> business))).isSameAs(refusal);
+            verify(business).close();
+            assertThat(f.root.runtime().business()).isEmpty();
+        }
+    }
+
+    @Test void aRecoverableStorageFailureKeepsFormalAuthenticationAvailable() {
+        try (var f = new Fixture()) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var business = f.business();
+            doThrow(StorageRuntime.unavailable()).when(business).start();
+            assertThatCode(() -> f.root.loadExisting(ignored -> business)).doesNotThrowAnyException();
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            assertThat(f.root.runtime().business()).isEmpty();
+            verify(business).close();
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+        }
+    }
+}

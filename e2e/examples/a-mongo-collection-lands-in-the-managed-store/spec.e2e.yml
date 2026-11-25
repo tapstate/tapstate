@@ -12,7 +12,7 @@
 # Mutation evidence: restore the discovered-table identity comparison in
 # StoreBackedDagSource.requireKeyIsTheFeedIdentity. This case fails on both tiers at its first await,
 # "views.order_state expected 12, found 0", and the runtime reports
-# actuation.view-key-not-feed-identity with identity=_id and key=id. The neighboring
+# TS0360024 with identity=_id and key=id. The neighboring
 # a-declared-view-materializes-with-no-serve-block case passes on both tiers in the same run.
 # Restoring the production fix passes all four runs without changing either case.
 name: a-mongo-collection-lands-in-the-managed-store
@@ -21,7 +21,8 @@ setup:
     src_store: { kind: mongo }
     store: { kind: mongo }
   connectors: [mongodb]
-  apply: [src_store.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_store.tap.yml, pipeline.tap.yml]
   discover: [src_store]
 pipeline: pipeline.tap.yml
 seed:

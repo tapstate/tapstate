@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.function.BooleanSupplier;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
@@ -96,6 +97,14 @@ public final class OtelMetricsExport implements MetricsExport {
     public void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
         producer.offer(pipelineId, state, observedAt, facts);
     }
+
+    @Override
+    public void offerIfCurrent(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts,
+            BooleanSupplier current) {
+        producer.offerIfCurrent(pipelineId, state, observedAt, facts, current);
+    }
+
+    @Override public void offerRuntime(Instant observedAt,List<MetricFact> facts) { producer.offerRuntime(observedAt,facts); }
 
     @Override
     public void forgetPipelinesOutside(Collection<String> pipelineIds) {

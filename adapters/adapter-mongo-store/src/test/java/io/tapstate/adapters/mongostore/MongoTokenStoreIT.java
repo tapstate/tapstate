@@ -7,9 +7,7 @@ import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Instant;
 import java.util.Optional;
@@ -27,11 +25,11 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 @RequiresDocker
 class MongoTokenStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Instant NOW = Instant.parse("2026-07-08T12:00:00Z");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoTokenStoreIT.class);
 
     @Test
     void savedTokenReadsBackWithItsFields() {
@@ -90,7 +88,7 @@ class MongoTokenStoreIT {
     /** Runs a test body against a fresh token store over a clean collection on the real replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("tokens");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("tokens");
             collection.drop();
             test.run(new MongoTokenStore(collection), collection);
         }

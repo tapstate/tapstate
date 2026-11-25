@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CasOutcome;
@@ -8,14 +10,19 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.ManagedViewStore;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewResource;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -121,6 +128,33 @@ class ArtifactMutationServiceTest {
         }
     }
 
+    @Test void nativeDeletionBindsBeforeAuditAndAuditFailureCannotInvokeItsMutation() {
+        var events=new ArrayList<String>(); var failed=new java.util.concurrent.atomic.AtomicBoolean(true);
+        var operations=new ArrayList<String>();
+        var original=pipeline("native"); store.save(original);
+        var unreadableState=new StateStore() {
+            @Override public java.util.Optional<CheckpointDoc> read(String id) { throw new AssertionError("native lifecycle validation"); }
+            @Override public void create(String id,String json,Instant at) { throw new AssertionError("native creation"); }
+            @Override public io.tapstate.core.lifecycle.CasOutcome compareAndSwap(String id,long epoch,String json,Instant at) { throw new AssertionError("native CAS"); }
+            @Override public void delete(String id) { throw new AssertionError("native reclamation"); }
+        };
+        AuditStore audit=record -> { events.add("audit"); operations.add(record.operationId()); if(failed.get())throw new IllegalStateException("audit down"); };
+        var nativeService=new ArtifactMutationService(store,desired,unreadableState,observations,layouts,srsMeta,derivedSchemas,rateHistory,
+                new AuditGate(audit,FIXED_CLOCK),DataBrowserFollows.NONE,(captured,expected) -> {
+                    assertThat(captured).isEqualTo(original); assertThat(expected).isEqualTo(hash(original)); events.add("bind");
+                    return () -> events.add("retire");
+                });
+        assertThatThrownBy(() -> nativeService.delete(PRINCIPAL,"native",hash(original))).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ControlError.AUDIT_BLOCKED));
+        assertThat(events).containsExactly("bind","audit");
+        failed.set(false); nativeService.delete(PRINCIPAL,"native",hash(original));
+        assertThat(events).containsExactly("bind","audit","bind","audit","retire");
+        nativeService.deletePipeline(PRINCIPAL,"native",hash(original));
+        assertThat(operations).containsExactly("artifact.delete","artifact.delete","pipeline.delete");
+        assertThat(events).containsExactly("bind","audit","bind","audit","retire","bind","audit","retire");
+        assertThat(store.get("native")).isPresent();
+    }
+
     @Test
     void deletesAnyKindThroughTheOneVerbAndRemovesOnlyThatArtifact() {
         List<Resource> kinds = List.of(
@@ -206,6 +240,107 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
+    void viewStoreDeleteNamesInlineAndReusableConsumersOnceInSortedOrder() {
+        SourceResource views = new SourceResource(
+                ManagedViewStore.SOURCE_ID, null, "mongodb", Map.of("uri", "mongodb://mongo/my_views"),
+                null, null, null, null);
+        PipelineResource inline = new PipelineResource(
+                "zeta", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                new ServeBlock.Inline(null, FromRef.literal("orders"),
+                        List.of(new SyncElement("copy", views.id(), null, null, null)), null, null),
+                null, null);
+        PipelineResource reused = new PipelineResource(
+                "alpha", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Use(null, "shared_view", FromRef.literal("orders")),
+                null, null, null);
+        ViewResource shared = new ViewResource("shared_view", null, "id", null, null);
+        store.saveAll(List.of(views, source("orders"), inline, reused, shared));
+        state.put(reused.id(), PipelineState.RUNNING);
+
+        assertArtifactError(
+                () -> service.delete(PRINCIPAL, views.id(), hash(views)),
+                ArtifactError.IN_USE,
+                Map.of("id", views.id(), "referrers", List.of("alpha", "zeta")));
+
+        assertThat(store.get(views.id())).contains(views);
+        assertThat(store.get(inline.id())).contains(inline);
+        assertThat(store.get(reused.id())).contains(reused);
+        assertThat(auditStore.records).isEmpty();
+        assertThat(followsStopped).isEmpty();
+    }
+
+    @Test
+    void viewStoreWithoutAnyDeclaringViewCanStillBeDeleted() {
+        SourceResource views = source(ManagedViewStore.SOURCE_ID);
+        store.saveAll(List.of(views, source("orders"), pipelineReading("reader", "orders")));
+
+        service.delete(PRINCIPAL, views.id(), hash(views));
+
+        assertThat(store.get(views.id())).isEmpty();
+        assertThat(store.get("reader")).isPresent();
+    }
+
+    @Test
+    void aPipelineNamedViewsWithAnInlineViewCanBeAppliedAndDeletedAfterTheSourceIsRemoved() {
+        SourceResource views = new SourceResource(
+                ManagedViewStore.SOURCE_ID, null, "mongodb", Map.of("uri", "mongodb://mongo/views"),
+                null, null, null, null);
+        store.save(views);
+        service.delete(PRINCIPAL, views.id(), hash(views));
+        assertThat(store.get(views.id())).isEmpty();
+
+        ApplyService apply = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
+        apply.apply(PRINCIPAL, List.of(
+                new ArtifactDraft(null, """
+                        version: tapstate/v1
+                        kind: source
+                        id: orders_src
+                        connector: mongodb
+                        config: { uri: "mongodb://mongo/orders" }
+                        mode: cdc
+                        tables: [orders]
+                        """),
+                new ArtifactDraft(null, """
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: views
+                        source: orders_src
+                        view:
+                          id: order_state
+                          from: orders
+                          primary_key: id
+                        """)));
+        PipelineResource pipeline = (PipelineResource) store.get(views.id()).orElseThrow();
+        assertThat(pipeline.view()).isInstanceOf(ViewBlock.Inline.class);
+        assertThat(ReferenceGraph.of(store.list()).referencedBy(pipeline.id())).isEmpty();
+
+        service.delete(PRINCIPAL, pipeline.id(), hash(pipeline));
+
+        assertThat(store.get(pipeline.id())).isEmpty();
+        assertThat(store.get("orders_src")).isPresent();
+        assertThat(followsStopped).containsExactly(views.id());
+    }
+
+    @Test
+    void anInlineViewDoesNotBlockDeletingAnUnrelatedSource() {
+        SourceResource unrelated = source("unrelated");
+        PipelineResource inline = new PipelineResource(
+                "reader", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                null, null, null);
+        store.saveAll(List.of(unrelated, source("orders"), source(ManagedViewStore.SOURCE_ID), inline));
+
+        service.delete(PRINCIPAL, unrelated.id(), hash(unrelated));
+
+        assertThat(store.get(unrelated.id())).isEmpty();
+        assertThat(store.get(ManagedViewStore.SOURCE_ID)).isPresent();
+        assertThat(store.get(inline.id())).contains(inline);
+    }
+
+    @Test
     void anUnreadableReferencingPipelineFailsClosedAndLeavesItsSourceStored() {
         SourceResource orders = source("orders");
         PipelineResource reader = pipelineReading("reader", "orders");
@@ -259,6 +394,59 @@ class ArtifactMutationServiceTest {
                 ArtifactError.PIPELINE_NOT_STOPPED,
                 Map.of("id", "flow", "actual", "STOPPED", "desired", "RUNNING"));
         assertThat(store.get("flow")).isPresent();
+    }
+
+    @Test
+    void aNaturallyCompletedPipelineIsDeletedWithItsConsumedRunningIntent() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        state.put("flow", PipelineState.COMPLETED, 8L);
+        desired.put("flow", PipelineState.RUNNING);
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(state.read("flow")).isEmpty();
+        assertThat(desired.read("flow")).isEmpty();
+    }
+
+    @Test
+    void completionCannotMakeAPendingStartDeletable() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        DesiredState pending = new DesiredState("flow", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 8L);
+        desired.save(pending);
+        for (long epoch : List.of(7L, 8L, 9L)) {
+            state.put("flow", PipelineState.COMPLETED, epoch);
+            assertArtifactError(() -> service.delete(PRINCIPAL, "flow", hash(flow)),
+                    ArtifactError.PIPELINE_NOT_STOPPED,
+                    Map.of("id", "flow", "actual", "COMPLETED", "desired", "RUNNING"));
+            assertThat(store.get("flow")).isPresent();
+            assertThat(desired.read("flow")).contains(pending);
+        }
+    }
+
+    @Test
+    void aStartAcceptedAfterTheCompletedPipelineDeleteCheckKeepsItsCheckpoint() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        state.put("flow", PipelineState.COMPLETED, 8L);
+        desired.put("flow", PipelineState.RUNNING);
+        DesiredState pending = new DesiredState("flow", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 8L);
+        store.afterDelete = () -> desired.save(pending);
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ArtifactError.RECLAIM_INCOMPLETE);
+                    assertThat(error.args()).containsEntry("reason", "pipeline-live");
+                });
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(state.read("flow")).isPresent();
+        assertThat(desired.read("flow")).contains(pending);
+        assertThat(reclaimOrder).isEmpty();
     }
 
     @Test
@@ -543,7 +731,7 @@ class ArtifactMutationServiceTest {
         assertThatThrownBy(() -> blocked.delete(PRINCIPAL, "orders", before))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("control.audit-blocked"));
+                        .isEqualTo("TS0210015"));
 
         assertThat(store.get("orders")).isPresent();
         assertThat(hash(store.get("orders").orElseThrow())).isEqualTo(before);
@@ -957,7 +1145,11 @@ class ArtifactMutationServiceTest {
         private RuntimeException deleteFailure;
 
         void put(String pipelineId, PipelineState actual) {
-            docs.put(pipelineId, CheckpointDoc.initial(pipelineId, StateJson.of(actual), Instant.EPOCH));
+            put(pipelineId, actual, 0);
+        }
+
+        void put(String pipelineId, PipelineState actual, long epoch) {
+            docs.put(pipelineId, new CheckpointDoc(pipelineId, StateJson.of(actual), epoch, Instant.EPOCH));
         }
 
         void failDeleteWith(RuntimeException failure) {

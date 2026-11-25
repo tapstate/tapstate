@@ -2,6 +2,8 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.IoErrorDefinitions;
 
 import java.util.Set;
 
@@ -30,32 +32,128 @@ public enum IoError implements TapstateErrorCode {
      * a failed TLS handshake, or a command error. {@code detail} is the failure the driver reported
      * (host and cluster state, never a credential).
      */
-    STORE_UNAVAILABLE("io.store-unavailable", Set.of("detail")),
+    STORE_UNAVAILABLE(IoErrorDefinitions.STORE_UNAVAILABLE),
+
+    /** The endpoint explicitly refused a write because its storage quota is exhausted. Carries no server data. */
+    STORE_QUOTA_EXCEEDED(IoErrorDefinitions.STORE_QUOTA_EXCEEDED),
 
     /**
      * The store rejected the credentials for the operation. Carries no placeholder on purpose: echoing
      * anything back risks leaking a credential.
      */
-    STORE_UNAUTHORIZED("io.store-unauthorized", Set.of()),
+    STORE_UNAUTHORIZED(IoErrorDefinitions.STORE_UNAUTHORIZED),
 
     /**
      * A stored document could not be read back into its model — a corrupt body, or one written by a
      * newer grammar, or a document missing a field this version requires. {@code id} is the stored
      * document's id.
      */
-    DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id", "field")),
+    DOCUMENT_UNREADABLE(IoErrorDefinitions.DOCUMENT_UNREADABLE),
+
+    /** A failed or losing upload cannot confirm cleanup of its own unpublished GridFS resource. */
+    CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED(IoErrorDefinitions.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED),
+
+    /** An input value cannot be represented by the store without changing its value. */
+    DOCUMENT_INVALID(IoErrorDefinitions.DOCUMENT_INVALID),
 
     /**
      * Re-discovery replaced a connection's schema during every permitted read attempt. The store
      * remains available, but the caller must retry after publication settles to read a coherent model.
      */
-    SCHEMA_READ_CONTENTION("io.schema-read-contention", Set.of("connectionId")),
+    SCHEMA_READ_CONTENTION(IoErrorDefinitions.SCHEMA_READ_CONTENTION),
 
     /** Publication lost its writer lease or exhausted its attempts under concurrent discovery. */
-    SCHEMA_WRITE_CONTENTION("io.schema-write-contention", Set.of("connectionId")),
+    SCHEMA_WRITE_CONTENTION(IoErrorDefinitions.SCHEMA_WRITE_CONTENTION),
 
     /** A side-effect write carried an expired, replaced, or otherwise non-current workload claim. */
-    WORKLOAD_CLAIM_FENCED("io.workload-claim-fenced", Set.of()),
+    WORKLOAD_CLAIM_FENCED(IoErrorDefinitions.WORKLOAD_CLAIM_FENCED),
+
+    /**
+     * A pipeline has aggregate sink progress from before progress was recorded per writer, and now names
+     * multiple writers. The aggregate may have been advanced by only the fastest writer, so it cannot be
+     * promoted into evidence that every writer reached that position. {@code pipeline} identifies the
+     * consumer whose retained state must be cleared before a full resync or an explicitly accepted new
+     * incremental baseline.
+     */
+    SINK_WRITER_PROGRESS_AMBIGUOUS(IoErrorDefinitions.SINK_WRITER_PROGRESS_AMBIGUOUS),
+
+    /** A note command lost its captured key revision and must not overwrite the current value. */
+    NOTE_WRITE_CONFLICT(IoErrorDefinitions.NOTE_WRITE_CONFLICT),
+
+    /** A diagnostic command no longer owns its original configuration binding or state generation. */
+    REQUIRED_DEAD_LETTER_FENCED(IoErrorDefinitions.REQUIRED_DEAD_LETTER_FENCED),
+
+    /** One source event cannot describe two different retained row, deletion or token facts. */
+    REQUIRED_DEAD_LETTER_CONFLICT(IoErrorDefinitions.REQUIRED_DEAD_LETTER_CONFLICT),
+
+    /** The captured cache authentication generation is no longer current or ready. */
+    CACHE_AUTH_FENCED(IoErrorDefinitions.CACHE_AUTH_FENCED),
+
+    /** A lifecycle intent no longer owns its captured storage binding or stable Pipeline state generation. */
+    PIPELINE_INTENT_FENCED(IoErrorDefinitions.PIPELINE_INTENT_FENCED),
+
+    /** Issued first-state authority has incomplete or inconsistent CACHE history; no counters may be recreated. */
+    PIPELINE_STATE_REBUILD_REQUIRED(IoErrorDefinitions.PIPELINE_STATE_REBUILD_REQUIRED),
+
+    /** Missing canonical capture history requires explicitly confirmed Cluster cache recovery. */
+    CAPTURE_STATE_REBUILD_REQUIRED(IoErrorDefinitions.CAPTURE_STATE_REBUILD_REQUIRED),
+
+    /** The captured business incarnation is unavailable or no longer current. */
+    CACHE_BUSINESS_FENCED(IoErrorDefinitions.CACHE_BUSINESS_FENCED),
+
+    /** An event cannot prove its exact ring, capture epoch and model version. */
+    SRS_EVENT_MODEL_UNAVAILABLE(IoErrorDefinitions.SRS_EVENT_MODEL_UNAVAILABLE),
+
+    /** A retained source consumer cannot prove its membership, stable state identity and cursor. */
+    SRS_CONSUMER_UNAVAILABLE(IoErrorDefinitions.SRS_CONSUMER_UNAVAILABLE),
+
+    /** A source checkpoint cannot prove its original chain, table frontiers and exact model closure. */
+    SRS_CHECKPOINT_UNPROVEN(IoErrorDefinitions.SRS_CHECKPOINT_UNPROVEN),
+
+    /** An exact actual model is absent or cannot be used for the captured stream context. */
+    SRS_MODEL_UNAVAILABLE(IoErrorDefinitions.SRS_MODEL_UNAVAILABLE),
+
+    /** Required retained models cannot safely fit in the existing chain history budget. */
+    SRS_MODEL_CAPACITY(IoErrorDefinitions.SRS_MODEL_CAPACITY),
+
+    /** A pending full baseline exceeds its bounded control-record budget. */
+    SRS_FULL_PREPARATION_CAPACITY(IoErrorDefinitions.SRS_FULL_PREPARATION_CAPACITY),
+
+    /** The original explicit full preparation or its exact baseline cannot be proved. */
+    SRS_FULL_PREPARATION_UNPROVEN(IoErrorDefinitions.SRS_FULL_PREPARATION_UNPROVEN),
+
+    /** An arbitrary source token cannot prove compatibility with the retained model history. */
+    SRS_POSITION_MODEL_UNPROVEN(IoErrorDefinitions.SRS_POSITION_MODEL_UNPROVEN),
+
+    /** An immutable model identity already names different structural content. */
+    SRS_MODEL_CONFLICT(IoErrorDefinitions.SRS_MODEL_CONFLICT),
+
+    /** A connector must not reuse retained notes with another connection or artifact. */
+    NOTE_ORIGIN_MISMATCH(IoErrorDefinitions.NOTE_ORIGIN_MISMATCH),
+
+    /** A retained shared capture still depends on this private note scope. */
+    NOTE_REFERENCED(IoErrorDefinitions.NOTE_REFERENCED),
+
+    /** Necessary connector notes cannot prove the captured namespace, owner or clear generation. */
+    NOTE_SCOPE_UNAVAILABLE(IoErrorDefinitions.NOTE_SCOPE_UNAVAILABLE),
+
+    /** Legacy pipeline-level progress cannot establish this source node's confirmed recovery cursor. */
+    SRS_PROGRESS_UNPROVEN(IoErrorDefinitions.SRS_PROGRESS_UNPROVEN),
+
+    /** The private direct source cannot prove the retained progress and ordered pending batches. */
+    DIRECT_CHANNEL_UNAVAILABLE(IoErrorDefinitions.DIRECT_CHANNEL_UNAVAILABLE),
+
+    /** The requested private source/read contract cannot reuse the prepared physical state. */
+    PIPELINE_CAPTURE_IDENTITY_UNPROVEN(IoErrorDefinitions.PIPELINE_CAPTURE_IDENTITY_UNPROVEN),
+
+    /** Added tables cannot join an already prepared Pipeline while its prior state is retained. */
+    PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED(IoErrorDefinitions.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED),
+
+    /** A configuration import cannot satisfy its original scope, input or publication conditions. */
+    CONFIGURATION_IMPORT_REFUSED(IoErrorDefinitions.CONFIGURATION_IMPORT_REFUSED),
+
+    /** A bounded import budget is exhausted without discarding retained outcomes. */
+    CONFIGURATION_IMPORT_LIMIT(IoErrorDefinitions.CONFIGURATION_IMPORT_LIMIT),
 
     /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
@@ -66,28 +164,25 @@ public enum IoError implements TapstateErrorCode {
      * one code until a size failure was found reaching callers as "a store operation could not
      * complete", which sends whoever reads it to check a store that is healthy.
      */
-    DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id"));
+    DOCUMENT_TOO_LARGE(IoErrorDefinitions.DOCUMENT_TOO_LARGE),
 
-    private final String code;
-    private final Set<String> placeholders;
+    /** Original prepared target bodies must fit their row and complete-scope budgets. */
+    SINK_MODEL_CAPACITY(IoErrorDefinitions.SINK_MODEL_CAPACITY),
 
-    IoError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-    }
+    /** Upload recovery could not establish publication or confirm removal of this attempt's chunks. */
+    CONNECTOR_UPLOAD_UNSETTLED(IoErrorDefinitions.CONNECTOR_UPLOAD_UNSETTLED),
 
-    @Override
-    public String code() {
-        return code;
-    }
+    /** A Source exists but cannot yet provide its required original lifetime/binding facts. */
+    SOURCE_IDENTITY_UNAVAILABLE(IoErrorDefinitions.SOURCE_IDENTITY_UNAVAILABLE),
 
-    @Override
-    public Severity severity() {
-        return Severity.ERROR;
-    }
+    /** A necessary Source lifecycle revision cannot advance without wrapping or losing ordering. */
+    SOURCE_IDENTITY_EXHAUSTED(IoErrorDefinitions.SOURCE_IDENTITY_EXHAUSTED);
 
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    private final ProductErrorDefinition definition;
+
+    IoError(ProductErrorDefinition definition) { this.definition = definition; }
+
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

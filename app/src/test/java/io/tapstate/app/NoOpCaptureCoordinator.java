@@ -11,6 +11,12 @@ final class NoOpCaptureCoordinator implements PipelineCaptureCoordinator {
     }
 
     @Override
+    public void startCapture(String pipelineId, io.tapstate.spi.store.ArtifactStore artifactSnapshot,
+            SourceModelSnapshot sourceModels) {
+        startCapture(pipelineId);
+    }
+
+    @Override
     public void stopCapture(String pipelineId, boolean purgeState) {
     }
 }

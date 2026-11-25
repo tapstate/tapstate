@@ -101,12 +101,12 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     private static final String CHILD_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, CHILD_SOURCE);
     private static final String GRANDCHILD_CONNECTOR_NAMESPACE =
             connectorNamespace(PIPELINE, GRANDCHILD_SOURCE);
-    private static final String SINK_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "sync_1");
+    private static final String SINK_CONNECTOR_NAMESPACE = io.tapstate.adapters.pdk.ConnectorStateNamespace.of(new PipelineNode(PIPELINE, "sync_1"), PipelineNode.Purpose.SYNC);
     private static final String SINK_PREPARATION_NAMESPACE =
             io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "sync_1"));
     private static final String VIEW_PREPARATION_NAMESPACE =
-            io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "orders_view"));
-    private static final String VIEW_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "orders_view");
+            io.tapstate.spi.sink.SinkPreparationNamespace.of(new PipelineNode(PIPELINE, "orders_view"), PipelineNode.Purpose.VIEW);
+    private static final String VIEW_CONNECTOR_NAMESPACE = io.tapstate.adapters.pdk.ConnectorStateNamespace.of(new PipelineNode(PIPELINE, "orders_view"), PipelineNode.Purpose.VIEW);
     private static final String OTHER_PIPELINE_CONNECTOR_NAMESPACE = connectorNamespace("other_pipe", PARENT_SOURCE);
     private static final String UNOPENED_CONNECTOR_NAMESPACE = connectorNamespace(PIPELINE, "removed_node");
     private static final String GLOBAL_CONNECTOR_NAMESPACE = "pdk.global-state";

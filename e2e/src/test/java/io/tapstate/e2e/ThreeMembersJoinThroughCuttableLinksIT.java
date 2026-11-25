@@ -35,10 +35,10 @@ class ThreeMembersJoinThroughCuttableLinksIT {
 
     @Test
     void threeProcessesJoinThroughTheirLinksAndEveryLinkKnowsWhoDialledIt() {
-        String store = SharedMongo.replicaSetUrl("e2e_three_members");
         List<String> nodes = List.of("node-a", "node-b", "node-c");
 
-        try (PartitionableCluster cluster = PartitionableCluster.start(store, "e2e-three-members", nodes)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             PartitionableCluster cluster = PartitionableCluster.startPrepared(storage, nodes)) {
             List<String> membership = cluster.awaitMembers("node-a", 3);
 
             assertThat(membership)

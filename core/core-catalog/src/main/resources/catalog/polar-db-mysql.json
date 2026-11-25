@@ -268,7 +268,7 @@
   ],
   "provenance": {
     "specPath": "connectors/polar-db-mysql-connector/src/main/resources/polar-db-mysql-spec.json",
-    "specContentHash": "c68ba1646bc9cc9d",
+    "specContentHash": "ccf61f7892de9997",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
@@ -20,10 +21,13 @@ class HazelcastExposureWarningTest {
 
     private final ListAppender<ILoggingEvent> written = new ListAppender<>();
     private Logger logger;
+    private Level previousLevel;
 
     @BeforeEach
     void captureConfigurationWarnings() {
         logger = (Logger) LoggerFactory.getLogger(HazelcastConfiguration.class);
+        previousLevel = logger.getLevel();
+        logger.setLevel(Level.WARN);
         written.start();
         logger.addAppender(written);
     }
@@ -32,6 +36,7 @@ class HazelcastExposureWarningTest {
     void stopCapturing() {
         logger.detachAppender(written);
         written.stop();
+        logger.setLevel(previousLevel);
     }
 
     @Test

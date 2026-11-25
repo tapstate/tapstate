@@ -10,15 +10,27 @@ import java.util.UUID;
 
 /**
  * A bounded, in-memory {@link LogSink}. It keeps at most a fixed number of the most recent lines per
- * pipeline (oldest evicted first) and tracks at most a fixed number of pipelines (the pipeline that
+ * pipeline (older generations evicted first, then oldest within a generation) and tracks at most a fixed number of pipelines (the pipeline that
  * has gone longest without a new line is dropped whole). Both bounds cap memory so a long-running or
  * noisy process cannot grow the buffer without limit. All operations are thread-safe: the runtime
  * appends from its own threads while a control read face tails concurrently.
  */
 public final class RingBufferLogSink implements LogSink {
 
+    private static final long UNSCOPED = 0;
+
+    private record Entry(long generation, long sequence, LogLine line) {}
+
+    private static final class Buffer {
+        final String cursorGeneration = UUID.randomUUID().toString();
+        long nextSequence = 1;
+        final Deque<Entry> lines = new ArrayDeque<>();
+        long firstGeneration;
+        boolean mixed;
+    }
+
     private final int maxLinesPerPipeline;
-    private final Map<String, PipelineBuffer> byPipeline;
+    private final Map<String, Buffer> byPipeline;
     private final Map<String, PipelineLogLevel> levels = new LinkedHashMap<>();
 
     /**
@@ -34,7 +46,7 @@ public final class RingBufferLogSink implements LogSink {
         this.maxLinesPerPipeline = maxLinesPerPipeline;
         this.byPipeline = new LinkedHashMap<>() {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<String, PipelineBuffer> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<String, Buffer> eldest) {
                 return size() > maxPipelines;
             }
         };
@@ -42,24 +54,80 @@ public final class RingBufferLogSink implements LogSink {
 
     @Override
     public synchronized void append(String pipelineId, LogLine line) {
+        appendLine(pipelineId, UNSCOPED, line);
+    }
+
+    @Override
+    public synchronized void append(String pipelineId, long generation, LogLine line) {
+        if (generation < 1) {
+            throw new IllegalArgumentException("a scoped log generation must be positive");
+        }
+        appendLine(pipelineId, generation, line);
+    }
+
+    private void appendLine(String pipelineId, long generation, LogLine line) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(line, "line");
-        if (!level(pipelineId).accepts(line.level())) {
+        if (!level(pipelineId).accepts(line.level())) return;
+        Buffer buffer = byPipeline.get(pipelineId);
+        if (buffer != null && generation != UNSCOPED && generation < buffer.firstGeneration) {
             return;
         }
-        // Remove then re-insert so this pipeline becomes the most-recently-appended entry (insertion
-        // order is the recency order the cardinality bound evicts against).
-        PipelineBuffer buffer = byPipeline.remove(pipelineId);
         if (buffer == null) {
-            buffer = new PipelineBuffer();
+            buffer = new Buffer();
         }
-        buffer.append(line);
-        while (buffer.lines.size() > maxLinesPerPipeline) {
-            buffer.lines.removeFirst();
-        }
+        var incoming = new Entry(generation, buffer.nextSequence++, line);
+        if (!buffer.lines.isEmpty() && buffer.lines.getFirst().generation() != generation) buffer.mixed = true;
+        buffer.lines.addLast(incoming);
+        if (buffer.lines.size() > maxLinesPerPipeline && evictOldest(buffer) == incoming) return;
+        // Reinsert only accepted writes so stale producers do not extend a pipeline's log retention.
+        byPipeline.remove(pipelineId);
         byPipeline.put(pipelineId, buffer);
     }
 
+    private static Entry evictOldest(Buffer buffer) {
+        if (!buffer.mixed) return buffer.lines.removeFirst();
+        // A predecessor must not evict a newer line even before the first verified read.
+        var oldest = buffer.lines.getFirst();
+        for (var entry : buffer.lines) {
+            if (entry.generation() < oldest.generation()) oldest = entry;
+        }
+        buffer.lines.removeFirstOccurrence(oldest);
+        refreshMixed(buffer);
+        return oldest;
+    }
+
+    private static void refreshMixed(Buffer buffer) {
+        var first = buffer.lines.peekFirst();
+        buffer.mixed = first != null && buffer.lines.stream().anyMatch(line -> line.generation() != first.generation());
+    }
+
+    @Override
+    public synchronized List<LogLine> tail(String pipelineId) {
+        Buffer buffer = byPipeline.get(pipelineId);
+        return buffer == null ? List.of() : buffer.lines.stream().map(Entry::line).toList();
+    }
+
+    @Override
+    public synchronized List<LogLine> tail(String pipelineId, long firstGeneration, long lastGeneration) {
+        if (firstGeneration < 1 || lastGeneration < firstGeneration) {
+            throw new IllegalArgumentException("invalid log generation window");
+        }
+        Buffer buffer = byPipeline.get(pipelineId);
+        if (buffer == null || firstGeneration < buffer.firstGeneration) {
+            return List.of();
+        }
+        if (firstGeneration > buffer.firstGeneration) {
+            // Learning a new lifetime also keeps late predecessors from filling the bounded buffer.
+            buffer.lines.removeIf(entry -> entry.generation() != UNSCOPED && entry.generation() < firstGeneration);
+            refreshMixed(buffer);
+            buffer.firstGeneration = firstGeneration;
+        }
+        return buffer.lines.stream()
+                .filter(entry -> entry.generation() >= firstGeneration && entry.generation() <= lastGeneration)
+                .map(Entry::line)
+                .toList();
+    }
     @Override
     public synchronized void level(String pipelineId, PipelineLogLevel level) {
         levels.put(Objects.requireNonNull(pipelineId, "pipelineId"), Objects.requireNonNull(level, "level"));
@@ -71,66 +139,41 @@ public final class RingBufferLogSink implements LogSink {
     }
 
     @Override
-    public synchronized List<LogLine> tail(String pipelineId) {
-        PipelineBuffer buffer = byPipeline.get(pipelineId);
-        if (buffer == null) {
-            return List.of();
-        }
-        return buffer.lines.stream().map(SequencedLine::line).toList();
+    public synchronized LogPage page(String pipelineId, LogCursor after, int limit) {
+        return page(pipelineId, after, limit, Long.MIN_VALUE, Long.MAX_VALUE);
     }
 
     @Override
-    public synchronized LogPage page(String pipelineId, LogCursor after, int limit) {
+    public synchronized LogPage page(String pipelineId, LogCursor after, int limit,
+            long firstGeneration, long lastGeneration) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (limit < 1) {
-            throw new IllegalArgumentException("limit must be positive");
-        }
-        PipelineBuffer buffer = byPipeline.get(pipelineId);
-        if (buffer == null || buffer.lines.isEmpty()) {
+        if (limit < 1) throw new IllegalArgumentException("limit must be positive");
+        if (firstGeneration > lastGeneration) throw new IllegalArgumentException("invalid log generation window");
+        if (firstGeneration > 0) tail(pipelineId, firstGeneration, lastGeneration);
+        Buffer buffer = byPipeline.get(pipelineId);
+        if (buffer == null || firstGeneration < buffer.firstGeneration && firstGeneration > 0) {
             return new LogPage(List.of(), null, after != null);
         }
-
-        List<SequencedLine> retained = List.copyOf(buffer.lines);
-        boolean truncated = after != null && !buffer.generation.equals(after.generation());
-        int from;
+        var retained = buffer.lines.stream()
+                .filter(entry -> entry.generation() >= firstGeneration && entry.generation() <= lastGeneration)
+                .toList();
+        String cursorGeneration = buffer.cursorGeneration + ":" + firstGeneration;
+        boolean truncated = after != null && !cursorGeneration.equals(after.generation());
+        int from = 0;
         if (after == null) {
             from = Math.max(0, retained.size() - limit);
-        } else if (truncated) {
-            from = 0;
-        } else {
-            long oldest = retained.getFirst().sequence();
-            if (after.sequence() < oldest) {
+        } else if (!truncated && !retained.isEmpty()) {
+            if (after.sequence() < retained.getFirst().sequence()) {
                 truncated = true;
-                from = 0;
             } else {
-                from = firstAfter(retained, after.sequence());
+                while (from < retained.size() && retained.get(from).sequence() <= after.sequence()) from++;
             }
         }
         int to = (int) Math.min((long) retained.size(), (long) from + limit);
-        List<LogLine> lines = retained.subList(from, to).stream().map(SequencedLine::line).toList();
-        LogCursor next = to == 0 ? after : new LogCursor(buffer.generation, retained.get(to - 1).sequence());
+        var lines = retained.subList(from, to).stream().map(Entry::line).toList();
+        LogCursor next = to == 0 ? (truncated ? null : after)
+                : new LogCursor(cursorGeneration, retained.get(to - 1).sequence());
         return new LogPage(lines, next, truncated);
     }
 
-    private static int firstAfter(List<SequencedLine> lines, long sequence) {
-        for (int index = 0; index < lines.size(); index++) {
-            if (lines.get(index).sequence() > sequence) {
-                return index;
-            }
-        }
-        return lines.size();
-    }
-
-    private static final class PipelineBuffer {
-        private final String generation = UUID.randomUUID().toString();
-        private final Deque<SequencedLine> lines = new ArrayDeque<>();
-        private long nextSequence = 1;
-
-        void append(LogLine line) {
-            lines.addLast(new SequencedLine(nextSequence++, line));
-        }
-    }
-
-    private record SequencedLine(long sequence, LogLine line) {
-    }
 }

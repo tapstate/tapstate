@@ -1,19 +1,28 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.InitialLoad;
+import java.time.Clock;
+import java.time.Duration;
 import io.tapstate.spi.store.ObservationStore;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * The pipeline observation read side: the three store-backed read faces — status / metrics / snapshot —
  * each a projection of the one per-pipeline observation the runtime publishes. The read peer of the
- * lifecycle write side; it reads the observation store and never calls the runtime (control and runtime
- * meet only through the store). Every refusal is coded, so the same read serves a frontend with no
+ * lifecycle write side. Stored measurements remain the sole source of metrics and snapshot facts; an
+ * optional neutral diagnostic qualifies status only, without changing the stored state or time.
+ * Every refusal is coded, so the same read serves a frontend with no
  * stderr/exit channel rather than a bare usage error.
  *
  * <p>A pipeline with no published observation is two different situations and they are answered by two
@@ -28,28 +37,145 @@ public final class PipelineObservationQueryService {
 
     /** The stored-artifact kind a lifecycle verb can observe; any other kind is not a pipeline at all. */
     private static final String PIPELINE_KIND = "pipeline";
+    private static final String PIPELINE_ID_ARGUMENT = "pipelineId";
 
     private final ArtifactQueryService artifacts;
     private final ObservationStore observations;
+    private final ExecutionPlans plans;
+    private final Clock clock;
+    private final Supplier<List<String>> members;
+    private final PipelineStatusDiagnostics diagnostics;
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations) {
-        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
-        this.observations = Objects.requireNonNull(observations, "observations");
+        this(artifacts, observations, ExecutionPlans.NONE);
     }
 
-    /** The pipeline's lifecycle state, with the coded reason its run died when there is one. */
+    /** As above, answering a status with the plan its pipeline's current run was submitted on, from {@code plans}. */
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans) {
+        this(artifacts, observations, plans, List::of);
+    }
+
+    /**
+     * As above, also naming the members of the cluster - {@code members}, by stable id - the plan was not worked
+     * out for.
+     */
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE, Clock.systemUTC());
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics) {
+        this(artifacts, observations, plans, members, diagnostics, Clock.systemUTC());
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, Clock clock) {
+        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE, clock);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, Clock clock, PipelineStatusDiagnostics diagnostics) {
+        this(artifacts, observations, plans, members, diagnostics, clock);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics, Clock clock) {
+        this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
+        this.observations = Objects.requireNonNull(observations, "observations");
+        this.plans = Objects.requireNonNull(plans, "plans");
+        this.members = Objects.requireNonNull(members, "members");
+    }
+
+    /**
+     * The pipeline's lifecycle state, with the coded reason its run died when there is one, the plan its current
+     * run was submitted on where one is recorded, and the members of the cluster that plan was not worked out for.
+     */
     public PipelineStatus status(String pipelineId) {
+        return findStatusWithPlan(pipelineId).orElseThrow(() -> unobserved(pipelineId));
+    }
+
+    /**
+     * The pipeline's status as {@link #status} answers it, without the plan: what a reader following the state
+     * as it changes asks for on every poll. The plan changes only when a new run is submitted, so reading it on
+     * every poll would be a read thrown away each time.
+     */
+    public PipelineStatus lifecycleStatus(String pipelineId) {
         Observation observation = require(pipelineId);
-        return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
-                observation.observedAt());
+        return statusOf(observation);
     }
 
     /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
     public Optional<PipelineStatus> findStatus(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
         return observations.read(pipelineId)
-                .map(observation -> new PipelineStatus(observation.pipelineId(), observation.state(),
-                        observation.failure(), observation.observedAt()));
+                .map(this::statusOf);
+    }
+
+    /** One read keeps state, measurement times and snapshot progress on the same publication. */
+    public record Read(PipelineStatus status, PipelineMetrics metrics, PipelineSnapshot snapshot) { }
+    public Optional<Read> findRead(String pipelineId) {
+        Objects.requireNonNull(pipelineId,PIPELINE_ID_ARGUMENT);
+        return observations.read(pipelineId).map(this::publication);
+    }
+
+    Map<String, Read> findReads(List<String> ids) {
+        if (ids.isEmpty()) return Map.of();
+        var result = new java.util.HashMap<String, Read>();
+        observations.readAll(ids).forEach((id, value) -> result.put(id, publication(value)));
+        return Map.copyOf(result);
+    }
+
+    private Read publication(Observation value) {
+        return new Read(statusOf(value),
+                new PipelineMetrics(value.pipelineId(),value.metrics(),value.positions(),value.facts()),
+                new PipelineSnapshot(value.pipelineId(),value.snapshot()));
+    }
+
+    /** Returns an observed status with its current execution plan, without requiring an observation to exist. */
+    public Optional<PipelineStatus> findStatusWithPlan(String pipelineId) {
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
+        return observations.read(pipelineId).map(observation -> withCurrentPlan(statusOf(observation), pipelineId));
+    }
+
+    /** Returns the status already carried by a catalog item with the current run plan, without rereading it. */
+    public Optional<PipelineStatus> findStatusWithPlan(PipelineCatalogItem item) {
+        Objects.requireNonNull(item, "item");
+        PipelineCatalogItem.Status status = item.status();
+        if (status.observedState() == null) {
+            return Optional.empty();
+        }
+        PipelineState effective = status.state() == PipelineCatalogItem.DisplayState.FAILED
+                && status.failure() != null ? PipelineState.FAILED : status.observedState();
+        // Reuse the catalog's proof snapshot; converting it neither remeasures nor acquires authority.
+        return Optional.of(withCurrentPlan(new PipelineStatus(item.id(), effective, status.failure(),
+                status.observedAt(), null, List.of(), status.observedState()), item.id()));
+    }
+
+    Map<String, PipelineStatus> findStatuses(List<String> ids) {
+        var result = new java.util.HashMap<String, PipelineStatus>();
+        observations.readAll(ids).forEach((id, value) -> result.put(id, statusOf(value)));
+        return Map.copyOf(result);
+    }
+
+    Map<String, PipelineState> currentEngineStates(Map<String, io.tapstate.spi.store.PipelineIntentScope> scopes) {
+        return diagnostics.currentStates(scopes);
+    }
+
+    PipelineStatus statusOf(Observation observation) {
+        var stored = new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(), observation.observedAt());
+        if (observation.failure() != null || (observation.state() != PipelineState.RUNNING
+                && observation.state() != PipelineState.PAUSED)) return stored;
+        return diagnostics.failure(observation.pipelineId(), observation.state()).map(stored::diagnosed).orElse(stored);
+    }
+
+    private PipelineStatus withCurrentPlan(PipelineStatus status, String pipelineId) {
+        ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+        return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(), plan,
+                plan == null ? List.of() : plan.notPlannedFor(members.get()), status.observedState());
     }
 
     /**
@@ -67,11 +193,22 @@ public final class PipelineObservationQueryService {
     /** The pipeline's per-table initial-load progress. */
     public PipelineSnapshot snapshot(String pipelineId) {
         Observation observation = require(pipelineId);
-        return new PipelineSnapshot(observation.pipelineId(), observation.snapshot());
+        InitialLoad load = observation.initialLoad();
+        if (load != null) {
+            ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+            // Completion removes the active plan; its target-confirmed final observation remains history.
+            boolean terminal = plan == null && load.phase(observation.state()) == InitialLoad.Phase.COMPLETED;
+            if (!terminal && !load.matches(plan) || observation.observedAt() == null
+                    || Duration.between(observation.observedAt(), clock.instant())
+                            .compareTo(PipelineExplainService.PUBLISHER_SILENCE) >= 0) {
+                load = null;
+            }
+        }
+        return new PipelineSnapshot(observation.pipelineId(), observation.snapshot(), load, load == null ? null : load.phase(observation.state()));
     }
 
     private Observation require(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
         return observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
     }
 

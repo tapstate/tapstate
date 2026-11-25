@@ -437,7 +437,7 @@ class WorkbenchRendererTest {
         assertStatus(new WorkbenchRemoteState.Rejected("access-denied", "Access denied"),
                 "Remote rejected: access-denied, Access denied", local);
         assertStatus(new WorkbenchRemoteState.Diagnostic(CliError.WORKBENCH_UNAVAILABLE, Map.of()),
-                "Diagnostic: cli.workbench-unavailable", local);
+                "Diagnostic: TS0330065", local);
         assertStatus(new WorkbenchRemoteState.Available(0), "Remote workspace is empty", local);
     }
 

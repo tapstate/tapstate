@@ -58,6 +58,22 @@ class SourceProjectionServiceTest {
             new SourceRepresentation(() -> catalog));
 
     @Test
+    void managedTargetDisplayComesFromAuthorityAndCannotBeSelectedAsAnInput() {
+        store.managedDefault = "views";
+        store.seed(new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://user:private@host/master"), null, null, null, null));
+        store.seed(new SourceResource("forged", new Metadata(Map.of("store", "true"), null), "mongodb", Map.of("uri", "mongodb://other/master"), null, null, null, null));
+        assertThat(sources.get("views").metadata().labels()).containsEntry("store", "true");
+        assertThat(sources.get("forged").metadata().labels()).doesNotContainKey("store");
+        assertThat(((SourceResource)store.get("views").orElseThrow()).metadata()).isNull();
+        var apply = new ApplyService(() -> catalog, store, new AuditGate(record -> {}, Clock.systemUTC()),
+                schemas, PlanAdvisories.none(), SchemaDerivation.none());
+        var failure = catchThrowable(() -> apply.planPreviewWorkspace(List.of(new ArtifactDraft(null,
+                "version: tapstate/v1\nkind: pipeline\nid: p\nsource: views\nview: {from: orders, primary_key: id}\n"))));
+        assertThat(failure).isInstanceOf(TapstateException.class);
+        assertThat(((TapstateException)failure).code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+    }
+
+    @Test
     void createAndReplaceUseGenericConditionalWrites() {
         SourceView created = sources.create("alice", input("orders", "before"));
 
@@ -223,6 +239,8 @@ class SourceProjectionServiceTest {
     }
 
     private static final class RecordingArtifactStore implements ArtifactStore {
+        String managedDefault;
+        @Override public Optional<String> managedDefaultSourceId() { return Optional.ofNullable(managedDefault); }
 
         private final Map<String, Resource> resources = new LinkedHashMap<>();
         private final List<ArtifactWrite> batchWrites = new ArrayList<>();

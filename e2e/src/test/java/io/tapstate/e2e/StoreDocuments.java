@@ -1,15 +1,23 @@
 package io.tapstate.e2e;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoAuthStores;
+import com.mongodb.client.result.UpdateResult;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -32,23 +40,36 @@ import java.util.stream.StreamSupport;
  */
 final class StoreDocuments implements AutoCloseable {
 
+    private final ConnectionString connection;
     private final MongoClient client;
     private final MongoDatabase database;
+    private final boolean nativeSrs;
 
-    private StoreDocuments(MongoClient client, MongoDatabase database) {
+    private StoreDocuments(ConnectionString connection, MongoClient client, MongoDatabase database, boolean nativeSrs) {
+        this.connection = connection;
         this.client = client;
         this.database = database;
+        this.nativeSrs = nativeSrs;
     }
 
     /** Opens a reader on the same database the product was launched against. */
     static StoreDocuments at(String storeUri) {
+        return at(storeUri, false);
+    }
+
+    /** Reads native SRS records from the installation's declared cache database. */
+    static StoreDocuments nativeSrsAt(String cacheUri) {
+        return at(cacheUri, true);
+    }
+
+    private static StoreDocuments at(String storeUri, boolean nativeSrs) {
         ConnectionString connection = new ConnectionString(storeUri);
         String name = connection.getDatabase();
         if (name == null) {
             throw new AssertionError("the store url names no database, so there is nothing to read: " + storeUri);
         }
         MongoClient client = MongoClients.create(connection);
-        return new StoreDocuments(client, client.getDatabase(name));
+        return new StoreDocuments(connection, client, client.getDatabase(name), nativeSrs);
     }
 
     /** Whether {@code collection} holds a document under {@code id}. */
@@ -66,6 +87,18 @@ final class StoreDocuments implements AutoCloseable {
                 .countDocuments(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId));
     }
 
+    /**
+     * The audit records of {@code operationId} on {@code resourceId}, oldest first. The audit has no read face
+     * either, and what a start recorded about its checks and the answers it was given is read where it was
+     * written.
+     */
+    List<Document> auditOf(String operationId, String resourceId) {
+        return database.getCollection(MongoAuthStores.AUDIT)
+                .find(new Document("operationId", operationId).append("resourceId", resourceId))
+                .sort(new Document("ts", 1))
+                .into(new ArrayList<>());
+    }
+
     /** Every {@code _id} in {@code collection} - the reconciliation set a converger would work from. */
     Set<String> ids(String collection) {
         return StreamSupport.stream(
@@ -81,35 +114,54 @@ final class StoreDocuments implements AutoCloseable {
      * difference matters because removing the shared root while another pipeline remains is forbidden.
      */
     Set<String> consumersOf(String miningChainId) {
-        if (!holds(MongoStorePort.SRS_META, miningChainId)) {
+        if (chain(miningChainId) == null) {
             return Set.of();
         }
-        return StreamSupport.stream(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                        .find(new Document("miningChainId", miningChainId))
-                        .projection(new Document("pipelineId", 1))
+        Document filter = new Document(nativeSrs ? "_id.chain" : "miningChainId", miningChainId);
+        if (nativeSrs) filter.append("detached", false);
+        return StreamSupport.stream(database.getCollection(nativeSrs ? SystemCollections.SRS_CONSUMERS.collectionName()
+                                : MongoStorePort.SRS_CONSUMER_OFFSETS)
+                        .find(filter)
+                        .projection(new Document(nativeSrs ? "_id.consumer" : "pipelineId", 1))
                         .spliterator(), false)
-                .map(document -> document.getString("pipelineId"))
+                .map(document -> nativeSrs ? document.get("_id", Document.class).getString("consumer")
+                        : document.getString("pipelineId"))
                 .collect(Collectors.toSet());
     }
 
     /** The whole consumer cursor of one pipeline on one chain, for comparing it byte for byte across a removal. */
     Document consumerOffset(String miningChainId, String pipelineId) {
-        if (!holds(MongoStorePort.SRS_META, miningChainId)) {
+        if (chain(miningChainId) == null) {
             return null;
         }
-        return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                .find(new Document("miningChainId", miningChainId).append("pipelineId", pipelineId))
+        return database.getCollection(nativeSrs ? SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName()
+                        : MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(nativeSrs ? new Document("_id.chain", miningChainId).append("_id.consumer", pipelineId)
+                        : new Document("miningChainId", miningChainId).append("pipelineId", pipelineId))
                 .first();
+    }
+
+    /** Native membership records retain the pipeline and source that own each consumer cursor. */
+    Document consumerMembership(String miningChainId, String consumerId) {
+        if (!nativeSrs) throw new IllegalStateException("native membership requires the cache reader");
+        return SystemCollections.SRS_CONSUMERS.on(database)
+                .find(new Document("_id.chain", miningChainId).append("_id.consumer", consumerId)).first();
     }
 
     /** Every mining chain id the store holds. */
     Set<String> miningChainIds() {
-        return ids(MongoStorePort.SRS_META);
+        return ids(nativeSrs ? SystemCollections.SRS_CHAINS.collectionName() : MongoStorePort.SRS_META);
+    }
+
+    /** The retained log's bounds, which survive removal of its already confirmed records. */
+    Document logBounds(String ringName) {
+        return database.getCollection(nativeSrs ? SystemCollections.SRS_LOG_BOUNDS.collectionName() : MongoStorePort.SRS_LOG)
+                .find(new Document("_id", "srs-log-bounds:" + ringName)).first();
     }
 
     /** The whole chain record, for reporting what a chain actually held when an assertion about it fails. */
     Document chain(String miningChainId) {
-        return database.getCollection(MongoStorePort.SRS_META)
+        return database.getCollection(nativeSrs ? SystemCollections.SRS_CHAINS.collectionName() : MongoStorePort.SRS_META)
                 .find(new Document("_id", miningChainId))
                 .first();
     }
@@ -123,6 +175,10 @@ final class StoreDocuments implements AutoCloseable {
      */
     String sourceReadOffset(String miningChainId) {
         Document chain = chain(miningChainId);
+        if (nativeSrs) {
+            Document checkpoint = chain == null ? null : chain.get("checkpoint", Document.class);
+            return checkpoint == null ? null : checkpoint.getString("token");
+        }
         return chain == null ? null : chain.getString("sourceReadOffset");
     }
 
@@ -136,6 +192,12 @@ final class StoreDocuments implements AutoCloseable {
      */
     long consumerReadSeq(String miningChainId, String pipelineId, String table) {
         Document offset = consumerOffset(miningChainId, pipelineId);
+        if (nativeSrs) {
+            if (offset == null) return -1L;
+            return offset.get("progress", Document.class).getList("perTableSeq", Document.class).stream()
+                    .filter(entry -> table.equals(entry.getString("table")))
+                    .mapToLong(entry -> entry.get("sequence", Number.class).longValue()).findFirst().orElse(-1L);
+        }
         if (offset == null || !(offset.get("perTableSeq") instanceof Document perTable)
                 || !(perTable.get(table) instanceof Number seq)) {
             return -1L;
@@ -158,6 +220,100 @@ final class StoreDocuments implements AutoCloseable {
                         .append("_id.resourceId", captureId))
                 .first();
         return claim == null ? null : claim.getDate("leaseUntil").toInstant();
+    }
+
+    /** Hands one fixture pipeline to another live member without stopping the original holder's process. */
+    void handPipelineTo(String clusterId, String pipelineId, String oldNodeId, String newNodeId) {
+        var claims = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+        Document session = claims.find(new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.NODE_SESSION.name())
+                .append("_id.resourceId", newNodeId)).first();
+        if (session == null) {
+            throw new AssertionError("the successor has no node session: " + newNodeId);
+        }
+        Document expected = new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                .append("_id.resourceId", pipelineId).append("ownerNodeId", oldNodeId);
+        Document next = new Document("ownerNodeId", newNodeId)
+                .append("ownerBootId", session.getString("ownerBootId"))
+                .append("claimGeneration", new Document("$add", List.of("$claimGeneration", 1L)))
+                .append("leaseUntil", new Document("$dateAdd", new Document("startDate", "$$NOW")
+                        .append("unit", "second").append("amount", 120L)));
+        if (claims.updateOne(expected, List.of(new Document("$set", next))).getModifiedCount() != 1) {
+            throw new AssertionError("the fixture did not hand pipeline " + pipelineId + " to " + newNodeId);
+        }
+    }
+
+    /**
+     * Opens a transaction on a client connected as {@code applicationName}, writes one chain's record in it, and
+     * leaves it open until what this returns is closed: what a process whose store client connected under that
+     * name leaves at the store when it is killed halfway through a write to the record.
+     *
+     * <p>The store holds what an open transaction wrote for as long as it stays open, so every other write to the
+     * record waits for it meanwhile. Nothing it writes ever lands: closing it aborts it, if nobody has ended it
+     * already.
+     */
+    HeldOpen holdChainOpenAs(String miningChainId, String applicationName) {
+        MongoClient named = MongoClients.create(MongoClientSettings.builder()
+                .applyConnectionString(connection)
+                .applicationName(applicationName)
+                .build());
+        ClientSession session;
+        try {
+            session = named.startSession();
+            session.startTransaction();
+            writeInside(named, session, miningChainId);
+        } catch (RuntimeException | Error failure) {
+            named.close();
+            throw failure;
+        }
+        return new HeldOpen() {
+            @Override
+            public boolean stillHeld() {
+                try {
+                    writeInside(named, session, miningChainId);
+                    return true;
+                } catch (MongoException ended) {
+                    return false;
+                }
+            }
+
+            @Override
+            public void close() {
+                try {
+                    if (session.hasActiveTransaction()) {
+                        session.abortTransaction();
+                    }
+                } catch (RuntimeException endedAlready) {
+                    // Somebody ended it first, which is what a case holding one open is usually about.
+                } finally {
+                    session.close();
+                    named.close();
+                }
+            }
+        };
+    }
+
+    private void writeInside(MongoClient named, ClientSession session, String miningChainId) {
+        UpdateResult written = named.getDatabase(database.getName()).getCollection(MongoStorePort.SRS_META)
+                .updateOne(session, new Document("_id", miningChainId),
+                        new Document("$inc", new Document("heldOpenByACase", 1L)));
+        if (written.getMatchedCount() != 1) {
+            throw new AssertionError("there is no record of chain '" + miningChainId + "' to hold open");
+        }
+    }
+
+    /** A write left open at the store; see {@link #holdChainOpenAs}. */
+    interface HeldOpen extends AutoCloseable {
+
+        /**
+         * Whether the store is still holding it - asked by writing inside it again, which the store refuses once
+         * the transaction has been ended.
+         */
+        boolean stillHeld();
+
+        @Override
+        void close();
     }
 
     @Override

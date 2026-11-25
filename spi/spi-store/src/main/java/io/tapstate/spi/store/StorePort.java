@@ -15,6 +15,31 @@ package io.tapstate.spi.store;
  */
 public interface StorePort {
 
+    /** Read-only admission: this Pipeline must use its explicit full recovery instead of an ordinary start. */
+    default boolean pipelineRecoveryRequired(String pipelineId) { return false; }
+
+    record PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+            java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+            java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
+            io.tapstate.core.lifecycle.PipelineState checkpoint, PipelineIntentScope scope) {
+        public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+                java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
+                io.tapstate.core.lifecycle.PipelineState checkpoint) {
+            this(observation, desired, intentFailure, runningObservationUnavailable, checkpoint, null);
+        }
+        public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+                java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable) {
+            this(observation, desired, intentFailure, runningObservationUnavailable, null, null);
+        }
+    }
+
+    /** Batched ordinary display states. Absent ids use the original per-Pipeline read path. */
+    default java.util.Map<String, PipelineCatalogState> pipelineCatalogStates(java.util.List<String> ids) {
+        return java.util.Map.of();
+    }
+
     /** The canonical, authoritative store of applied resources. */
     ArtifactStore artifacts();
 
@@ -65,6 +90,16 @@ public interface StorePort {
     }
 
     /**
+     * Ends every store transaction the process {@code processId} left open, and answers how many it ended: what
+     * a process that went away halfway through a write still holds at the store, let go as soon as whoever is
+     * left knows the process has gone rather than whenever the store gives up on it. A store that leaves no
+     * transaction open ends none.
+     */
+    default int endTransactionsLeftOpenBy(String processId) {
+        return 0;
+    }
+
+    /**
      * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
      * process that read them and a ring can be rebuilt where it left off.
      */
@@ -79,6 +114,11 @@ public interface StorePort {
 
     /** The editor-only canvas layout store; it never changes a Pipeline artifact's content hash. */
     PipelineLayoutStore layouts();
+
+    /** Durable Pipeline authoring drafts; runtime and CLI never read this store. */
+    default PipelineDraftStore drafts() {
+        throw new UnsupportedOperationException("pipeline draft store is not configured");
+    }
 
     /**
      * The cold layer under a stateful operator: one opaque state document per key, within a namespace.

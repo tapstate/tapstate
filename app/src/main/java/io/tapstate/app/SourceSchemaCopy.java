@@ -34,6 +34,8 @@ import java.util.Objects;
  */
 final class SourceSchemaCopy {
 
+    private static final int COPY_BATCH_SIZE = 32;
+
     /**
      * What took the copy. Informational, like its counterpart on the join side - the question "did the
      * derivation change" is answered by the columns moving while its inputs did not.
@@ -66,6 +68,23 @@ final class SourceSchemaCopy {
         records.record(pipelineId, nodeId, columnsOf(discovered), fingerprintOf(nodeId),
                 fingerprintOf(discovered), DERIVED_BY);
         return true;
+    }
+
+    /** Copies a source's selected models in bounded groups sharing the backend's transaction. */
+    List<String> copyBatch(String pipelineId, String sourceId, List<SourceTable> tables) {
+        var copied = new ArrayList<String>();
+        var pending = new ArrayList<DerivedSchemaStore.Recording>();
+        for (SourceTable table : tables) {
+            String nodeId = nodeId(sourceId, table.name());
+            pending.add(new DerivedSchemaStore.Recording(nodeId, columnsOf(table), fingerprintOf(nodeId),
+                    fingerprintOf(table), DERIVED_BY));
+            copied.add(nodeId);
+            if (pending.size() == COPY_BATCH_SIZE) {
+                records.recordBatch(pipelineId, List.copyOf(pending)); pending.clear();
+            }
+        }
+        if (!pending.isEmpty()) records.recordBatch(pipelineId, List.copyOf(pending));
+        return copied;
     }
 
     /**

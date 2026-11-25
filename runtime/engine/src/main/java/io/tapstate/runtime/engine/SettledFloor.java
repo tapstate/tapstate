@@ -46,12 +46,17 @@ final class SettledFloor implements SinkFrontier {
 
     private final ChainAxes axes;
     private final int maxEntriesPerChain;
+    private final boolean routedWriter;
     // Per chain, ordered by the packed order: what has settled and not yet been acked away. The packing is
     // strictly increasing in the order it carries, so the natural order of these keys is the order itself.
     private final Map<String, NavigableMap<Long, ChainPosition>> settledByChain = new HashMap<>();
     // Per chain: the newest bound the engine combined across every queue, and the last position acked.
     private final Map<String, Long> boundByChain = new HashMap<>();
     private final Map<String, Long> ackedByChain = new HashMap<>();
+    // A routed writer receives only its share of a chain. Once its bound is released, that whole share
+    // has landed, even when the latest positions went to sibling writers. This is metric coverage only:
+    // an opaque source token can still be acknowledged only from an actual settled position.
+    private final Map<String, Long> coveredByChain = new HashMap<>();
     // Per chain: when its durable position last moved, or when the chain was first seen where it never
     // has. Wall clock, because what is measured against it is a log retention, which is kept in the same
     // time - and because a chain that is pinned is pinned precisely when nothing is happening to it, so a
@@ -75,6 +80,18 @@ final class SettledFloor implements SinkFrontier {
      * the graph and the supplier does not have to survive being serialized with it.
      */
     SettledFloor(ChainAxes axes, int maxEntriesPerChain, LongSupplier clock) {
+        this(axes, maxEntriesPerChain, clock, false);
+    }
+
+    /**
+     * A writer receiving a routed subset of each chain. The sink releases a bound only after every row
+     * received before it has landed, so it proves this writer's coverage, including positions routed away.
+     */
+    static SettledFloor forRoutedWriter(ChainAxes axes, int maxEntriesPerChain) {
+        return new SettledFloor(axes, maxEntriesPerChain, System::currentTimeMillis, true);
+    }
+
+    private SettledFloor(ChainAxes axes, int maxEntriesPerChain, LongSupplier clock, boolean routedWriter) {
         if (maxEntriesPerChain < 2) {
             throw new IllegalArgumentException(
                     "a chain must be able to hold its lowest and its highest position, got "
@@ -83,6 +100,7 @@ final class SettledFloor implements SinkFrontier {
         this.axes = axes;
         this.maxEntriesPerChain = maxEntriesPerChain;
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.routedWriter = routedWriter;
     }
 
     /**
@@ -134,6 +152,17 @@ final class SettledFloor implements SinkFrontier {
         boundByChain.put(chain, bound.timestamp());
         firstSeen(chain);
         advance(chain, ack);
+        if (routedWriter) {
+            Long previous = coveredByChain.put(chain, bound.timestamp());
+            if (previous == null || bound.timestamp() > previous) {
+                sinceByChain.put(chain, clock.getAsLong());
+            }
+        }
+    }
+
+    @Override
+    public String chainOf(Watermark bound) {
+        return axes == null ? null : axes.chainOn(bound.key());
     }
 
     /**
@@ -145,6 +174,9 @@ final class SettledFloor implements SinkFrontier {
      * positions the frontier could have covered and did not. A bound a whole generation ahead reads as an
      * enormous distance rather than a count of changes - far past any threshold worth setting, which is the
      * direction to be wrong in for something read to raise an alarm.
+     *
+     * <p>For a routed writer, a released bound also covers positions assigned to siblings. Comparing it
+     * solely with the last row assigned here would report an idle, fully settled writer as falling behind.
      */
     @Override
     public Map<String, Long> gaps() {
@@ -152,7 +184,7 @@ final class SettledFloor implements SinkFrontier {
         ackedByChain.forEach((chain, reached) -> {
             Long bound = boundByChain.get(chain);
             if (bound != null) {
-                gaps.put(chain, bound - reached);
+                gaps.put(chain, bound - coveredThrough(chain, reached));
             }
         });
         return gaps;
@@ -205,7 +237,11 @@ final class SettledFloor implements SinkFrontier {
         }
         Long bound = boundByChain.get(chain);
         Long acked = ackedByChain.get(chain);
-        return bound != null && acked != null && bound > acked;
+        return bound != null && acked != null && bound > coveredThrough(chain, acked);
+    }
+
+    private long coveredThrough(String chain, long acked) {
+        return Math.max(acked, coveredByChain.getOrDefault(chain, acked));
     }
 
     /** Starts the clock on a chain the first time anything is heard of it, and never restarts it. */

@@ -74,6 +74,11 @@ public interface NestStateLedger extends Serializable {
             ledger.record(pipelineId, nodeId, paths);
             return;
         }
+        requireSameShape(nodeId, recorded, paths);
+    }
+
+    /** The same verdict after an atomic first-publication race returned another start's shape. */
+    static void requireSameShape(String nodeId, Set<String> recorded, Set<String> paths) {
         if (!recorded.equals(paths)) {
             throw new TapstateException(NestError.STATE_PATHS_CHANGED, Map.of(
                     "stepId", nodeId,

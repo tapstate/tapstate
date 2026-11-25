@@ -7,6 +7,7 @@ import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -172,13 +174,13 @@ class PipelineActuationOwnershipTest {
     void theRunAKilledMemberLeftBehindIsAdmittedForRebuildingByTheOneThatInheritsIt() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);
         assertThat(nodeA.permit("orders").granted()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeA.departure("orders", SETTLING))
                 .as("a pipeline nobody has run yet is not a run anybody left behind")
-                .isFalse();
+                .isEqualTo(PipelineActuationOwnership.Departure.NO_RUN);
         assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeA.departure("orders", SETTLING))
                 .as("and nothing has moved under the member that submitted it")
-                .isFalse();
+                .isEqualTo(PipelineActuationOwnership.Departure.NOBODY_LEFT);
 
         // That member is killed: it stops renewing, and the lease it never released runs out.
         claims.elapse(TTL.plusSeconds(1));
@@ -188,10 +190,160 @@ class PipelineActuationOwnershipTest {
         assertThat(nodeB.permit("orders").granted())
                 .as("the pipeline changes hands once the dead holder's lease expires")
                 .isTrue();
-        assertThat(nodeB.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeB.departure("orders", SETTLING))
                 .as("the member that inherits a claim already carrying an execution is holding a run "
                         + "nobody is driving, and that is the whole of what it needs to know to replace it")
-                .isTrue();
+                .isEqualTo(PipelineActuationOwnership.Departure.INHERITED);
+    }
+
+    /**
+     * A member's pass is one thread over every pipeline it drives, and a start can hold that thread for
+     * longer than a lease. With claims renewed only from the pass, one slow start let every claim the member
+     * held run out behind it: on a three-member cluster a start of a pipeline over a hundred tables held the
+     * pass for 26 s, and seven claims were taken over from a member that was still there -- each one then
+     * counted as a member leaving, until a rebuild budget was spent on nothing.
+     */
+    @Test
+    void aStartThatHoldsThePassForLongerThanALeaseLetsNoClaimOfThisMemberRunOut() {
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        MemberActuator actuator = new MemberActuator(new VerbCounts());
+        // While the slow start runs, the pass is held and only the renewer moves, as it does on its own thread.
+        actuator.whileStarting = pipelineId -> {
+            if (pipelineId.equals("slow")) {
+                for (int second = 0; second <= TTL.toSeconds(); second += 5) {
+                    claims.elapse(Duration.ofSeconds(5));
+                    nanos.addAndGet(Duration.ofSeconds(5).toNanos());
+                    nodeA.renewDue();
+                }
+            }
+        };
+        ConvergenceDriver driver = new ConvergenceDriver(
+                new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC)), desired,
+                new ObservationPublisher(state, new InMemoryObservationStore()), () -> true, nodeA);
+        desired.save(new DesiredState("orders", PipelineState.RUNNING, "rev-1"));
+        desired.save(new DesiredState("slow", PipelineState.RUNNING, "rev-1"));
+
+        driver.reconcile();
+
+        assertThat(actuator.carrying()).as("both were started in the one pass").contains("orders", "slow");
+        PipelineActuationOwnership nodeB = ownership(NODE_B);
+        assertThat(nodeB.permit("orders").granted())
+                .as("a pipeline started before the slow one in the same pass is still this member's")
+                .isFalse();
+        assertThat(nodeB.permit("slow").granted())
+                .as("and so is the slow one, whose run was submitted after more than a lease had gone by")
+                .isFalse();
+        assertThat(claims.read(ORDERS).orElseThrow().claim().claimGeneration())
+                .as("nobody took either over in between").isEqualTo(1);
+    }
+
+    /** A run is this member's to submit while its own claim is live under the run's generations, and only then. */
+    @Test
+    void aRunIsProvedOnlyWhileItsOwnClaimIsLiveUnderItsGenerations() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+
+        assertThat(nodeA.proveExecution(fence)).as("its own live claim, under its own generations").isTrue();
+        assertThat(nodeA.proveExecution(
+                new ExecutionFence("orders", fence.claimGeneration(), fence.executionGeneration() + 1)))
+                .as("a run under a generation the claim has not reached is not this run")
+                .isFalse();
+
+        claims.elapse(TTL.plusSeconds(1));
+        assertThat(nodeA.proveExecution(fence))
+                .as("a lease that ran out proves nothing, though nobody has taken the claim yet")
+                .isFalse();
+
+        nanos.addAndGet(RENEW.toNanos());
+        assertThat(ownership(NODE_B).permit("orders").granted()).isTrue();
+        assertThat(nodeA.proveExecution(fence)).as("nor does a claim another member holds now").isFalse();
+    }
+
+    /**
+     * The renewer keeps a held claim live on its own thread, with no pass running at all -- which is the
+     * whole point of it, since the pass is what a slow start holds.
+     */
+    @Test
+    void theRenewerKeepsAHeldClaimLiveWhileNoPassRuns() throws Exception {
+        Duration renew = Duration.ofMillis(20);
+        PipelineActuationOwnership nodeA = new PipelineActuationOwnership(
+                "cluster-a", NODE_A, membership, new ClusterWorkloadClaims(claims, membership), TTL, renew);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+
+        try (ActuationClaimRenewer renewer = new ActuationClaimRenewer(nodeA, renew)) {
+            for (int second = 0; second <= TTL.toSeconds(); second += 10) {
+                Instant leasedUntil = claims.read(ORDERS).orElseThrow().claim().leaseUntil();
+                claims.elapse(Duration.ofSeconds(10));
+                long giveUp = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                while (System.nanoTime() - giveUp < 0
+                        && !claims.read(ORDERS).orElseThrow().claim().leaseUntil().isAfter(leasedUntil)) {
+                    Thread.sleep(2);
+                }
+            }
+        }
+
+        assertThat(claims.read(ORDERS).orElseThrow().leased())
+                .as("more than a lease went by with no pass, and the claim is still live").isTrue();
+        assertThat(ownership(NODE_B).permit("orders").granted())
+                .as("so no other member could take it").isFalse();
+    }
+
+    @Test void aCoordinatedOwnerNeverProvesAMissingExecutionFence() {
+        var owner = ownership(NODE_A);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        assertThat(owner.proveExecution(null)).isFalse();
+    }
+
+    @Test void anOldPassCannotAdvanceAReacquiredTenureUnderTheSamePipelineId() {
+        var owner = ownership(NODE_A);
+        var original = WorkloadClaimFence.from(owner.permit("orders").claim());
+        claims.elapse(TTL.plusSeconds(1)); nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit("orders").granted()).isFalse();
+        nanos.addAndGet(RENEW.toNanos());
+        var current = owner.permit("orders");
+        assertThat(current.granted()).isTrue();
+        assertThat(current.claim().claimGeneration()).isGreaterThan(original.claimGeneration());
+        assertThat(owner.beginExecution("orders", original).allowed()).isFalse();
+        assertThat(claims.read(ORDERS).orElseThrow().claim().executionGeneration()).isZero();
+        var advanced = owner.beginExecution("orders", WorkloadClaimFence.from(current.claim()));
+        assertThat(advanced.allowed()).isTrue();
+        assertThat(advanced.claimFence()).isEqualTo(WorkloadClaimFence.from(claims.read(ORDERS).orElseThrow().claim()));
+        assertThat(advanced.claimFence().owner()).isEqualTo(NODE_A);
+        assertThat(advanced.claimFence().topologyRevision()).isEqualTo(current.claim().topologyRevision());
+    }
+
+    @Test void leaseOnlyRenewalKeepsTheOriginalPassIdentityButAdvancementSpendsIt() {
+        var owner = ownership(NODE_A);
+        var original = owner.permit("orders").claim();
+        var expected = WorkloadClaimFence.from(original);
+        claims.elapse(Duration.ofSeconds(5)); nanos.addAndGet(RENEW.toNanos());
+        owner.renewDue();
+        assertThat(claims.read(ORDERS).orElseThrow().claim().leaseUntil()).isAfter(original.leaseUntil());
+        var advanced = owner.beginExecution("orders", expected);
+        assertThat(advanced.allowed()).isTrue();
+        assertThat(advanced.claimFence().executionGeneration()).isEqualTo(expected.executionGeneration() + 1);
+        assertThat(owner.beginExecution("orders", expected).allowed()).isFalse();
+        var next = owner.beginExecution("orders", advanced.claimFence());
+        assertThat(next.allowed()).isTrue();
+        assertThat(next.claimFence().executionGeneration()).isEqualTo(advanced.claimFence().executionGeneration() + 1);
+    }
+
+    @Test void anOldPassCannotAttributeItsRefusalToALaterRun() {
+        var owner = ownership(NODE_A);
+        var original = WorkloadClaimFence.from(owner.permit("orders").claim());
+        var advanced = owner.beginExecution("orders", original);
+        owner.startRefusedBeforeItsRun("orders", original);
+        assertThat(owner.departure("orders", SETTLING)).isEqualTo(PipelineActuationOwnership.Departure.NOBODY_LEFT);
+        owner.startRefusedBeforeItsRun("orders", advanced.claimFence());
+        assertThat(owner.departure("orders", SETTLING)).isEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    @Test void anExplicitOriginalClaimCannotUseAnUncoordinatedFixtureOwner() {
+        var original = WorkloadClaimFence.from(ownership(NODE_A).permit("orders").claim());
+        assertThat(PipelineActuationOwnership.single().beginExecution("orders", original).allowed()).isFalse();
     }
 
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {
@@ -200,10 +352,146 @@ class PipelineActuationOwnershipTest {
                 nanos::get);
     }
 
+    @Test void independentFailedRenewalDropsTheOriginalClaimBeforeTheNextPass() {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        org.mockito.Mockito.doReturn(Optional.empty()).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+        assertThat(owner.permit("orders").granted()).isFalse();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"acquire","renew","unknown-commit"})
+    void closingDuringStoreIoNeverPublishesTheReturnedClaim(String operation) throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        boolean renew=operation.equals("renew");
+        if(renew){assertThat(owner.permit("orders").granted()).isTrue();nanos.addAndGet(RENEW.toNanos());}
+        org.mockito.stubbing.Answer<Object> blocked=call->{
+            entered.countDown();if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("store IO was not released");
+            if(renew)return claims.renew(call.getArgument(0),call.getArgument(1));
+            var acquired=claims.acquire(call.getArgument(0),call.getArgument(1),call.getArgument(2),call.getArgument(3));
+            if(operation.equals("unknown-commit"))throw StorageRuntime.unavailable();
+            return acquired;
+        };
+        if(renew)org.mockito.Mockito.doAnswer(blocked).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        else org.mockito.Mockito.doAnswer(blocked).when(boundary).acquire(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.any());
+        try(var executor=java.util.concurrent.Executors.newFixedThreadPool(2)){
+            var result=executor.submit(()->owner.permit("orders"));
+            assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            executor.submit(owner::stopForShutdown).get(1,java.util.concurrent.TimeUnit.SECONDS);
+            org.assertj.core.api.Assertions.assertThatThrownBy(()->owner.awaitStopped(System.nanoTime()+Duration.ofMillis(30).toNanos()))
+                    .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            release.countDown();assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            owner.awaitStopped(System.nanoTime()+Duration.ofSeconds(3).toNanos());
+            assertThat(owner.permit("orders").granted()).isFalse();
+        }finally{release.countDown();owner.stopForShutdown();}
+    }
+
+    @Test void majorityLossDuringRenewalCannotPublishOrReviveTheOriginalGrant() throws Exception {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(call->{entered.countDown();
+            if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("renewal was not released");
+            return claims.renew(call.getArgument(0),call.getArgument(1));
+        }).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());
+        try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var result=executor.submit(()->owner.permit("orders"));
+            try {assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();membership.canCommit(Set.of("node-a"));}
+            finally {release.countDown();}
+            assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            membership.canCommit(Set.of("node-a","node-b"));
+            assertThat(owner.permit("orders").granted()).isFalse();
+        }finally {release.countDown();owner.stopForShutdown();}
+    }
+
+    @Test void aTopologyChangeDuringRenewalCannotPublishAnUnscopedClaim() {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        org.mockito.Mockito.doAnswer(call->{membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
+            return claims.renew(call.getArgument(0),call.getArgument(1));
+        }).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit("orders").granted()).isFalse();
+        assertThat(owner.permit("orders").granted()).isFalse();
+    }
+
+    @Test void boundSingleControlSurvivesDataPlaneLossButNotItsOriginalNodeProof() {
+        var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.SINGLE);
+        var gate=new ClusterMembershipGate(properties);
+        var node=claims.acquire(new WorkloadClaimKey("node-a",WorkloadClaimType.NODE_SESSION,"node-a"),NODE_A,1,TTL).claim();
+        gate.bindSingle(node);
+        var active=new java.util.concurrent.atomic.AtomicBoolean(true);gate.observeNodeSession(active::get);
+        var member=org.mockito.Mockito.mock(com.hazelcast.cluster.Member.class);
+        org.mockito.Mockito.when(member.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn("node-a");
+        org.mockito.Mockito.when(member.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE)).thenReturn("boot-a");
+        assertThat(gate.apply(List.of(member))).isTrue();
+        var dataPlane=new java.util.concurrent.atomic.AtomicBoolean(true);gate.observeDataPlane(dataPlane::get);
+        var owner=new PipelineActuationOwnership("node-a",NODE_A,gate,new ClusterWorkloadClaims(claims,gate),TTL,RENEW,nanos::get);
+        var original=owner.permit("orders");assertThat(original.granted()).isTrue();
+        dataPlane.set(false);nanos.addAndGet(RENEW.toNanos());
+        var retained=owner.permit("orders");assertThat(retained.granted()).isTrue();
+        assertThat(WorkloadClaimFence.from(retained.claim())).isEqualTo(WorkloadClaimFence.from(original.claim()));
+        assertThat(new ClusterWorkloadClaims(claims,gate).acquire(
+                new WorkloadClaimKey("node-a",WorkloadClaimType.CAPTURE,"new-capture"),NODE_A,1,TTL)).isEmpty();
+        assertThat(owner.permit("orders").granted()).isTrue();
+        active.set(false);nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit("orders").granted()).isFalse();
+        assertThat(owner.beginExecution("orders",WorkloadClaimFence.from(retained.claim())).allowed()).isFalse();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"permit","begin"})
+    void queuedAdmissionSpendsItsOriginalBudgetBeforeTheIoHeldMonitor(String operation) throws Exception {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        var original=owner.permit("orders");assertThat(original.granted()).isTrue();
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(call->{entered.countDown();
+            if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("renewal was not released");
+            return claims.renew(call.getArgument(0),call.getArgument(1));
+        }).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());
+        try(var workers=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var running=workers.submit(()->owner.permit("orders"));
+            assertThat(entered.await(2,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            var returned=new java.util.concurrent.CountDownLatch(1);var granted=new java.util.concurrent.atomic.AtomicBoolean(true);
+            var queued=workers.submit(()->{
+                new ShutdownAwait().complete(System.nanoTime()+Duration.ofMillis(100).toNanos(),()->{
+                    granted.set(operation.equals("permit")?owner.permit("other").granted()
+                            :owner.beginExecution("orders",WorkloadClaimFence.from(original.claim())).allowed());
+                });returned.countDown();
+            });
+            assertThat(returned.await(1,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            queued.get();assertThat(granted).isFalse();
+            org.mockito.Mockito.verify(boundary,org.mockito.Mockito.times(1)).acquire(
+                    org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.any());
+            org.mockito.Mockito.verify(boundary,org.mockito.Mockito.never()).advanceExecution(
+                    org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.anySet());
+            owner.stopForShutdown();release.countDown();assertThat(running.get(2,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            owner.awaitStopped(System.nanoTime()+Duration.ofSeconds(2).toNanos());
+        }finally {release.countDown();owner.stopForShutdown();}
+    }
+
     private static ClusterMembershipGate eligibleGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.observeNodeSession(() -> true);
         gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
         gate.canCommit(Set.of("node-a", "node-b"));
         return gate;
@@ -231,6 +519,8 @@ class PipelineActuationOwnershipTest {
 
         private final VerbCounts counts;
         private final Set<String> carrying = new HashSet<>();
+        /** What happens on this member while a start of the named pipeline is in progress. */
+        private Consumer<String> whileStarting = pipelineId -> { };
 
         private MemberActuator(VerbCounts counts) {
             this.counts = counts;
@@ -243,6 +533,7 @@ class PipelineActuationOwnershipTest {
         @Override
         public void start(String pipelineId) {
             counts.record("start");
+            whileStarting.accept(pipelineId);
             carrying.add(pipelineId);
         }
 

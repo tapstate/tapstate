@@ -130,14 +130,36 @@ class NestKeysTest {
     }
 
     @Test
-    void anExactDecimalAndAWholeNumberAreStillTwoKeys() {
+    void anIntegralExactDecimalAndAWholeNumberShareOnlyAPreviewKeyAndPartition() {
         Map<String, Object> decimal = Map.of("amount", new BigDecimal("1.0"));
         Map<String, Object> whole = Map.of("amount", 1L);
+        String preview = "nest..preview_numeric.node.$root";
 
-        // Normalizing the scale is not coercion between kinds. The state layer names a decimal and a
-        // whole number with different letters on purpose, and merging them here would file two keys it
-        // tells apart under one name.
-        assertThat(NestKeys.valuesOf(decimal, List.of("amount")))
-                .isNotEqualTo(NestKeys.valuesOf(whole, List.of("amount")));
+        assertThat(NestKeys.valuesOf(decimal, List.of("amount"), preview))
+                .isEqualTo(NestKeys.valuesOf(whole, List.of("amount"), preview));
+        assertThat(NestKeys.valuesOf(decimal, List.of("amount"), preview).hashCode())
+                .isEqualTo(NestKeys.valuesOf(whole, List.of("amount"), preview).hashCode());
+        assertThat(NestStateKeys.nameOf(NestKeys.valuesOf(decimal, List.of("amount"), preview)))
+                .isEqualTo(NestStateKeys.nameOf(NestKeys.valuesOf(whole, List.of("amount"), preview)));
+        assertThat(NestKeys.valuesOf(Map.of("amount", new BigDecimal("9007199254740993.00")),
+                List.of("amount"), preview)).isEqualTo(List.of(9007199254740993L));
+        assertThat(NestKeys.valuesOf(Map.of("amount", new BigDecimal("1.01")), List.of("amount"), preview))
+                .isNotEqualTo(NestKeys.valuesOf(whole, List.of("amount"), preview));
+        assertThat(NestKeys.valuesOf(Map.of("amount", new BigDecimal("9223372036854775808.0")),
+                List.of("amount"), preview)).containsExactly(new BigDecimal("9223372036854775808"));
+        assertThat(decimal).containsEntry("amount", new BigDecimal("1.0"));
+    }
+
+    @Test
+    void liveNamespacesKeepReleasedDecimalAndInt64ColdKeysDistinct() {
+        Map<String, Object> decimal = Map.of("amount", new BigDecimal("1.0"));
+        Map<String, Object> whole = Map.of("amount", 1L);
+        for (String live : List.of("nest.pipeline.node.$root", "nest.preview_numeric.node.$root",
+                "nest.pipeline.preview_numeric.$root")) {
+            assertThat(NestStateKeys.nameOf(NestKeys.valuesOf(decimal, List.of("amount"), live)))
+                    .isEqualTo("[1]~m");
+            assertThat(NestStateKeys.nameOf(NestKeys.valuesOf(whole, List.of("amount"), live)))
+                    .isEqualTo("[1]~l");
+        }
     }
 }

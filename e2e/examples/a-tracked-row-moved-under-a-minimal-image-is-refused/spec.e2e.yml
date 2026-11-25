@@ -35,7 +35,8 @@ setup:
     src: { kind: postgres }
     store: { kind: mongo }
   connectors: [postgres, mongodb]
-  apply: [src_move_orders.tap.yml, src_move_items.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_move_orders.tap.yml, src_move_items.tap.yml, pipeline.tap.yml]
   discover: [src_move_orders, src_move_items]
 pipeline: pipeline.tap.yml
 seed:
@@ -52,5 +53,5 @@ steps:
   - await: { doc: { views.move_state: { where: { id: 1 }, size: { items: 1 } } } }
   - cdc: { src_move_items.move_items: { update: { where: { id: 1 }, set: { order_id: 2 } } } }
   - await: { state: FAILED }
-  - assert: { failure_code: nest.key-change-tracking-requires-before-image }
+  - await: { failure_code: TS0490026 }
   - assert: { count: { views.move_state: 2 } }

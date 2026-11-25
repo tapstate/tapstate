@@ -14,9 +14,11 @@ import java.util.stream.Collectors;
  * so they are answered per pipeline by whatever keeps the state; this holds the vocabulary, which is
  * the same for every pipeline and is what a surface with no pipeline in hand can still speak from.
  *
- * <p>Nothing declared anywhere names the user's own database, and the sentence says so out loud. A stop
+ * <p>Nothing declared anywhere names the user's own data, and the sentence says so out loud. A stop
  * reaches what this product recorded about the pipeline; the rows the pipeline wrote to its target are
- * the user's, and no answer to a stop touches them.
+ * the user's, and no answer to a stop touches them. The one thing declared on a database of the user's is
+ * what a source connector created there itself so as to read its changes -- a replication slot -- and it
+ * is named as exactly that.
  */
 public final class PipelineStateInventory {
 
@@ -28,14 +30,28 @@ public final class PipelineStateInventory {
      * what was dropped. It belongs to the clearing answer alone -- on the other one it would be false --
      * and it is here rather than at a surface because every surface that offers the choice owes it.
      *
-     * <p>It says the position is gone, and stops there. "Reads its whole source again" is the sentence a
-     * reader wants and it is not always true: which tables finished their initial load is recorded on
-     * the chain, not on the pipeline, so a pipeline leaving a chain that others are still reading has
-     * lost its position without that record going anywhere. Saying the stronger thing would be right for
-     * the ordinary pipeline and wrong for exactly the arrangement shared mining exists to produce.
+     * <p>It says the position is gone, and stops there. The next run does load every table it selects
+     * again: which tables a pipeline finished loading is recorded on that pipeline's own record, which
+     * clearing takes away, on a chain others still read as much as on one it reads alone. What that load
+     * does to the rows already in the target is not this sentence's to say, because it depends on the
+     * target's full-load policy and on what the target holds when the run starts -- which is when the
+     * start itself says it.
      */
     public static final String NEXT_RUN_HAS_NO_POSITION =
             "The run after this one has no position to carry on from.";
+
+    /**
+     * What clearing means for the rows already written, which is the part a person reading a clearing stop
+     * does not think of. The rows in targets and views stay, and the new full load that follows copies only
+     * what the source still holds: a row deleted from the source in the meantime is in neither, and stays in
+     * the target. The clearing answer alone says it -- after a stop that keeps the state the run carries on
+     * and replays those deletes. The question is limited to targets the server can read; an unreadable
+     * target must not be described as protected by a question.
+     */
+    public static final String KEPT_ROWS_OUTLIVE_THEIR_SOURCE =
+            "Rows already written to targets and views stay. The next run loads afresh and does not see rows "
+                    + "deleted from the source in the meantime. Starting it asks before keeping rows in targets "
+                    + "the server can read; unreadable targets produce a warning and the start goes ahead.";
 
     /**
      * What the pipeline's operators had built up: what a nest assembled, the shape it assembled under
@@ -64,19 +80,32 @@ public final class PipelineStateInventory {
             PipelineStateHolding.Scope.PIPELINE);
 
     /**
-     * What the shared mining chain itself accumulated -- how far it had read, the seam its tail resumes
-     * from, the schema it saw, and which tables finished their initial load. It belongs to the chain
-     * rather than to any one pipeline on it, so a stop only takes it when the pipeline stopping was the
-     * last one reading that chain. Its label says so, because a description that promised to clear it
-     * unconditionally would be untrue for every pipeline that shares a chain -- which is the arrangement
-     * shared mining exists to produce.
+     * What the shared mining chain itself accumulated -- how far it had read and the schema it saw. It
+     * belongs to the chain rather than to any one pipeline on it, so a stop only takes it when the
+     * pipeline stopping was the last one reading that chain. Its label says so, because a description
+     * that promised to clear it unconditionally would be untrue for every pipeline that shares a chain --
+     * which is the arrangement shared mining exists to produce. Which tables a pipeline finished loading
+     * and the seam its load began at are that pipeline's own, and go with its resume position.
      */
     public static final PipelineStateHolding CHAIN_RECORD = PipelineStateHolding.named(
             "what the shared mining chain had read, once this is the last pipeline reading it",
             PipelineStateHolding.Scope.CHAIN);
 
+    /**
+     * What a source connector set up on the source to read the chain's changes -- a PostgreSQL replication
+     * slot above all, which the source keeps its change log for until it is let go of; another connector may
+     * have set up a change feed, or kept a cache of its own. It goes with the chain, once this is the last
+     * pipeline reading through it; a pipeline reading its source directly has a chain of its own, so what was
+     * set up for it goes with the pipeline. A source that cannot be reached at the time keeps it, and the
+     * clearing goes on and says what is left to remove there by hand.
+     */
+    public static final PipelineStateHolding SOURCE_RESOURCES = PipelineStateHolding.named(
+            "what its source connector set up on the source to read changes, such as a replication slot, once "
+                    + "this is the last pipeline reading through it",
+            PipelineStateHolding.Scope.CHAIN);
+
     private static final List<PipelineStateHolding> VOCABULARY =
-            List.of(OPERATOR_STATE, CONNECTOR_STATE, RESUME_POSITION, CHAIN_RECORD);
+            List.of(OPERATOR_STATE, CONNECTOR_STATE, RESUME_POSITION, CHAIN_RECORD, SOURCE_RESOURCES);
 
     /**
      * Every kind of state this product records about a running pipeline. What a surface says without a
@@ -136,6 +165,7 @@ public final class PipelineStateInventory {
         holdings.forEach(holding -> lines.add("  - " + holding.label()));
         if (purgeState) {
             lines.add(NEXT_RUN_HAS_NO_POSITION);
+            lines.add(KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
         }
         lines.add(TARGET_UNTOUCHED);
         return List.copyOf(lines);

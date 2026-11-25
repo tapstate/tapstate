@@ -4,6 +4,7 @@ import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.DerivedCapability;
 import io.tapstate.core.catalog.ModeResolver;
 import io.tapstate.core.catalog.ModeSource;
+import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.SourceMode;
 import org.junit.jupiter.api.Test;
@@ -67,8 +68,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * written by hand, derivation cannot reproduce it and is not supposed to; the sink capability is
  * derived for every connector, so it is compared for every connector.
  *
- * <p>Supplying {@code tapstate.pdk.it.manifest} activates the {@code pdk-it} profile, which puts the
- * PDK runtime on the host test classpath — a connector's base class bootstraps the runtime through
+ * <p>Supplying {@code tapstate.pdk.it.manifest} selects the audit inputs; the PDK runtime is always
+ * on the host test classpath — a connector's base class bootstraps the runtime through
  * the host class loader, so it must be host-reachable, not inside the isolated connector loader.
  * A connector dist jar is a thin plugin and does not always bundle its own driver libraries either;
  * {@code tapstate.pdk.it.runtimeCp} is an optional {@link File#pathSeparator}-joined list of those,
@@ -115,7 +116,10 @@ class CapabilityHarnessRealJarTest {
 
             ConnectorCatalogEntry snapshot = catalog.byId(row.id());
             Set<DerivedCapability> derived = DerivedCapability.fromCapabilityIds(live);
-            assertThat(derived.contains(DerivedCapability.WRITE_RECORD))
+            // A source-only connector may well register write_record; the catalog merge withdraws its
+            // sink as a support boundary, so that is the row both derivations have to arrive at.
+            assertThat(derived.contains(DerivedCapability.WRITE_RECORD)
+                    && !OfficialConnectors.isSourceOnly(row.id()))
                     .as("live-derived sink capability for %s", row.id())
                     .isEqualTo(snapshot.sink().capable());
 

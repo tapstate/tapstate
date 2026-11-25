@@ -19,11 +19,12 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * A bounded pool of live connector instances, keyed by {@link ConnectionFingerprint}. Opening a
@@ -105,14 +106,23 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
     private final Limits limits;
     private final Clock clock;
     private final ExecutorService calls;
+    private final Runnable beforeClaim;
 
     private final ReentrantLock lock = new ReentrantLock();
+    private final Condition capacityReturned = lock.newCondition();
     private final Map<String, Slot> slots = new LinkedHashMap<>();
     private final AtomicLong returns = new AtomicLong();
     private int live;
+    private int closingReservations;
     private boolean closed;
 
     ConnectorInstancePool(Function<ConnectionConfig, T> open, Consumer<T> dispose, Limits limits, Clock clock) {
+        this(open, dispose, limits, clock, null);
+    }
+
+    ConnectorInstancePool(Function<ConnectionConfig, T> open, Consumer<T> dispose, Limits limits, Clock clock,
+                          Runnable beforeClaim) {
+        this.beforeClaim = beforeClaim;
         this.open = open;
         this.dispose = dispose;
         this.limits = limits;
@@ -132,6 +142,10 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
      * limit, in which case it is thrown away instead.
      */
     <R> R call(ConnectionConfig config, PooledCall<T, R> action) {
+        return call(config, action, ignored -> true);
+    }
+
+    <R> R call(ConnectionConfig config, PooledCall<T, R> action, Predicate<T> reusable) {
         Lease lease = acquire(config);
         R result;
         try {
@@ -146,10 +160,18 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
             // The connector reported a failure and is still healthy - a failed query is not a failed
             // connection - so the instance goes back. Treating every failure as poison would reopen a
             // connector for every bad query.
-            release(lease);
+            if (reusable.test(lease.instance)) {
+                release(lease);
+            } else {
+                discard(lease);
+            }
             throw failed;
         }
-        release(lease);
+        if (reusable.test(lease.instance)) {
+            release(lease);
+        } else {
+            discard(lease);
+        }
         return result;
     }
 
@@ -174,7 +196,7 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
                     }
                     evicted.add(entry.instance);
                     slot.live--;
-                    live--;
+                    returnPlace();
                     return true;
                 });
             }
@@ -205,6 +227,7 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
         lock.lock();
         try {
             closed = true;
+            capacityReturned.signalAll();
             for (Slot slot : slots.values()) {
                 slot.idle.forEach(entry -> remaining.add(entry.instance));
                 live -= slot.idle.size();
@@ -222,6 +245,9 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
 
     /** A booked place in the host-wide ceiling for an instance the pool does not hold. */
     interface Reservation extends AutoCloseable {
+
+        /** Marks cleanup in progress without giving the place back. Idempotent. */
+        void beginClose();
 
         /** Gives the place back. Idempotent. */
         @Override
@@ -244,30 +270,66 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
     Reservation reserveOutsidePool() {
         lock.lock();
         try {
-            if (closed) {
-                throw new TapstateException(ConnectorError.INSTANCE_LIMIT_REACHED,
-                        Map.of("limit", String.valueOf(limits.total())), null);
+            // A closed follow may still be releasing its source cursor. Keep that instance counted,
+            // but let a replacement wait for its cleanup, bounded by the existing call limit.
+            // A ceiling filled by active follows still refuses immediately.
+            long remaining = limits.call().toNanos();
+            while (!closed && live >= limits.total() && closingReservations > 0 && remaining > 0) {
+                try {
+                    remaining = capacityReturned.awaitNanos(remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw instanceLimit(interrupted);
+                }
             }
-            if (live >= limits.total()) {
-                throw new TapstateException(ConnectorError.INSTANCE_LIMIT_REACHED,
-                        Map.of("limit", String.valueOf(limits.total())), null);
+            if (closed || live >= limits.total()) {
+                throw instanceLimit(null);
             }
             live++;
+            return new OutsideReservation();
         } finally {
             lock.unlock();
         }
-        AtomicBoolean released = new AtomicBoolean();
-        return () -> {
-            if (!released.compareAndSet(false, true)) {
-                return;
-            }
+    }
+
+    private TapstateException instanceLimit(Throwable cause) {
+        return new TapstateException(ConnectorError.INSTANCE_LIMIT_REACHED,
+                Map.of("limit", String.valueOf(limits.total())), cause);
+    }
+
+    private final class OutsideReservation implements Reservation {
+        private boolean closing;
+        private boolean released;
+
+        @Override
+        public void beginClose() {
             lock.lock();
             try {
-                live--;
+                if (!released && !closing) {
+                    closing = true;
+                    closingReservations++;
+                }
             } finally {
                 lock.unlock();
             }
-        };
+        }
+
+        @Override
+        public void close() {
+            lock.lock();
+            try {
+                if (released) {
+                    return;
+                }
+                released = true;
+                if (closing) {
+                    closingReservations--;
+                }
+                returnPlace();
+            } finally {
+                lock.unlock();
+            }
+        }
     }
 
     /** How many connections this pool is still keeping bookkeeping for. */
@@ -315,6 +377,9 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
             }
             boolean handedOut = false;
             try {
+                if (beforeClaim != null) {
+                    beforeClaim.run();
+                }
                 Claim<T> claim = claim(key, slot);
                 if (claim == null) {
                     // The slot was let go between looking it up and this turn becoming ours. Nothing was
@@ -394,10 +459,16 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
         lock.lock();
         try {
             slot.live--;
-            live--;
+            returnPlace();
         } finally {
             lock.unlock();
         }
+    }
+
+    /** Returns one place and wakes admission waiting for cleanup. The caller holds the pool lock. */
+    private void returnPlace() {
+        live--;
+        capacityReturned.signalAll();
     }
 
     /** Removes and returns the instance idle longest across every connection, or null when none is. */
@@ -418,7 +489,7 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
         }
         oldestSlot.idle.pollLast();
         oldestSlot.live--;
-        live--;
+        returnPlace();
         return oldest.instance;
     }
 
@@ -432,7 +503,7 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
                 lease.slot.idle.addFirst(new Idle<>(lease.instance, clock.millis(), returns.incrementAndGet()));
             } else {
                 lease.slot.live--;
-                live--;
+                returnPlace();
             }
         } finally {
             lock.unlock();
@@ -448,7 +519,7 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
         lock.lock();
         try {
             lease.slot.live--;
-            live--;
+            returnPlace();
         } finally {
             lock.unlock();
         }

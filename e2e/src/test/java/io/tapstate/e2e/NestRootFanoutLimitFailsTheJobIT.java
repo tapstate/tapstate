@@ -61,7 +61,7 @@ class NestRootFanoutLimitFailsTheJobIT {
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "fanout_orders";
-    private static final String EXPECTED_CODE = "nest.root-fanout-limit-exceeded";
+    private static final String EXPECTED_CODE = "TS0490019";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
@@ -90,13 +90,12 @@ class NestRootFanoutLimitFailsTheJobIT {
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("fanout_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("fanout_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -120,11 +119,11 @@ class NestRootFanoutLimitFailsTheJobIT {
                                 + "  documents: %s%n  metrics: %s", CHILDREN, ELEMENT_LIMIT,
                                 mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE), control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);
 
-                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.failureCode(pipelineId))
                         .as("what killed the run, read from the status face rather than from a log.%n"
                                 + "  logs: %s", control.logs(pipelineId))

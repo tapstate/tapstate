@@ -8,6 +8,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
@@ -36,6 +37,7 @@ import io.tapstate.runtime.engine.nest.ReleasedChild;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.transform.TransformPort;
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -132,6 +134,36 @@ class NestDagRunTest {
         assertThat(items(documents.get(2)).get(0)).containsEntry("sku", "s20");
     }
 
+    @Test
+    void aPreviewDecimalChildKeyJoinsTheSameWholeNumberRoot() {
+        DAG dag = ordersWithItems(
+                List.of(row("order_id", 1L, "code", "A"), row("order_id", 2L, "code", "B")),
+                List.of(row("item_id", 10L, "order_id", new BigDecimal("1.00"), "sku", "s10"),
+                        row("item_id", 20L, "order_id", new BigDecimal("2.01"), "sku", "s20")),
+                false, false, false, ".preview_numeric");
+
+        member.getJet().newJob(dag).join();
+
+        Map<Object, Map<String, Object>> documents = latestPerRoot();
+        assertThat(items(documents.get(1L))).extracting(item -> item.get("sku")).containsExactly("s10");
+        assertThat(items(documents.get(1L)).get(0).get("order_id"))
+                .isEqualTo(new BigDecimal("1.00"));
+        assertThat(items(documents.get(2L))).isEmpty();
+    }
+
+    @Test
+    void aPreviewDecimalReferenceFindsTheWholeNumberLookupRow() {
+        DAG dag = ordersWithCustomers(
+                List.of(row("order_id", 1L, "cust_ref", new BigDecimal("7.00"))),
+                List.of(row("customer_id", 7L, "name", "customer-seven")), ".preview_lookup_numeric");
+
+        member.getJet().newJob(dag).join();
+
+        Map<String, Object> document = latestPerRoot().get(1L);
+        assertThat(customer(document)).containsEntry("name", "customer-seven");
+        assertThat(document).containsEntry("cust_ref", new BigDecimal("7.00"));
+    }
+
     /**
      * The same job with key changes followed, which draws a second edge into the assembler carrying every
      * row again keyed by what it is leaving. Two things could go wrong and neither shows up anywhere else:
@@ -160,6 +192,21 @@ class NestDagRunTest {
                 .describedAs("arriving on two edges is not arriving twice into the document")
                 .hasSize(2);
         assertThat(items(documents.get(2))).hasSize(1);
+    }
+
+    @Test
+    void filtersBeforeATrackedNestDropRootsAndChildrenWithoutStoppingTheJob() {
+        DAG dag = ordersWithItems(
+                List.of(row("order_id", 1, "code", "A"), row("order_id", 2, "keep", false)),
+                List.of(row("item_id", 10, "order_id", 1, "sku", "s10"),
+                        row("item_id", 11, "order_id", 1, "keep", false)),
+                false, true, true);
+
+        member.getJet().newJob(dag, new JobConfig().setName("filtered_nest")).join();
+
+        Map<Object, Map<String, Object>> documents = latestPerRoot();
+        assertThat(documents.keySet()).containsExactly(1);
+        assertThat(items(documents.get(1))).containsExactly(row("item_id", 10, "order_id", 1, "sku", "s10"));
     }
 
     @Test
@@ -263,19 +310,37 @@ class NestDagRunTest {
 
     private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
             boolean endless, boolean trackKeyChanges) {
+        return ordersWithItems(orders, items, endless, trackKeyChanges, false);
+    }
+
+    private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
+            boolean endless, boolean trackKeyChanges, boolean filtered) {
+        return ordersWithItems(orders, items, endless, trackKeyChanges, filtered, "p");
+    }
+
+    private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
+            boolean endless, boolean trackKeyChanges, boolean filtered, String pipelineId) {
         Embed item = new Embed("item", Map.of("order_id", "order_id"), EmbedAs.ARRAY, "items",
                 List.of("item_id"), null, trackKeyChanges ? Boolean.TRUE : null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
                 new NestRoot("order", List.of("order_id"), null, null, List.of(item)));
 
         Map<String, FromRef> aliases = new LinkedHashMap<>();
-        aliases.put("order", FromRef.literal("orders"));
-        aliases.put("item", FromRef.literal("order_items"));
+        aliases.put("order", FromRef.literal(filtered ? "kept_orders" : "orders"));
+        aliases.put("item", FromRef.literal(filtered ? "kept_items" : "order_items"));
         Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null);
+        List<Step> steps = new ArrayList<>();
+        if (filtered) {
+            steps.add(Step.inline("kept_orders", FromClause.list(FromRef.literal("orders")),
+                    new TransformBody.Filter("!has(row.keep) || row.keep"), null));
+            steps.add(Step.inline("kept_items", FromClause.list(FromRef.literal("order_items")),
+                    new TransformBody.Filter("!has(row.keep) || row.keep"), null));
+        }
+        steps.add(step);
 
-        PipelineResource pipeline = new PipelineResource("p", null,
+        PipelineResource pipeline = new PipelineResource(pipelineId, null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("order_items")),
-                List.of(step), null,
+                steps, null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
@@ -290,7 +355,13 @@ class NestDagRunTest {
 
         DagBindings bindings = new DagBindings(
                 sources::get,
-                s -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                s -> {
+                    boolean isFilter = s instanceof Step.Inline inline
+                            && inline.body() instanceof TransformBody.Filter;
+                    return (SupplierEx<TransformPort>) () -> event ->
+                            isFilter && Boolean.FALSE.equals(event.after().get("keep"))
+                                    ? List.of() : List.of(event);
+                },
                 syncElement -> (SupplierEx<SinkWriter>) CollectingSinkWriter::new,
                 ref -> List.of(((FromRef.Literal) ref).ref()),
                 new NestBinding(tables::get, HeapNestStores.onHeap(),
@@ -307,6 +378,11 @@ class NestDagRunTest {
      */
     private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
             List<Map<String, Object>> customers) {
+        return ordersWithCustomers(orders, customers, "p");
+    }
+
+    private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
+            List<Map<String, Object>> customers, String pipelineId) {
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
@@ -317,7 +393,7 @@ class NestDagRunTest {
         aliases.put("customer", FromRef.literal("customers"));
         Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null);
 
-        PipelineResource pipeline = new PipelineResource("p", null,
+        PipelineResource pipeline = new PipelineResource(pipelineId, null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("customers")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),

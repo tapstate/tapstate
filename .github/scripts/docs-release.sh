@@ -36,7 +36,8 @@
 #                         already gone out by then; this is the part that catches up afterwards
 #
 # The issue is found again by its exact title, because the two halves run in different workflow
-# dispatches and nothing carries a number between them. A title that does not match exactly once is
+# dispatches and nothing carries a number between them. Requests closed as not planned belong to
+# retired attempts and are excluded. The remaining title must match exactly once; otherwise it is
 # treated as "not done" rather than guessed at: asking twice costs a notification, tagging the wrong
 # thing costs a published site.
 #
@@ -203,18 +204,22 @@ Nothing here blocks the release. It does decide whether the tag is one less thin
 fi
 
 # Find the issue this version's `open` created, by its exact title -- the halves run in different
-# jobs and nothing carries a number between them. Sets `state` and, when there is exactly one,
-# `number`. Anything other than exactly one match is reported and treated as open, which is the
-# answer that costs a notification rather than a wrongly published tag.
+# jobs and nothing carries a number between them. A closed NOT_PLANNED request was withdrawn by
+# `retire`, so it cannot identify the current attempt or prove publication. Keep every other match:
+# choosing the newest would conceal competing requests. Sets `state` and, when there is exactly
+# one remaining match, `number`; otherwise reports the ambiguity and treats the request as open.
 find_issue() {
     state="$assume"
     [ -z "$state" ] || return 0
     found="$(gh issue list --repo "$repo" --state all --limit 50 \
-               --search "\"$title\" in:title" --json title,state,number 2>/dev/null || true)"
-    n="$(printf '%s' "$found" | jq -r --arg t "$title" '[.[]|select(.title==$t)]|length' 2>/dev/null || echo 0)"
+               --search "\"$title\" in:title" --json title,state,stateReason,number 2>/dev/null || true)"
+    found="$(printf '%s' "$found" | jq --arg t "$title" \
+        '[.[] | select(.title == $t) | select(.state != "CLOSED" or .stateReason != "NOT_PLANNED")]' \
+        2>/dev/null || echo '[]')"
+    n="$(printf '%s' "$found" | jq -r 'length' 2>/dev/null || echo 0)"
     if [ "$n" = 1 ]; then
-        state="$(printf '%s' "$found" | jq -r --arg t "$title" 'first(.[]|select(.title==$t))|.state' | tr '[:upper:]' '[:lower:]')"
-        number="$(printf '%s' "$found" | jq -r --arg t "$title" 'first(.[]|select(.title==$t))|.number')"
+        state="$(printf '%s' "$found" | jq -r '.[0].state' | tr '[:upper:]' '[:lower:]')"
+        number="$(printf '%s' "$found" | jq -r '.[0].number')"
     else
         # stdout, like every other outcome here: the caller tees stdout into the step summary and
         # tees stderr nowhere, so this is the only place the decision below can be seen from.

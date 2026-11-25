@@ -127,6 +127,8 @@ has  "the positioning window is disclosed" "Changes lost while the change stream
 has  "delivery is not claimed exactly-once" "at-least-once"
 has  "the measured macOS floor is in"      "Recommended macOS: 15.0 or newer."
 has  "the measured glibc floor is in"      "Recommended glibc: 2.34 or newer."
+has  "cluster mode is disclosed as a preview" "cluster mode is an opt-in preview"
+has  "the unauthenticated member port is disclosed" "Cluster members talk over an unauthenticated port"
 
 # Layer 2 -- harvested, verbatim.
 has  "a written note is carried over verbatim" "* You can assemble tables from MySQL and PostgreSQL into one object, without creating a view."
@@ -224,6 +226,11 @@ has "an empty range discloses the lack of join fan-out" "Duplicate dimension key
 has "an empty range discloses the join SQL subset" "WHERE, aggregation, subqueries, and ordering/pagination are unsupported"
 has "an empty range discloses the keyed-sync projection requirement" "For default/upsert sync, publish every fact primary-key column"
 has "an empty range links the Join usage draft" "https://github.com/tapstate/tapstate/blob/${empty_sha}/docs/join/README.md"
+# The runtime as it was before cluster mode and persisted state. Every body carried this line until
+# one was corrected by hand, and nothing about a release says when its fixed prose stopped being true.
+# Asked of the fixed prose alone: a harvested note is somebody else's sentence and may use either word.
+hasnt "the fixed prose does not call the runtime single-node" "single-node"
+hasnt "the fixed prose does not call the runtime in-memory"   "in-memory"
 out="$with_notes"
 
 # A range whose base does not exist is a mis-wired release, not an empty one.

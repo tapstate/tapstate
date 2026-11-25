@@ -1,7 +1,7 @@
 # Zero-agent-footprint gate.
 # This is a public repository that must never carry agent-governance artifacts.
 # The build fails if any of the following appear:
-#   - agent instruction files (CLAUDE.md / AGENTS.md / GEMINI.md / CODEX.md / COPILOT.md), at any depth
+#   - agent instruction files or repair-coordinator history at any depth
 #   - a .claude/ directory
 #   - agent-generated footers in the PR's commit messages or in the PR body
 # Human-facing README.md / CONTRIBUTING.md are fine — they are not matched here.
@@ -32,7 +32,7 @@ jobs:
           shellcheck .github/scripts/no-agent-footprint.sh .github/scripts/no-agent-footprint-smoke.sh
           bash .github/scripts/no-agent-footprint-smoke.sh
 
-      - name: No agent instruction files
+      - name: No agent instruction files or repair-coordinator history
         run: bash .github/scripts/no-agent-footprint.sh files
 
       - name: No .claude directory

@@ -98,7 +98,7 @@ public final class MongoCatalogStore implements CatalogStore {
     }
 
     /** Copies a bson document into a plain map, normalizing every value away from driver types. */
-    private static Map<String, Object> normalizeMap(Document document) {
+    static Map<String, Object> normalizeMap(Document document) {
         Map<String, Object> out = new LinkedHashMap<>();
         for (Map.Entry<String, Object> entry : document.entrySet()) {
             out.put(entry.getKey(), normalizeValue(entry.getValue()));
