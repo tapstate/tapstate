@@ -221,16 +221,14 @@ class PipelineLaunchLatencyIT {
                     try (var otherBarrier = blockProof ? new PositionReadBarrier(NativeAppStorage.business(application)
                             .getBean(PipelineActuationOwnership.class), ((ThreeLayerStorePort) port).scope("launch-0"))
                             : blockPositionRead ? new PositionReadBarrier(publisher,"launch-0") : null;
-                         var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                         var raw = com.mongodb.client.MongoClients.create(storage.cacheUri());
+                         var observationWrite = !blockPriorObservation && !restartPlanning
+                                 ? new PositionReadBarrier(business.getBean(ProcessObservationWriter.class)) : null) {
                         var barrier = maintenance == null ? otherBarrier : maintenance;
                         if (maintenance != null) maintenance.armMaintenance.set(true);
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
                                 .as("the prior Pipeline must enter the selected observation, maintenance or proof barrier").isTrue();
                         var admin = raw.getDatabase("admin");
-                        if (!blockPriorObservation && !restartPlanning) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
-                                .append("data", new org.bson.Document("failCommands", List.of("update"))
-                                        .append("namespace", storage.cacheDatabase() + "." + io.tapstate.adapters.mongostore.SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName())
-                                        .append("blockConnection", true).append("blockTimeMS", 5000)));
                         try {
                             long requested = System.nanoTime();
                             request(http, origin, cookie, "POST", "/api/pipelines/" + running + ":start", Map.of(), 200);
@@ -240,6 +238,11 @@ class PipelineLaunchLatencyIT {
                             System.out.println((blockPriorObservation ? "INDEPENDENT_ENGINE_READY_MS " : "ENGINE_READY_MS ") + readyMillis);
                             if (barrier != null) assertThat(barrier.release.getCount())
                                     .as("the new real engine must run before the unrelated dependency is released").isEqualTo(1);
+                            if (observationWrite != null) {
+                                assertThat(observationWrite.entered.await(30, TimeUnit.SECONDS))
+                                        .as("the real Mongo observation update is held while the engine runs").isTrue();
+                                assertThat(observationWrite.blocked.get()).isTrue();
+                            }
                             var state = request(http, origin, cookie, "GET", "/api/pipelines/" + running + "/status", null, 200);
                             assertThat(state).containsEntry("state", "RUNNING").containsEntry("displayState", "RUNNING");
                             if (!blockPriorObservation && !restartPlanning) assertThat(state).doesNotContainKeys("observedAt", "observedState");
@@ -260,8 +263,17 @@ class PipelineLaunchLatencyIT {
                                             + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
                                 }
                             }
-                            if (!blockPriorObservation && !restartPlanning) {
-                                // Engine readiness may precede the asynchronous observation write.
+                            if (observationWrite != null) {
+                                // Release only after status was read with the actual update still held.
+                                var configured = admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand")
+                                        .append("mode", "alwaysOn")
+                                        .append("data", new org.bson.Document("failCommands", List.of("update"))
+                                                .append("namespace", storage.cacheDatabase() + "." + io.tapstate.adapters.mongostore.SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName())
+                                                .append("blockConnection", true).append("blockTimeMS", 5000)));
+                                observationWrite.release.countDown();
+                                admin.runCommand(new org.bson.Document("waitForFailPoint", "failCommand")
+                                        .append("timesEntered", ((Number) configured.get("count")).longValue() + 1)
+                                        .append("maxTimeMS", 15_000));
                                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
                                         .until(() -> diagnostics.slowPublication(running).isPresent());
                                 var publication = diagnostics.slowPublication(running).orElseThrow();
@@ -422,6 +434,28 @@ class PipelineLaunchLatencyIT {
         final Object original;
         ExecutorService proofWorker;
         Future<?> proof;
+
+        PositionReadBarrier(ProcessObservationWriter writer) throws Exception {
+            publisher = writer;
+            field = ProcessObservationWriter.class.getDeclaredField("cache");
+            field.setAccessible(true);
+            original = field.get(writer);
+            var cache = (io.tapstate.adapters.mongostore.MongoCacheDomain) original;
+            var observed = org.mockito.Mockito.mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class,
+                    org.mockito.AdditionalAnswers.delegatesTo(cache));
+            org.mockito.Mockito.doAnswer(call -> {
+                try (var command = io.tapstate.adapters.mongostore.PipelineLaunchCommandProbe.holdObservationUpdate(() -> {
+                    blocked.set(true);
+                    entered.countDown();
+                    try { release.await(); }
+                    catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
+                    finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                })) {
+                    return cache.writeObservations(call.getArgument(0));
+                }
+            }).when(observed).writeObservations(org.mockito.ArgumentMatchers.anyList());
+            field.set(writer, observed);
+        }
 
         PositionReadBarrier(PipelineActuationOwnership ownership, PipelineIntentScope scope) throws Exception {
             var expected = WorkloadClaimFence.from(ownership.permit(scope).claim());
