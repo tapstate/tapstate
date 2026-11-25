@@ -938,6 +938,8 @@ class ScopedConvergenceDriverTest {
             periodicObservations = observations;
             var driver = driver();
             driver.reconcile();
+            org.awaitility.Awaitility.await("first observation finishes before taking a write baseline")
+                    .atMost(Duration.ofSeconds(5)).until(() -> observations.idle("orders"));
             long before = views.writes.stream().filter(write -> write.kind().equals("observation")).count();
             views.beforeObservationWrite = () -> {
                 entered.countDown();

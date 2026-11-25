@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.*;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -39,7 +40,7 @@ class PipelineLaunchLatencyIT {
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("artifact_page_config"),
                     cache.getReplicaSetUrl("artifact_page_cache"), cache.getReplicaSetUrl("artifact_page_master"),
                     StorageBinding.Mode.CLOUD, NativeCloudAlertManagementIT.CLUSTER);
-            try (var application = new SpringApplicationBuilder(Bootstrap.class,
+            try (var fixture = new LaunchFixture(new SpringApplicationBuilder(Bootstrap.class,
                     NativeCloudAlertManagementIT.ControlledSdk.class, Measurements.class)
                     .environment(CloudFixtureEnvironment.isolated()).run(
                             "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
@@ -51,12 +52,12 @@ class PipelineLaunchLatencyIT {
                             "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                             "--SDK_STATUS_SENDER_ENABLED=false",
                             "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
-                            "--tapstate.connectors.plugins-dir=" + work.resolve("artifact-page-plugins"));
+                            "--tapstate.connectors.plugins-dir=" + work.resolve("artifact-page-plugins")));
                  var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+                var application = fixture.application;
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                         assertThat(application.getBean(StorageRoot.class).runtime().business()).isPresent());
-                NativeAppStorage.awaitBusiness(application);
-                var port = NativeAppStorage.business(application).getBean(StorePort.class);
+                var port = fixture.awaitBusiness().getBean(StorePort.class);
                 var parser = new io.tapstate.core.dsl.DslParser();
                 port.artifacts().save(new SourceResource("page-input", null, "mongodb",
                         Map.of("isUri", true, "uri", storage.masterUri()), null,
@@ -134,8 +135,7 @@ class PipelineLaunchLatencyIT {
                     cache.getReplicaSetUrl("launch_cache"), cache.getReplicaSetUrl("launch_master"),
                     StorageBinding.Mode.CLOUD, NativeCloudAlertManagementIT.CLUSTER);
             boolean blockPositionRead = blockPriorObservation && !blockMaintenance && !blockProof;
-            HazelcastInstance positionReadMember;
-            try (var application = new SpringApplicationBuilder(Bootstrap.class,
+            try (var fixture = new LaunchFixture(new SpringApplicationBuilder(Bootstrap.class,
                     NativeCloudAlertManagementIT.ControlledSdk.class, Measurements.class)
                     .environment(CloudFixtureEnvironment.isolated()).run(
                             "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
@@ -149,14 +149,13 @@ class PipelineLaunchLatencyIT {
                             "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                             "--SDK_STATUS_SENDER_ENABLED=false",
                             "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
-                            "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
+                            "--tapstate.connectors.plugins-dir=" + work.resolve("plugins")));
                     var diagnostics = new DiagnosticRecording()) {
+                var application = fixture.application;
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                         assertThat(application.getBean(StorageRoot.class).runtime().business())
                                 .as("phase=" + application.getBean(StorageRoot.class).phase()).isPresent());
-                NativeAppStorage.awaitBusiness(application);
-                var business = NativeAppStorage.business(application);
-                positionReadMember = blockPositionRead ? business.getBean(HazelcastInstance.class) : null;
+                var business = fixture.awaitBusiness();
                 var port = business.getBean(StorePort.class);
                 try (var data = com.mongodb.client.MongoClients.create(storage.masterUri())) {
                     for (String table : List.of("orders", "customers", "lines"))
@@ -272,12 +271,6 @@ class PipelineLaunchLatencyIT {
                                         .isLessThanOrEqualTo(64);
                             }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
-                    } finally {
-                        if (blockPositionRead) {
-                            var observations = business.getBean(PeriodicObservations.class);
-                            org.awaitility.Awaitility.await("released launch-0 observation finishes before shutdown")
-                                    .atMost(Duration.ofSeconds(15)).until(() -> observations.idle("launch-0"));
-                        }
                     }
                     if (blockProof) org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                             assertThat(diagnostics.claimIo).anySatisfy(record -> {
@@ -323,10 +316,39 @@ class PipelineLaunchLatencyIT {
                     }
                 }
             }
-            if (blockPositionRead) {
+        }
+    }
+
+    private static final class LaunchFixture implements AutoCloseable {
+        private final ConfigurableApplicationContext application;
+        private ConfigurableApplicationContext business;
+        private HazelcastInstance member;
+
+        private LaunchFixture(ConfigurableApplicationContext application) { this.application = application; }
+
+        private ConfigurableApplicationContext awaitBusiness() {
+            NativeAppStorage.awaitBusiness(application);
+            business = NativeAppStorage.business(application);
+            member = business.getBean(HazelcastInstance.class);
+            return business;
+        }
+
+        @Override public void close() {
+            try (application) {
+                if (business != null) {
+                    // Barriers have already closed. Let admitted work finish while Jet and Mongo are still live.
+                    business.getBean(ConvergenceDriver.class).stopForShutdown();
+                    var convergences = business.getBean(PipelineConvergences.class);
+                    var observations = business.getBean(PeriodicObservations.class);
+                    org.awaitility.Awaitility.await("launch fixture finishes convergence and observations before shutdown")
+                            .atMost(Duration.ofSeconds(15))
+                            .until(() -> convergences.pipelineIds().isEmpty() && observations.pipelineIds().isEmpty());
+                }
+            }
+            if (member != null) {
                 assertThat(Hazelcast.getAllHazelcastInstances())
-                        .as("the position-read fixture must release its own member when the context closes")
-                        .doesNotContain(positionReadMember);
+                        .as("the launch fixture must release its own member when the context closes")
+                        .doesNotContain(member);
             }
         }
     }
