@@ -146,6 +146,10 @@ public final class ControlOperations {
             "state-store.connect", Scope.WRITE, true, null,
             "Configure the one Cloud MongoDB Atlas destination for materialized views.", CLI_AND_REST);
 
+    public static final Operation STATE_STORE_CONNECTION_URI = new Operation(
+            "state-store.connection-uri", Scope.WRITE, true, null,
+            "Retrieve the bound application data store URI for an authorized human session.", REST_ONLY);
+
     public static final Operation STORAGE_STATUS = storage("storage.status", Scope.READ, false);
     public static final Operation STORAGE_TEST = storage("storage.test", Scope.WRITE, false);
     public static final Operation STORAGE_SETUP_COMMIT = storage("storage.setup.commit", Scope.WRITE, true);
@@ -504,7 +508,7 @@ public final class ControlOperations {
             SOURCE_DELETE,
             SAMPLE_SOURCE_LIST,
             SAMPLE_SOURCE_INSTALL,
-            STATE_STORE_CONNECT,
+            STATE_STORE_CONNECT, STATE_STORE_CONNECTION_URI,
             STORAGE_STATUS, STORAGE_TEST, STORAGE_SETUP_COMMIT, STORAGE_SETUP_STATUS, STORAGE_SETUP_ACTIVATE,
             STORAGE_RECOVERY_PLAN, STORAGE_RECOVERY_CONFIRM, STORAGE_RECOVERY_STATUS,
             CONFIGURATION_EXPORT, CONFIGURATION_IMPORT_PREFLIGHT, CONFIGURATION_IMPORT_COMMIT, CONFIGURATION_IMPORT_STATUS,
