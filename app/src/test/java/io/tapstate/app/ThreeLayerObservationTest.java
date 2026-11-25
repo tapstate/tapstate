@@ -103,7 +103,8 @@ class ThreeLayerObservationTest {
         var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
                 Optional.empty(), Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1, params, false);
         var ids = List.of("pipeline");
-        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenReturn(Map.of("pipeline", header));
+        when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
+                .thenReturn(Map.of("pipeline", header));
 
         var failure = f.port.pipelineCatalogStates(ids).get("pipeline").observation().orElseThrow().failure();
         assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
@@ -138,6 +139,36 @@ class ThreeLayerObservationTest {
 
         assertThat(f.port.observations().readAll(ids)).containsEntry("pipeline", f.observed);
         verify(f.cache, never()).pipelineObservations(any());
+    }
+
+    @Test void aClearingStopAcceptedDuringTheCacheReadSupersedesTheOldReceipt() {
+        var f = new Fixture();
+        var ids = List.of("pipeline");
+        var preparation = f.preparations.read("pipeline").orElseThrow();
+        var completed = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.STOPPED, "hash", false)),
+                Optional.empty(), false, Optional.empty(), 1, Map.of(), true);
+        var clearing = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.STOPPED, "hash", true)),
+                Optional.empty(), false, Optional.empty(), 2, Map.of(), false);
+        var structure = new MongoConfigurationDomain.PipelineDisplayHeader(
+                f.mapping.get(), preparation, Optional.empty(), Optional.empty(), false);
+        var intent = new AtomicReference<>(completed);
+        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenAnswer(call -> Map.of("pipeline", intent.get()));
+        when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
+                .thenReturn(Map.of("pipeline", structure));
+        var stopped = new Observation("pipeline", PipelineState.STOPPED, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(true))).thenAnswer(call -> {
+            intent.set(clearing);
+            return Map.of("pipeline", new MongoCacheDomain.PipelineObservationReading(
+                    Optional.of(stopped), false, PipelineState.STOPPED));
+        });
+
+        var result = f.port.pipelineCatalogStates(ids).get("pipeline");
+        assertThat(result.desired()).isEqualTo(clearing.desired());
+        assertThat(result.completedStopClear()).isFalse();
+        assertThat(result.observation()).contains(stopped);
+        verify(f.configuration).pipelineDisplayHeaders(ids, true);
     }
 
     @Test void aRebuildThatOvertakesAnObservationReadCannotPublishTheOldGeneration() {

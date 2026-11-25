@@ -50,6 +50,40 @@ class MongoPipelineIntentStoreIT {
     private static final String HASH = CanonicalHash.of(pipeline());
 
     @Test
+    void displayReadsIntentsInOnlyOneConfigurationSnapshot() {
+        withConfiguration((domain, database, scope) -> {
+            var ids = List.of(scope.pipelineId());
+            var business = domain.bindings().cachePreparation().orElseThrow().businessScope();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                var unprepared = domain.pipelineDisplayHeaders(ids, true);
+                var singleSnapshot = List.copyOf(commands);
+                commands.clear();
+                assertThat(domain.pipelineDisplayHeadersBeforeCache(ids, business)).isEqualTo(unprepared);
+                assertThat(commands).containsExactlyInAnyOrderElementsOf(singleSnapshot);
+
+                var intent = readyForActuation(domain, database, scope);
+                commands.clear();
+                var complete = domain.pipelineDisplayHeaders(ids, true);
+                domain.pipelineDisplayHeaders(ids, false);
+                var previous = List.copyOf(commands);
+                commands.clear();
+
+                var before = domain.pipelineDisplayHeadersBeforeCache(ids, business).get(scope.pipelineId());
+                assertThat(before.preparation()).isEqualTo(complete.get(scope.pipelineId()).preparation());
+                assertThat(before.desired()).isEmpty();
+                assertThat(commands).doesNotContain("find:" + SystemCollections.PIPELINE_INTENTS.collectionName());
+                var after = domain.pipelineDisplayHeaders(ids, true).get(scope.pipelineId());
+                assertThat(after.desired()).contains(intent);
+                assertThat(commands).containsExactlyInAnyOrderElementsOf(previous);
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+        });
+    }
+
+    @Test
     void schedulingHintsUseOneProjectionAndTrackEveryIntentRevisionAndPhysicalScope() {
         withConfiguration((domain, database, scope) -> {
             assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();
