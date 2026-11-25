@@ -577,7 +577,7 @@ class PipelineDirectPreparationIT {
     }
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {return fixtureProvisioner("c".repeat(64));}
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner(String hash) {
-        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,hash,false);
+        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class,CALLS_REAL_METHODS);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,hash,false);
         when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb",hash)).thenReturn(ref);return provisioner;
     }
     private static HazelcastInstance sharedMember(SrsLogStore log) {return sharedMember(log,false);}
