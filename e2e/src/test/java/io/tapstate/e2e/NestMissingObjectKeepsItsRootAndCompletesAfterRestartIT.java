@@ -2,10 +2,14 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.spi.store.ProcessNodeSession;
 import io.tapstate.testsupport.DockerGate;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -16,6 +20,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -35,7 +40,7 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void missingCustomersDoNotRemoveOrdersAndLateCustomersCompletePersistedRoots(Tiers tier) throws Exception {
+    void missingCustomersDoNotRemoveOrdersAndLateCustomersCompletePersistedRoots(Tiers tier, @TempDir Path plugins) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> mysql = SharedMySql.settings("nest_missing_src_" + suffix);
         seed(mysql);
@@ -43,9 +48,17 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
         String pipeline = "acc_nest_mysql_" + suffix;
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(storage)) {
-                ControlPlane control = new ControlPlane(server.baseUrl());
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                var observer = MongoClients.create(storage.cacheUri())) {
+            var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(observer.getDatabase(storage.cacheDatabase()));
+            var processOwned = java.util.Date.from(ProcessNodeSession.PROCESS_OWNED);
+            var liveNodeSessions = new Document("_id.resourceType", "NODE_SESSION")
+                    .append("$or", List.of(new Document("leaseUntil", processOwned),
+                            new Document("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")))));
+            Document originalSession;
+            ServerHandle first = tier.launch(storage, plugins);
+            try (first) {
+                ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -70,13 +83,34 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
                     return snapshots.size() == 3 && snapshots.values().stream().allMatch(TableSnapshot::landed);
                 }, () -> String.valueOf(control.snapshotTables(pipeline)));
                 assertThat(control.state(pipeline)).contains(PipelineState.RUNNING);
+                originalSession = claims.find(liveNodeSessions).first();
+                assertThat(originalSession).as("the original deployment held a live node session").isNotNull();
             }
+
+            if (first instanceof RealProcessServer process) {
+                assertThat(process.exitedBeforeCloseRequest()).as("the running deployment received the shutdown request").isFalse();
+                assertThat(process.forcedDuringClose()).as("the original process exited within the graceful shutdown budget").isFalse();
+            }
+            var sessionKey = new Document("_id", originalSession.get("_id"));
+            var endedSession = new Document(sessionKey)
+                    .append("ownerBootId", originalSession.getString("ownerBootId"))
+                    .append("claimGeneration", originalSession.get("claimGeneration"))
+                    .append("leaseUntil", new Document("$ne", processOwned))
+                    .append("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")));
+            assertThat(claims.countDocuments(endedSession))
+                    .as("the original node session is no longer live on the CACHE server before restart")
+                    .isEqualTo(1);
 
             // Restart the running deployment, as the existing restart witnesses do. A pause/resume
             // addresses a suspended Jet job in the same cluster, not a job in a cluster that has ended.
-            try (ServerHandle server = tier.launch(storage)) {
+            try (ServerHandle server = tier.launch(storage, plugins)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
+                var restartedSession = claims.find(sessionKey).first();
+                assertThat(restartedSession).isNotNull();
+                assertThat(restartedSession.getString("ownerBootId")).isNotEqualTo(originalSession.getString("ownerBootId"));
+                assertThat(((Number) restartedSession.get("claimGeneration")).longValue())
+                        .isGreaterThan(((Number) originalSession.get("claimGeneration")).longValue());
                 Await.until("the restarted server to adopt the existing continuous nest", () -> control.state(pipeline).filter(
                         PipelineState.RUNNING::equals).isPresent(), () -> String.valueOf(control.state(pipeline)));
                 try (Connection connection = SharedMySql.connect(mysql);

@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** A shutdown attempt shares one result and one monotonic allowance across all owned workers. */
 final class ShutdownAwait {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ShutdownAwait.class);
     private static final ThreadLocal<Boolean> WORKER = new ThreadLocal<>();
     private static final ThreadLocal<Long> DEADLINE = new ThreadLocal<>();
     private final AtomicReference<CompletableFuture<Void>> attempt = new AtomicReference<>();
@@ -81,6 +82,16 @@ final class ShutdownAwait {
             throw new IllegalStateException("shutdown produced a checked failure",failure.getCause());
         } catch (TimeoutException failure) {
             var unavailable=StorageRuntime.unavailable();unavailable.addSuppressed(failure);throw unavailable;
+        }
+    }
+
+    @SuppressWarnings("java:S1181") // A failed stage is logged and the original throwable is rethrown.
+    static void stage(String name, Runnable action) {
+        try {
+            action.run();
+        } catch (RuntimeException | Error failure) {
+            LOG.error("Shutdown stage failed [{}]", name, failure);
+            throw failure;
         }
     }
 

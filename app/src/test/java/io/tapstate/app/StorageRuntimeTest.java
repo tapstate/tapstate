@@ -131,6 +131,23 @@ class StorageRuntimeTest {
         }
     }
 
+    @Test void cacheCloseFailureStillClosesConfigurationAndPreservesTheFailure() {
+        var config = configuration();
+        var cache = mock(MongoCacheDomain.class);
+        var failure = new IllegalStateException("cache close failed");
+        var root = new StorageRuntime(config, binding -> cache);
+        root.loadBound().orElseThrow();
+        doThrow(failure).when(cache).close();
+
+        assertThat(catchThrowable(root::close)).hasSuppressedException(failure);
+        verify(config).close();
+        assertThat(root.cleanupRequired()).isTrue();
+
+        doNothing().when(cache).close();
+        root.close();
+        verify(config).close();
+    }
+
     @Test void businessCleanupErrorRetainsClientsUntilTheOriginalOwnerCanBeRetried() {
         var config = configuration(); var cache = mock(MongoCacheDomain.class); var business = mock(StorageRuntime.Business.class);
         var failure = new AssertionError("business cleanup failed"); doThrow(failure).when(business).close();
