@@ -367,6 +367,11 @@ def dispatch_fixture():
 def main():
     workflow = (HERE.parent / 'workflows/ci.yml').read_text()
     check(r.workflow_recipe(workflow), 'actual producer workflow has the exact bounded capture recipe')
+    guard = "        if: needs.shard-plan.outputs.docs-only != 'true'\n"
+    check(r.workflow_recipe(workflow.replace(guard, '')), 'original unconditional capture remains supported')
+    for other in ("        if: false\n", "        if: needs.shard-plan.outputs.docs-only == 'true'\n",
+                  "        if: github.event_name == 'push'\n"):
+        check(not r.workflow_recipe(workflow.replace(guard, other)), 'unrecognized capture guard remains unsupported')
     check(not r.workflow_recipe(workflow.replace('ci-evidence.sh resolve --root', 'echo ci-evidence.sh resolve --root')), 'echoed commands cannot claim a capture recipe')
     check(not r.workflow_recipe(workflow.replace('name: ' + r.STEP, 'name: Unrelated')), 'unrelated step cannot claim pre-selection capture')
     legacy=workflow.replace(' --probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"','')

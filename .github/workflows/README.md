@@ -24,6 +24,24 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Prose-only pull requests
+
+The planner uses the classifier and its controls from the event's base commit to
+inspect the original PR commit identities and complete Git diff. A base without
+those controls selects full CI.
+Changes limited to regular, non-executable root README, contribution, security,
+code-of-conduct or changelog pages, or Markdown pages under `docs/`, use the
+lightweight documentation route. Existing documentation and hygiene gates still
+run. The stable `installer`, `build` and `sonarqube` checks explicitly report that compilation,
+tests, images and analysis were not evaluated. No test or coverage receipts are
+invented for this route.
+
+Code, scripts, fixtures, build files, workflows, mixed changes, symlinks,
+executable files and unknown comparisons retain full CI. Main pushes, release
+tags and manual dispatch always retain full CI, including documentation-only
+commits. The routing fixtures run in the planner; workflow shape controls retain
+the full suite and required check names.
+
 ## Hundred-table verification
 
 `AHundredTablesShareTheSinksWritersIT` runs in the default verification inventory.
