@@ -49,7 +49,7 @@ class CloudAlertSdkChannelTest {
             calls.incrementAndGet();
             try {
                 assertThat(exchange.getRequestMethod()).isEqualTo("POST");
-                assertThat(exchange.getRequestURI().toString()).isEqualTo("/v1/api/clusters/" + CLUSTER + "/" + endpoint);
+                assertThat(exchange.getRequestURI()).hasToString("/v1/api/clusters/" + CLUSTER + "/" + endpoint);
                 auth.set(exchange.getRequestHeaders().getFirst("Authorization"));
                 assertThat(exchange.getRequestHeaders().getFirst("Cookie")).isNull();
                 JsonNode request = JSON.readTree(exchange.getRequestBody()); body.set(request); handler.run(exchange, request);
@@ -141,12 +141,29 @@ class CloudAlertSdkChannelTest {
             assertThat(body.get().has("recipient")).isFalse();
             assertThat(auth.get()).isEqualTo("Bearer fixture-token");
 
-            handler = (exchange, sent) -> reply(exchange, 200, receipt(sent));
+            handler = (exchange, sent) -> reply(exchange, 200, JSON.writeValueAsString(java.util.Map.of(
+                    "code", "ok", "opId", "email-request", "data", java.util.Map.of(
+                            "id", delivery, "orgId", ORG, "channel", "EMAIL",
+                            "recipient", "owner@example.test", "status", "QUEUED"))));
             var invalid = channel.send(request);
             assertThat(invalid.outcome()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
             assertThat(invalid.receipt()).isNull();
         }
         assertThat(calls).hasValue(2);
+    }
+    @Test void malformedStagedEmailPayloadDoesNotReachCloud() throws Exception {
+        var destination = new NotificationChannel.Destination(new AlarmKey.Scope(ORG, CLUSTER),
+                AlertChannelPolicy.CLOUD_EMAIL.typeId(), "receiver-1", "target-1", "binding-1");
+        byte[] malformed = JSON.writeValueAsBytes(java.util.Map.of("channel", "EMAIL", "subject", "Missing body",
+                "textBody", "Message body", "dedupeKey", "delivery-1"));
+        var request = new NotificationChannel.Request(destination, NotificationChannel.Purpose.BUSINESS,
+                "delivery-1", "attempt-1", Instant.now().plusSeconds(10), "application/json", malformed);
+        try (var channel = new CloudAlertSdkChannel(AlertChannelPolicy.Deployment.CLOUD_MANAGED, destination, origin,
+                "fixture-token", ORG, new InetAddress[]{InetAddress.getLoopbackAddress()}, SSLContext.getDefault(),
+                Clock.systemUTC(), Duration.ofSeconds(3), true)) {
+            assertThatThrownBy(() -> channel.send(request)).isInstanceOf(TapstateException.class);
+        }
+        assertThat(calls).hasValue(0);
     }
     @Test void stableKeySeparatesRoundRecoveryBindingAndClusterWithoutMutableSubject() throws Exception {
         var d = binding();

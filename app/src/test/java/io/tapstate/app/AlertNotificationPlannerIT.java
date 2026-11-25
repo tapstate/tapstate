@@ -412,9 +412,15 @@ class AlertNotificationPlannerIT {
         });
     }
 
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
-    void cloudEventsKeepTheirTimingWhileDirectEmailWaitsForTheSameEpisode(boolean recoversQuickly) {
+    @Test void aShortCloudEpisodeSendsEventsWithoutEmail() {
+        cloudEventsKeepTheirTimingWhileDirectEmailWaitsForTheSameEpisode(true);
+    }
+
+    @Test void aLongCloudEpisodeSendsFaultAndRecoveryEmail() {
+        cloudEventsKeepTheirTimingWhileDirectEmailWaitsForTheSameEpisode(false);
+    }
+
+    private static void cloudEventsKeepTheirTimingWhileDirectEmailWaitsForTheSameEpisode(boolean recoversQuickly) {
         AlertEvaluationHostIT.withFixture(false, true, f -> {
             var planner = new AlertNotificationPlanner(f.store(), f.clock(), "planner-a",
                     java.net.URI.create("https://cloud.example.test"), ACTIVE);
@@ -438,6 +444,21 @@ class AlertNotificationPlannerIT {
                 assertThat(direct.value().frozen().createdAt()).isEqualTo(T.plusSeconds(60));
                 assertThat(direct.value().frozen().retry().maximumTotalAttempts()).isOne();
                 acceptManagedDelivery(f, direct, "cloud-email-1");
+                var management = AlertManagementIT.service(f);
+                var rules = AlertManagementIT.call(management, "configuration.list", Map.of("kind", "RULE"));
+                assertThat(((List<?>) rules.get("rows")).stream().map(AlertHttpModel::object))
+                        .anySatisfy(rule -> assertThat(rule).containsEntry("id", f.rule().header().identity().id()));
+                var emailPage = AlertManagementIT.call(management, "deliveries",
+                        Map.of("channel", AlertChannelPolicy.CLOUD_EMAIL.typeId()));
+                assertThat((List<?>) emailPage.get("rows")).hasSize(1);
+                var email = AlertHttpModel.object(((List<?>) emailPage.get("rows")).getFirst());
+                assertThat(email).containsEntry("cloudDeliveryId", "cloud-email-1").containsEntry("eventId", null);
+                assertThat((String) email.get("title")).isNotBlank();
+                var eventPage = AlertManagementIT.call(management, "deliveries",
+                        Map.of("channel", AlertChannelPolicy.CLOUD_EVENTS.typeId()));
+                assertThat((List<?>) eventPage.get("rows")).hasSize(1);
+                assertThat(AlertHttpModel.object(((List<?>) eventPage.get("rows")).getFirst()))
+                        .containsEntry("eventId", "cloud-event-1").doesNotContainKey("cloudDeliveryId");
                 f.now().set(T.plusSeconds(61));
             }
             recover(f);

@@ -84,9 +84,8 @@ final class AlertNotificationPlanner {
         var roots=new LinkedHashMap<AlertSchedule.Key,AlertSchedule.Record>();var original=new HashMap<AlertSchedule.Key,AlertStore.Stored<AlertSchedule.Record>>();
         view.schedules().stream().filter(v->v.value().batch()==null&&v.value().retiredAt()==null).forEach(v->{roots.put(v.value().key(),v.value());original.put(v.value().key(),v);});
         var changed=new LinkedHashSet<AlertSchedule.Key>();
+        heads.values().removeIf(head -> !eligibleForRegistration(view, head));
         for(var head:heads.values()){
-            if(!firing(head)||head.binding()==null||BuiltinAlarmTypes.retired(head.snapshot().rule().key().typeId())
-                    ||view.unavailableRules().containsKey(head.binding().ruleIdentity().id()))continue;
             for(var destination:destinations(view,head)){
                 if(!installed(view.host(),destination))continue;
                 String group=group(destination,head.binding());
@@ -114,6 +113,11 @@ final class AlertNotificationPlanner {
             }
         }
         return new Changes(List.of(),changed.stream().map(k->new AlertStore.ScheduleChange(original.get(k),roots.get(k))).toList());
+    }
+    private static boolean eligibleForRegistration(AlertStore.Planning view, AlertStateRecord.Head head) {
+        return firing(head) && head.binding() != null
+                && !BuiltinAlarmTypes.retired(head.snapshot().rule().key().typeId())
+                && !view.unavailableRules().containsKey(head.binding().ruleIdentity().id());
     }
     private Changes advance(AlertStore.Planning view,AlertStore.Stored<AlertSchedule.Record> stored) {
         var root=stored.value();Instant now=clock.instant();var ownership=claim(root.owner(),now);
@@ -217,9 +221,8 @@ final class AlertNotificationPlanner {
         for(var member:ended){
             var previous=new ArrayList<DeliveryEvidence.Previous>();var summary=summaries.get(member.episodeMember());if(summary!=null)previous.add(summary.evidence());
             for(var key:refs)if(key.notification().kind()==DeliveryKey.Kind.FAULT||key.notification().kind()==DeliveryKey.Kind.REMINDER){var intent=changedIntent(view,edits,key);if(intent.frozen().members().stream().anyMatch(m->m.episodeMember().equals(member.episodeMember())))previous.add(evidence(intent));}
-            var ep=episode(view,member);boolean revoked=destination==null||!bindingCurrent(view,member)
-                    || !cloudSeverityEligible(destination, ep.value().severity())
-                    ||ep.value().endReason()!=AlertSnapshot.EndReason.RECOVERED;
+            var ep = episode(view, member);
+            boolean revoked = recoveryRevoked(view, member, destination, ep.value());
             boolean silenced=view.definitions().stream().filter(d->d instanceof AlertConfiguration.Silence).map(d->(AlertConfiguration.Silence)d).anyMatch(s->s.matches(member.evaluation().key(),now));
             var recovery=DeliveryEvidence.recovery(previous,now,revoked,silenced);
             if(recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE&&(!canCreate||!targetReady(view,destination,now))||recovery.kind()==DeliveryEvidence.RecoveryKind.WAIT||planned&&recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE){waiting.add(member);continue;}
@@ -252,6 +255,12 @@ final class AlertNotificationPlanner {
         if(edits.size()>MAX_CHANGES||schedules.size()>MAX_CHANGES)throw invalid("planning-commit-budget");
         return new Changes(List.copyOf(edits.values()),List.copyOf(schedules));
     }
+    private static boolean recoveryRevoked(AlertStore.Planning view, AlertIntent.Member member,
+            Destination destination, AlertSnapshot.Episode episode) {
+        return destination == null || !bindingCurrent(view, member)
+                || !cloudSeverityEligible(destination, episode.severity())
+                || episode.endReason() != AlertSnapshot.EndReason.RECOVERED;
+    }
     private static boolean held(AlertStore.Planning view,AlertSchedule.Record root){
         if(root.members().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id()))
                 ||root.pending().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id()))
@@ -263,10 +272,7 @@ final class AlertNotificationPlanner {
     private List<Destination> destinations(AlertStore.Planning view,AlertStateRecord.Head head) {
         var host=view.host();var result=new ArrayList<Destination>();
         if(host.deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED){
-            if(host.managedRoute()==null||host.managedTarget()==null||cloudOrigin==null)throw invalid("managed-planning-binding");
-            if (head != null && head.episode().value().severity() == AlarmSeverity.WARNING) return List.of();
-            return List.of(cloudDestination(host, AlertChannelPolicy.CLOUD_EVENTS, Duration.ZERO),
-                    cloudDestination(host, AlertChannelPolicy.CLOUD_EMAIL, Duration.ofSeconds(60)));
+            return managedDestinations(host, head);
         }
         for(var definition:view.definitions())if(definition instanceof AlertConfiguration.Subscription route&&route.header().active()&&route.enabled()&&route.bindingRevision()>0){
             if(head!=null&&!route.matches(head.snapshot().rule().key(),head.episode().value().severity()))continue;
@@ -282,6 +288,14 @@ final class AlertNotificationPlanner {
             }
         }
         return result;
+    }
+    private List<Destination> managedDestinations(AlertStore.Host host, AlertStateRecord.Head head) {
+        if (host.managedRoute() == null || host.managedTarget() == null || cloudOrigin == null) {
+            throw invalid("managed-planning-binding");
+        }
+        if (head != null && head.episode().value().severity() == AlarmSeverity.WARNING) return List.of();
+        return List.of(cloudDestination(host, AlertChannelPolicy.CLOUD_EVENTS, Duration.ZERO),
+                cloudDestination(host, AlertChannelPolicy.CLOUD_EMAIL, Duration.ofSeconds(60)));
     }
     private static Destination cloudDestination(AlertStore.Host host, AlertChannelPolicy.Capability channel, Duration initialWait) {
         var target = host.managedTarget();
@@ -369,10 +383,7 @@ final class AlertNotificationPlanner {
             }
             var rendered=renderer.render(new NotificationRenderer.Facts(kind,identity.deliveryId(),key.notification().round(),now,items,items.size(),links.details(members,recoveryMessage),prior,null,null),d.messages());
             if(rendered.successful()){
-                if (capability.equals(AlertChannelPolicy.CLOUD_EMAIL)) {
-                    bytes = CloudAlertNotificationWire.encode(rendered.snapshot(), identity.deliveryId());
-                } else if(d.target() instanceof AlertIntent.ReceiverTarget receiver&&receiver.transport() instanceof AlertReceiver.Email email){var mime=EmailMime.freeze(identity.deliveryId(),now,email.from(),d.targetId(),rendered.snapshot());if(mime.successful())bytes=mime.bytes();}
-                else bytes=rendered.snapshot().webhook();
+                bytes = encodeRenderedContent(d, capability, identity.deliveryId(), now, rendered.snapshot());
             }
         }
         var payload=bytes==null?null:new AlertIntent.Payload(bytes);
@@ -381,6 +392,18 @@ final class AlertNotificationPlanner {
         if(payload==null)retained=retained.stop(now,now);
         return new AlertIntent.Record(frozen,new AlertIntent.State(AlertOwnership.unclaimed(),0,payload==null,payload==null?AlertIntent.StopReason.RENDER_FAILED:null,
                 payload==null?null:now,0,List.of(),DeliveryEvidence.Outcome.NOT_ATTEMPTED,AlertIntent.Retained.capture(retained),payload,null,null,null,null));
+    }
+    private static byte[] encodeRenderedContent(Destination destination, AlertChannelPolicy.Capability capability,
+            String deliveryId, Instant now, NotificationRenderer.Snapshot snapshot) {
+        if (capability.equals(AlertChannelPolicy.CLOUD_EMAIL)) {
+            return CloudAlertNotificationWire.encode(snapshot, deliveryId);
+        }
+        if (destination.target() instanceof AlertIntent.ReceiverTarget receiver
+                && receiver.transport() instanceof AlertReceiver.Email email) {
+            var mime = EmailMime.freeze(deliveryId, now, email.from(), destination.targetId(), snapshot);
+            return mime.successful() ? mime.bytes() : null;
+        }
+        return snapshot.webhook();
     }
     private static Instant observed(AlertStore.Planning view,AlertIntent.Member member,AlertStateRecord.Episode episode) {
         if(episode.diagnostics().latest()!=null)return episode.diagnostics().latest().observedAt();

@@ -38,6 +38,8 @@ import org.apache.hc.core5.io.CloseMode;
 
 /** Single-attempt SDK adapter. Durable admission, deduplication and DNS refresh belong to the host. */
 final class CloudAlertSdkChannel implements NotificationChannel {
+    private static final String OBJECT_ID_PATTERN = "[a-fA-F0-9]{24}";
+    private static final String EVENT_PAYLOAD = "eventPayload";
     private static final ObjectMapper JSON = new ObjectMapper();
     private final Destination binding;
     private final AlertChannelPolicy.Capability capability;
@@ -87,9 +89,7 @@ final class CloudAlertSdkChannel implements NotificationChannel {
         if (Thread.currentThread().isInterrupted()) { throw new InterruptedException(); }
         if (!binding.equals(request.destination()) || request.purpose() != Purpose.BUSINESS || !request.contentType().equals("application/json")
                 || request.payload().length > CloudAlertEventWire.MAX_BYTES) { throw CloudAlertEventWire.invalid("frozenRequest"); }
-        var notification = capability.equals(AlertChannelPolicy.CLOUD_EMAIL)
-                ? CloudAlertNotificationWire.decode(request.payload()) : null;
-        var event = notification == null ? decodeEvent(request.payload()) : null;
+        var payload = decodePayload(request.payload());
         Duration remaining = Duration.between(clock.instant(), request.deadline());
         if (remaining.isNegative() || remaining.isZero()) { return result(Outcome.NOT_ACCEPTED, Action.STOP, Phase.DEADLINE, 0, null); }
         if (closed.get() || !slots.tryAcquire()) { return result(Outcome.NOT_ACCEPTED, Action.PAUSE, Phase.CAPACITY, 0, null); }
@@ -124,7 +124,7 @@ final class CloudAlertSdkChannel implements NotificationChannel {
             long millis = Math.max(1, budget.toMillis());
             ApiClient client = new BoundedApiClient(http).setBasePath(origin.toString().replaceAll("/$", ""))
                     .setConnectTimeout((int)Math.min(5000, millis)).setReadTimeout((int)Math.min(10000, millis));
-            var outcome = notification == null ? ingest(client, event) : enqueue(client, notification);
+            var outcome = dispatch(client, payload);
             if (Thread.currentThread().isInterrupted()) { throw new InterruptedException(); }
             return outcome;
         } catch (ApiException failure) {
@@ -145,6 +145,16 @@ final class CloudAlertSdkChannel implements NotificationChannel {
             slots.release();
         }
     }
+
+    private DecodedPayload decodePayload(byte[] payload) {
+        return capability.equals(AlertChannelPolicy.CLOUD_EMAIL)
+                ? new DecodedPayload(null, CloudAlertNotificationWire.decode(payload))
+                : new DecodedPayload(decodeEvent(payload), null);
+    }
+    private Result dispatch(ApiClient client, DecodedPayload payload) throws ApiException {
+        return payload.notification() == null ? ingest(client, payload.event()) : enqueue(client, payload.notification());
+    }
+    private record DecodedPayload(ClusterEventRequest event, NotificationSendRequest notification) { }
     private static ClusterEventRequest decodeEvent(byte[] payload) {
         try {
             var tree = JSON.readTree(payload);
@@ -152,13 +162,13 @@ final class CloudAlertSdkChannel implements NotificationChannel {
                     || !tree.path("dedupeKey").asText().matches("[a-f0-9]{64}") || !tree.path("subject").isTextual()
                     || !tree.path("occurredAt").isTextual() || !tree.path("payload").isObject()
                     || tree.path("payload").path("wireVersion").asInt(-1) != CloudAlertEventWire.VERSION) {
-                throw CloudAlertEventWire.invalid("eventPayload");
+                throw CloudAlertEventWire.invalid(EVENT_PAYLOAD);
             }
             var event = JSON.treeToValue(tree, ClusterEventRequest.class);
-            if (event.getSeverity() == null || event.getOccurredAt() == null) throw CloudAlertEventWire.invalid("eventPayload");
+            if (event.getSeverity() == null || event.getOccurredAt() == null) throw CloudAlertEventWire.invalid(EVENT_PAYLOAD);
             return event;
         } catch (IOException bad) {
-            throw CloudAlertEventWire.invalid("eventPayload");
+            throw CloudAlertEventWire.invalid(EVENT_PAYLOAD);
         }
     }
 
@@ -198,7 +208,7 @@ final class CloudAlertSdkChannel implements NotificationChannel {
         return result(Outcome.UNKNOWN, Action.STOP, Phase.FINAL_RESPONSE, 200, null);
     }
 
-    private static boolean identifier(String value) { return value != null && value.matches("[a-fA-F0-9]{24}"); }
+    private static boolean identifier(String value) { return value != null && value.matches(OBJECT_ID_PATTERN); }
     private Result result(Outcome outcome, Action action, Phase phase, int status, Receipt receipt) {
         return new Result(outcome, action, null, phase, status,
                 capability.equals(AlertChannelPolicy.CLOUD_EMAIL) ? "sdk-notification" : "sdk-event-center", receipt);

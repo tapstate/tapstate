@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.alerting.AlertChannelPolicy;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -69,6 +70,20 @@ class CloudRuntimeSettingsTest {
         assertThat(settings.metadataUri("mongodb://localhost:27017/tapstate"))
                 .isEqualTo("mongodb+srv://cluster.example/tapstate");
         assertThat(settings.toString()).doesNotContain("secret-token", "cluster.example");
+    }
+
+    @Test
+    void bothManagedAlertChannelsRequireAnEligibleCloudOrigin() {
+        var properties = complete();
+        properties.setClusterId("507f1f77bcf86cd799439011");
+        properties.setBaseUrl("https://cloud.example.test");
+        var deployment = AlertChannelPolicy.Deployment.CLOUD_MANAGED;
+
+        assertThat(AlertChannels.capabilities(deployment, CloudRuntimeSettings.resolve(properties)))
+                .containsExactlyInAnyOrder(AlertChannelPolicy.CLOUD_EVENTS, AlertChannelPolicy.CLOUD_EMAIL);
+
+        properties.setBaseUrl("http://cloud.example.test");
+        assertThat(AlertChannels.capabilities(deployment, CloudRuntimeSettings.resolve(properties))).isEmpty();
     }
 
     @Test
