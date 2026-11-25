@@ -34,7 +34,17 @@ final class SinkLaneClaims {
     }
 
     boolean requiresReservation(Envelope e) {
-        if (!constraints.exactScalarEquality()) throw unsupported(e);
+        if (!constraints.exactScalarEquality()) {
+            // This table cannot admit a move. Rows that stay on their existing key can still use its native writer.
+            if (e.op() == Op.UPDATE) {
+                for (var column : target.keyColumns()) {
+                    Object oldKey = e.before() == null ? null : ConvertedValue.unwrap(e.before().get(column));
+                    Object newKey = e.after() == null ? null : ConvertedValue.unwrap(e.after().get(column));
+                    if (oldKey == null || !java.util.Objects.deepEquals(oldKey, newKey)) throw unsupported(e);
+                }
+            }
+            return false;
+        }
         for (var column : target.keyColumns()) {
             if (e.op() != Op.INSERT && !known(e.before(), column)
                     || e.op() != Op.DELETE && !known(e.after(), column)) throw unsupported(e);

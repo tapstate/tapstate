@@ -57,6 +57,23 @@ class SinkLaneRouterTest {
     }
 
     @Test
+    void anUncertifiedTargetKeepsStableDataFlowingAndRejectsAnActualMove() throws Exception {
+        try (var f = fixture(TargetKeyConstraints.unknown(), 8)) {
+            var inserted = insert(1, 7, "first");
+            var stable = update(2, 7, "first", 7, "second");
+            var removed = Envelope.delete(3, "orders", image(7, "second"), null);
+            var ordinary = List.of(inserted, stable, removed);
+            f.router.process(0, new TestInbox(ordinary));
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactlyElementsOf(ordinary);
+            var move = update(4, 7, "second", 8, "second");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(move))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+        }
+    }
+
+    @Test
     void aPartialOrDifferentlyTypedKeyStopsBeforeAnyTargetCommand() throws Exception {
         try (var f = fixture(false, 1)) {
             for (var oldRow : List.<Map<String, Object>>of(Map.of("label", "unknown"), Map.of("id", "01"))) {
@@ -203,10 +220,16 @@ class SinkLaneRouterTest {
     private static Fixture fixture(boolean secondary, int capacity) throws Exception {
         var keys = secondary ? List.of(List.of("id"), List.of("email"), List.of("_id"))
                 : List.of(List.of("id"), List.of("_id"));
+        return fixture(new TargetKeyConstraints(keys, true, true,
+                Map.of("id", TapstateType.INT64, "email", TapstateType.STRING)), capacity);
+    }
+
+    private static Fixture fixture(TargetKeyConstraints constraints, int capacity) throws Exception {
         var router = new SinkLaneRouter("copy", Map.of("orders", TARGET),
-                Map.of("orders", new TargetKeyConstraints(keys, true, true, Map.of("id", TapstateType.INT64, "email", TapstateType.STRING))), AXES, Map.of(0, List.of("orders")));
+                Map.of("orders", constraints), AXES, Map.of(0, List.of("orders")));
         var out = new TestOutbox(new int[] {capacity, capacity}, capacity);
-        router.init(out, new TestProcessorContext().setHazelcastInstance(first));
+        router.openReplies(first);
+        router.init(out, new TestProcessorContext());
         return new Fixture(router, out);
     }
 

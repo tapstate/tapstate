@@ -1,11 +1,15 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.core.AbstractProcessor;
+import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -18,7 +22,8 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /** Orders moves before the first row-key fan-out of a direct copy. All CDC for a physical table enters in FIFO order. */
-final class SinkLaneRouter extends AbstractProcessor {
+final class SinkLaneRouter extends AbstractProcessor implements Staged {
+    private StageTimer timer = StageTimer.none(Stage.SINK);
     private static final int MAX_HELD = 32;
     private static final long ACK_TIMEOUT = TimeUnit.MINUTES.toNanos(5);
     private record Output(int ordinal, Object item) {}
@@ -51,8 +56,24 @@ final class SinkLaneRouter extends AbstractProcessor {
         bounds = axes == null ? null : new LevelBounds(chains, axes, this::lowestHeld);
     }
 
+    @Override public Stage stage() { return Stage.SINK; }
+
     @Override protected void init(Processor.Context context) {
-        replies = new SinkLaneAcks(context.hazelcastInstance());
+        timer = StageTimer.of(stage(), context);
+        if (replies == null) openReplies(context.hazelcastInstance());
+    }
+
+    void openReplies(HazelcastInstance member) {
+        replies = new SinkLaneAcks(member);
+    }
+
+    @Override public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            super.process(ordinal, inbox);
+        } finally {
+            timer.end(started);
+        }
     }
 
     @Override public void close() {
