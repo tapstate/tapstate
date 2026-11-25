@@ -417,6 +417,25 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             return pending;
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) { throw unreadable(); }
     }
+    static void requireObservablePending(Document mapping, PipelineStateMapping state, PipelineIntentSnapshot intent) {
+        try {
+            var annex = mapping.get("stateRebuild", Document.class);
+            annexVersion(annex, false);
+            var scope = intent.scope();
+            var target = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(),
+                    scope.pipelineId(), scope.stateGeneration() + 1);
+            if (!state.operationId().equals(annex.getString("operationId"))
+                    || !Long.valueOf(intent.intentRevision()).equals(annex.get("intentRevision"))
+                    || !scope.equals(MongoPipelinePreparationFacts.scope(annex.get("originalScope", Document.class)))
+                    || !target.equals(MongoPipelinePreparationFacts.scope(annex.get("targetScope", Document.class)))
+                    || !(annex.get("confirmationHash") instanceof String hash) || !hash.matches("[0-9a-f]{64}")) throw unreadable();
+            checkedId(annex.getString("preparationId"));
+            checkedId(annex.getString("previousPreparationId"));
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) {
+            throw unreadable();
+        }
+    }
+
     private static String checkedId(String id) {
         if (!UUID.fromString(id).toString().equals(id)) throw new IllegalArgumentException("invalid rebuild preparation id");
         return id;

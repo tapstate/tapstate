@@ -113,10 +113,12 @@ class RealMysqlToMongoDroppedColumnIT {
                             .containsEntry(TIMESTAMP_COLUMN, Date.from(CREATED_AT))
                             .doesNotContainKey("secret");
                 }
+                assertThat((List<?>) control.pipelineStatus(PIPELINE_ID).get("connectorVersions")).hasSize(2);
                 control.stop(PIPELINE_ID, true);
                 Await.until("pipeline to stop before reading all write attempts",
                         () -> control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent(),
                         () -> String.valueOf(control.state(PIPELINE_ID)));
+                assertThat(control.pipelineStatus(PIPELINE_ID).get("connectorVersions")).isEqualTo(List.of());
                 assertEveryWriteModel(witness);
                 try (var client = MongoClients.create(targetUri)) {
                     MongoDatabase database = client.getDatabase(new ConnectionString(targetUri).getDatabase());

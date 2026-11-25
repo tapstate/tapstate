@@ -1034,6 +1034,25 @@ class MongoCachePipelineRebuildsIT {
             assertCode(() -> f.configuration.requiredNotes().read(token,"late"),IoError.NOTE_SCOPE_UNAVAILABLE);
         });
     }
+    @Test void connectorVersionsRemainReadableDuringRetirement() {
+        withFixture(f -> {
+            var pipeline = f.configuration.artifacts().get("flow").orElseThrow();
+            var intents = f.configuration.intents();
+            var desired = new io.tapstate.core.lifecycle.DesiredState("flow",
+                    io.tapstate.core.lifecycle.PipelineState.STOPPED, CanonicalHash.of(pipeline), false);
+            long revision = intents.load("flow").orElseThrow().intentRevision();
+            assertThat(intents.compareAndSet(f.scope, revision, desired)).isTrue();
+            var request = new PipelineRetirementRequest("delete-while-observing", f.scope,
+                    CanonicalHash.of(pipeline), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"), 0)));
+            var pending = f.configuration.retirements().begin(request);
+
+            assertThat(intents.connectorBindings().loadCurrent("flow")).isEmpty();
+            assertCode(() -> intents.compareAndSet(f.scope, revision + 1, desired), IoError.PIPELINE_INTENT_FENCED);
+
+            f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business, ACTIVE).retire(pending, f.node));
+        });
+    }
+
     @Test void deletionClearsOnlyTheRetiringGenerationOfConfigurationDeadLetters() {
         withFixture(f -> {
             var deadLetters = SystemCollections.CONFIG_NEST_DEAD_LETTERS.on(f.config);
