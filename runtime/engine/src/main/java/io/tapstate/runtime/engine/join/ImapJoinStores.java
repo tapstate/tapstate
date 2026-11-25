@@ -126,8 +126,14 @@ public final class ImapJoinStores implements JoinStores {
     }
 
     @Override
-    public void removeDimensionRow(String source, String dimensionKey) {
-        dimension(source).delete(dimensionKey);
+    public boolean removeDimensionRow(String source, String dimensionKey, List<String> identityColumns,
+            String expectedIdentity) {
+        ProtectedMap<String, Map<String, Object>> rows = dimension(source);
+        if (expectedIdentity == null) {
+            rows.delete(dimensionKey);
+            return true;
+        }
+        return rows.executeOnKey(dimensionKey, new RemoveDimensionRow(identityColumns, expectedIdentity));
     }
 
     @Override
@@ -362,6 +368,23 @@ public final class ImapJoinStores implements JoinStores {
         @Override
         public EntryProcessor<ReverseBucket.At, ReverseBucket, Set<String>> getBackupProcessor() {
             return null;
+        }
+    }
+
+    /** Checks the source identity where the old key lives, atomically with any removal. */
+    private record RemoveDimensionRow(List<String> identityColumns, String expectedIdentity)
+            implements EntryProcessor<String, Map<String, Object>, Boolean>, Serializable {
+
+        @Override
+        public Boolean process(Map.Entry<String, Map<String, Object>> entry) {
+            Map<String, Object> row = entry.getValue();
+            if (JoinKeys.isDifferentRow(row, identityColumns, expectedIdentity)) {
+                return false;
+            }
+            if (row != null) {
+                entry.setValue(null);
+            }
+            return true;
         }
     }
 
