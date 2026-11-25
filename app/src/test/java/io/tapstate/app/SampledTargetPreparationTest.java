@@ -36,7 +36,8 @@ class SampledTargetPreparationTest {
             List<SinkPreparationStore.Prepared> models=call.getArgument(0);assertThat(models).containsExactly(original);return models;
         });
         var notes=mock(RequiredNoteStore.class);when(notes.guardedBy(any())).thenReturn(notes);
-        when(notes.open(any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0),1));
+        when(notes.openPipelineScopes(any(),any())).thenAnswer(call -> new RequiredNoteStore.PipelineScopes(
+                new RequiredNoteScope(call.getArgument(0),1),new RequiredNoteScope(call.getArgument(1),1)));
         when(notes.prepareOrigin(any(),any())).thenAnswer(call -> call.getArgument(1));
         var ref=new ConnectorRef(List.of(),"not.loaded","1.0",null,null,"d".repeat(64),false);
         var binder=new StoreBackedDagSource.PdkSinkWriterBinder(notes,id -> ref);

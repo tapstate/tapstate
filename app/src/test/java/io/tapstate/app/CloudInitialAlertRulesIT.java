@@ -36,7 +36,7 @@ class CloudInitialAlertRulesIT {
         try (var initializer = new CloudConfigurationInitialization(settings, cloud, bridge, BootId.fresh());
                 var configuration = initializer.open(); var observer = MongoClients.create(settings.uri())) {
             var rows = observer.getDatabase(database).getCollection("alert_rules").find().into(new ArrayList<>());
-            assertThat(rows).hasSize(4);
+            assertThat(rows).hasSize(6);
             assertThat(rows).extracting(row -> row.get("body", Document.class).getString("typeId"))
                     .containsExactlyInAnyOrderElementsOf(BuiltinAlarmTypes.catalog().types().stream().map(type -> type.id()).toList());
             for (var row : rows) {

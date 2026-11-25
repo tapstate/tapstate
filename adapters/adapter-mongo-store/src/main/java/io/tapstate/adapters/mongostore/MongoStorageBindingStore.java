@@ -113,19 +113,17 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     @Override public Optional<StorageBinding> load() {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.call(client, null, () -> StoreIo.call(() -> {
             requireActive.run();
-            verifyIndex();
             return transaction(session -> load(session).map(Loaded::binding));
-        });
+        }));
     }
 
     @Override public Optional<CachePreparation> cachePreparation() {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.call(client, null, () -> StoreIo.call(() -> {
             requireActive.run();
-            verifyIndex();
             return transaction(session -> load(session).map(Loaded::cachePreparation));
-        });
+        }));
     }
     MongoStorageRecoveryStore.Authentication authenticationRecovery() {
         return StoreIo.call(() -> transaction(session -> {
@@ -385,13 +383,35 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     /** Same-client configuration consumers reuse the original transaction's authoritative scope. */
     Optional<CachePreparation> cachePreparationForTransaction(ClientSession session) {
-        verifyIndex();
         return load(session).map(Loaded::cachePreparation);
     }
 
     /** Rechecks the durable scope of a previously admitted runtime without reopening its connection. */
     Optional<CachePreparation> admittedCachePreparation(ClientSession session) {
+        if (!MongoBindingReadFacts.supported(client)) return cachePreparationForTransaction(session);
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        appendAdmittedPreparation(stages);
+        var row = identity.aggregate(session, stages).first();
+        var bound = MongoStartConfigRead.boundedRow(row, "binding", SINGLETON_ID);
+        var stage = MongoStartConfigRead.boundedRow(row, "setup", SINGLETON_ID);
+        var recovery = MongoStartConfigRead.boundedRow(row, "recovery", SINGLETON_ID);
+        if (row != null && row.get("root") instanceof Document root && SINGLETON_ID.equals(root.get("_id"))
+                && bound != null && stage != null && recovery != null)
+            return admittedObservationFacts(root, stage, bound, null, recovery).preparation();
         return admittedFacts(session, false).preparation();
+    }
+
+    static void appendAdmittedPreparation(List<Document> stages) {
+        var bindingFields = new Document("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)
+                .append("installationId", 1).append("operationId", 1).append("generation", 1)
+                .append("mode", 1).append("defaultSourceId", 1).append("candidateHash", 1);
+        stages.add(new Document("$lookup", new Document("from", SystemCollections.STORAGE_BINDING.collectionName())
+                .append("as", "binding").append("pipeline", List.of(new Document("$match", new Document("_id", SINGLETON_ID)),
+                        new Document("$limit", 2), new Document("$project", bindingFields),
+                        new Document("$project", new Document("value", MongoStartConfigRead.boundedValue()))))));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", SINGLETON_ID));
+        stages.add(MongoStartConfigRead.boundedSingleton(SystemCollections.STORAGE_RECOVERY, "recovery"));
     }
 
     record AdmittedFacts(Optional<CachePreparation> preparation, Document version) {}
@@ -405,17 +425,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 (owner, mode, version, stage) -> MongoStorageRecoveryStore.read(session, database, owner, mode, version, stage).preparation());
     }
 
-    private final MongoStructureProof actuationStructures = new MongoStructureProof();
-    private volatile boolean actuationCollations;
-
     boolean supportsActuationBatch() {
-        if (!MongoReadBudget.supportsSnapshotReads(client)) return false;
-        actuationStructures.require(MongoStructureProof.Kind.OBSERVATION, () ->
-                actuationCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
-                        SystemCollections.PIPELINE_INTENTS, SystemCollections.OPERATOR_GENERATIONS, SystemCollections.PIPELINES,
-                        SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP, SystemCollections.STORAGE_BINDING,
-                        SystemCollections.STORAGE_RECOVERY, SystemCollections.CONFIGURATION_VERSION)));
-        return actuationCollations;
+        return MongoReadBudget.supportsSnapshotReads(client);
     }
 
     AdmittedFacts admittedObservationFacts(Document cluster, Document state, Document stored, Document version, Document recovery) {
@@ -480,10 +491,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return client == expectedClient && database.getName().equals(expectedDatabase);
     }
 
-    void verifyObservationIndex() { verifyIndex(); }
-
     Optional<StorageBinding> loadForTransaction(ClientSession session) {
-        verifyIndex();
         return load(session).map(Loaded::binding);
     }
 
@@ -491,7 +499,13 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return read(session).loaded();
     }
 
+    boolean supportsAlertWriteFacts() { return MongoBindingReadFacts.supported(client); }
+
     TransactionFacts readForTransaction(ClientSession session) {
+        return read(session);
+    }
+
+    TransactionFacts readForStorageLifecycle(ClientSession session) {
         verifyIndex();
         return read(session);
     }
@@ -539,6 +553,12 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     /** Decodes a full binding audit with facts already read in the original CONFIG snapshot. */
     CachePreparation auditedObservationBinding(Document cluster, Document stage, Document stored, Document recovery,
             Document source, Document global, boolean conflictingResource) {
+        return auditedObservationFacts(cluster,stage,stored,recovery,source,global,conflictingResource).preparation();
+    }
+
+    record AuditedBinding(StorageBinding binding,CachePreparation preparation) { }
+    AuditedBinding auditedObservationFacts(Document cluster,Document stage,Document stored,Document recovery,
+            Document source,Document global,boolean conflictingResource) {
         requireClusterIdentity(cluster);
         String clusterId = cluster.getString("clusterId");
         long version = cluster.getLong(BINDING_VERSION);
@@ -547,7 +567,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         requireDefaultSource(stored, source, conflictingResource);
         requireGlobalScope(global, clusterId);
         if (recovery == null) throw unreadable();
-        return MongoStorageRecoveryStore.read(recovery, binding.setup(), binding.mode(), version, () -> stage).preparation();
+        return new AuditedBinding(binding,MongoStorageRecoveryStore.read(recovery,binding.setup(),binding.mode(),version,()->stage).preparation());
     }
 
     private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
@@ -630,6 +650,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private <T> T transaction(Function<ClientSession, T> body, Runnable requireCommit) {
         try (ClientSession session = client.startSession()) {
             return session.withTransaction(() -> {
+                MongoStructureFailureScope.beginCallback();
                 requireActive.run();
                 requireCommit.run();
                 T result = body.apply(session);

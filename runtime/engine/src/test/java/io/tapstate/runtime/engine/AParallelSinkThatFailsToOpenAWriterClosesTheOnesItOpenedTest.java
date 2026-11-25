@@ -44,6 +44,8 @@ class AParallelSinkThatFailsToOpenAWriterClosesTheOnesItOpenedTest {
     private static final AtomicInteger OPENED = new AtomicInteger();
     private static final AtomicInteger CLOSED = new AtomicInteger();
     private static final AtomicInteger WRITTEN = new AtomicInteger();
+    private static volatile java.util.concurrent.CountDownLatch returnedLast;
+    private static volatile java.util.concurrent.CountDownLatch allClosed;
 
     private HazelcastInstance member;
 
@@ -61,7 +63,7 @@ class AParallelSinkThatFailsToOpenAWriterClosesTheOnesItOpenedTest {
         member = Hazelcast.newHazelcastInstance(config);
         OPENED.set(0);
         CLOSED.set(0);
-        WRITTEN.set(0);
+        WRITTEN.set(0); returnedLast = null; allClosed = null;
     }
 
     @AfterEach
@@ -98,6 +100,56 @@ class AParallelSinkThatFailsToOpenAWriterClosesTheOnesItOpenedTest {
         assertThat(WRITTEN).as("nothing written through them").hasValue(0);
     }
 
+    @Test
+    void optInConcurrentWritersFailBeforeAnyDataRunsAndCloseEveryReturnedInstance() throws Exception {
+        returnedLast = new java.util.concurrent.CountDownLatch(1);
+        allClosed = new java.util.concurrent.CountDownLatch(3);
+        PipelineResource pipeline = new PipelineResource("p", null, List.of(SourceRef.bare("orders")), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders"),
+                        List.of(new SyncElement("s", "dest", null, null, null)), null, null),
+                null, null);
+        ExecutionShape shape = new ExecutionShape(1,
+                Map.of("serve.s", new NodeParallelism("serve.s", 4, NodeParallelism.Origin.EXPLICIT,
+                        NodeParallelism.Scope.NATIVE, 1, 4, 4, List.of())),
+                Map.of(),
+                Map.of("serve.s", Map.of("orders", new SinkTarget("orders", List.of("id")))));
+        DagBindings bindings = new DagBindings(
+                sourceId -> ProcessorMetaSupplier.forceTotalParallelismOne(
+                        ProcessorSupplier.of((SupplierEx<Processor>) Rows::new), sourceId),
+                step -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                element -> new ConcurrentIndexedOpens(),
+                ref -> List.of(((FromRef.Literal) ref).ref()));
+
+        Throwable failure = catchThrowable(() ->
+                member.getJet().newJob(PipelineDagBuilder.build(pipeline, bindings, null, null, shape)).join());
+
+        assertThat(failure).as("a sink whose writer cannot open does not run").isNotNull();
+        assertThat(allClosed.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(OPENED).hasValue(3);
+        assertThat(CLOSED.get()).isEqualTo(OPENED.get());
+        assertThat(WRITTEN).as("nothing written through them").hasValue(0);
+    }
+
+    private static final class ConcurrentIndexedOpens implements IndexedSinkWriterFactory {
+        public SinkWriter getEx() { return forWriter(0, 0); }
+        public SinkWriter forWriter(int memberIndex, int localIndex) {
+            if (localIndex == 2) {
+                try { if (!returnedLast.await(2, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("remaining slot was not opened"); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                throw new IllegalStateException("indexed opening refused");
+            }
+            OPENED.incrementAndGet();
+            if (localIndex == 3) returnedLast.countDown();
+            return new ThirdFailsToOpen();
+        }
+        public Opening opening() {
+            return new Opening() {
+                public SinkWriter open(int memberIndex, int localIndex) { return forWriter(memberIndex, localIndex); }
+                public int maximumConcurrentRemainingOpens() { return 2; }
+            };
+        }
+    }
+
     /** A writer whose third opening fails, counting the openings, closes and rows written. */
     private static final class ThirdFailsToOpen implements SinkWriter {
 
@@ -118,6 +170,7 @@ class AParallelSinkThatFailsToOpenAWriterClosesTheOnesItOpenedTest {
         @Override
         public void close() {
             CLOSED.incrementAndGet();
+            if (allClosed != null) allClosed.countDown();
         }
     }
 

@@ -10,5 +10,5 @@ record AlertTypeAssembly(AlarmTypeCatalog catalog,AlarmTypeText descriptions,Set
     AlertTypeAssembly {Objects.requireNonNull(catalog);Objects.requireNonNull(descriptions);providers=Set.copyOf(providers);
         if(providers.size()>128)throw new IllegalArgumentException("too many fixed providers");}
     static AlertTypeAssembly builtin(){return new AlertTypeAssembly(BuiltinAlarmTypes.catalog(),AlarmTypeText.english(),
-            Set.of("pipeline-lifecycle","pipeline-observations","source-operational-health","cluster-storage-health"));}
+            Set.of("pipeline-lifecycle","pipeline-observations","source-operational-health","cluster-storage-health","cluster-structure-inspection"));}
 }

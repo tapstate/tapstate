@@ -14,6 +14,13 @@ public interface RequiredNoteStore {
     /** Opens an existing scope for the captured persistent owner; missing or inconsistent facts refuse. */
     RequiredNoteScope open(RequiredNoteOwner owner);
 
+    record PipelineScopes(RequiredNoteScope primary, RequiredNoteScope global) {}
+
+    /** Opens the original Pipeline and global note scopes together when the adapter can share their snapshot. */
+    default PipelineScopes openPipelineScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
+        return new PipelineScopes(open(primary), open(global));
+    }
+
     record CaptureScopes(RequiredNoteScope primary, RequiredNoteScope global) {}
 
     default CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {

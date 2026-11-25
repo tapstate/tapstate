@@ -166,6 +166,31 @@ class MongoDirectChannelStoreIT {
             assertThat(raw(f)).isEqualTo(before); assertThat(f.database().listCollectionNames().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(names);
         });
     }
+    @Test void directProgressReadsAndWritesContinueWithoutTheBatchIndex() {
+        withBusiness(f -> {
+            var batches = SystemCollections.DIRECT_BATCHES.on(f.database());
+            var index = SystemCollections.DIRECT_BATCHES.indexes().getFirst();
+            batches.dropIndex(index.indexName());
+            open(f);
+            var commands = new ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build();
+            try (var client = MongoClients.create(settings)) {
+                var direct = store(client, client.getDatabase(f.database().getName()));
+                direct.recordBatch(batch(1, 1, 2, Map.of("orders", 1L)), 0, f.captureFence(), f.pipelineFence());
+                assertThat(direct.pending(CONTEXT, 1)).hasSize(1);
+                assertThat(commands).doesNotContain("listCollections", "listIndexes");
+            }
+            assertThat(batches.listIndexes().into(new ArrayList<>())).noneMatch(row -> index.indexName().equals(row.get("name")));
+        });
+    }
+
     @Test void anIndividuallyCanonicalManifestStillMustMatchTheOriginalCrossResourceReceipt() {
         withBusiness(f -> {
             open(f); var original = batch(1,1,2,Map.of("orders",1L)); f.store().recordBatch(original,0,f.captureFence(),f.pipelineFence());
@@ -276,7 +301,7 @@ class MongoDirectChannelStoreIT {
             var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find().into(new ArrayList<>());
             var batches = SystemCollections.DIRECT_BATCHES.on(f.database()).find().into(new ArrayList<>());
             try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"delete","direct_batches")) {
-                var guarded = new MongoDirectChannelStore(witness.client,witness.database,BUSINESS,witness::refuseAfterCommand,MongoRateHistoryStore.DEFAULT_RETENTION);
+                var guarded = new MongoDirectChannelStore(witness.client,witness.database,BUSINESS,witness::refuseAfterCommand);
                 assertThatThrownBy(() -> guarded.advanceWriter(CONTEXT,1,"run","orders","slow",point(1,1),f.pipelineFence())).isInstanceOf(TapstateException.class);
                 witness.requireCommand();
             }
@@ -326,7 +351,7 @@ class MongoDirectChannelStoreIT {
     private static Document raw(Fixture f) { return SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.database()).find().first(); }
     private static void unavailable(Throwable error) { assertThat(error).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(IoError.DIRECT_CHANNEL_UNAVAILABLE)); }
     private static void fenced(Throwable error) { assertThat(error).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED)); }
-    private static MongoDirectChannelStore store(MongoClient client,MongoDatabase database) { return new MongoDirectChannelStore(client,database,BUSINESS,() -> {},MongoRateHistoryStore.DEFAULT_RETENTION); }
+    private static MongoDirectChannelStore store(MongoClient client,MongoDatabase database) { return new MongoDirectChannelStore(client,database,BUSINESS,() -> {}); }
     private static void withBusiness(Scenario scenario) {
         try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var database = client.getDatabase("direct_"+UUID.randomUUID().toString().replace("-",""));

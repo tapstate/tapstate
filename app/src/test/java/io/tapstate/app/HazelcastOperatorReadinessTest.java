@@ -347,6 +347,10 @@ class HazelcastOperatorReadinessTest {
                 var bytes = new ByteArrayOutputStream(); try (var out = new ObjectOutputStream(bytes)) { out.writeObject(invocation.getArgument(0)); }
                 serializedTask.set(bytes.toByteArray()); dispatches.incrementAndGet(); dispatch.run(); return answers;
             });
+            when(executor.submitToMembers(any(HazelcastOperatorReadiness.CollectTerminal.class),anyCollection())).thenAnswer(invocation -> {
+                var bytes = new ByteArrayOutputStream(); try (var out = new ObjectOutputStream(bytes)) { out.writeObject(invocation.getArgument(0)); }
+                serializedTask.set(bytes.toByteArray()); dispatches.incrementAndGet(); dispatch.run(); return answers;
+            });
             when(executor.submitToMembers(any(HazelcastOperatorReadiness.SharedCall.class),anyCollection())).thenAnswer(invocation -> {
                 var bytes=new ByteArrayOutputStream();try(var out=new ObjectOutputStream(bytes)){out.writeObject(invocation.getArgument(0));}
                 serializedTask.set(bytes.toByteArray());dispatches.incrementAndGet();dispatch.run();return answers;
@@ -357,13 +361,16 @@ class HazelcastOperatorReadinessTest {
     private static final class RealMembers implements AutoCloseable {
         final HazelcastInstance a,b; final OperatorMapBindings registryA,registryB; final AtomicBoolean refuseB = new AtomicBoolean();
         final Bytes bytes = new Bytes();
-        RealMembers() {
+        RealMembers() { this(false); }
+        RealMembers(boolean jet) {
             var first = config("operator-rpc-"+UUID.randomUUID(),"a"); first.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true);
+            first.getJetConfig().setEnabled(jet).setCooperativeThreadCount(1);
             a = Hazelcast.newHazelcastInstance(first);
             HazelcastInstance joined = null; OperatorMapBindings leftRegistry = null, rightRegistry = null;
             try {
                 var second = config(first.getClusterName(),"b"); second.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true)
                         .addMember("127.0.0.1:"+a.getCluster().getLocalMember().getAddress().getPort());
+                second.getJetConfig().setEnabled(jet).setCooperativeThreadCount(1);
                 joined = Hazelcast.newHazelcastInstance(second);
                 leftRegistry = OperatorMapBindings.bindTo(a,(binding,active) -> { active.run(); return bytes; });
                 rightRegistry = OperatorMapBindings.bindTo(joined,(binding,active) -> { active.run(); if (refuseB.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); return bytes; });
@@ -393,4 +400,80 @@ class HazelcastOperatorReadinessTest {
         @Override public void dropNamespace(String namespace) { values.keySet().removeIf(key -> key.startsWith(namespace+"/")); }
         @Override public long count(String namespace) { return values.keySet().stream().filter(key -> key.startsWith(namespace+"/")).count(); }
     }
+    @Test void actualMembersProveTerminalWithoutPerformingRetirementOrResolvingPendingSubmissions() throws Exception {
+        try (var f = new RealMembers(true)) {
+            var left = mock(ScopedPipelineCaptureCoordinator.class); var right = mock(ScopedPipelineCaptureCoordinator.class);
+            var pending = new AtomicBoolean();
+            HazelcastOperatorReadiness.bindRetirement(f.a, left, () -> {});
+            HazelcastOperatorReadiness.bindRetirement(f.b, right, () -> {});
+            HazelcastOperatorReadiness.bindTerminalRead(f.a, scope -> true, () -> {});
+            var reads = new HazelcastOperatorReadiness(f.a, Duration.ofSeconds(5));
+            var original = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, SCOPE.pipelineId()),
+                    new WorkloadOwner("a", "boot-a"), 3, 4, 1);
+            assertThatThrownBy(() -> reads.requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+            HazelcastOperatorReadiness.bindTerminalRead(f.b, scope -> !pending.get(), () -> {});
+            assertThatCode(() -> reads.requireTerminal(SCOPE, original, () -> {})).doesNotThrowAnyException();
+            var dag = new com.hazelcast.jet.core.DAG();
+            dag.newVertex("wait", com.hazelcast.jet.core.ProcessorMetaSupplier.of(TerminalWaitProcessor::new));
+            var job = f.a.getJet().newJob(dag, new com.hazelcast.jet.config.JobConfig().setName(SCOPE.pipelineId()));
+            try {
+                assertThatThrownBy(() -> reads.requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+            } finally {
+                job.cancel();
+                try { job.getFuture().get(10, TimeUnit.SECONDS); }
+                catch (ExecutionException | CancellationException ended) { }
+            }
+            pending.set(true);
+            assertThatThrownBy(() -> reads.requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+            pending.set(false);
+            when(right.hasPipelineWork(SCOPE.pipelineId())).thenReturn(true);
+            assertThatThrownBy(() -> reads.requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+            when(right.hasPipelineWork(SCOPE.pipelineId())).thenReturn(false);
+            var priorScope = new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation(), SCOPE.pipelineId(), SCOPE.stateGeneration() - 1);
+            var prior = new ExecutionFence(priorScope, original);
+            var binding = new OperatorMapBinding(new OperatorPlacement(priorScope, "cache", OperatorPlacement.Resource.NEST_STATE, "nest", "[]", "state"),
+                    prior, prior.operatorExecutionKey());
+            f.registryB.install(List.of(binding));
+            assertThatThrownBy(() -> reads.requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.registryB.release(binding)).isTrue();
+            assertThatCode(() -> reads.requireTerminal(SCOPE, original, () -> {})).doesNotThrowAnyException();
+            verify(left, never()).retireScope(any(), any()); verify(right, never()).retireScope(any(), any());
+        }
+    }
+
+    @Test void terminalProofRequiresAllOriginalMemberIdentitiesAndAStableRoster() {
+        var f = new MockMembers(); var original = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, SCOPE.pipelineId()),
+                new WorkloadOwner("a", "boot-a"), 3, 4, 1);
+        assertThatCode(() -> f.readiness().requireTerminal(SCOPE, original, () -> {})).doesNotThrowAnyException();
+        assertThat(f.serializedTask.get()).isNotEmpty();
+        f.answers.remove(f.b);
+        assertThatThrownBy(() -> f.readiness().requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+        f.answers.put(f.b, CompletableFuture.completedFuture(new HazelcastOperatorReadiness.Result(identity(f.b), null)));
+        f.dispatch = () -> f.members.set(new LinkedHashSet<>(List.of(f.a, member("b", "boot-b", UUID.randomUUID()))));
+        assertThatThrownBy(() -> f.readiness().requireTerminal(SCOPE, original, () -> {})).isInstanceOf(TapstateException.class);
+    }
+
+    private static final class TerminalWaitProcessor extends com.hazelcast.jet.core.AbstractProcessor {
+        @Override public boolean complete() { return false; }
+    }
+
+    @Test void anUnreturnedTerminalMemberUsesAtMostFiveSecondsThenRefusesTheOptimization() {
+        var f = new MockMembers();
+        var unanswered = new CompletableFuture<HazelcastOperatorReadiness.Result>();
+        f.answers.put(f.a, unanswered);
+        var original = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, SCOPE.pipelineId()),
+                new WorkloadOwner("a", "boot-a"), 3, 4, 1);
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> new HazelcastOperatorReadiness(f.member, Duration.ofSeconds(60))
+                .requireTerminal(SCOPE, original, () -> {}))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ActuationError.OPERATOR_STATE_UNAVAILABLE_ON_MEMBER);
+                    assertThat(failure.args()).containsEntry("reason", "timeout");
+                });
+        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        assertThat(elapsed).isBetween(4500L, 10000L);
+        System.out.printf("STOPPED_TERMINAL_BUDGET configured_ms=60000 elapsed_ms=%d unanswered=true fallback=timeout%n", elapsed);
+        assertThat(unanswered.isDone()).isFalse();
+    }
+
 }

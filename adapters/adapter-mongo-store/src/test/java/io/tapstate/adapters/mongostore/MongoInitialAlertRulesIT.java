@@ -31,12 +31,14 @@ class MongoInitialAlertRulesIT {
                 "pipeline.failed", "Pipeline execution failed",
                 "pipeline.observation-stale", "Pipeline observation stale",
                 "source.connection-failed", "Source connection failed",
-                "cluster.storage-unavailable", "Required storage unavailable");
+                "cluster.storage-unavailable", "Required storage unavailable",
+                "cluster.config-structure-drift", "CONFIG collection or index changed",
+                "cluster.cache-structure-drift", "CACHE collection or index changed");
         try (var observer = MongoClients.create(settings.uri())) {
             var raw = observer.getDatabase(database);
             try (var configuration = MongoConfigurationBootstrap.prepareWithAlerts(settings, "cluster", "installation", "setup", 1, scope, deployment)) {
                 var rows = SystemCollections.ALERT_RULES.on(raw).find().into(new ArrayList<>());
-                assertThat(rows).hasSize(4);
+                assertThat(rows).hasSize(6);
                 assertThat(rows.stream().mapToInt(MongoAlertConfigurationCodec::size).sum()).isLessThan(16 * 1024);
                 for (var row : rows) {
                     String id = row.get("_id", Document.class).getString("id");

@@ -8,6 +8,9 @@ public interface SnapshotStateStore {
     /** The explicitly prepared counter; missing history is never interpreted as zero. */
     long order();
 
+    /** The same retained counter read for an ordinary shared Capture startup. */
+    default long startupOrder() { return order(); }
+
     /** One allocation per original execution, after every bounded capture has been admitted. */
     long advanceOrder(long expectedOrder,long retainedFloor,Map<String,CaptureCacheState> originalCaptures);
 

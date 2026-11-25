@@ -377,15 +377,8 @@ class UnwindDerivedKeyTest {
                 .isEmpty();
     }
 
-    /**
-     * A key column is a claim about the rows a node emits, so it survives only as long as the column
-     * does. A projection downstream of an expansion that drops the ordinal leaves rows keyed on the
-     * parent alone - the same collapse as before, and naming a column the target has not got would
-     * hide it behind a key that reads complete.
-     */
     @Test
-    @DisplayName("a projection that drops the expansion's column drops it from the key too")
-    void aDroppedColumnLeavesTheKey() {
+    void aDroppedLocatorLeavesThePublishedIdentityUnresolved() {
         NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
 
         NodeColumns projected = NodeColumns.of(
@@ -393,11 +386,37 @@ class UnwindDerivedKeyTest {
                 one(expanded), null);
 
         assertThat(projected.columns()).doesNotContainKey("item_no");
-        // Asserted on the node's own answer as well as the published one. The published rule drops
-        // a key column it is not publishing anyway, so through that alone a projection that kept
-        // the claim would look identical - and the claim is read by whatever comes next too.
         assertThat(projected.key()).isEmpty();
-        assertThat(publishedKey(projected)).containsExactly("o_id");
+        assertThat(publishedKey(projected)).isEmpty();
+
+        NodeColumns reused = NodeColumns.of(
+                new TransformBody.MapProjection(Map.of("item_no", FieldRule.literal(0))),
+                one(projected), null);
+        assertThat(reused.columns()).containsKey("item_no");
+        assertThat(publishedKey(reused)).isEmpty();
+    }
+
+    @Test
+    void aCompositeParentKeyStillNeedsTheUnwindLocator() {
+        TargetTable source = new TargetTable("orders", List.of(
+                new TargetField("o_id", "bigint", true),
+                new TargetField("o_region", "text", true),
+                new TargetField("items", "json", false)));
+        NodeColumns upstream = atTheSource();
+        NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(upstream), null);
+
+        for (FieldRule rule : List.of(FieldRule.drop(), FieldRule.literal(0),
+                FieldRule.computed("after.o_id + 1"), FieldRule.rename("items"))) {
+            NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(Map.of("item_no", rule)),
+                    one(expanded), null);
+            assertThat(keyOf(StoreBackedDagSource.publishedAs(source, projected, upstream)))
+                    .as("locator rule %s", rule).isEmpty();
+        }
+
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(Map.of("line_no", FieldRule.rename("item_no"))),
+                one(expanded), null);
+        assertThat(keyOf(StoreBackedDagSource.publishedAs(source, renamed, upstream)))
+                .containsExactly("o_id", "o_region", "line_no");
     }
 
     /** A projection that keeps it keeps it: the pass-through half of the case above. */
