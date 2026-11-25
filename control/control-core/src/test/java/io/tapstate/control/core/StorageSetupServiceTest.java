@@ -269,13 +269,13 @@ class StorageSetupServiceTest {
         var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
         var relabelledSrv = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                 "mongodb+srv://user:secret@customer/cache", "cache", null);
-        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {},
-                new StorageSetupService.Candidate(null, relabelledSrv, connection("master")), StorageSetupService.Layer.CACHE))
+        var srvCandidate = new StorageSetupService.Candidate(null, relabelledSrv, connection("master"));
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, srvCandidate, StorageSetupService.Layer.CACHE))
                 .isInstanceOf(TapstateException.class).hasMessageStartingWith(ControlError.MALFORMED_REQUEST.code());
         var relabelledPlain = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
                 "mongodb://user:secret@customer/cache", "cache", null);
-        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {},
-                new StorageSetupService.Candidate(null, relabelledPlain, connection("master")), StorageSetupService.Layer.CACHE))
+        var plainCandidate = new StorageSetupService.Candidate(null, relabelledPlain, connection("master"));
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, plainCandidate, StorageSetupService.Layer.CACHE))
                 .isInstanceOf(TapstateException.class).hasMessageStartingWith(ControlError.MALFORMED_REQUEST.code());
     }
 
