@@ -39,6 +39,7 @@ public final class CdcRecoveryFixture {
     static byte[] connectorJar(Path delegate) throws IOException, URISyntaxException {
         Manifest manifest = new Manifest();
         manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        manifest.getMainAttributes().put(Attributes.Name.IMPLEMENTATION_VERSION, "1.0");
         manifest.getMainAttributes().put(new Attributes.Name("PDK-API-Version"), "2.0.8");
         manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, delegate.toAbsolutePath().toUri().toString());
         var resource = CdcRecoveryFixture.class.getClassLoader().getResource("io/tapstate/e2e/");

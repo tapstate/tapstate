@@ -165,6 +165,12 @@ enum CliError implements TapstateErrorCode {
      */
     WATCH_NEEDS_A_TERMINAL(CliErrorDefinitions.WATCH_NEEDS_A_TERMINAL),
 
+    /** The full-screen workbench cannot safely render into redirected or non-terminal output. */
+    WORKBENCH_NEEDS_A_TERMINAL(CliErrorDefinitions.WORKBENCH_NEEDS_A_TERMINAL),
+
+    /** The local terminal could not initialize the full-screen workbench. */
+    WORKBENCH_UNAVAILABLE(CliErrorDefinitions.WORKBENCH_UNAVAILABLE),
+
     /**
      * A verb that clears what a pipeline accumulated was run where there is no terminal to confirm at,
      * and nothing said to go ahead unasked; {@code verb} names it. Refused rather than either of the
