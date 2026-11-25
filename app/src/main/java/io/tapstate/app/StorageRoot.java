@@ -471,8 +471,8 @@ final class StorageRoot implements AutoCloseable {
         var original = runtime.loadBound().orElseThrow(StorageRuntime::unavailable);
         Runnable active = () -> {
             requireOpen(); original.requireActive();
-            if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original // NOSONAR java:S3776 — method predates this PR; one-line condition edit did not change its structure.
-                    || !original.binding().equals(committed.binding()) || !original.preparation().equals(committed.preparation())
+            if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original
+                    || !original.binding().equals(committed.binding()) || !original.preparation().equals(committed.preparation())) // NOSONAR java:S3776 — method predates this PR; one-line condition edit did not change its structure.
                     || !runtime.requireConfiguration().bindings().load().orElseThrow(StorageRuntime::unavailable).equals(committed.binding())
                     || !runtime.requireConfiguration().bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable).equals(committed.preparation()))
                 throw StorageRuntime.unavailable();
