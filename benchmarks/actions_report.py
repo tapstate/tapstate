@@ -69,7 +69,12 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
             accepted_artifacts[str(index)] = artifact_name
     reference, baseline_status = read_baseline(inputs, run, manifest)
     if manifest and not manifest["unallocated"]:
-        result = report.reconcile(manifest, measurements, reference, baseline_status=baseline_status)
+        batch_conditions = {
+            int(index): {key: evidence[key] for key in ("cpu", "runner_image", "mongo_images") if key in evidence}
+            for index, evidence in batch_evidence.items()
+        }
+        result = report.reconcile(manifest, measurements, reference, baseline_status=baseline_status,
+                                  batch_conditions=batch_conditions)
         result["errors"].extend(errors)
     else:
         reasons = {item["id"]: item["reason"] for item in errors if "id" in item}
