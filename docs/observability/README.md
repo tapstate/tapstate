@@ -187,7 +187,7 @@ remain preview surface and may change.
 Lag is the age of the last event that the target acknowledged for that table. It is not source backlog,
 and it cannot say whether the source has more changes waiting.
 
-CDC delivery time measures the time from a change’s event timestamp to confirmed target write.
+CDC delivery time measures the time from the source event timestamp to target acknowledgement.
 It counts only writes backed by incremental source positions. Full loads, mixed or unknown source
 positions, and missing or future timestamps are excluded. If a change produces multiple confirmed
 outputs, each output is one delivery. History differences the cumulative count and elapsed-time
