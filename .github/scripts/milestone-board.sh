@@ -21,19 +21,18 @@ project_json=$(gh api graphql -f owner="$owner" -F number="$project_number" -f q
   query($owner:String!, $number:Int!) {
     organization(login:$owner) { projectV2(number:$number) {
       id
-      fields(first:50) { nodes {
+      field(name:"Status") {
         ... on ProjectV2SingleSelectField { id name options { id name } }
-      } }
+      }
     } }
   }')
 project_id=$(jq -r '.data.organization.projectV2.id // empty' <<<"$project_json")
 [[ -n $project_id ]] || die "cannot read organization project $owner/$project_number"
-status_field_id=$(jq -r '.data.organization.projectV2.fields.nodes[] | select(.name == "Status") | .id' <<<"$project_json")
+status_field_id=$(jq -r '.data.organization.projectV2.field.id // empty' <<<"$project_json")
 [[ -n $status_field_id ]] || die 'project has no Status field'
 
 status_option_id() {
-  jq -r --arg name "$1" '.data.organization.projectV2.fields.nodes[]
-    | select(.name == "Status") | .options[] | select(.name == $name) | .id' <<<"$project_json"
+  jq -r --arg name "$1" '.data.organization.projectV2.field.options[] | select(.name == $name) | .id' <<<"$project_json"
 }
 for status in Todo 'In Progress' Done; do
   [[ -n $(status_option_id "$status") ]] || die "project Status has no '$status' option"
@@ -52,50 +51,51 @@ legacy_filter_for() {
 }
 
 project_views() {
-  gh api graphql -f owner="$owner" -F number="$project_number" -f query='
-    query($owner:String!, $number:Int!) {
+  gh api graphql --paginate --slurp -f owner="$owner" -F number="$project_number" -f query='
+    query($owner:String!, $number:Int!, $endCursor:String) {
       organization(login:$owner) { projectV2(number:$number) {
-        views(first:100) { nodes { id name filter } }
+        views(first:100, after:$endCursor) {
+          nodes { id name filter layout }
+          pageInfo { hasNextPage endCursor }
+        }
       } }
-    }'
+    }' | jq '[.[].data.organization.projectV2.views.nodes[] | select(.layout == "BOARD_LAYOUT")]'
 }
 
 ensured_view_title=''
 ensure_view() {
-  local title=$1 previous=${2:-} desired legacy previous_filter previous_legacy views view_id current_name current_filter body status_rest_id
+  local title=$1 previous=${2:-} desired legacy previous_filter views view_id body status_rest_id
   [[ $title != "$ensured_view_title" || -n $previous ]] || return 0
   desired=$(filter_for "$title")
   legacy=$(legacy_filter_for "$title")
   previous_filter=''
-  previous_legacy=''
   if [[ -n $previous ]]; then
     previous_filter=$(filter_for "$previous")
-    previous_legacy=$(legacy_filter_for "$previous")
   fi
   views=$(project_views)
-  view_id=$(jq -r --arg desired "$desired" --arg legacy "$legacy" \
-    --arg previous "$previous_filter" --arg previous_legacy "$previous_legacy" \
-    '[.data.organization.projectV2.views.nodes[]
-      | select(.filter == $desired or .filter == $legacy or
-               ($previous != "" and .filter == $previous) or
-               ($previous_legacy != "" and .filter == $previous_legacy))][0].id // empty' <<<"$views")
+  # Reuse an existing board for this exact scope without renaming a manually titled view.
+  if jq -e --arg desired "$desired" --arg legacy "$legacy" \
+      'any(.[]; .filter == $desired or .filter == $legacy)' <<<"$views" >/dev/null; then
+    ensured_view_title=$title
+    return
+  fi
+  # Only a rename webhook links the old and new names. Restrict updates to one exact match.
+  view_id=$(jq -r --arg old "$previous" --arg previous "$previous_filter" \
+    '[.[] | select($old != "" and .name == $old and .filter == $previous)]
+     | if length == 1 then .[0].id else empty end' <<<"$views")
   if [[ -n $view_id ]]; then
-    current_name=$(jq -r --arg id "$view_id" '.data.organization.projectV2.views.nodes[] | select(.id == $id) | .name' <<<"$views")
-    current_filter=$(jq -r --arg id "$view_id" '.data.organization.projectV2.views.nodes[] | select(.id == $id) | .filter' <<<"$views")
-    if [[ $current_name != "$title" || $current_filter != "$desired" ]]; then
-      gh api graphql -f view="$view_id" -f name="$title" -f filter="$desired" -f query='
-        mutation($view:ID!, $name:String!, $filter:String!) {
-          updateProjectV2View(input:{viewId:$view, name:$name, filter:$filter}) {
-            projectV2View { id }
-          }
-        }' >/dev/null
-      note "updated view: $title"
-    fi
+    gh api graphql -f view="$view_id" -f name="$title" -f filter="$desired" -f query='
+      mutation($view:ID!, $name:String!, $filter:String!) {
+        updateProjectV2View(input:{viewId:$view, name:$name, filter:$filter}) {
+          projectV2View { id }
+        }
+      }' >/dev/null
+    note "updated view: $title"
     ensured_view_title=$title
     return
   fi
 
-  status_rest_id=$(gh api "orgs/$owner/projectsV2/$project_number/fields" \
+  status_rest_id=$(gh api --paginate "orgs/$owner/projectsV2/$project_number/fields" \
     --jq '.[] | select(.name == "Status") | .id')
   [[ -n $status_rest_id ]] || die 'cannot read REST Status field ID'
   body=$(jq -n --arg name "$title" --arg filter "$desired" --argjson status "$status_rest_id" \
@@ -106,13 +106,16 @@ ensure_view() {
 }
 
 project_item_for_issue() {
-  gh api graphql -f issue="$1" -f query='
-    query($issue:ID!) {
+  gh api graphql --paginate --slurp -f issue="$1" -f query='
+    query($issue:ID!, $endCursor:String) {
       node(id:$issue) { ... on Issue {
-        projectItems(first:100) { nodes { id project { id } } }
+        projectItems(first:100, after:$endCursor) {
+          nodes { id project { id } }
+          pageInfo { hasNextPage endCursor }
+        }
       } }
     }' | jq -r --arg project "$project_id" \
-      '[.data.node.projectItems.nodes[] | select(.project.id == $project)][0].id // empty'
+      '[.[].data.node.projectItems.nodes[] | select(.project.id == $project)][0].id // empty'
 }
 
 remove_issue() {
@@ -141,18 +144,13 @@ read_status() {
   gh api graphql -f item="$1" -f query='
     query($item:ID!) {
       node(id:$item) { ... on ProjectV2Item {
-        fieldValues(first:50) { nodes {
-          ... on ProjectV2ItemFieldSingleSelectValue {
-            name field { ... on ProjectV2SingleSelectField { name } }
-          }
-        } }
+        fieldValueByName(name:"Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
       } }
-    }' | jq -r '[.data.node.fieldValues.nodes[]
-      | select(.field.name == "Status")][0].name // empty'
+    }' | jq -r '.data.node.fieldValueByName.name // empty'
 }
 
 upsert_issue() {
-  local issue=$1 issue_id number title state option_id result item_id prior attempt actual
+  local issue=$1 issue_id number title state option_id result item_id attempt actual
   issue_id=$(jq -r '.node_id // empty' <<<"$issue")
   number=$(jq -r '.number // empty' <<<"$issue")
   [[ -n $issue_id && -n $number ]] || die 'issue payload lacks node_id or number'
@@ -166,17 +164,28 @@ upsert_issue() {
     elif any(.labels[]?; .name == $label) then "In Progress"
     else "Todo" end' <<<"$issue")
   option_id=$(status_option_id "$state")
-  prior=$(project_item_for_issue "$issue_id")
-  result=$(gh api graphql -f project="$project_id" -f issue="$issue_id" -f query='
-    mutation($project:ID!, $issue:ID!) {
-      addProjectV2ItemById(input:{projectId:$project, contentId:$issue}) {
-        item { id }
-      }
-    }')
-  item_id=$(jq -r '.data.addProjectV2ItemById.item.id // empty' <<<"$result")
-  [[ -n $item_id ]] || die "cannot add issue #$number to project"
-  # The built-in item-added workflow can land after the mutation and reset Status to Todo.
-  [[ -n $prior || $state == Todo ]] || sleep 2
+  item_id=$(project_item_for_issue "$issue_id")
+  if [[ -z $item_id ]]; then
+    result=$(gh api graphql -f project="$project_id" -f issue="$issue_id" -f query='
+      mutation($project:ID!, $issue:ID!) {
+        addProjectV2ItemById(input:{projectId:$project, contentId:$issue}) {
+          item { id }
+        }
+      }')
+    item_id=$(jq -r '.data.addProjectV2ItemById.item.id // empty' <<<"$result")
+    [[ -n $item_id ]] || die "cannot add issue #$number to project"
+  fi
+  actual=$(read_status "$item_id")
+  # The native item-added automation initializes Status. A replay of a new item can arrive before it finishes.
+  if [[ $state != Todo && -z $actual ]]; then
+    for attempt in 1 2 4 8 16; do
+      sleep "$attempt"
+      actual=$(read_status "$item_id")
+      [[ -z $actual ]] || break
+    done
+    [[ -n $actual ]] || note "issue #$number: no native default observed; applying the requested Status"
+  fi
+  [[ $actual != "$state" ]] || return 0
   set_status "$item_id" "$option_id"
   for attempt in 1 2 3; do
     actual=$(read_status "$item_id")
@@ -197,7 +206,9 @@ reconcile() {
     milestone=$(printf '%s' "$encoded" | base64 -d)
     title=$(jq -r '.title' <<<"$milestone")
     number=$(jq -r '.number' <<<"$milestone")
-    ensure_view "$title"
+    if [[ $(jq -r '.state' <<<"$milestone") == open ]]; then
+      ensure_view "$title"
+    fi
     issue_lines=$(gh api --paginate "repos/$repo/issues?state=all&milestone=$number&per_page=100" \
       --jq '.[] | select(.pull_request == null) | @base64') || die "cannot list issues for milestone $number"
     while IFS= read -r issue_encoded; do
@@ -256,9 +267,19 @@ fi
 event=$(<"$GITHUB_EVENT_PATH")
 case ${GITHUB_EVENT_NAME:-} in
   milestone)
-    title=$(jq -r '.milestone.title // empty' <<<"$event")
-    previous=$(jq -r '.changes.title.from // empty' <<<"$event")
-    [[ -n $title ]] || die 'milestone event has no title'
+    action=$(jq -r '.action' <<<"$event")
+    if [[ $action == deleted ]]; then
+      note 'milestone deleted; ownership of existing views requires maintainer verification before removal'
+      exit 0
+    fi
+    number=$(jq -er '.milestone.number' <<<"$event")
+    milestone=$(gh api "repos/$repo/milestones/$number")
+    [[ $(jq -r '.state' <<<"$milestone") == open ]] || exit 0
+    title=$(jq -er '.title' <<<"$milestone")
+    previous=''
+    if [[ $action == edited && $title == "$(jq -r '.milestone.title' <<<"$event")" ]]; then
+      previous=$(jq -r '.changes.title.from // empty' <<<"$event")
+    fi
     ensure_view "$title" "$previous"
     ;;
   issues)

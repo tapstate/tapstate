@@ -2,7 +2,7 @@ name: Milestone board
 
 on:
   milestone:
-    types: [created, edited]
+    types: [created, edited, opened, closed, deleted]
   issues:
     types: [opened, milestoned, demilestoned, labeled, unlabeled, closed, reopened]
   workflow_dispatch:
@@ -13,8 +13,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: tapstate-milestone-board-${{ github.event_name }}-${{ github.event.issue.number || github.event.milestone.number || 'all' }}
+  group: tapstate-milestone-board-8
   cancel-in-progress: false
+  queue: max
 
 jobs:
   reconcile:

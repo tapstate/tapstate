@@ -42,44 +42,49 @@ endpoint = "graphql" if "graphql" in args else next(
 )
 if endpoint == "graphql":
     query = params.get("query", "")
-    if "fields(first:50)" in query:
+    if 'field(name:"Status")' in query:
         answer({"data": {"organization": {"projectV2": {
-            "id": "PVT8", "fields": {"nodes": [{"id": "STATUS_FIELD", "name": "Status",
+            "id": "PVT8", "field": {"id": "STATUS_FIELD", "name": "Status",
             "options": [{"id": "TODO", "name": "Todo"},
                         {"id": "PROGRESS", "name": "In Progress"},
-                        {"id": "DONE", "name": "Done"}]}]}
+                        {"id": "DONE", "name": "Done"}]}
         }}}})
-    if "views(first:100)" in query:
-        answer({"data": {"organization": {"projectV2": {
-            "views": {"nodes": state["views"]}
-        }}}})
+    if "views(first:100," in query:
+        assert "--paginate" in args and "--slurp" in args and "after:$endCursor" in query
+        answer([{"data": {"organization": {"projectV2": {"views": {"nodes": chunk}}}}}
+                for chunk in ([], state["views"])])
     if "updateProjectV2View" in query:
         view = next(view for view in state["views"] if view["id"] == params["view"])
         view["name"] = params["name"]
         view["filter"] = params["filter"]
         answer({"data": {"updateProjectV2View": {"projectV2View": {"id": view["id"]}}}})
-    if "projectItems(first:100)" in query:
+    if "projectItems(first:100," in query:
+        assert "--paginate" in args and "--slurp" in args and "after:$endCursor" in query
         item = state["items"].get(params["issue"])
         nodes = [{"id": item["id"], "project": {"id": "PVT8"}}] if item else []
-        answer({"data": {"node": {"projectItems": {"nodes": nodes}}}})
-    if "fieldValues(first:50)" in query:
+        answer([{"data": {"node": {"projectItems": {"nodes": chunk}}}}
+                for chunk in ([{"id":"OTHER_ITEM","project":{"id":"OTHER_PROJECT"}}], nodes)])
+    if 'fieldValueByName(name:"Status")' in query:
         item = next(value for value in state["items"].values() if value["id"] == params["item"])
-        if item.get("reset_once") and item["status"] != "TODO":
-            item["status"] = "TODO"
-            item["reset_once"] = False
+        if item.get("pending_reads", 0) > 0:
+            item["pending_reads"] -= 1
+            if not item["pending_reads"]:
+                item["status"] = "TODO"
         names = {"TODO": "Todo", "PROGRESS": "In Progress", "DONE": "Done"}
-        nodes = [{"name": names[item["status"]], "field": {"name": "Status"}}] if item["status"] else []
-        answer({"data": {"node": {"fieldValues": {"nodes": nodes}}}})
+        value = {"name": names[item["status"]]} if item["status"] else None
+        answer({"data": {"node": {"fieldValueByName": value}}})
     if "addProjectV2ItemById" in query:
         issue = params["issue"]
-        if issue not in state["items"]:
-            state["items"][issue] = {"id": "ITEM-" + issue, "status": None, "reset_once": True}
+        assert issue not in state["items"], "an existing item must never trigger another native add"
+        state["items"][issue] = {"id": "ITEM-" + issue, "status": None, "pending_reads": 2}
         answer({"data": {"addProjectV2ItemById": {
             "item": {"id": state["items"][issue]["id"]}
         }}})
     if "updateProjectV2ItemFieldValue" in query:
         assert params["project"] == "PVT8" and params["field"] == "STATUS_FIELD"
         item = next(value for value in state["items"].values() if value["id"] == params["item"])
+        if params["option"] != "TODO":
+            assert not item.get("pending_reads"), "an unfinished native add can overwrite this Status"
         item["status"] = params["option"]
         answer({"data": {"updateProjectV2ItemFieldValue": {
             "projectV2Item": {"id": item["id"]}
@@ -110,12 +115,15 @@ if endpoint == "orgs/tapstate/projectsV2/8/views":
     assert body["layout"] == "board"
     assert body["vertical_group_by"] == [427213889]
     view = {"id": "VIEW-" + str(max(int(view["id"].split("-")[1]) for view in state["views"]) + 1),
-            "name": body["name"], "filter": body["filter"]}
+            "name": body["name"], "filter": body["filter"], "layout": "BOARD_LAYOUT"}
     state["views"].append(view)
     answer({"value": view})
 if endpoint.startswith("repos/tapstate/tapstate/issues/"):
     number = endpoint.rsplit("/", 1)[1]
     answer(state["issues"]["ISSUE-" + number])
+if endpoint.startswith("repos/tapstate/tapstate/milestones/"):
+    number = int(endpoint.rsplit("/", 1)[1])
+    answer(next(row for row in state["milestones"] if row["number"] == number))
 if endpoint.startswith("repos/tapstate/tapstate/milestones?"):
     if os.environ.get("MOCK_GH_FAIL_MILESTONES") == "1":
         sys.exit(12)
@@ -143,18 +151,21 @@ def issue(number, milestone, state="open", labels=None):
 
 
 def run():
+    workflow = (ROOT.parent / "workflows/milestone-board.yml").read_text()
+    assert "group: tapstate-milestone-board-8" in workflow and "queue: max" in workflow
+    assert "types: [created, edited, opened, closed, deleted]" in workflow
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         mock = directory / "gh"
         mock.write_text(MOCK_GH)
         mock.chmod(0o755)
         state_file = directory / "state.json"
-        week4 = {"number": 5, "title": "Week 4 — MVP lifecycle"}
-        week8 = {"number": 6, "title": "Week 8 — First customer"}
-        week12 = {"number": 7, "title": "Week 12 — Paid pilot"}
+        week4 = {"number": 5, "state": "open", "title": "Week 4 — MVP lifecycle"}
+        week8 = {"number": 6, "state": "open", "title": "Week 8 — First customer"}
+        week12 = {"number": 7, "state": "open", "title": "Week 12 — Paid pilot"}
         state_file.write_text(json.dumps({
             "views": [{"id": "VIEW-2", "name": "Week 4 Board",
-                       "filter": 'milestone:"Week 4 — MVP lifecycle"'}],
+                       "layout":"BOARD_LAYOUT", "filter": 'milestone:"Week 4 — MVP lifecycle"'}],
             "items": {"ISSUE-576": {"id": "ITEM-ISSUE-576", "status": "PROGRESS"},
                       "ISSUE-999": {"id": "ITEM-ISSUE-999", "status": "TODO"}},
             "milestones": [week4, week8, week12],
@@ -172,6 +183,12 @@ def run():
                 current_issue = payload["issue"]
                 current_state["issues"][current_issue["node_id"]] = current_issue
                 state_file.write_text(json.dumps(current_state))
+            if event_name == "milestone" and refresh_issue and payload.get("action") != "deleted":
+                current_state = json.loads(state_file.read_text())
+                milestone = payload["milestone"]
+                current_state["milestones"] = [m for m in current_state["milestones"]
+                                               if m["number"] != milestone["number"]] + [milestone]
+                state_file.write_text(json.dumps(current_state))
             event_file.write_text(json.dumps(payload))
             result = subprocess.run([str(SCRIPT)], env=dict(env, GITHUB_EVENT_NAME=event_name,
                                     GITHUB_EVENT_PATH=str(event_file)), capture_output=True,
@@ -182,17 +199,26 @@ def run():
         state = invoke("milestone", {"milestone": week4})
         assert len(state["views"]) == 1
         assert state["views"][0]["id"] == "VIEW-2"
-        assert state["views"][0]["filter"] == 'repo:tapstate/tapstate milestone:"Week 4 — MVP lifecycle"'
+        assert state["views"][0]["name"] == "Week 4 Board"
+        assert state["views"][0]["filter"] == 'milestone:"Week 4 — MVP lifecycle"'
 
         state = invoke("milestone", {"milestone": week8})
         state = invoke("milestone", {"milestone": week8})
         assert len(state["views"]) == 2, "a replay must not create a second view"
         previous = week8["title"]
         week8 = dict(week8, title="Week 8 revised")
-        state = invoke("milestone", {"milestone": week8, "changes": {"title": {"from": previous}}})
+        state = invoke("milestone", {"action": "edited", "milestone": week8, "changes": {"title": {"from": previous}}})
         assert len(state["views"]) == 2
         assert state["views"][1]["filter"] == 'repo:tapstate/tapstate milestone:"Week 8 revised"', state["views"]
 
+        stale_title = dict(week8, title=previous)
+        state = invoke("milestone", {"action": "edited", "milestone": stale_title}, refresh_issue=False)
+        assert len(state["views"]) == 2, "a stale event must read the current milestone"
+        retired = {"number": 10, "title": "Retired", "state": "closed"}
+        state = invoke("milestone", {"action": "closed", "milestone": retired})
+        assert len(state["views"]) == 2, "closing a milestone must not create a new view"
+        state = invoke("milestone", {"action": "deleted", "milestone": retired})
+        assert len(state["views"]) == 2
         current = issue(900, week8)
         state = invoke("issues", {"issue": current})
         assert state["items"]["ISSUE-900"]["status"] == "TODO"
@@ -219,7 +245,8 @@ def run():
         assert state["items"]["ISSUE-901"]["status"] == "DONE"
         assert state["items"]["ISSUE-576"]["status"] == "PROGRESS"
         assert "ISSUE-999" not in state["items"], "reconcile must remove stale items"
-        assert len([view for view in state["views"] if view["name"] == week4["title"]]) == 1
+        assert sum(view["name"] == "Week 4 Board" for view in state["views"]) == 1
+        assert all(view["name"] != "Retired" for view in state["views"])
         failure = subprocess.run([str(SCRIPT), "--reconcile"],
                                  env=dict(env, MOCK_GH_FAIL_MILESTONES="1"),
                                  capture_output=True, text=True, check=False)
