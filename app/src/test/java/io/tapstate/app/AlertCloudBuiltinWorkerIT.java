@@ -112,8 +112,12 @@ class AlertCloudBuiltinWorkerIT {
                             .allMatch(row->row.contains(":ACCEPTED:1:"));});
             }
             var records=store.deliveries(null,100,null,null,f.reads()).rows();assertThat(records).hasSize(9);
-            var expectedKinds=new TreeMap<String,Long>();for(var type:catalog.types())if(type.defaultSeverity()!=AlarmSeverity.WARNING)
-                for(var kind:List.of(DeliveryKey.Kind.FAULT,DeliveryKey.Kind.REMINDER,DeliveryKey.Kind.RECOVERY))expectedKinds.put(type.id()+":"+kind,1L);
+            var expectedKinds = new TreeMap<String, Long>();
+            for (var type : List.of("pipeline.failed", "source.connection-failed", "cluster.storage-unavailable")) {
+                for (var kind : List.of(DeliveryKey.Kind.FAULT, DeliveryKey.Kind.REMINDER, DeliveryKey.Kind.RECOVERY)) {
+                    expectedKinds.put(type + ":" + kind, 1L);
+                }
+            }
             var actualKinds=new TreeMap<String,Long>();for(var record:records){assertThat(record.value().frozen().members()).hasSize(1);
                 actualKinds.merge(record.value().frozen().members().getFirst().evaluation().key().typeId()+":"+((AlertIntent.Business)record.value().frozen().identity()).key().notification().kind(),1L,Long::sum);}
             assertThat(actualKinds).containsExactlyInAnyOrderEntriesOf(expectedKinds);
