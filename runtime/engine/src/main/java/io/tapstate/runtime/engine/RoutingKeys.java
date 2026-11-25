@@ -119,6 +119,19 @@ final class RoutingKeys {
         return key.name();
     }
 
+    /** A complete before/after pair that routes the row to different keys. */
+    static boolean changesKey(Envelope row, List<String> columns) {
+        if (row.before() == null || row.after() == null) return false;
+        for (String column : columns) {
+            if (java.util.Objects.deepEquals(ConvertedValue.unwrap(row.before().get(column)),
+                    ConvertedValue.unwrap(row.after().get(column)))) continue;
+            JoinKey before = keyFrom(row.before(), columns);
+            JoinKey after = keyFrom(row.after(), columns);
+            return before != null && after != null && !before.equals(after);
+        }
+        return false;
+    }
+
     /** The key {@code columns} spell on {@code image}, or null where a column is absent or holds nothing. */
     private static JoinKey keyFrom(Map<String, Object> image, List<String> columns) {
         if (image == null) {

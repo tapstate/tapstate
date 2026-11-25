@@ -707,7 +707,7 @@ public final class PipelineDagBuilder {
         ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
                 sinkAck, () -> SettledFloor.forRoutedWriter(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
                 shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis(),
-                chains == null ? Map.of() : chains.assembledOutputs(sink.upstream())),
+                chains == null ? Map.of() : chains.assembledOutputs(sink.upstream()), targets),
                 sink);
         if (startsTheRun != null) {
             writers = WriterRunStart.of(writers, sinkAck, startsTheRun);

@@ -166,6 +166,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     private final Map<String, Long> waitingSince = new LinkedHashMap<>();
     private int queuedRows;
     private final KeyMoveSinkWriter moveWriter;
+    private Map<String, SinkTarget> nativeTargets = Map.of();
     private QueuedMove queuedMove;
 
     private record QueuedMove(long order, Envelope row, KeyMoveHandoffs.Receipt receipt, List<Envelope> batch,
@@ -375,7 +376,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
                 new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, edgesFactory, vertexName, true,
-                        maxRecords, maxWaitMillis, assembledOutputs),
+                        maxRecords, maxWaitMillis, assembledOutputs, Map.of()),
                 vertexName);
     }
 
@@ -394,12 +395,13 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory, SinkAckFactory sinkAckFactory,
             SupplierEx<SinkFrontier> frontierFactory, SupplierEx<LevelBounds> edgesFactory, int plannedMembers,
-            int maxRecords, long maxWaitMillis, Map<String, List<String>> assembledOutputs) {
+            int maxRecords, long maxWaitMillis, Map<String, List<String>> assembledOutputs,
+            Map<String, SinkTarget> nativeTargets) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         ProcessorSupplier supplier = new AckSinkSupplier(writerFactory,sinkAckFactory,
                 sinkAckFactory==null?()->null:Objects.requireNonNull(frontierFactory,"frontierFactory"),
-                edgesFactory, vertexName, false, maxRecords, maxWaitMillis, assembledOutputs);
+                edgesFactory, vertexName, false, maxRecords, maxWaitMillis, assembledOutputs, nativeTargets);
         return PlannedMembersGuard.of(ProcessorMetaSupplier.of(supplier), plannedMembers);
     }
 
@@ -495,10 +497,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 enqueue((Envelope) item);
             }
         }
-        if (queuedMove != null && moveWriter != null) {
+        if (queuedMove != null && queuedMove.receipt() != null && moveWriter != null) {
             while (queuedRows + queuedMove.batch().size() < maxBatchSize && inbox.peek() instanceof Envelope next
                     && next.src().equals(queuedMove.row().src()) && moveWriter.receiptFor(next) == null
-                    && queuedMove.admit().test(next)) {
+                    && !nativeMove(next) && queuedMove.admit().test(next)) {
                 queuedMove.batch().add((Envelope) inbox.poll());
                 nextOrder++;
             }
@@ -518,6 +520,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 return;
             }
         }
+        if (nativeMove(row)) {
+            // A bulk writer may reorder its input. Submit the native update by itself and
+            // require its acceptance before an old-key replacement can enter the target.
+            queuedMove = new QueuedMove(nextOrder++, row, null, List.of(row), ignored -> false);
+            return;
+        }
         ArrayDeque<Queued> queue = queued.get(row.src());
         if (queue == null) {
             queue = new ArrayDeque<>();
@@ -526,6 +534,17 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
         queue.add(new Queued(nextOrder++, row));
         queuedRows++;
+    }
+
+    private boolean nativeMove(Envelope row) {
+        if (row.op() != io.tapstate.core.event.Op.UPDATE) return false;
+        var target = nativeTargets.get(row.src());
+        return target != null && RoutingKeys.changesKey(row, target.keyColumns());
+    }
+
+    SinkProcessor withNativeTargets(Map<String, SinkTarget> targets) {
+        nativeTargets = targets;
+        return this;
     }
 
     private QueuedMove reserveMove(Envelope row, KeyMoveHandoffs.Receipt receipt, KeyMoveSinkWriter writer) {
@@ -577,7 +596,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         boolean wrote = false;
         while (inFlight.size() < maxInFlight) {
             if (queuedMove != null && queued.isEmpty()) {
-                if (!queuedMove.receipt().mayWrite()) return wrote;
+                if (queuedMove.receipt() != null && !queuedMove.receipt().mayWrite()) return wrote;
                 var batch = queuedMove.batch();
                 inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
                         queuedMove.order(), queuedMove.receipt(), batch.size()));
@@ -850,13 +869,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
             try {
                 WriteResult result = settle(batch.future());
-                if (batch.receipt() != null) {
-                    if (result.written() != batch.expectedWrites()) {
-                        throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
-                                Map.of("expected", batch.expectedWrites(), "accepted", result.written()), null);
-                    }
-                    batch.receipt().written();
+                if (batch.expectedWrites() > 0 && result.written() != batch.expectedWrites()) {
+                    throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
+                            Map.of("expected", batch.expectedWrites(), "accepted", result.written()), null);
                 }
+                if (batch.receipt() != null) batch.receipt().written();
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
@@ -1116,6 +1133,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final int maxRecords;
         private final long maxWaitMillis;
         private final Map<String, List<String>> assembledOutputs;
+        private final Map<String, SinkTarget> nativeTargets;
         private transient SinkAck sinkAck;
         private transient int memberIndex;
         private transient Set<String> completedSnapshotInputs;
@@ -1123,7 +1141,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
                 SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
                 SupplierEx<LevelBounds> edgesFactory, String vertexName, boolean totalOne,
-                int maxRecords, long maxWaitMillis, Map<String, List<String>> assembledOutputs) {
+                int maxRecords, long maxWaitMillis, Map<String, List<String>> assembledOutputs,
+                Map<String, SinkTarget> nativeTargets) {
+            this.nativeTargets = Map.copyOf(nativeTargets);
             this.writerFactory = writerFactory;
             this.sinkAckFactory = sinkAckFactory;
             this.frontierFactory = frontierFactory;
@@ -1159,7 +1179,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                     DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
                     new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
                     edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime)
-                    .withAssembledOutputs(assembledOutputs).withCompletedSnapshotInputs(completedSnapshotInputs));
+                    .withNativeTargets(nativeTargets).withAssembledOutputs(assembledOutputs)
+                    .withCompletedSnapshotInputs(completedSnapshotInputs));
         }
     }
 

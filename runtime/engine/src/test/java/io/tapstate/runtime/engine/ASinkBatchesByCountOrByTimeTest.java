@@ -319,6 +319,40 @@ class ASinkBatchesByCountOrByTimeTest {
         assertThat(hotWriter.batches).containsExactly(List.of(3));
     }
 
+    @Test
+    void aNativeWriterMustConfirmTheMoveBeforeSubmittingOldKeyReuse() throws Exception {
+        var writer = new ManualWriter();
+        var ack = new RecordingAck();
+        var sink = sink(writer, ack, new ContiguousPrefix(AXES), 32, 20)
+                .withNativeTargets(Map.of("orders", new SinkTarget("orders", List.of("id"))));
+        var move = Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 2), null)
+                .withPosition(new ChainPosition(new SourceOrder(1, 2), "move"));
+        var inbox = inbox(row("orders", 1), move, row("orders", 1));
+        sink.process(0, inbox);
+        elapse(20);
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(1));
+        writer.completeAll();
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(1), List.of(2));
+        writer.pending.getLast().complete(new WriteResult(0));
+        assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+        assertThat(ack.calls).isEmpty();
+        assertThat(writer.batches).hasSize(2);
+    }
+
+    @Test
+    void ordinaryUpdatesAtANativeWriterStillShareABatch() throws Exception {
+        var writer = new RecordingWriter();
+        var sink = sink(writer, null, null, 3, 20)
+                .withNativeTargets(Map.of("orders", new SinkTarget("orders", List.of("tenant", "id"))));
+        var before = Map.<String, Object>of("tenant", "t", "id", 4, "value", 1);
+        var after = Map.<String, Object>of("tenant", "t", "id", 4, "value", 2);
+        sink.process(0, inbox(row("orders", 1), Envelope.update(2, "orders", before, after, null), row("orders", 3)));
+        assertThat(writer.batches).containsExactly(List.of(1, 4, 3));
+    }
+
     private static MoveWriter taking(KeyMoveHandoffs.Receipt receipt) {
         return new MoveWriter() {
             @Override
