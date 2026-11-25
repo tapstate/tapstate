@@ -19,6 +19,7 @@ public final class AlertIntent {
     public static final int MAX_BYTES = 512 * 1024;
     public static final int MAX_ATTEMPT_BYTES = 4 * 1024;
     public static final int MAX_DIAGNOSTIC_BYTES = 2 * 1024;
+    private static final String ACCEPTED_RECEIPT_FIELD = "acceptedReceipt";
     private AlertIntent() { }
 
     public sealed interface Identity permits Business, Test {
@@ -194,10 +195,7 @@ public final class AlertIntent {
                 AlertValidation.require(configured.identity().scope().equals(identity.scope()), "route", "foreign-scope");
             }
             if (retention.deployment() == Deployment.CLOUD_MANAGED) {
-                AlertValidation.require(identity instanceof Business && route instanceof SystemRoute && target instanceof SdkTarget
-                        && (identity.channelType().equals(AlertChannelPolicy.CLOUD_EVENTS.typeId())
-                                || identity.channelType().equals(AlertChannelPolicy.CLOUD_EMAIL.typeId()))
-                        && retry.maximumTotalAttempts() == 1, "cloudIntent", "not-a-single-sdk-delivery");
+                validateCloudIntent(identity, route, target, retry);
             } else {
                 AlertValidation.require(!(route instanceof SystemRoute)
                         && (identity instanceof Business ? target instanceof ReceiverTarget && route instanceof ConfiguredRoute
@@ -223,6 +221,26 @@ public final class AlertIntent {
             }
         }
     }
+    private static String expectedReceiptSource(Identity identity) {
+        return AlertChannelPolicy.CLOUD_EVENTS.typeId().equals(identity.channelType())
+                ? "sdk-event-center" : "channel-protocol";
+    }
+
+    private static boolean matchesReceiptSource(Receipt receipt, String expectedSource) {
+        return receipt == null || receipt.source().equals(expectedSource);
+    }
+
+    private static void validateCloudIntent(Identity identity, Route route, Target target, ChannelRetryPolicy retry) {
+        AlertValidation.require(identity instanceof Business && route instanceof SystemRoute && target instanceof SdkTarget
+                && managedChannel(identity.channelType()) && retry.maximumTotalAttempts() == 1,
+                "cloudIntent", "not-a-single-sdk-delivery");
+    }
+
+    private static boolean managedChannel(String channelType) {
+        return AlertChannelPolicy.CLOUD_EVENTS.typeId().equals(channelType)
+                || AlertChannelPolicy.CLOUD_EMAIL.typeId().equals(channelType);
+    }
+
     public enum StopReason { ACCEPTED, RENDER_FAILED, REVOKED, DISABLED, EXPIRED, EXHAUSTED, AGE_LIMIT, NON_RETRYABLE, CANCELLED }
     public enum Action { STOP, RETRY, PAUSE }
     public enum Phase { LOCAL, CONNECT, TLS, AUTHENTICATION, ENVELOPE, BODY, FINAL_RESPONSE, DEADLINE, CAPACITY }
@@ -351,8 +369,7 @@ public final class AlertIntent {
                             "permitsStoppedAt", "must-retain-final-budget-consumption-time");
                 }
             }
-            String receiptSource = frozen.identity().channelType().equals(AlertChannelPolicy.CLOUD_EVENTS.typeId())
-                    ? "sdk-event-center" : "channel-protocol";
+            String receiptSource = expectedReceiptSource(frozen.identity());
             int pending = 0;
             for (int index = 0; index < state.attempts().size(); index++) {
                 Attempt attempt = state.attempts().get(index); var permit = attempt.permit();
@@ -402,18 +419,18 @@ public final class AlertIntent {
             AlertValidation.require((state.summary() == Outcome.ACCEPTED) == (retained.acceptedAt() != null),
                     "acceptedAt", "does-not-match-accepted-evidence");
             AlertValidation.require(state.acceptedReceipt() == null || state.summary() == Outcome.ACCEPTED && state.acceptedReceipt().requestId() == null,
-                    "acceptedReceipt", "invalid-retained-receipt");
-            AlertValidation.require(state.acceptedReceipt() == null || state.acceptedReceipt().source().equals(receiptSource),
-                    "acceptedReceipt", "foreign-retained-receipt-source");
+                    ACCEPTED_RECEIPT_FIELD, "invalid-retained-receipt");
+            AlertValidation.require(matchesReceiptSource(state.acceptedReceipt(), receiptSource),
+                    ACCEPTED_RECEIPT_FIELD, "foreign-retained-receipt-source");
             if (frozen.retention().deployment() == Deployment.CLOUD_MANAGED && state.summary() == Outcome.ACCEPTED) {
                 AlertValidation.require(state.acceptedReceipt() != null,
-                        "acceptedReceipt", "missing-retained-sdk-evidence");
+                        ACCEPTED_RECEIPT_FIELD, "missing-retained-sdk-evidence");
             }
             if (state.acceptedReceipt() != null && state.detailsPrunedAt() == null) {
                 AlertValidation.require(state.attempts().stream().anyMatch(attempt -> attempt.receipt() != null
                         && Objects.equals(attempt.acceptedRecordedAt(), retained.acceptedAt())
                         && attempt.receipt().source().equals(state.acceptedReceipt().source())
-                        && attempt.receipt().remoteId().equals(state.acceptedReceipt().remoteId())), "acceptedReceipt", "not-from-first-durable-accepted");
+                        && attempt.receipt().remoteId().equals(state.acceptedReceipt().remoteId())), ACCEPTED_RECEIPT_FIELD, "not-from-first-durable-accepted");
             }
             AlertValidation.require(state.summary() != Outcome.ACCEPTED || state.permitsStopped(),
                     "permitsStopped", "accepted-cannot-grant-again");
