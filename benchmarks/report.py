@@ -70,7 +70,13 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None, batch
         observed = row if key in rows else None
         if observed and batch_conditions and baseline and baseline.get("schema_version") == baseline_schema.SOURCE_SCHEMA:
             observed = {**row, "runner": batch_conditions.get(case_batches[key[0]], {})}
-        failures = memory_failures(observed or row, baseline, manifest["environment"])
+        outcome = observed or row
+        failures = memory_failures(outcome, baseline, manifest["environment"])
+        checks = source_memory_checks(outcome, baseline, manifest["environment"])
+        if checks:
+            row["memory_budget_checks"] = checks
+            failures.extend({**check, "reason": "memory-budget-exceeded"}
+                            for check in checks if check["status"] == "exceeded")
         if failures:
             row["memory_failures"] = failures
             if row["status"] not in verdict.FAILED_STATUSES:
@@ -127,26 +133,36 @@ def memory_failures(row, baseline, environment):
                 if limit and source == limit["source"] and valid(observed) and observed > limit["limit_kib"]:
                     failures.append({"arm": name, "reason": "memory-budget-exceeded", "metric": metric,
                                      "observed": observed, **limit})
-    if baseline and baseline.get("schema_version") == baseline_schema.SOURCE_SCHEMA:
-        failures.extend(source_memory_failures(row, baseline, environment))
     return failures
 
 
-def source_memory_failures(row, baseline, environment):
-    if row["status"] != "completed" or baseline["environment"] != environment:
+def source_memory_checks(row, baseline, environment):
+    if not baseline or baseline.get("schema_version") != baseline_schema.SOURCE_SCHEMA:
         return []
-    case = baseline["cases"].get(row["case_id"])
     limits = baseline.get("memory_limits", {}).get(row["case_id"])
-    if not case or case["status"] != "completed" or not limits or not matches_reference(row, case["current"]):
+    if not limits:
         return []
-    failures = []
-    for name, arm in arms_for(row).items():
-        for metric, value, binding in source_metrics(arm):
-            for budget in limits.get(name, {}).get(metric, ()):
-                if metric_binding_matches(budget, binding) and value > budget["limit"]:
-                    failures.append({**budget, "arm": name, "metric": metric, "observed": value,
-                                     "reason": "memory-budget-exceeded"})
-    return failures
+    reference = baseline["cases"][row["case_id"]]["current"]
+    if row["status"] != "completed":
+        missing = "result-unavailable"
+    elif baseline["environment"] != environment or not matches_reference(row, reference):
+        missing = "incompatible-conditions"
+    else:
+        missing = "evidence-insufficient"
+    arms = arms_for(row) if missing == "evidence-insufficient" else {}
+    checks = []
+    for name, metrics in limits.items():
+        observations = list(source_metrics(arms[name])) if name in arms else []
+        for metric, budgets in metrics.items():
+            for budget in budgets:
+                observed = next((value for key, value, binding in observations
+                                 if key == metric and metric_binding_matches(budget, binding)), None)
+                check = {**budget, "arm": name, "metric": metric, "status": missing}
+                if observed is not None:
+                    check.update(observed=observed,
+                                 status="exceeded" if observed > budget["limit"] else "within-budget")
+                checks.append(check)
+    return checks
 
 
 def summarize_repeats(results):

@@ -130,10 +130,30 @@ class BaselineSourcesTest(unittest.TestCase):
         self.assertEqual("memory-budget-exceeded", over["memory_failures"][0]["reason"])
         self.assertEqual(2, over["memory_failures"][0]["budget_version"])
         self.assertEqual(425000 * 1024, over["memory_failures"][0]["observed"])
+        self.assertEqual("exceeded", over["memory_budget_checks"][0]["status"])
+        passing = deepcopy(summary)
+        window = passing["results"][0]["resources"]["windows"]["startup"]
+        window["rss_peak_kib"] = 410000
+        under = report.reconcile(manifest, [passing], accepted, batch_conditions={0: runner})["results"][0]
+        self.assertEqual("completed", under["status"])
+        self.assertEqual("within-budget", under["memory_budget_checks"][0]["status"])
+        self.assertEqual(410000 * 1024, under["memory_budget_checks"][0]["observed"])
+        self.assertNotIn("memory_failures", under)
+        window["covered"] = False
+        unavailable = report.reconcile(manifest, [passing], accepted, batch_conditions={0: runner})["results"][0]
+        self.assertEqual("completed", unavailable["status"])
+        self.assertEqual("evidence-insufficient", unavailable["memory_budget_checks"][0]["status"])
+        self.assertNotIn("observed", unavailable["memory_budget_checks"][0])
+        self.assertNotIn("memory_failures", unavailable)
         incompatible = report.reconcile(manifest, [summary], accepted,
                                         batch_conditions={0: {**runner, "cpu": "Different CPU"}})["results"][0]
         self.assertEqual("incompatible", incompatible["comparisons"]["status"])
+        self.assertEqual("incompatible-conditions", incompatible["memory_budget_checks"][0]["status"])
         self.assertNotIn("memory_failures", incompatible)
+        missing = report.reconcile(manifest, [], accepted, batch_conditions={0: runner})["results"][0]
+        self.assertEqual("missing", missing["status"])
+        self.assertEqual("result-unavailable", missing["memory_budget_checks"][0]["status"])
+        self.assertNotIn("memory_failures", missing)
 
     def test_zero_reference_requires_explicit_thresholds(self):
         release = deepcopy(self.fixture["initial"])
