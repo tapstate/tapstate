@@ -307,6 +307,17 @@ TEST_MODE=publish-dev STUB_PUSH_FAIL=true expect_failure 'failed dev replacement
 TEST_MODE=publish-dev TEST_GITHUB_OUTPUT="$WORK/action-output" STUB_ANONYMOUS_DIGEST_MISMATCH=true \
     expect_failure 'dev also refuses wrong anonymous bytes' 'anonymous manifest digest differs'
 if [[ ! -s "$WORK/action-output" ]]; then ok 'dev readback failure emits no deployment output'; else bad 'dev readback failure emits no deployment output'; fi
+temporary_tag="ghcr.io/tapstate/tapstate-cloud:0.9.0-dev-${DIGEST#sha256:}"
+: > "$WORK/action-output"
+if TEST_MODE=publish-temporary TEST_VERSION=0.9.0 TEST_GITHUB_OUTPUT="$WORK/action-output" \
+        run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF "imagetools create --tag $temporary_tag " "$WORK/commands.log" \
+        && grep -qxF "tag=$temporary_tag" "$WORK/action-output" \
+        && grep -qxF "image=ghcr.io/tapstate/tapstate-cloud@$DIGEST" "$WORK/action-output"; then
+    ok 'temporary publication tags the verified image by its full manifest hash'
+else bad 'temporary publication tags the verified image by its full manifest hash'; fi
+TEST_MODE=publish-temporary STUB_EXISTING_DIGEST="sha256:different" \
+    expect_failure 'a temporary tag cannot be replaced with different content' 'overwriting is forbidden'
 TEST_MODE=publish-prod expect_failure 'an unknown mode cannot choose a package' 'usage:'
 if [[ ! -s "$WORK/commands.log" ]]; then ok 'an unknown mode performs no external operation'; else bad 'an unknown mode performs no external operation'; fi
 if [[ ! -e "$ROOT/.github/workflows/cloud-ecr.yml" ]]; then

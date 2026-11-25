@@ -5,8 +5,8 @@ umask 077
 fail() { printf 'Cloud GHCR publication refused: %s\n' "$1" >&2; exit 1; }
 mode="${1:-}"
 case "$mode" in
-    publish|publish-dev) ;;
-    *) fail 'usage: ghcr-publish.sh <publish|publish-dev> --archive FILE --version VERSION --expected-digest SHA256 [--dev-source-sha SHA]' ;;
+    publish|publish-dev|publish-temporary) ;;
+    *) fail 'usage: ghcr-publish.sh <publish|publish-dev|publish-temporary> --archive FILE --version VERSION --expected-digest SHA256 [--dev-source-sha SHA]' ;;
 esac
 shift
 archive='' version='' expected_digest='' dev_source_sha=''
@@ -22,6 +22,7 @@ while [[ $# -gt 0 ]]; do
     shift 2
 done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'a numeric release version is required; floating tags are forbidden'
+[[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'expected OCI digest is missing or invalid'
 tag="$version"
 if [[ -n "$dev_source_sha" ]]; then
     [[ "$mode" == publish-dev ]] || fail 'a dev source SHA is valid only for publish-dev'
@@ -30,8 +31,9 @@ fi
 if [[ "$mode" == publish-dev ]]; then
     tag="$version-dev"
     if [[ -n "$dev_source_sha" ]]; then tag+="-${dev_source_sha:0:12}"; fi
+elif [[ "$mode" == publish-temporary ]]; then
+    tag="$version-dev-${expected_digest#sha256:}"
 fi
-[[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'expected OCI digest is missing or invalid'
 [[ -f "$archive" ]] || fail 'verified OCI archive is missing'
 workflow_identity=false
 if [[ -z "${CLOUD_GHCR_TOKEN:-}" && "${GITHUB_ACTIONS:-}" == true && -n "${GITHUB_TOKEN:-}" ]]; then
@@ -103,7 +105,7 @@ existing="$(gh api --paginate "$endpoint/versions?per_page=100" \
     --jq ".[] | select((.metadata.container.tags // []) | index(\"$tag\")) | .name" \
     2>"$scratch/api-error")" || fail 'existing Cloud release tags could not be read'
 [[ "$mode" == publish-dev || -z "$existing" || "$existing" == "$expected_digest" ]] \
-    || fail 'the release version already names different bytes; overwriting is forbidden'
+    || fail 'the version tag already names different bytes; overwriting is forbidden'
 
 printf '%s' "$CLOUD_GHCR_TOKEN" \
     | docker login ghcr.io --username "$CLOUD_GHCR_USERNAME" --password-stdin \
