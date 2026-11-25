@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import java.nio.file.Path;
+import java.util.List;
 import java.util.function.BiFunction;
 
 /**
@@ -24,10 +26,15 @@ enum Tiers {
     }
 
     ServerHandle launch(PreparedNativeStore storage) {
+        return launch(storage, null);
+    }
+
+    ServerHandle launch(PreparedNativeStore storage, Path retainedPlugins) {
         return switch (this) {
-            case IN_PROCESS -> InProcessServer.startPrepared(storage);
-            case REAL_PROCESS -> RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
-                    port -> java.util.List.of("--tapstate.cluster.id=" + storage.clusterId(),
+            case IN_PROCESS -> InProcessServer.startPrepared(storage, retainedPlugins == null ? List.of()
+                    : List.of("--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + retainedPlugins));
+            case REAL_PROCESS -> RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", retainedPlugins,
+                    port -> List.of("--tapstate.cluster.id=" + storage.clusterId(),
                             "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
         };
     }
