@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.model.Collation;
 import com.mongodb.client.model.IndexOptions;
 import org.bson.Document;
 import io.tapstate.core.common.JsonWriter;
@@ -27,19 +28,26 @@ class DefaultCopyPrimaryKeyUpdateIT {
     private static final Map<String, Object> UPDATED_KEY = Map.of("K1", 2, "K2", "r1");
     private static final Map<String, Object> OTHER_KEY = Map.of("ID", 1);
 
+    private enum Install { FRESH, LEGACY, UNSUPPORTED_INDEX }
+
     @Test
     void aPrimaryKeyUpdateDoesNotStopChangeDeliveryToAnotherTable() throws Exception {
-        verifyKeyMove(Map.of(), false);
+        verifyKeyMove(Map.of(), Install.FRESH);
     }
 
     @Test
     void fourExplicitWritersPreserveTheMovedRowAndTheReplacement() throws Exception {
-        verifyKeyMove(Map.of("parallelism", 4, "batch", Map.of("max_records", 32, "max_wait", "20ms")), false);
+        verifyKeyMove(Map.of("parallelism", 4, "batch", Map.of("max_records", 32, "max_wait", "20ms")), Install.FRESH);
     }
 
     @Test
     void aLegacyInstallWritesOrdinaryChangesAndRefusesOnlyTheMove() throws Exception {
-        verifyKeyMove(Map.of(), true);
+        verifyKeyMove(Map.of(), Install.LEGACY);
+    }
+
+    @Test
+    void aMoveRefusedBeforeDispatchCanBeRetriedAfterCorrectingTheIndex() throws Exception {
+        verifyKeyMove(Map.of(), Install.UNSUPPORTED_INDEX);
     }
 
     private static ServerHandle launch(PreparedNativeStore store, boolean legacy) throws Exception {
@@ -54,12 +62,12 @@ class DefaultCopyPrimaryKeyUpdateIT {
         return Tiers.IN_PROCESS.launch(store);
     }
 
-    private void verifyKeyMove(Map<String, Object> execution, boolean legacy) throws Exception {
+    private void verifyKeyMove(Map<String, Object> execution, Install install) throws Exception {
         DockerGate.require();
         RealConnectorGate.require("mysql", "mongodb");
         var mysql = SharedMySql.settings("key_change_" + UUID.randomUUID().toString().replace("-", ""));
         try (var connection = SharedMySql.connect(mysql); Statement sql = connection.createStatement();
-                var storage = PreparedNativeStore.create(); ServerHandle server = launch(storage, legacy);
+                var storage = PreparedNativeStore.create(); ServerHandle server = launch(storage, install == Install.LEGACY);
                 var mongo = new MongoEndpoints(); var targetClient = MongoClients.create(storage.masterUri())) {
             sql.execute("CREATE TABLE ACC_COMPOSITE (K1 INT, K2 VARCHAR(20), VAL INT, " +
                     "OWNER VARCHAR(20) NOT NULL UNIQUE, PRIMARY KEY (K1, K2))");
@@ -97,6 +105,10 @@ class DefaultCopyPrimaryKeyUpdateIT {
             var physical = targetClient.getDatabase(new ConnectionString(storage.masterUri()).getDatabase())
                     .getCollection(COMPOSITE);
             physical.createIndex(new Document("OWNER", 1), new IndexOptions().unique(true));
+            if (install == Install.UNSUPPORTED_INDEX) {
+                physical.createIndex(new Document("OWNER", 1), new IndexOptions().name("owner_non_simple")
+                        .unique(true).collation(Collation.builder().locale("en").build()));
+            }
             control.lifecycle(PIPELINE, LifecycleVerb.START);
 
             var target = EndpointAddress.uri(storage.masterUri());
@@ -114,7 +126,35 @@ class DefaultCopyPrimaryKeyUpdateIT {
                     .fetch(target, COMPOSITE, ORIGINAL_KEY).filter(row -> "21".equals(String.valueOf(row.get("VAL"))))
                     .isPresent(), () -> control.pipelineStatus(PIPELINE).toString());
 
-            if (legacy) {
+            if (install == Install.UNSUPPORTED_INDEX) {
+                assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
+                Await.until("the non-simple index to refuse the move before dispatch",
+                        () -> control.failure(PIPELINE).isPresent(),
+                        () -> control.pipelineStatus(PIPELINE).toString());
+                try (var configClient = MongoClients.create(storage.configurationUri())) {
+                    var windows = configClient.getDatabase(storage.configurationDatabase()).getCollection("pipeline_key_move_windows");
+                    assertThat(windows.countDocuments(new Document("_id", PIPELINE)))
+                            .as("rejecting before dispatch leaves no uncertain target write").isZero();
+                }
+                var original = physical.find(new Document("K1", 2).append("K2", "k1")).first();
+                assertThat(original).isNotNull();
+                assertThat(mongo.fetch(target, COMPOSITE, UPDATED_KEY)).isEmpty();
+                assertThat(control.failure(PIPELINE).orElseThrow().code()).isEqualTo("TS0440017");
+                control.stop(PIPELINE, false);
+                physical.dropIndex("owner_non_simple");
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Await.until("the retained source position to replay the move with the repaired index",
+                        () -> mongo.fetch(target, COMPOSITE, UPDATED_KEY).isPresent()
+                                && mongo.fetch(target, COMPOSITE, ORIGINAL_KEY).isEmpty(),
+                        () -> control.pipelineStatus(PIPELINE).toString());
+                var moved = physical.find(new Document("K1", 2).append("K2", "r1")).first();
+                assertThat(moved).isNotNull();
+                assertThat(moved.get("_id")).as("a resumed move keeps the original physical document")
+                        .isEqualTo(original.get("_id"));
+                control.stop(PIPELINE, false);
+                return;
+            }
+            if (install == Install.LEGACY) {
                 assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
                 Await.until("the legacy installation to refuse the move before dispatch",
                         () -> control.failure(PIPELINE).filter(f -> f.code().equals("TS0480044")).isPresent(),

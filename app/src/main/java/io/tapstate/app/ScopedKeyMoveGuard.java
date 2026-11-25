@@ -6,6 +6,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.srs.SourceChangeGuard;
+import io.tapstate.runtime.engine.SourceKeyMovePreflight;
 import io.tapstate.spi.store.*;
 
 import java.util.List;
@@ -23,10 +24,14 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
     }
 
     @Override public SourceChangeGuard open(Processor.Context context) {
+        return open(context, null);
+    }
+
+    @Override public SourceChangeGuard open(Processor.Context context, SourceKeyMovePreflight.Check preflight) {
         var member = context.hazelcastInstance();
         if (!(member.getUserContext().get(STORE_KEY) instanceof PipelineKeyMoveWindows windows))
             throw PipelineKeyMoveWindows.unresolved(fence.pipelineId());
-        return new Guard(member, context.executionId(), windows);
+        return new Guard(member, context.executionId(), windows, preflight);
     }
 
     private final class Guard implements SourceChangeGuard {
@@ -37,9 +42,11 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
         private final ExecutionAuthorization authorization;
         private PipelineKeyMoveWindows.Window open;
         private long nextPoll;
+        private final SourceKeyMovePreflight.Check preflight;
 
-        Guard(HazelcastInstance member, long execution, PipelineKeyMoveWindows windows) {
+        Guard(HazelcastInstance member, long execution, PipelineKeyMoveWindows windows, SourceKeyMovePreflight.Check preflight) {
             this.member = member;
+            this.preflight = preflight;
             this.execution = execution;
             this.windows = windows;
             authorization = ExecutionAuthorization.of(member);
@@ -57,6 +64,8 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
             PipelineKeyMoveWindows.Range changes = null;
             for (var row : rows) {
                 if (!mayMove(row, keys)) continue;
+                if (preflight == null) throw PipelineKeyMoveWindows.unresolved(fence.pipelineId());
+                preflight.validate(row);
                 var position = row.position();
                 if (position == null || position.order() == null || position.order().seq() < 0)
                     throw PipelineKeyMoveWindows.unresolved(fence.pipelineId());

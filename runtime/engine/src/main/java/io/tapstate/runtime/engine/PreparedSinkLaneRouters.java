@@ -5,6 +5,7 @@ import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
+import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -20,6 +21,7 @@ final class PreparedSinkLaneRouters implements ProcessorMetaSupplier {
     private final ChainAxes axes;
     private final Map<Integer, List<String>> chains;
     private transient ProcessorMetaSupplier delegate;
+    private transient Context context;
 
     private PreparedSinkLaneRouters(String node, Map<String, SinkTarget> targets, PreparesTargets preparation,
             ChainAxes axes, Map<Integer, List<String>> chains) {
@@ -42,7 +44,8 @@ final class PreparedSinkLaneRouters implements ProcessorMetaSupplier {
 
     @Override
     public void init(Context context) throws Exception {
-        var evidence = Map.copyOf(preparation.prepareTargetConstraints(context.hazelcastInstance()));
+        this.context = context;
+        var evidence = evidence(context, node, preparation);
         String name = node;
         var targetTables = targets;
         var chainAxes = axes;
@@ -64,6 +67,25 @@ final class PreparedSinkLaneRouters implements ProcessorMetaSupplier {
 
     @Override
     public void close(Throwable failure) throws Exception {
-        if (delegate != null) delegate.close(failure);
+        try {
+            if (delegate != null) delegate.close(failure);
+        } finally {
+            if (context != null) forget(context, node);
+        }
     }
+    @SuppressWarnings("unchecked")
+    static Map<String, TargetKeyConstraints> evidence(Context context, String node, PreparesTargets preparation) {
+        return (Map<String, TargetKeyConstraints>) context.hazelcastInstance().getUserContext()
+                .computeIfAbsent(cacheKey(context, node), ignored -> Map.copyOf(
+                        preparation.prepareTargetConstraints(context.hazelcastInstance())));
+    }
+
+    static void forget(Context context, String node) {
+        context.hazelcastInstance().getUserContext().remove(cacheKey(context, node));
+    }
+
+    private static String cacheKey(Context context, String node) {
+        return PreparedSinkLaneRouters.class.getName() + "." + context.jobId() + "." + context.executionId() + "." + node;
+    }
+
 }

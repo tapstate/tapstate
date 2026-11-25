@@ -15,7 +15,8 @@ import java.util.Map;
 import java.util.Set;
 
 /** All values a row releases or acquires in its physical target, under proven simple equality. */
-final class SinkLaneClaims {
+final class SinkLaneClaims implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
     record Key(String table, List<String> columns, List<Object> value) {}
     record Row(Envelope event, Set<Key> keys, List<String> fences, String destination, boolean reserved) {}
 

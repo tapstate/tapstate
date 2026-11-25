@@ -63,7 +63,7 @@ import java.util.function.LongConsumer;
  * log and read-cursor sink are resolved on the
  * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads, io.tapstate.runtime.engine.SourceKeyMovePreflight {
 
     @Override
     public Stage stage() {
@@ -86,6 +86,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final RingTail ringTail;
     private final SourceChangeGuard.Factory changeGuardFactory;
     private SourceChangeGuard changeGuard;
+    private io.tapstate.runtime.engine.SourceKeyMovePreflight.Check preflight;
+
+    @Override public void withKeyMovePreflight(io.tapstate.runtime.engine.SourceKeyMovePreflight.Check check) {
+        preflight = Objects.requireNonNull(check);
+    }
     private int admittedRows;
     private final boolean bounded;
     // The most changes one pass reads from the ring and sends on before yielding: the batch the source's author
@@ -176,7 +181,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             }
         }
         try {
-            if (changeGuardFactory != null) changeGuard = changeGuardFactory.open(context);
+            if (changeGuardFactory != null) changeGuard = changeGuardFactory.open(context, preflight);
             initialize(context);
         } catch (RuntimeException | Error failure) {
             if (failures != null) failures.accept(failure);

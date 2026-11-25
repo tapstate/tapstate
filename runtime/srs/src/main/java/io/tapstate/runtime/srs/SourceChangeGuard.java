@@ -12,5 +12,10 @@ public interface SourceChangeGuard {
     @FunctionalInterface
     interface Factory extends Serializable {
         SourceChangeGuard open(Processor.Context context);
+
+        default SourceChangeGuard open(Processor.Context context,
+                io.tapstate.runtime.engine.SourceKeyMovePreflight.Check preflight) {
+            return open(context);
+        }
     }
 }

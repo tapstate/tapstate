@@ -562,6 +562,7 @@ public final class PipelineDagBuilder {
             connect(dag, verticesOf(sink.upstream(), byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
         }
 
+        bindSourcePreflights(dag, rawSources, sinks, shape);
         // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
         // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
         boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
@@ -579,6 +580,33 @@ public final class PipelineDagBuilder {
         }
 
         return dag;
+    }
+
+    private static void bindSourcePreflights(DAG dag, Set<String> rawSources, List<SinkNode> sinks,
+            ExecutionShape shape) {
+        for (String source : rawSources) {
+            var routes = new ArrayList<com.hazelcast.function.FunctionEx<Object, Object>>();
+            var targets = new ArrayList<SourcePreflightStart.Target>();
+            for (var edge : dag.getOutboundEdges(source)) {
+                String destination = edge.getDestName();
+                if (shape.isNative(destination) && shape.inputKeys().containsKey(destination)) {
+                    routes.add(RoutingKeys.forNode(destination, shape.inputKeysOf(destination)));
+                }
+                for (var sink : sinks) {
+                    if (!destination.equals(ROUTE_VERTEX_PREFIX + sink.name())) continue;
+                    var tables = shape.sinkTargetsOf(sink.name());
+                    if (coordinatesMoves(sink, rawSources, tables)) {
+                        targets.add(new SourcePreflightStart.Target(sink.name(), tables, (PreparesTargets) sink.writers()));
+                    } else {
+                        routes.add(RoutingKeys.forSink(sink.name(), tables, false));
+                    }
+                }
+            }
+            dag.getVertex(source).updateMetaSupplier(delegate -> {
+                var checked = SourcePreflightStart.of(delegate, routes, targets);
+                return targets.isEmpty() ? checked : PlannedMembersGuard.of(checked, shape.plannedMembers());
+            });
+        }
     }
 
     /**
@@ -689,9 +717,7 @@ public final class PipelineDagBuilder {
         Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
         int local = shape.localOf(name);
         var preparation = sink.writers() instanceof PreparesTargets p ? p : null;
-        boolean coordinated = preparation != null && preparation.supportsParallelKeyMoves()
-                && rawSources.containsAll(sink.upstream()) && targets.values().stream().map(SinkTarget::table)
-                        .distinct().count() == targets.size();
+        boolean coordinated = coordinatesMoves(sink, rawSources, targets);
         var ingress = RoutingKeys.forSink(name, targets, coordinated);
         var writerLane = RoutingKeys.forSink(name, targets, false);
         var inputs = chains == null ? null : chains.perOrdinal(sink.upstream());
@@ -721,6 +747,12 @@ public final class PipelineDagBuilder {
         dag.edge(Edge.from(router, SinkRouter.SPREAD).to(vertex, SinkRouter.SPREAD).distributed());
         dag.edge(Edge.from(router, SinkRouter.BY_KEY).to(vertex, SinkRouter.BY_KEY)
                 .partitioned(writerLane).distributed());
+    }
+
+    private static boolean coordinatesMoves(SinkNode sink, Set<String> rawSources, Map<String, SinkTarget> targets) {
+        return sink.writers() instanceof PreparesTargets preparation && preparation.supportsParallelKeyMoves()
+                && rawSources.containsAll(sink.upstream()) && targets.values().stream().map(SinkTarget::table)
+                        .distinct().count() == targets.size();
     }
 
     /**
