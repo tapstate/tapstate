@@ -38,6 +38,26 @@ class PdkReadRetryTest {
         assertThat(hookCalls).hasValue(1);
     }
 
+    @Test
+    void aMissingFailureDoesNotCallTheConnectorHook() {
+        var hookCalls = new AtomicInteger();
+
+        assertThat(PdkReadRetry.prepare(mysqlWithRetryHook(hookCalls), PDKMethod.SOURCE_STREAM_READ, null))
+                .isEmpty();
+        assertThat(hookCalls).hasValue(0);
+    }
+
+    @Test
+    void anIncompleteDebeziumMessageStillUsesTheConnectorHook() {
+        var hookCalls = new AtomicInteger();
+        var failure = new RuntimeException(new DebeziumException(
+                "The MySQL server is not configured to use a FULL binlog_row_image, but the error was incomplete."));
+
+        assertThat(PdkReadRetry.prepare(mysqlWithRetryHook(hookCalls), PDKMethod.SOURCE_STREAM_READ, failure))
+                .isPresent();
+        assertThat(hookCalls).hasValue(1);
+    }
+
     private static PdkConnector mysqlWithRetryHook(AtomicInteger hookCalls) {
         var connector = mock(PdkConnector.class);
         when(connector.connectorId()).thenReturn("mysql");
