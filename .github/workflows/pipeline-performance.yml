@@ -110,6 +110,7 @@ jobs:
           {
             echo "STORE=$RUNNER_TEMP/performance-maven"
             echo "EVIDENCE=$evidence"
+            echo "LEGACY_REPOSITORY=$HOME/.m2/repository"
           } >> "$GITHUB_ENV"
           now=$(date +%s)
           if (( now >= STOP_AT )); then
@@ -136,7 +137,7 @@ jobs:
       - name: Bind the Maven cache to the build inputs
         env:
           MAVEN_INPUTS: ${{ hashFiles('**/pom.xml', '.mvn/**', '.github/scripts/setup-ci-maven.sh', 'benchmarks/actions_maven.py') }}
-        run: echo "CACHE_PREFIX=perf-maven-v1-${RUNNER_OS}-${RUNNER_ARCH}-${MAVEN_INPUTS}-" >> "$GITHUB_ENV"
+        run: echo "CACHE_PREFIX=perf-maven-v2-${RUNNER_OS}-${RUNNER_ARCH}-${MAVEN_INPUTS}-" >> "$GITHUB_ENV"
       - uses: actions/cache/restore@v5
         id: previous
         with:
@@ -147,7 +148,7 @@ jobs:
         if: steps.previous.outputs.cache-matched-key == ''
         id: legacy
         with:
-          path: ~/.m2/repository
+          path: ${{ env.LEGACY_REPOSITORY }}
           key: setup-java-Linux-x64-maven-${{ hashFiles('**/pom.xml') }}
       - name: Bootstrap the pinned Maven distribution
         if: steps.previous.outputs.cache-matched-key == ''
@@ -168,7 +169,7 @@ jobs:
             legacy=(--legacy-hit)
           fi
           python3 -B benchmarks/actions_maven.py prepare \
-            --inputs "$RUNNER_TEMP/performance-inputs" --store "$STORE" --legacy "$HOME/.m2/repository" \
+            --inputs "$RUNNER_TEMP/performance-inputs" --store "$STORE" --legacy "$LEGACY_REPOSITORY" \
             --evidence "$EVIDENCE" --prefix "$CACHE_PREFIX" --warm-key "$WARM_KEY" \
             --stop-at "$SEED_STOP_AT" "${legacy[@]}"
       - uses: actions/cache/restore@v5

@@ -17,7 +17,7 @@ import runner
 
 ATTEMPT = {"run_id": 123, "attempt": 1}
 SHA = "a" * 40
-PREFIX = "perf-maven-v1-Linux-X64-" + "a" * 64 + "-"
+PREFIX = "perf-maven-v2-Linux-X64-" + "a" * 64 + "-"
 CASE = "copy.snapshot.basic.standard"
 
 

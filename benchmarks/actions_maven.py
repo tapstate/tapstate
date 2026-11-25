@@ -18,7 +18,7 @@ import runner
 
 ROOT = Path(__file__).resolve().parent.parent
 DIGEST = re.compile(r"[a-f0-9]{64}")
-CACHE_PREFIX = re.compile(r"perf-maven-v1-Linux-X64-[a-f0-9]{64}-")
+CACHE_PREFIX = re.compile(r"perf-maven-v2-Linux-X64-[a-f0-9]{64}-")
 CENTRAL_REQUEST = re.compile(r"^(?:\[INFO\] )?Downloading from central:", re.MULTILINE)
 CENTRAL_429 = re.compile(r"from/to central .*?(?:HTTP Status: 429|status code: 429)", re.IGNORECASE)
 MAVEN_GOALS = (
