@@ -50,11 +50,25 @@ final class PipelineFirstStatePreparer {
         requireActive.run();cache.verifySources(original,inputs);requireActive.run();
     }
 
+    boolean verifyRetainedSourcesAndCheckSinkModels(PipelineIntentScope scope, PipelinePreparationInputs inputs,
+            WorkloadClaimFence original, Runnable requireSinkActive) {
+        requireActive.run();
+        boolean prepared = cache.verifySourcesAndCheckSinkModels(scope, inputs, original, requireSinkActive);
+        requireActive.run();
+        return prepared;
+    }
+
     /** Runtime preparation requires the current captured source contract even when CONFIG already says COMPLETE. */
     PipelinePreparation prepare(PipelineIntentScope original,PipelinePreparationInputs inputs) {
         Objects.requireNonNull(inputs,"inputs"); requireActive.run();
         var result = prepareAttempt(original,inputs,null,() -> {}); requireActive.run();
         cache.verifySources(original,inputs); requireActive.run(); return result;
+    }
+
+    /** Keeps CONFIG admission and preparation; the owning startup verifies retained CACHE sources. */
+    void prepareForStartIntent(PipelineIntentScope original, PipelinePreparationInputs inputs) {
+        prepareAttempt(original, Objects.requireNonNull(inputs, "inputs"), null, () -> {});
+        requireActive.run();
     }
 
     void prepareDeferred(io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {

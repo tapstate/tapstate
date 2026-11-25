@@ -52,11 +52,11 @@ class MongoValidationResultStoreIT {
         }
     }
 
-    @Test void collectionProbeFailuresRemainCodedWithoutLeakingDriverExceptions() {
+    @Test void resultWriteFailuresRemainCodedWithoutLeakingDriverExceptions() {
         try (var f = new Fixture()) {
             var admin = f.client.getDatabase("admin");
             admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
-                    .append("data", new Document("failCommands", List.of("listCollections")).append("errorCode", 13)));
+                    .append("data", new Document("failCommands", List.of("insert")).append("errorCode", 13)));
             try {
                 assertThatThrownBy(() -> f.first.publish(f.write(1, 1, true))).isInstanceOfSatisfying(TapstateException.class,
                         failure -> { assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE); assertThat(failure.getCause()).isNull(); });
@@ -215,7 +215,7 @@ class MongoValidationResultStoreIT {
             SystemCollections.VALIDATION_REPORTS.on(f.database).deleteOne(new Document("_id", MongoValidationAdmissionStore.reportId(f.start.run())));
             assertThat(f.first.publish(f.write(1, 1, true))).isEqualTo(Publication.CLOSED_OR_EXPIRED);
             assertThat(f.differences().countDocuments()).isZero(); f.differences().drop();
-            assertThatThrownBy(() -> f.first.publish(f.write(1, 1, true))).isInstanceOf(TapstateException.class).hasMessageContaining("validation-differences");
+            assertThat(f.first.publish(f.write(1, 1, true))).isEqualTo(Publication.CLOSED_OR_EXPIRED);
             assertThat(f.database.listCollectionNames()).doesNotContain("validation_differences");
         }
     }

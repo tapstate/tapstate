@@ -174,13 +174,20 @@ class MongoRequiredDeadLetterStoreIT {
 
     @ParameterizedTest
     @ValueSource(strings = {"missing-index", "ttl"})
-    void ordinaryAccessRefusesIndexLossOrExpiryWithoutRepair(String damage) {
+    void ordinaryAccessDefersIndexLossOrExpiryToInspection(String damage) {
         withConfiguration((domain, database) -> {
             var store = domain.requiredDeadLetters(); assertThat(store.record(SCOPE, 0, fact("a", 10, Map.of()))).isTrue();
             if (damage.equals("ttl")) rows(database).createIndex(new Document("expiredAt", 1), new IndexOptions().name("forbidden_ttl").expireAfter(1L, TimeUnit.SECONDS));
             else rows(database).dropIndex("required_dead_letters_recent");
-            assertThatThrownBy(() -> store.read(SCOPE, 10)).satisfies(error -> code(error, IoError.DOCUMENT_UNREADABLE));
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(database), "cluster-a")).satisfies(error -> code(error, IoError.DOCUMENT_UNREADABLE));
+            assertThat(store.read(SCOPE, 10)).hasSize(1);
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                assertThat(reopened.requiredDeadLetters().read(SCOPE, 10)).hasSize(1);
+                assertThat(reopened.inspectStructure(new MongoReadBudget(java.time.Duration.ofSeconds(5))))
+                        .anySatisfy(issue -> {
+                            assertThat(issue.collection()).isEqualTo(SystemCollections.CONFIG_NEST_DEAD_LETTERS.collectionName());
+                            assertThat(issue.index()).isEqualTo(damage.equals("ttl") ? "forbidden_ttl" : "required_dead_letters_recent");
+                        });
+            }
             assertThat(rows(database).countDocuments()).isOne();
         });
     }

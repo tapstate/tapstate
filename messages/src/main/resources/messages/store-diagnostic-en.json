@@ -70,5 +70,13 @@
   "TS0470018": {
     "message": "The storage TLS trust bundle is invalid.",
     "solution": "Provide a PEM certificate bundle of at most 64 KiB without private keys. Check the server chain and hostname; do not disable verification."
+  },
+  "TS0470019": {
+    "message": "The existing CONFIG schema needs its component identity recorded.",
+    "solution": "Stop the CONFIG writers and run the server binary with migrate --prepare-config-component-identity on the original CONFIG endpoint."
+  },
+  "TS0470020": {
+    "message": "The original CONFIG component identity could not be verified.",
+    "solution": "Contact support to confirm the original CONFIG components before proceeding."
   }
 }

@@ -29,12 +29,10 @@ final class MongoCacheSessionStore implements SessionStore {
     private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "secretHash", "principal", "scope", "issuer", "revoked",
             "createdAt", "lastUsedAt", "idleExpiresAt", "absoluteExpiresAt");
     private final MongoCacheIdentity facts;
-    private final Runnable requireStructures;
     private final MongoCollection<Document> sessions;
 
-    MongoCacheSessionStore(MongoCacheIdentity facts, MongoDatabase database, Runnable requireStructures) {
+    MongoCacheSessionStore(MongoCacheIdentity facts, MongoDatabase database) {
         this.facts = Objects.requireNonNull(facts, "facts");
-        this.requireStructures = Objects.requireNonNull(requireStructures, "requireStructures");
         if (facts.scope().mode() != StorageBinding.Mode.OP) throw new IllegalArgumentException("OP sessions require an OP cache scope");
         this.sessions = SystemCollections.OP_SESSIONS.on(database);
     }
@@ -114,11 +112,7 @@ final class MongoCacheSessionStore implements SessionStore {
         Objects.requireNonNull(id, "id"); Objects.requireNonNull(hash, "hash"); Objects.requireNonNull(issuer, "issuer"); Objects.requireNonNull(now, "now");
     }
     private <T> T transaction(Function<ClientSession, T> operation) {
-        return facts.transaction(session -> {
-            // Check structure before the session's first command; retries retain the original scope.
-            requireStructures.run();
-            return operation.apply(session);
-        });
+        return facts.transaction(operation);
     }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "op-session", "field", "session"), null); }
 }

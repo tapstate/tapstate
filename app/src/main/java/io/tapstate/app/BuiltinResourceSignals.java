@@ -33,11 +33,18 @@ final class BuiltinResourceSignals {
     private static final class Connection {
         final String id=UUID.randomUUID().toString();boolean closed;int pending;
     }
-    private static final class Reports { final Object monitor=new Object();boolean closed;int pending; }
+    private static final class Reports { final Object monitor=new Object();boolean closed;int pending;Runnable drained=()->{}; }
     private final Map<String,Connection> connections=new java.util.concurrent.ConcurrentHashMap<>();
     SourceOperationObserver source(SourceBindingSnapshot original,Runnable operation){return source(original,"legacy-source",operation,active);}
     SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,Runnable localProof) {
-        return source(original,logical,operation,localProof,new Reports(),true,diagnostics.snapshot(original));
+        var reports=new Reports();
+        var owner=operation instanceof PipelineAlertRuntime.PipelineGuard pipeline ? pipeline : null;
+        if(owner!=null){if(!owner.retained())return SourceOperationObserver.NONE;reports.drained=owner::close;}
+        try {
+            var observer=source(original,logical,operation,localProof,reports,true,diagnostics.snapshot(original));
+            if(observer==SourceOperationObserver.NONE && owner!=null)owner.close();
+            return observer;
+        }catch(RuntimeException|Error failed){if(owner!=null)owner.close();throw failed;}
     }
     private SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,
             Runnable localProof,Reports reports,boolean root,AlertDiagnosticMessages.SourceRedaction redaction) {
@@ -63,6 +70,7 @@ final class BuiltinResourceSignals {
         Runnable settled=()->{synchronized(reports.monitor){synchronized(connection){
             if(--connection.pending<0 || --reports.pending<0)throw new IllegalStateException("negative pending operation count");
             if(connection.closed && connection.pending==0)connections.remove(base,connection);
+            if(reports.closed && reports.pending==0)reports.drained.run();
         }}};
         return new SourceOperationObserver() {
             @Override public void completed(Capability capability,Throwable failure){completed("connection",capability,failure);}
@@ -89,7 +97,7 @@ final class BuiltinResourceSignals {
             }
             @Override public SourceOperationObserver fork(String phase){closeConnection();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof,reports,false,redaction);}
             @Override public boolean hasPendingReports(){synchronized(reports.monitor){return reports.pending>0;}}
-            @Override public void close(){synchronized(reports.monitor){if(root)reports.closed=true;closeConnection();}}
+            @Override public void close(){synchronized(reports.monitor){if(root)reports.closed=true;closeConnection();if(root&&reports.pending==0)reports.drained.run();}}
             private void closeConnection(){synchronized(reports.monitor){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}}
         };
     }

@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
+import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
 import io.tapstate.control.core.*;
 import io.tapstate.core.model.*;
 import io.tapstate.spi.store.*;
@@ -377,9 +378,12 @@ class NativeValidationRelationalApiIT {
                     "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--logging.level.io.tapstate.app.NativeValidationOwnerReservations=WARN","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                     "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=relational-validation-http-signing-key")){
-                NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);var registrar=child.getBean(ConnectorArtifactRegistrar.class);
-                var sourceConnector=registrar.register(artifact(kind),RegistrationSource.REGISTER).registration().connectorId();
-                var targetConnector=registrar.register(artifact("mongodb"),RegistrationSource.REGISTER).registration().connectorId();
+                NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
+                var local=child.getBean(LocalConnectorArtifacts.class);
+                var sourceConnector=local.register(Files.readAllBytes(artifact(kind)),RegistrationSource.REGISTER)
+                        .registration().connectorId();
+                var targetConnector=local.register(Files.readAllBytes(artifact("mongodb")),RegistrationSource.REGISTER)
+                        .registration().connectorId();
                 var artifacts=child.getBean(ArtifactStore.class);
                 artifacts.create(new SourceResource("input",null,sourceConnector,source,SourceMode.SNAPSHOT,textOnly?List.of(TableRef.literal("orders"),TableRef.literal("items"),TableRef.literal("text_orders")):List.of(TableRef.literal("orders"),TableRef.literal("items")),null,null));
                 artifacts.create(new SourceResource("target",null,targetConnector,Map.of("uri",MONGO.getReplicaSetUrl(targetName),"database",targetName,"isUri",true),null,null,null,null));

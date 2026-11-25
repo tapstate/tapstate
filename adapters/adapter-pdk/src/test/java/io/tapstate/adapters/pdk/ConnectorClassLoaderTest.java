@@ -3,6 +3,8 @@ package io.tapstate.adapters.pdk;
 import io.tapdata.pdk.apis.TapConnector;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.InputStream;
 import java.net.URLConnection;
@@ -10,8 +12,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -213,6 +219,105 @@ class ConnectorClassLoaderTest {
             assertThat(replacement.loader().load("synthetic.Widget").getClassLoader())
                     .isNotSameAs(original.load("synthetic.Widget").getClassLoader());
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retirementWaitsForAConnectorThreadThatStillNeedsItsClasses(boolean childContext, @TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        var entered = new CountDownLatch(1);
+        var finish = new CountDownLatch(1);
+        var failure = new AtomicReference<Throwable>();
+        ConnectorClassLoader original;
+        Thread worker;
+        try (var use = ConnectorClassLoader.acquire(List.of(jar))) {
+            original = use.loader();
+            ClassLoader isolated = original.load("synthetic.Widget").getClassLoader();
+            worker = new Thread(() -> {
+                entered.countDown();
+                try {
+                    if (!finish.await(5, TimeUnit.SECONDS)) throw new AssertionError("worker was not released");
+                    try (var stream = isolated.getResourceAsStream(MESSAGES_ENTRY)) {
+                        assertThat(stream.readAllBytes()).isEqualTo(MESSAGES);
+                    }
+                } catch (Throwable caught) {
+                    failure.set(caught);
+                }
+            }, "connector-cleanup-witness");
+            worker.setContextClassLoader(childContext ? new ClassLoader(isolated) {} : isolated);
+            worker.start();
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+        }
+        try {
+            assertThat(ConnectorClassLoader.retireUnused(jar)).isFalse();
+        } finally {
+            finish.countDown();
+            worker.join(5000);
+        }
+        assertThat(worker.isAlive()).isFalse();
+        assertThat(failure.get()).isNull();
+        assertThat(ConnectorClassLoader.retireUnused(jar)).isTrue();
+    }
+
+    @Test
+    void retirementWaitsWhenAConnectorWorkerStartsAChildDuringInspection(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        var handoff = new CountDownLatch(1);
+        var finish = new CountDownLatch(1);
+        var child = new AtomicReference<Thread>();
+        var failure = new AtomicReference<Throwable>();
+        Thread parent;
+        try (var use = ConnectorClassLoader.acquire(List.of(jar))) {
+            var isolated = use.loader().load("synthetic.Widget").getClassLoader();
+            parent = new Thread(() -> {
+                try {
+                    assertThat(handoff.await(5, TimeUnit.SECONDS)).isTrue();
+                    var worker = new Thread(() -> {
+                        try {
+                            assertThat(finish.await(5, TimeUnit.SECONDS)).isTrue();
+                            var inherited = Thread.currentThread().getContextClassLoader();
+                            try (var stream = inherited.getResourceAsStream(MESSAGES_ENTRY)) {
+                                assertThat(stream).isNotNull();
+                                assertThat(stream.readAllBytes()).isEqualTo(MESSAGES);
+                            }
+                        } catch (Throwable caught) {
+                            failure.set(caught);
+                        }
+                    }, "connector-handoff-child");
+                    child.set(worker);
+                    worker.start();
+                } catch (Throwable caught) {
+                    failure.set(caught);
+                }
+            }, "connector-handoff-parent");
+            parent.setContextClassLoader(isolated);
+            parent.start();
+        }
+
+        try {
+            assertThat(ConnectorClassLoader.retireUnused(jar, () -> {
+                var snapshot = Thread.getAllStackTraces().keySet();
+                assertThat(snapshot).contains(parent);
+                handoff.countDown();
+                try {
+                    assertThat(parent.join(Duration.ofSeconds(5))).isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+                assertThat(child.get()).isNotNull();
+                assertThat(child.get().isAlive()).isTrue();
+                assertThat(snapshot).doesNotContain(child.get());
+                return snapshot;
+            })).isFalse();
+        } finally {
+            handoff.countDown();
+            finish.countDown();
+            assertThat(parent.join(Duration.ofSeconds(5))).isTrue();
+            if (child.get() != null) assertThat(child.get().join(Duration.ofSeconds(5))).isTrue();
+        }
+        assertThat(failure.get()).isNull();
+        assertThat(ConnectorClassLoader.retireUnused(jar)).isTrue();
     }
 
     @Test

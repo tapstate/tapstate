@@ -260,7 +260,7 @@ class PipelineDirectPreparationIT {
                 var bodies=f.cacheDatabase.getCollection("srs_models").find(new Document("_id.chain",chain)).into(new ArrayList<>());
                 assertThat(bodies).hasSize(2);
                 for(var body:bodies)assertThat(f.cacheDatabase.getCollection("srs_models").deleteOne(new Document("_id",body.get("_id"))).getDeletedCount()).isOne();
-                assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                assertFreshChainReadReportsMissingModel(f, chain);
                 var observed=stores.consumers().inspectSharedRecovery(prepared);assertThat(observed.pipelines().keySet()).containsExactly("flow");
                 var capture=claims.read(captureKey).orElseThrow();assertThat(capture.leased()).isTrue();
                 if(missingControls) {
@@ -464,7 +464,7 @@ class PipelineDirectPreparationIT {
                     stopFixtureMaintenance(otherRoot);
                     status(f,otherScope,otherFence,retainedStatus.equals("PAUSED")?"PAUSED":"RUNNING");
                     assertThat(f.cacheDatabase.getCollection("srs_models").deleteMany(new Document("_id.chain",chain)).getDeletedCount()).isPositive();
-                    assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                    assertFreshChainReadReportsMissingModel(f, chain);
                     status(f,f.scope,firstFence,"STOPPED");
                     // The remote consumer still needs this original physical owner even when model bodies are lost.
                     var stopped=sharedCleanupControls(f);
@@ -525,6 +525,13 @@ class PipelineDirectPreparationIT {
             assertThat(f.configDatabase.getCollection("capture_preparations").countDocuments()).isOne();
         });
     }
+    private static void assertFreshChainReadReportsMissingModel(Fixture fixture, String chain) {
+        try (var reader = MongoCacheDomain.connect(fixture.cacheConnection, Duration.ofSeconds(5), "srs-model-loss-check")) {
+            var chains = reader.srs(fixture.business(), ACTIVE).chains();
+            assertCode(() -> chains.load(chain), IoError.SRS_MODEL_UNAVAILABLE);
+        }
+    }
+
     private static void stopFixtureMaintenance(ScopedPipelineCaptureCoordinator coordinator) throws Exception {
         for (String fieldName : List.of("maintenance", "ownerOperations")) {
             var field = ScopedPipelineCaptureCoordinator.class.getDeclaredField(fieldName);
@@ -554,6 +561,16 @@ class PipelineDirectPreparationIT {
                 .map(SrsChainState::checkpoint).map(checkpoint -> checkpoint.position().token())
                 .filter(token::equals).isPresent());
     }
+    private static void stubInitialCapture(CaptureOwnership ownership, Fixture fixture) {
+        var claims = (DeadlineWorkloadClaimStore) fixture.cache.workloadClaims(fixture.business());
+        when(ownership.acquireInitial(any())).thenAnswer(call -> {
+            CaptureId capture = call.getArgument(0);
+            var key = new WorkloadClaimKey(fixture.business().clusterId(), WorkloadClaimType.CAPTURE, capture.value());
+            var attempt = claims.withInitialCaptureAcquisition(key, () -> {}, () -> claims.acquire(key, OWNER, 1, TTL));
+            return new CaptureOwnership.Permit(attempt.acquired(), attempt.claim());
+        });
+    }
+
     private static CaptureOwnership cacheOwnership(Fixture f,WorkloadOwner owner) {
         return cacheOwnership(f, owner, () -> true);
     }
@@ -577,7 +594,7 @@ class PipelineDirectPreparationIT {
     }
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {return fixtureProvisioner("c".repeat(64));}
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner(String hash) {
-        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,hash,false);
+        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class,CALLS_REAL_METHODS);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,hash,false);
         when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb",hash)).thenReturn(ref);return provisioner;
     }
     private static HazelcastInstance sharedMember(SrsLogStore log) {return sharedMember(log,false);}
@@ -818,6 +835,7 @@ class PipelineDirectPreparationIT {
             var claims=f.cache.workloadClaims(f.business());var initial=claims.readPipeline(f.scope).orElseThrow().claim();
             var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow();var original=WorkloadClaimFence.from(running);
             var ownership=mock(CaptureOwnership.class);
+            stubInitialCapture(ownership, f);
             when(ownership.acquire(any())).thenAnswer(call -> {
                 var id=call.getArgument(0,CaptureId.class);var attempt=claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id.value()),OWNER,1,TTL);
                 return new CaptureOwnership.Permit(attempt.acquired(),attempt.claim());
@@ -925,6 +943,7 @@ class PipelineDirectPreparationIT {
             var claims=f.cache.workloadClaims(f.business());var initial=claims.readPipeline(f.scope).orElseThrow().claim();
             var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow();var original=WorkloadClaimFence.from(running);
             var ownership=mock(CaptureOwnership.class);
+            stubInitialCapture(ownership, f);
             when(ownership.acquire(any())).thenAnswer(call -> {
                 var id=call.getArgument(0,CaptureId.class);
                 var attempt=claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id.value()),OWNER,1,TTL);
@@ -998,6 +1017,7 @@ class PipelineDirectPreparationIT {
             var claims=f.cache.workloadClaims(f.business()); var initial=claims.readPipeline(f.scope).orElseThrow().claim();
             var running=claims.advanceExecution(initial,1,Set.of(OWNER.nodeId())).orElseThrow(); var original=WorkloadClaimFence.from(running);
             var ownership=mock(CaptureOwnership.class);
+            stubInitialCapture(ownership, f);
             when(ownership.acquire(any())).thenAnswer(call -> {
                 var id=call.getArgument(0,CaptureId.class);
                 var attempt=claims.acquire(new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,id.value()),OWNER,1,TTL);

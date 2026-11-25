@@ -51,7 +51,6 @@ final class MongoCacheNestShapeStore implements NestShapeStore {
                 return Optional.of(decode(existing, id));
             }
             if (known) throw access.unreadable("nest-shape");
-            new MongoCacheMetadataStructure(target, access.rateRetention).verifyFacet(SystemCollections.CACHE_NEST_STATE);
             var retained = new Document("_id.placement.scope", MongoPipelinePreparationFacts.scope(access.scope))
                     .append("_id.placement.stepId", OperatorStateText.encode(stepId));
             if (SystemCollections.CACHE_NEST_STATE.on(target).find(session, retained).projection(new Document("_id", 1)).first() != null)
@@ -63,7 +62,6 @@ final class MongoCacheNestShapeStore implements NestShapeStore {
     }
 
     void requirePath(ClientSession session, OperatorPlacement placement) {
-        new MongoCacheMetadataStructure(target, access.rateRetention).verifyFacet(SystemCollections.CACHE_NEST_SHAPES);
         Document id = id(placement.stepId());
         Document row = SystemCollections.CACHE_NEST_SHAPES.on(target).find(session, new Document("_id", id)).first();
         Document inventory = MongoOperatorInventory.require(session, access.database, access.scope);

@@ -41,15 +41,17 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
         if (pipeline.isEmpty()) {
             return Map.of();
         }
-        Runnable current=storePort instanceof ThreeLayerStorePort nativeStore?nativeStore.readingGuard(pipelineId):() -> {};
+        var nativeStore = storePort instanceof ThreeLayerStorePort scoped ? scoped : null;
+        var current = nativeStore == null ? null : nativeStore.planningScope(pipelineId);
         Map<String, SourceCaptureResolution> resolutions = new LinkedHashMap<>();
+        Map<String, SourceResource> shared = new LinkedHashMap<>();
         for (String binding : pipeline.get().sourceBindings()) {
             var ref = pipeline.get().sourceReference(binding);
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), ref.id());
             SourceCaptureResolution resolution;
             try {
-                resolution = SourceCaptureResolution.forStoredPipeline(
-                        storePort,pipeline.get(),ref,source,SourceDiscovery.model(storePort, source),true).orElse(null);
+                resolution = SourceCaptureResolution.forPipeline(
+                        pipeline.get(), ref, source, SourceDiscovery.model(storePort, source)).orElse(null);
             } catch (TapstateException unresolved) {
                 if (unresolved.code() == ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED) {
                     // The read face treats a not-yet-resolvable selection as absent while discovery catches up.
@@ -57,36 +59,57 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                 }
                 throw unresolved;
             }
-            if (resolution != null) {
-                resolutions.put(binding, resolution);
-            }
+            if (resolution == null) continue;
+            resolutions.put(binding, resolution);
+            boolean direct = ref instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs();
+            if (nativeStore != null && !direct && (pipeline.get().settings() == null
+                    || pipeline.get().settings().readMode() != io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY))
+                shared.put(binding, source);
         }
         Map<String, String> positions = new LinkedHashMap<>();
         resolutions.forEach((sourceId, resolution) -> {
+            if (shared.containsKey(sourceId)) {
+                nativeStore.sharedSinkOffset(current, shared.get(sourceId), resolution)
+                        .ifPresent(offset -> addLabeledPositions(positions, sourceId, resolution, resolutions.values(), offset));
+                return;
+            }
             boolean singleNode = resolutions.values().stream()
                     .filter(candidate -> candidate.chainId().equals(resolution.chainId())).count() == 1;
-            storePort.meta().read(resolution.chainId().value()).ifPresent(meta -> {
-                ConsumerOffset offset = meta.consumerOffset(SrsConsumerId.of(pipelineId, sourceId).value())
-                        .orElseGet(() -> singleNode ? meta.consumerOffset(pipelineId).orElse(null) : null);
-                if (offset == null) {
-                    return;
-                }
-                for (String table : resolution.tables()) {
-                    ChainPosition confirmed = offset.sinkAckedByTable().get(table);
-                    if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
-                            || (offset.progressKind() == ConsumerProgressKind.LEGACY
-                                    && resolution.tables().size() == 1 && offset.perTableSeq().size() <= 1))) {
-                        confirmed = offset.sinkAcked();
-                    }
-                    if (confirmed != null && confirmed.token() != null) {
-                        String label = PipelineTableSelection.label(sourceId, table,
-                                resolutions.values().stream().map(SourceCaptureResolution::tables));
-                        positions.put(label, confirmed.token());
-                    }
-                }
-            });
+            ConsumerOffset offset = storePort.meta().read(resolution.chainId().value())
+                    .flatMap(meta -> meta.consumerOffset(SrsConsumerId.of(pipelineId, sourceId).value())
+                            .or(() -> singleNode ? meta.consumerOffset(pipelineId) : Optional.empty()))
+                    .orElse(null);
+            if (offset != null) {
+                addLabeledPositions(positions, sourceId, resolution, resolutions.values(), offset);
+            }
         });
-        current.run();return positions;
+        if (current != null) current.verify().run();
+        return positions;
+    }
+
+    private static void addLabeledPositions(Map<String, String> positions, String binding,
+            SourceCaptureResolution resolution, java.util.Collection<SourceCaptureResolution> resolutions,
+            ConsumerOffset offset) {
+        var confirmed = new LinkedHashMap<String, String>();
+        addConfirmedPositions(confirmed, resolution.tables(), offset);
+        confirmed.forEach((table, position) -> positions.put(PipelineTableSelection.label(binding, table,
+                resolutions.stream().map(SourceCaptureResolution::tables)), position));
+    }
+
+    /** The same durable acknowledgement projection serves live samples and stored-position fallbacks. */
+    static void addConfirmedPositions(Map<String, String> positions, java.util.Collection<String> tables,
+            ConsumerOffset offset) {
+        for (String table : tables) {
+            ChainPosition confirmed = offset.sinkAckedByTable().get(table);
+            if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
+                    || (offset.progressKind() == ConsumerProgressKind.LEGACY
+                            && tables.size() == 1 && offset.perTableSeq().size() <= 1))) {
+                confirmed = offset.sinkAcked();
+            }
+            if (confirmed != null && confirmed.token() != null) {
+                positions.put(table, confirmed.token());
+            }
+        }
     }
 
     /** The stored pipeline for the id, or empty when its artifact is absent or names another kind. */

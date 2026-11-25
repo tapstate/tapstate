@@ -44,6 +44,12 @@ public final class StoreErrorDefinitions {
     public static final ProductErrorDefinition TLS_TRUST_INVALID =
             DEFINITIONS.define(18, Severity.ERROR, Set.of());
 
+    public static final ProductErrorDefinition CONFIG_COMPONENT_IDENTITY_REQUIRED =
+            DEFINITIONS.define(19, Severity.ERROR, Set.of());
+
+    public static final ProductErrorDefinition CONFIG_COMPONENT_IDENTITY_UNVERIFIED =
+            DEFINITIONS.define(20, Severity.ERROR, Set.of());
+
     private StoreErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

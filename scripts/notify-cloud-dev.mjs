@@ -60,29 +60,22 @@ export async function notifyCloudDev(env = process.env, fetchImpl = fetch) {
     // A transport failure can occur after the write; do not retry or expose credential-bearing errors.
     throw new Error('Cloud dev version registration failed or timed out; delivery may be uncertain');
   }
-  if (response.status === 409) {
-    let conflict;
-    try { conflict = await response.json(); }
-    catch { throw new Error('Cloud dev version registration received an invalid conflict response'); }
-    if (conflict?.code === 'cluster.version-duplicate') {
-      // Rebuilds intentionally retain the first catalog record, including its Git and image metadata.
-      return `Cloud dev version ${version} already exists; kept the original catalog record. Rebuilt image: ${image}`;
-    }
-    throw new Error('Cloud dev version registration failed (HTTP 409); unrecognized conflict');
-  }
-  if (response.status !== 201) {
+  if (response.status !== 201 && response.status !== 200) {
     throw new Error(`Cloud dev version registration failed (HTTP ${response.status}); reconcile before retrying`);
   }
   let receipt;
   try { receipt = await response.json(); }
   catch { throw new Error('Cloud dev version registration received an invalid JSON response'); }
   const saved = receipt?.data;
+  const updated = response.status === 200;
+  const validState = saved?.state === 'ACTIVE' || (updated && saved?.state === 'OFFLINE');
   if (receipt?.code !== 'ok' || saved?.version !== version || saved?.releaseCode !== releaseCode
-      || saved?.state !== 'ACTIVE' || saved?.git?.commitId !== commitId || saved?.git?.branch !== branch
+      || !validState || saved?.git?.commitId !== commitId || saved?.git?.branch !== branch
       || Object.entries(extra).some(([key, value]) => saved?.git?.extra?.[key] !== value)) {
     throw new Error('Cloud dev version registration receipt does not match the published image');
   }
-  return `Registered Cloud dev version ${version}: ${image}`;
+  const action = updated ? 'Updated' : 'Registered';
+  return `${action} Cloud dev version ${version}: ${image} (${saved.state})`;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

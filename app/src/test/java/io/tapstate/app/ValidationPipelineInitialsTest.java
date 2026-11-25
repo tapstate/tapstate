@@ -282,5 +282,13 @@ class ValidationPipelineInitialsTest {
         join.getTcpIpConfig().setEnabled(true); if (seed != null) join.getTcpIpConfig().addMember(seed);
         return config;
     }
-    private static void await(BooleanSupplier ready) throws Exception { long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(12); while (!ready.getAsBoolean() && System.nanoTime() - until < 0) Thread.sleep(10); assertThat(ready.getAsBoolean()).isTrue(); }
+    private static void await(BooleanSupplier ready) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(12);
+        boolean observedReady = ready.getAsBoolean();
+        while (!observedReady && System.nanoTime() - deadline < 0) {
+            Thread.sleep(10);
+            observedReady = ready.getAsBoolean();
+        }
+        assertThat(observedReady).isTrue();
+    }
 }

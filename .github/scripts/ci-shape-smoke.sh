@@ -48,7 +48,7 @@ def check(workflows, contexts, inputs):
     plan = ci.get('shard-plan', '')
     assert 'ci-receipt.sh event-inputs' in plan and '${{ runner.temp }}/ci-event-inputs.json' in plan, \
         'the original event and actual checkout must be retained with the shard plan'
-    assert 'matrix: ${{ steps.plan.outputs.matrix }}' in plan and 'id: plan' in plan, \
+    assert 'matrix: ${{ steps.scope.outputs.matrix || steps.plan.outputs.matrix }}' in plan and 'id: plan' in plan, \
         'the planner must publish its exact matrix output'
     assert 'ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json"' in plan, \
         'matrix IDs must come from the actual emitted plan'
@@ -201,6 +201,11 @@ def check(workflows, contexts, inputs):
     assert 'package io.tapstate.app;' in cloud_context_source \
         and re.search(r'\bclass\s+CloudClusterContextCarriesTheCurrentEgressAddressIT\b', cloud_context_source), \
         'the Cloud context test class named by CI must still exist at its declared package'
+    temporary = jobs(workflows['build-cluster-image.yml'])['image']
+    assert 'bash workflow-tools/deploy/cloud/ghcr-publish.sh publish-temporary ' in temporary, \
+        'branch-pair builds must use the workflow publisher in temporary mode'
+    assert 'notify-cloud-dev.mjs' not in temporary and 'ghcr-publish.sh publish-dev ' not in temporary, \
+        'branch-pair builds must leave the shared dev tag and catalog alone'
     cloud_dev = jobs(workflows['cloud-cluster-dev.yml']).get('image', '')
     assert cloud_dev, 'the Cloud dev image job must exist'
     assert '  workflow_call:' in workflows['cloud-cluster-dev.yml'], \
@@ -284,7 +289,7 @@ for original, replacement in [
     ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
-    ('matrix: ${{ steps.plan.outputs.matrix }}', 'matrix: wrong-output'),
+    ('matrix: ${{ steps.scope.outputs.matrix || steps.plan.outputs.matrix }}', 'matrix: wrong-output'),
     ('ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json"', 'echo unrelated-matrix'),
     ('matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}', 'matrix: {shard: [rest]}'),
     ('name: test-shards (${{ matrix.shard }})', 'name: unrelated-worker'),
