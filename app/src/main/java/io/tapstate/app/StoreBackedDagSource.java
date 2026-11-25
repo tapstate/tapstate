@@ -2425,8 +2425,14 @@ final class StoreBackedDagSource implements DagSource {
                 // have durably acknowledged, which only a run bound to an execution can read.
                 operators == null ? ReplayFloorFactory.NONE : new ScopedSrsReplayFloorFactory(scopedSources, scopedDirect),
                 io.tapstate.runtime.engine.aggregate.AggregateProcessor.Sweep.DEFAULT);
+        var operatorKeys = captureBindings == null || snapshotOnly ? Map.<String, Set<String>>of()
+                : SourceMoveColumns.forDirectInputs(stepsById, compiledJoins,
+                        operators == null ? Map.of() : operators.coordinates().nests(),
+                        ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
+                        sourceVertices.keySet());
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
+                key -> sourceVertex(sourceVertices.get(key), operatorKeys.getOrDefault(key, Set.of()),
+                        axes, snapshotOnly, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
@@ -3897,7 +3903,7 @@ final class StoreBackedDagSource implements DagSource {
      * writer fills.
      */
     private ProcessorMetaSupplier sourceVertex(
-            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
+            SourceVertex vertex, Set<String> operatorKeys, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
             boolean direct,PipelineCaptureBindings captureBindings, long sourceEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
@@ -3920,7 +3926,9 @@ final class StoreBackedDagSource implements DagSource {
             String physical = vertex.resolution().chainId().value();
             var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream(physical, vertex.sourceId(), vertex.table(),
                     direct ? captureBindings.requireDirect(vertex.sourceId(), physical, vertex.table()).context().captureId() : null);
-            var guard = new ScopedKeyMoveGuard(captureBindings.original(), table.primaryKey(), stream);
+            var keys = new LinkedHashSet<>(table.primaryKey());
+            keys.addAll(operatorKeys);
+            var guard = new ScopedKeyMoveGuard(captureBindings.original(), List.copyOf(keys), stream);
             if (direct) {
                 var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
                 return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.loadEpoch(),
