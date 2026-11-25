@@ -5,6 +5,7 @@ import io.tapdata.pdk.apis.TapConnector;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.lang.management.ManagementFactory;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -15,6 +16,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * A live, isolated class loader for one connector.
@@ -89,6 +92,10 @@ public final class ConnectorClassLoader implements AutoCloseable {
 
     /** Retires idle matching loaders before the owner makes a local artifact reclaimable. */
     static boolean retireUnused(Path jar) {
+        return retireUnused(jar, () -> Thread.getAllStackTraces().keySet());
+    }
+
+    static boolean retireUnused(Path jar, Supplier<Set<Thread>> threadSnapshot) {
         var path = jar.toAbsolutePath().normalize();
         synchronized (SHARED) {
             var keys = SHARED.keySet().stream()
@@ -96,8 +103,12 @@ public final class ConnectorClassLoader implements AutoCloseable {
                     .toList();
             if (keys.isEmpty()) return true;
             if (keys.stream().map(SHARED::get).anyMatch(loader -> loader.pinned || loader.users != 0)) return false;
-            var threads = Thread.getAllStackTraces().keySet();
+            var threadBean = ManagementFactory.getThreadMXBean();
+            long startedBeforeInspection = threadBean.getTotalStartedThreadCount();
+            var threads = threadSnapshot.get();
             if (keys.stream().map(SHARED::get).anyMatch(loader -> usedBy(threads, loader.loader))) return false;
+            // A worker can hand off its context loader to a child while it exits the snapshot.
+            if (threadBean.getTotalStartedThreadCount() != startedBeforeInspection) return false;
             for (var key : keys) {
                 var loader = SHARED.get(key);
                 try {
