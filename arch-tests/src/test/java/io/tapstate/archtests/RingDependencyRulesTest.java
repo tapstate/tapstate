@@ -136,9 +136,10 @@ class RingDependencyRulesTest {
                         "io.tapstate.control.client..",
                         // the shared error-code message catalog + renderer (presentation layer)
                         "io.tapstate.messages..",
-                        // the CLI's own facade libraries
+                        // The CLI's facade libraries, also pinned by cli/pom.xml.
                         "picocli..",
-                        "org.jline..")
+                        "org.jline..",
+                        "dev.tamboui..")
                 .allowEmptyShould(true)
                 .because("the CLI talks to services through the framework-free HTTP client only; it "
                         + "must have no dependency on control services or runtime modules; the message catalog is "

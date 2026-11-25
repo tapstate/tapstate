@@ -70,13 +70,15 @@ class MongoCacheOperatorStateStoreIT {
                     paused.countDown(); await(resume);
                 }
             }};
-            try (var client = observed(listener); var workers = Executors.newFixedThreadPool(2)) {
+            // Each client has its own local write lane, as it would on a different worker.
+            try (var client = observed(listener); var otherClient = observed(listener);
+                    var workers = Executors.newFixedThreadPool(2)) {
                 var at = f.at(OperatorPlacement.Resource.NEST_STATE);
                 var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,
                         client.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE,
                         MongoRateHistoryStore.DEFAULT_RETENTION), at);
-                var otherWriter = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,
-                        client.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE), at);
+                var otherWriter = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(otherClient,
+                        otherClient.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE), at);
                 var first = workers.submit(() -> writer.save(at.mapName(), "old-one", new byte[]{1}));
                 var second = workers.submit(() -> otherWriter.save(at.mapName(), "old-two", new byte[]{2}));
                 try {

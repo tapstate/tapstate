@@ -584,7 +584,9 @@ class RealDummyPipelineIT {
                 Await.until("the prewritten MongoDB delete acknowledgement", Duration.ofSeconds(30),
                         () -> acked(witness)[2] > 0 || control.state(id).filter(PipelineState.FAILED::equals).isPresent(),
                         () -> control.state(id) + " " + control.logs(id));
-                assertThat(control.state(id)).as(control.logs(id)).contains(PipelineState.RUNNING);
+                var state = Await.answered("the first pipeline status after the MongoDB delete acknowledgement",
+                        Duration.ofSeconds(10), () -> control.state(id));
+                assertThat(state).as(control.logs(id)).isEqualTo(PipelineState.RUNNING);
                 assertThat(control.errorCount(id)).contains(0L);
                 String position = Await.answered("MongoDB backlog durable target position", Duration.ofSeconds(10),
                         () -> control.durablePosition(id, "dummy_orders"));
