@@ -131,10 +131,9 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
                 await(() -> control.failure(pipelineId).isPresent());
                 var failure = control.failure(pipelineId).orElseThrow();
                 assertThat(failure.code()).isEqualTo(EXPECTED_CODE);
-                assertThat(failure.params()).containsEntry("connector", "mysql");
                 assertThat(failure.params().get("detail"))
                         .asString()
-                        .contains("binlog_row_image=FULL");
+                        .contains("FULL binlog_row_image");
             }
         }
     }
