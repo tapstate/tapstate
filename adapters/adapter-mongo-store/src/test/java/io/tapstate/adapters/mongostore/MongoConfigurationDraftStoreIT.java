@@ -2,6 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
@@ -16,6 +17,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore.Published;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.testsupport.RequiresDocker;
@@ -23,6 +25,7 @@ import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -40,6 +43,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -47,7 +51,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Real configuration-only encrypted editing, publication and metadata-only wire projection witnesses. */
 @RequiresDocker
 class MongoConfigurationDraftStoreIT {
-    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final Instant NOW = Instant.parse("2026-10-17T00:00:00Z");
     private static final DslParser PARSER = new DslParser();
 
@@ -149,6 +154,131 @@ class MongoConfigurationDraftStoreIT {
                     .isEqualTo(PipelineDraftMutation.REPLACED);
             assertThat(revision(database)).isEqualTo(before + 1);
         });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"2, true", "4, false"})
+    void publicationAttemptsCommitAtMostThreeTimes(int unknownReplies, boolean confirmed) {
+        withPublicationFault("commitTransaction", unknownReplies, new Document("writeConcernError",
+                new Document("code", 64).append("errmsg", "test commit acknowledgement lost"))
+                .append("errorLabels", List.of(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)),
+                (store, publication, commands) -> {
+                    if (confirmed) {
+                        assertThat(store.publishWithGeneration(publication)).isEqualTo(new Published(PipelineDraftMutation.PUBLISHED, 1));
+                    } else {
+                        assertThatThrownBy(() -> store.publishWithGeneration(publication))
+                                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                    assertThat(error.code()).isEqualTo(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN);
+                                    assertThat(error.args()).containsExactlyEntriesOf(Map.of("pipeline", "orders"));
+                                });
+                    }
+                    var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                    assertThat(starts).hasSize(1);
+                    var first = starts.getFirst();
+                    assertThat(first.getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+                    assertThat(commands.stream().filter(command -> command.containsKey("abortTransaction"))).isEmpty();
+                    assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                            .hasSize(3).allSatisfy(commit -> {
+                                assertThat(commit.get("lsid")).isEqualTo(first.get("lsid"));
+                                assertThat(commit.get("txnNumber")).isEqualTo(first.get("txnNumber"));
+                                var writeConcern = commit.getDocument("writeConcern");
+                                assertThat(writeConcern.getString("w").getValue()).isEqualTo("majority");
+                                assertThat(writeConcern.getBoolean("j").getValue()).isTrue();
+                            });
+                });
+    }
+
+    @Test
+    void publicationRetriesATransientTransactionBodyFailure() {
+        withPublicationFault("find", 1, new Document("errorCode", 112)
+                .append("errorLabels", List.of(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL)),
+                (store, publication, commands) -> {
+                    assertThat(store.publishWithGeneration(publication)).isEqualTo(new Published(PipelineDraftMutation.PUBLISHED, 1));
+                    var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                    assertThat(starts).hasSize(2);
+                    assertThat(starts.getFirst().get("txnNumber")).isNotEqualTo(starts.getLast().get("txnNumber"));
+                    assertThat(commands.stream().filter(command -> command.containsKey("abortTransaction")))
+                            .singleElement().satisfies(abort -> assertThat(abort.get("txnNumber")).isEqualTo(starts.getFirst().get("txnNumber")));
+                    assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                            .singleElement().satisfies(commit -> assertThat(commit.get("txnNumber")).isEqualTo(starts.getLast().get("txnNumber")));
+                });
+    }
+
+    private static void withPublicationFault(String command, int times, Document fault, PublicationScenario scenario) {
+        withConfiguration((domain, database) -> {
+            domain.artifacts().create(source("src", "secret"));
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            long before = revision(database);
+            var publication = publication("orders", 1, null, Map.of());
+            withObservedFault(database, command, times, fault, (store, commands) -> scenario.run(store, publication, commands));
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(domain.drafts().get("orders").orElseThrow().publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"2, true", "4, false"})
+    void definitionChangesBoundAmbiguousCommits(int unknownReplies, boolean confirmed) {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            var hash = CanonicalHash.of(changed);
+            var change = new PipelineDraft.DefinitionChange("orders", publication.publishedArtifactHash(),
+                    changed, hash, Map.of(), draft -> changedDraft(draft, hash));
+            long before = revision(database);
+            var fault = new Document("writeConcernError", new Document("code", 64).append("errmsg", "acknowledgement lost"))
+                    .append("errorLabels", List.of(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL));
+            withObservedFault(database, "commitTransaction", unknownReplies, fault, (store, commands) -> {
+                if (confirmed) {
+                    assertThat(store.changeDefinition(change)).isEqualTo(PipelineDraftMutation.REPLACED);
+                } else {
+                    assertThatThrownBy(() -> store.changeDefinition(change))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                assertThat(error.code()).isEqualTo(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN);
+                                assertThat(error.args()).containsExactlyEntriesOf(Map.of("pipeline", "orders"));
+                            });
+                }
+                var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                assertThat(starts).hasSize(1);
+                assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                        .hasSize(3).allSatisfy(commit -> {
+                            assertThat(commit.get("lsid")).isEqualTo(starts.getFirst().get("lsid"));
+                            assertThat(commit.get("txnNumber")).isEqualTo(starts.getFirst().get("txnNumber"));
+                        });
+            });
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            assertThat(domain.drafts().get("orders").orElseThrow().revision()).isEqualTo(2);
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    private static void withObservedFault(MongoDatabase database, String command, int times, Document fault,
+            BiConsumer<MongoConfigurationDraftStore, List<BsonDocument>> scenario) {
+        var ciphers = SourceConfigCipherProvider.fixed(cipher(database));
+        List<BsonDocument> commands = new CopyOnWriteArrayList<>();
+        var witness = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommand().containsKey("autocommit")) commands.add(event.getCommand().clone());
+            }
+        };
+        String appName = database.getName();
+        try (var observed = MongoClients.create(MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).applicationName(appName)
+                .addCommandListener(witness).build())) {
+            var target = observed.getDatabase(database.getName());
+            var store = new MongoConfigurationDraftStore(observed, target, ciphers, new MongoConfigurationArtifactStore(observed, target, ciphers));
+            var admin = observed.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", times))
+                    .append("data", fault.append("failCommands", List.of(command)).append("appName", appName)));
+            try { scenario.accept(store, commands); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+        }
+    }
+
+    @FunctionalInterface
+    private interface PublicationScenario {
+        void run(MongoConfigurationDraftStore store, PipelineDraft.Publication publication, List<BsonDocument> commands);
     }
 
     @Test
