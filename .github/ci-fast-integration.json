@@ -36,6 +36,7 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCacheConnectorRegistryIT", "method": "exactCatalogRowsKeepDistinctHashesWithTheSameVersionAndSpec"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCacheConnectorRegistryIT", "method": "preparesAndRecordsOnePossessionPerNodeAndHash"},
   {"module": "e2e", "class": "io.tapstate.e2e.InitialClusterLifecycleIT"},
+  {"module": "e2e", "class": "io.tapstate.e2e.OversizedConnectorUploadKeepsItsRefusalIT"},
   {"module": "e2e", "class": "io.tapstate.e2e.CloudConfigurationWriteConcernIT", "method": "aReplacementCloudRuntimeResumesTheOriginalAlertPreparation"},
   {"module": "e2e", "class": "io.tapstate.e2e.AHundredTablesShareTheSinksWritersIT"},
   {"module": "e2e", "class": "io.tapstate.e2e.PublishedExamplesIT", "example": "examples/the-snapshot-half-reaches-the-target/spec.e2e.yml"},
