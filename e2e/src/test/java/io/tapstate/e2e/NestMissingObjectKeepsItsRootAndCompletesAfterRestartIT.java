@@ -89,12 +89,13 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
                 assertThat(process.forcedDuringClose()).as("the original process exited within the graceful shutdown budget").isFalse();
             }
             var sessionKey = new Document("_id", originalSession.get("_id"));
-            var closedSession = claims.find(sessionKey).first();
-            assertThat(closedSession).isNotNull();
-            assertThat(closedSession.getDate("leaseUntil"))
-                    .as("orderly close ended the original lease before its previously observed expiration")
-                    .isBefore(originalSession.getDate("leaseUntil"));
-            assertThat(claims.countDocuments(liveNodeSessions)).isZero();
+            var endedSession = new Document(sessionKey)
+                    .append("ownerBootId", originalSession.getString("ownerBootId"))
+                    .append("claimGeneration", originalSession.get("claimGeneration"))
+                    .append("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")));
+            assertThat(claims.countDocuments(endedSession))
+                    .as("the original node session is no longer live on the CACHE server before restart")
+                    .isEqualTo(1);
 
             // Restart the running deployment, as the existing restart witnesses do. A pause/resume
             // addresses a suspended Jet job in the same cluster, not a job in a cluster that has ended.
