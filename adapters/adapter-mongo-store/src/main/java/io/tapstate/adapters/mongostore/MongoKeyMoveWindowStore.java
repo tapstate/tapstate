@@ -20,10 +20,12 @@ import java.util.UUID;
 
 /** One majority-durable interval per pipeline. A new revision is issued on every admission. */
 final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
+    private final MongoDatabase database;
     private final MongoCollection<Document> rows;
     private final Runnable active;
 
     MongoKeyMoveWindowStore(MongoDatabase database, Runnable active) {
+        this.database = database;
         this.rows = SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database)
                 .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.LINEARIZABLE)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
@@ -32,8 +34,17 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
 
     @Override public Optional<Window> read(String pipelineId) {
         active.run();
-        return StoreIo.call(() -> Optional.ofNullable(rows.find(new Document("_id", pipelineId)).first())
-                .map(MongoKeyMoveWindowStore::decode));
+        return StoreIo.call(() -> {
+            var stored = rows.find(new Document("_id", pipelineId)).first();
+            if (stored != null) return Optional.of(decode(stored));
+            requireCollection(pipelineId);
+            return Optional.empty();
+        });
+    }
+
+    private void requireCollection(String pipelineId) {
+        if (database.listCollections().filter(new Document("name", rows.getNamespace().getCollectionName())).first() == null)
+            throw PipelineKeyMoveWindows.unresolved(pipelineId);
     }
 
     @Override public Window arm(PipelineIntentScope scope, long executionId, String activation, Stream stream, Range changes,
@@ -58,10 +69,20 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
                 active.run();
                 if (previous.isPresent()) {
                     if (rows.replaceOne(encode(previous.get()), encode(next)).getMatchedCount() == 1) {
-                        verifyAuthority.run();
+                        try {
+                            verifyAuthority.run();
+                        } catch (RuntimeException lost) {
+                            try {
+                                rows.replaceOne(match(next), encode(previous.get()));
+                            } catch (RuntimeException cleanup) {
+                                lost.addSuppressed(cleanup);
+                            }
+                            throw lost;
+                        }
                         return next;
                     }
                 } else {
+                    requireCollection(scope.pipelineId());
                     try {
                         rows.insertOne(encode(next));
                     } catch (MongoWriteException raced) {

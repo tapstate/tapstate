@@ -90,6 +90,43 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void disappearanceOfTheWindowCollectionRefusesTheNextAdmission() {
+        withConfiguration((domain, database, scope) -> {
+            var windows = domain.keyMoveWindows();
+            var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "input", "orders", null);
+            var changes = point(new io.tapstate.core.event.SourceOrder(1, 2));
+            var last = windows.arm(scope, 42, "activation", stream, changes, null, () -> {});
+            SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database).drop();
+            assertThatThrownBy(() -> windows.requireClear(scope.pipelineId())).isInstanceOfSatisfying(
+                    TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+            assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream, changes, last, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(database.listCollectionNames()).doesNotContain(SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.collectionName());
+        });
+    }
+
+    @Test
+    void aRefusedExtensionRestoresOnlyTheRangeItActuallyExtended() {
+        withConfiguration((domain, database, scope) -> {
+            var windows = domain.keyMoveWindows();
+            var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "input", "orders", null);
+            var first = point(new io.tapstate.core.event.SourceOrder(1, 2));
+            var last = point(new io.tapstate.core.event.SourceOrder(1, 6));
+            var admitted = windows.arm(scope, 42, "activation", stream, first, null, () -> {});
+            Runnable lost = () -> { throw new IllegalStateException("execution stopped"); };
+            assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream, last, admitted, lost))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThat(windows.read(scope.pipelineId())).contains(admitted);
+            var later = point(new io.tapstate.core.event.SourceOrder(1, 9));
+            assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream, last, admitted, () -> {
+                windows.arm(scope, 42, "activation", stream, later, null, () -> {});
+                lost.run();
+            })).isInstanceOf(IllegalStateException.class);
+            assertThat(windows.read(scope.pipelineId()).orElseThrow().ranges().get(stream).last()).isEqualTo(9);
+        });
+    }
+
+    @Test
     void aPreparedArtifactHandoffPreservesTheOriginalBindingWhenItsStartIsSuperseded() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();

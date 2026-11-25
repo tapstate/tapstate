@@ -37,8 +37,14 @@ final class KeyMoveRecovery {
                 if (chain.isEmpty() || chain.get().resumeOverride() != null || chain.get().checkpoint() == null) return false;
                 var table = chain.get().checkpoint().tables().get(stream.table());
                 var consumer = progress.get().ringDoneThrough().get(stream.table());
-                if (table == null || consumer == null) return false;
-                resumable.put(stream, new SourceOrder(table.model().captureEpoch(), Math.min(table.sequence(), consumer)));
+                var confirmed = progress.get().cursor().sinkAckedByTable().get(stream.table());
+                if (table == null || consumer == null || confirmed == null) return false;
+                var order = confirmed.order();
+                // The reader resumes at the greater of the physical floor and this original confirmation.
+                // A larger bare floor has no capture generation and cannot establish a safe restart here.
+                if (order == null || order.seq() < consumer || order.seq() > table.sequence()
+                        || order.epoch() != table.model().captureEpoch()) return false;
+                resumable.put(stream, order);
                 recordSettled(settled, stream, writers.withSnapshotEpoch(null));
             }
         }
