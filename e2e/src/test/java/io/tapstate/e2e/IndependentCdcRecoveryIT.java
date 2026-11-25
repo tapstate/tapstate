@@ -309,7 +309,8 @@ class IndependentCdcRecoveryIT {
             CdcRecoveryFixture.change(fixture.source(), 2052, ROOT, "3", "", "replay-barrier");
             awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "3", "replay-barrier");
             assertThat(priority(fixture.rootTarget(), ROOT, "2")).isEqualTo("High");
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            assertThat(Await.answered("the first post-replay error count", Duration.ofSeconds(10),
+                    () -> control.errorCount(ROOT_PIPELINE))).isZero();
             System.out.println("The paused SRS consumer replayed 2048 retained updates to its sink in "
                     + Duration.ofNanos(System.nanoTime() - replayedFrom).toMillis() + " ms.");
         }
