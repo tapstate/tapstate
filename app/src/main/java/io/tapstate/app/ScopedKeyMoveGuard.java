@@ -62,8 +62,8 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
                     throw PipelineKeyMoveWindows.unresolved(fence.pipelineId());
                 var order = position.order();
                 if (changes != null && changes.epoch() != order.epoch()) {
-                    arm(changes);
-                    changes = null;
+                    // Admission is atomic for a prefix. Never publish half a rejected request.
+                    throw PipelineKeyMoveWindows.unresolved(fence.pipelineId());
                 }
                 changes = changes == null ? new PipelineKeyMoveWindows.Range(order.epoch(), order.seq(), order.seq())
                         : new PipelineKeyMoveWindows.Range(order.epoch(), Math.min(changes.first(), order.seq()), Math.max(changes.last(), order.seq()));
@@ -73,6 +73,8 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
 
         private void arm(PipelineKeyMoveWindows.Range changes) {
             authorization.require(fence);
+            var previous = open == null ? null : open.ranges().get(stream);
+            if (previous != null && previous.epoch() != changes.epoch()) reconcile();
             open = windows.arm(fence.scope(), execution, activation, stream, changes, open, () -> authorization.requireFresh(fence));
         }
 
@@ -81,6 +83,10 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
             long now = System.nanoTime();
             if (now - nextPoll < 0) return;
             nextPoll = now + TimeUnit.SECONDS.toNanos(1);
+            reconcile();
+        }
+
+        private void reconcile() {
             var pending = windows.read(fence.pipelineId());
             if (pending.isEmpty()) {
                 open = null;

@@ -86,7 +86,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final RingTail ringTail;
     private final SourceChangeGuard.Factory changeGuardFactory;
     private SourceChangeGuard changeGuard;
-    private boolean batchAdmitted;
+    private int admittedRows;
     private final boolean bounded;
     // The most changes one pass reads from the ring and sends on before yielding: the batch the source's author
     // asked for, which is how many rows it hands on at a time - never how many the connector fetches.
@@ -583,26 +583,47 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // A private hand-off can supply several output batches in one drain. Its read position
         // already names the last of them, so intermediate bounds must come from emitted rows.
         boolean directCdc = ringTail == null && !bounded && stamp != null && !awaitingSnapshot && !snapshotBoundDue;
-        if (!pending.isEmpty() && !batchAdmitted && changeGuard != null) {
-            changeGuard.beforeBatch(pending);
-            batchAdmitted = true;
+        if (!pending.isEmpty() && admittedRows == 0) {
+            admittedRows = changeGuard == null ? pending.size() : admitEpoch();
         }
-        while (!pending.isEmpty()) {
+        while (admittedRows > 0) {
             Envelope row = pending.peek();
-            if (!tryEmit(row)) {
-                return false;
-            }
+            if (!tryEmit(row)) return false;
             pending.remove();
-            if (pending.isEmpty()) batchAdmitted = false;
-            if (directCdc && ++directRowsSinceBound == readBatch) {
+            admittedRows--;
+            boolean epochEnded = admittedRows == 0 && !pending.isEmpty();
+            if (epochEnded || directCdc && ++directRowsSinceBound == readBatch) {
                 directRowsSinceBound = 0;
-                stampAt(row.position().order());
-                if (!announce()) return false;
+                if (!snapshotBoundDue && row.position() != null && row.position().order() != null) stampAt(row.position().order());
+                if (!announce() || epochEnded) return false;
             }
         }
         directRowsSinceBound = 0;
         stampWhatHasLeft();
         return announce();
+    }
+
+    /** A watermark for the first capture generation must leave before a later generation is admitted. */
+    private int admitEpoch() {
+        var first = pending.getFirst().position();
+        var last = pending.getLast().position();
+        if (first != null && last != null && first.order() != null && last.order() != null
+                && first.order().epoch() == last.order().epoch()) {
+            changeGuard.beforeBatch(pending);
+            return pending.size();
+        }
+        var prefix = new java.util.ArrayList<Envelope>();
+        SourceOrder boundary = null;
+        for (var row : pending) {
+            var position = row.position();
+            if (position != null && position.order() != null) {
+                if (boundary != null && position.order().epoch() != boundary.epoch()) break;
+                boundary = position.order();
+            }
+            prefix.add(row);
+        }
+        changeGuard.beforeBatch(prefix);
+        return prefix.size();
     }
 
     /**

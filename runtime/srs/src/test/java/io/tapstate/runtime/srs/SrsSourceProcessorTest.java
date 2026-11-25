@@ -698,6 +698,43 @@ class SrsSourceProcessorTest {
         }
     }
 
+    @Test
+    void aMixedEpochDrainFinishesTheFirstAdmissionBeforeRegisteringItsSuccessor() throws Exception {
+        String ring = "direct.two-key-move-epochs";
+        var buffer = new SnapshotBuffer();
+        for (int epoch = 1; epoch <= 2; epoch++) {
+            buffer.append(PIPELINE, ring, Envelope.update(epoch, "orders", Map.of("id", epoch),
+                    Map.of("id", epoch + 1), null).withPosition(new ChainPosition(new SourceOrder(epoch, epoch), null)));
+        }
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        try {
+            var admitted = new ArrayList<Long>();
+            SourceChangeGuard.Factory guard = context -> new SourceChangeGuard() {
+                @Override public void beforeBatch(Iterable<Envelope> rows) {
+                    long first = rows.iterator().next().position().order().epoch();
+                    rows.forEach(row -> assertThat(row.position().order().epoch()).isEqualTo(first));
+                    admitted.add(first);
+                }
+                @Override public void poll() {}
+            };
+            var meta = SrsSourceProcessor.directMetaSupplier(PIPELINE, ring, "orders", 1L, RECORDED_STAMP,
+                    SourcePlacement.anyMember(), 8, guard);
+            withOneSlotOutbox(meta, (processor, outbox) -> {
+                List<Object> emitted = new ArrayList<>();
+                for (int pass = 0; pass < 12; pass++) {
+                    processor.complete();
+                    outbox.drainQueueAndReset(0, emitted, false);
+                }
+                assertThat(admitted).containsExactly(1L, 2L);
+                assertThat(emitted.stream().map(item -> item instanceof Watermark ? "bound"
+                        : "epoch-" + ((Envelope) item).position().order().epoch()))
+                        .containsExactly("epoch-1", "bound", "epoch-2", "bound");
+            });
+        } finally {
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+        }
+    }
+
     private void assertTwoRowsPerBound(ProcessorMetaSupplier meta) throws Exception {
         withOneSlotOutbox(meta, (processor, outbox) -> {
             List<Object> emitted = new ArrayList<>();
