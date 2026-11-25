@@ -66,7 +66,7 @@ class ANestAcceptsPositionsSettledByAFilterTest {
         assertThat(topology.vertices()).hasSize(2);
 
         int routed = 0;
-        Map<String, Integer> isolatedOutputs = new LinkedHashMap<>();
+        Map<String, Integer> ownerOutputs = new LinkedHashMap<>();
         Integer settlementPartition = null;
         for (Map.Entry<String, Vertex> filter : filters.entrySet()) {
             Envelope kept = Envelope.insert(1L, filter.getKey(), row("customer_id", 1, "profile_ref", 1,
@@ -77,9 +77,17 @@ class ANestAcceptsPositionsSettledByAFilterTest {
             assertThat(filtered).containsExactly(kept, new SettledPositions(dropped.positions()));
             List<Edge> routes = new ArrayList<>();
             for (Edge first : dag.getOutboundEdges(filter.getValue().getName())) {
-                if (first.getRoutingPolicy() == Edge.RoutingPolicy.ISOLATED) {
+                boolean rootDispatcher = first.getDestName().endsWith(":root-owners");
+                if (rootDispatcher) {
+                    assertThat(filter.getKey()).isEqualTo("customer");
+                    assertThat(first.getRoutingPolicy()).isEqualTo(Edge.RoutingPolicy.PARTITIONED);
+                    Partitioner<Object> admission = partitioner(first);
+                    assertThat(admission.getPartition(kept, 271))
+                            .isEqualTo(admission.getPartition(filtered.get(1), 271));
+                }
+                if (rootDispatcher || first.getRoutingPolicy() == Edge.RoutingPolicy.ISOLATED) {
                     List<Edge> afterOwners = dag.getOutboundEdges(first.getDestName());
-                    assertThat(isolatedOutputs.put(filter.getKey(), afterOwners.size())).isNull();
+                    assertThat(ownerOutputs.put(filter.getKey(), afterOwners.size())).isNull();
                     routes.addAll(afterOwners);
                 } else {
                     routes.add(first);
@@ -87,9 +95,7 @@ class ANestAcceptsPositionsSettledByAFilterTest {
             }
             for (Edge edge : routes) {
                 assertThat(edge.getRoutingPolicy()).isEqualTo(Edge.RoutingPolicy.PARTITIONED);
-                @SuppressWarnings("unchecked")
-                Partitioner<Object> partitioner = (Partitioner<Object>) edge.getPartitioner();
-                partitioner.init(key -> Math.floorMod(key.hashCode(), 271));
+                Partitioner<Object> partitioner = partitioner(edge);
                 partitioner.getPartition(filtered.get(0), 271);
                 int partition = partitioner.getPartition(filtered.get(1), 271);
                 if (settlementPartition == null) {
@@ -99,8 +105,15 @@ class ANestAcceptsPositionsSettledByAFilterTest {
                 routed++;
             }
         }
-        assertThat(isolatedOutputs).containsExactlyInAnyOrderEntriesOf(Map.of("customer", 2, "profile", 1));
+        assertThat(ownerOutputs).containsExactlyInAnyOrderEntriesOf(Map.of("customer", 2, "profile", 1));
         assertThat(routed).isEqualTo(9);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Partitioner<Object> partitioner(Edge edge) {
+        Partitioner<Object> partitioner = (Partitioner<Object>) edge.getPartitioner();
+        partitioner.init(key -> Math.floorMod(key.hashCode(), 271));
+        return partitioner;
     }
 
     @Test
