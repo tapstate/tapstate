@@ -94,7 +94,10 @@ public final class ConnectorClassLoader implements AutoCloseable {
             var keys = SHARED.keySet().stream()
                     .filter(key -> key.entries().stream().anyMatch(entry -> entry.path().equals(path)))
                     .toList();
+            if (keys.isEmpty()) return true;
             if (keys.stream().map(SHARED::get).anyMatch(loader -> loader.pinned || loader.users != 0)) return false;
+            var threads = platformThreads();
+            if (keys.stream().map(SHARED::get).anyMatch(loader -> usedBy(threads, loader.loader))) return false;
             for (var key : keys) {
                 var loader = SHARED.get(key);
                 try {
@@ -106,6 +109,28 @@ public final class ConnectorClassLoader implements AutoCloseable {
                 SHARED.remove(key);
             }
             return true;
+        }
+    }
+
+    /** Platform workers inherit the connector context loader and may finish after a handle closes. */
+    private static boolean usedBy(Thread[] threads, ClassLoader loader) {
+        for (var thread : threads) {
+            if (thread == null || !thread.isAlive()) continue;
+            for (var context = thread.getContextClassLoader(); context != null; context = context.getParent()) {
+                if (context == loader) return true;
+            }
+        }
+        return false;
+    }
+
+    private static Thread[] platformThreads() {
+        var group = Thread.currentThread().getThreadGroup();
+        while (group.getParent() != null) group = group.getParent();
+        int size = Math.max(16, group.activeCount());
+        while (true) {
+            var threads = new Thread[size];
+            if (group.enumerate(threads, true) < threads.length) return threads;
+            size = Math.multiplyExact(size, 2);
         }
     }
 
