@@ -577,6 +577,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         boolean wrote = false;
         while (inFlight.size() < maxInFlight) {
             if (queuedMove != null && queued.isEmpty()) {
+                if (!queuedMove.receipt().mayWrite()) return wrote;
                 var batch = queuedMove.batch();
                 inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
                         queuedMove.order(), queuedMove.receipt(), batch.size()));

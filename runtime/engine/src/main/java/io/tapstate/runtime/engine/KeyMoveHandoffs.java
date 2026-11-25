@@ -16,6 +16,8 @@ import java.util.concurrent.CompletionStage;
  */
 public final class KeyMoveHandoffs<K> {
     public interface Receipt {
+        /** Whether earlier conflicting target writes have settled on every writer. */
+        default boolean mayWrite() { return true; }
         void queued();
         void written();
     }
@@ -24,7 +26,9 @@ public final class KeyMoveHandoffs<K> {
     private final Set<Input> live = new HashSet<>();
     private final Map<K, Set<Input>> pending = new HashMap<>();
     private final Map<K, Input> orderedTails = new HashMap<>();
-    private Throwable failure;
+    // Handoff lets the next operator compute. Target submission has its own, longer-lived tail.
+    private final Map<K, Input> writeTails = new HashMap<>();
+    private volatile Throwable failure;
 
     public KeyMoveHandoffs(int capacity) {
         if (capacity < 1) throw new IllegalArgumentException("capacity must be positive");
@@ -48,7 +52,19 @@ public final class KeyMoveHandoffs<K> {
             Input previousMove = orderedTails.get(after);
             ready = previousMove == null ? CompletableFuture.completedFuture(null) : previousMove.handed;
         }
-        Input input = new Input(before, after, ready, move);
+        Input oldWriter = writeTails.get(before);
+        Input newWriter = move ? writeTails.get(after) : oldWriter;
+        CompletableFuture<Void> mayWrite;
+        if (oldWriter == null) {
+            mayWrite = newWriter == null ? CompletableFuture.completedFuture(null) : newWriter.settled;
+        } else if (newWriter == null || newWriter == oldWriter) {
+            mayWrite = oldWriter.settled;
+        } else {
+            mayWrite = CompletableFuture.allOf(oldWriter.settled, newWriter.settled);
+        }
+        Input input = new Input(before, after, ready, mayWrite, move);
+        writeTails.put(after, input);
+        if (move) writeTails.put(before, input);
         live.add(input);
         pending.computeIfAbsent(after, ignored -> new HashSet<>()).add(input);
         if (move) {
@@ -73,9 +89,11 @@ public final class KeyMoveHandoffs<K> {
             live.clear();
             pending.clear();
             orderedTails.clear();
+            writeTails.clear();
         }
         retired.forEach(input -> input.ready.completeExceptionally(cause));
         retired.forEach(input -> input.handed.completeExceptionally(cause));
+        retired.forEach(input -> input.settled.completeExceptionally(cause));
     }
 
     private void releaseKey(K key, Input input) {
@@ -89,6 +107,8 @@ public final class KeyMoveHandoffs<K> {
         private final K before;
         private final K after;
         private final CompletableFuture<Void> ready;
+        private final CompletableFuture<Void> mayWrite;
+        private final CompletableFuture<Void> settled = new CompletableFuture<>();
         private final CompletableFuture<Void> handed = new CompletableFuture<>();
         private final Receipt arrival;
         private final Receipt departure;
@@ -96,9 +116,10 @@ public final class KeyMoveHandoffs<K> {
         private int queued;
         private int written;
 
-        private Input(K before, K after, CompletableFuture<Void> ready, boolean move) {
+        private Input(K before, K after, CompletableFuture<Void> ready, CompletableFuture<Void> mayWrite, boolean move) {
             this.before = before;
             this.after = after;
+            this.mayWrite = mayWrite;
             // Each blocked input has its own admission gate. A predecessor may already have
             // left live while another thread is still publishing its handoff callbacks.
             this.ready = ready.isDone() ? ready : ready.copy();
@@ -113,6 +134,12 @@ public final class KeyMoveHandoffs<K> {
 
         private Receipt side(int bit) {
             return new Receipt() {
+                @Override
+                public boolean mayWrite() {
+                    if (failure != null) throw new IllegalStateException("execution ended", failure);
+                    return mayWrite.isDone() && !mayWrite.isCompletedExceptionally();
+                }
+
                 public void queued() { acknowledge(bit, false); }
                 public void written() { acknowledge(bit, true); }
             };
@@ -120,6 +147,7 @@ public final class KeyMoveHandoffs<K> {
 
         private void acknowledge(int bit, boolean committed) {
             boolean unlock;
+            boolean finished;
             synchronized (KeyMoveHandoffs.this) {
                 if (!live.contains(this)) return;
                 if (!ready.isDone() || ready.isCompletedExceptionally())
@@ -131,9 +159,15 @@ public final class KeyMoveHandoffs<K> {
                     if (sides == 3) releaseKey(before, this);
                 }
                 if (committed) written |= bit;
-                if (written == sides) live.remove(this);
+                finished = written == sides;
+                if (finished) {
+                    live.remove(this);
+                    writeTails.remove(after, this);
+                    if (sides == 3) writeTails.remove(before, this);
+                }
             }
             // Admitting the next input can call back into the coordinator or enter a writer.
+            if (finished) settled.complete(null);
             if (unlock) handed.complete(null);
         }
     }

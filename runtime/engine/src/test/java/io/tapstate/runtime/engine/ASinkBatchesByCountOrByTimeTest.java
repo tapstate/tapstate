@@ -292,6 +292,42 @@ class ASinkBatchesByCountOrByTimeTest {
         assertThat(writer.notices).containsExactly("queued 3", "queued 4", "written 3", "written 4");
     }
 
+    @Test
+    void aSecondWriterCanQueueTheNextMoveButMustWaitForBothEarlierWrites() throws Exception {
+        var sequence = new KeyMoveHandoffs<String>(32);
+        var first = sequence.tryRegister("A", "B");
+        first.departure().queued();
+        first.arrival().queued();
+        var next = sequence.tryRegister("B", "A");
+        var independent = sequence.tryRegister("C", "C");
+        assertThat(next.ready().toCompletableFuture()).isCompleted();
+
+        var hotWriter = taking(next.arrival());
+        var coldWriter = taking(independent.arrival());
+        var hot = sink(hotWriter, null, null, 32, 0);
+        var cold = sink(coldWriter, null, null, 32, 0);
+        hot.process(0, inbox(row("orders", 3)));
+        cold.process(0, inbox(row("orders", 4)));
+        assertThat(coldWriter.batches).containsExactly(List.of(4));
+        assertThat(hotWriter.batches).isEmpty();
+
+        first.departure().written();
+        hot.tryProcess();
+        assertThat(hotWriter.batches).isEmpty();
+        first.arrival().written();
+        hot.tryProcess();
+        assertThat(hotWriter.batches).containsExactly(List.of(3));
+    }
+
+    private static MoveWriter taking(KeyMoveHandoffs.Receipt receipt) {
+        return new MoveWriter() {
+            @Override
+            public KeyMoveHandoffs.Receipt receiptFor(Envelope row) {
+                return receipt;
+            }
+        };
+    }
+
     private static class IndependentWriter extends MoveWriter {
         @Override
         public Predicate<Envelope> batchAdmission(Envelope reserved) {
