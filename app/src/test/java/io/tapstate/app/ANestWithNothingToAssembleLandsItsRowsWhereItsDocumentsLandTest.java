@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
+import io.tapstate.core.common.NumericType;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -125,6 +127,32 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
         assertThat(bound.get().get(TABLE).fields()).extracting(TargetField::name).containsExactlyElementsOf(fields);
         assertThat(planned.shape().sinkTargetsOf(SINK))
                 .containsOnly(Map.entry(TABLE, new SinkTarget(TABLE, List.of("id"))));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void conflictingDecimalDescriptorsCannotFallBackToOneRoutesSpelling(boolean directFirst) {
+        Step project = Step.inline("project", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(Map.of("amount", FieldRule.computed("after.other_amount"))), null);
+        FromRef direct = FromRef.literal(TABLE);
+        FromRef projected = FromRef.literal("project");
+        InMemoryStorePort store = seedStore(List.of(rootOnly(STEP, "id"), project),
+                directFirst ? FromClause.list(direct, projected) : FromClause.list(projected, direct));
+        NumericType wider = new NumericType(null, true, false, null, null, null, 12, 3);
+        store.schemas().save(new DiscoveredSourceModel(SOURCE, "fake", 1L, new SourceModel(List.of(
+                new SourceTable(TABLE, List.of(new SourceField("id", "int"),
+                        new SourceField("amount", "decimal(10,2)", TapstateType.DECIMAL),
+                        new SourceField("other_amount", "decimal(12,3)", TapstateType.DECIMAL, null, wider)),
+                        List.of("id"), List.of())))));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(store, capturing(bound)).dagFor(PIPELINE);
+
+        assertThat(bound.get().get(TABLE).fields()).filteredOn(field -> field.name().equals("amount"))
+                .singleElement().satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.DECIMAL);
+                    assertThat(field.type()).isNull();
+                    assertThat(field.numericType()).isNull();
+                });
     }
 
     @Test

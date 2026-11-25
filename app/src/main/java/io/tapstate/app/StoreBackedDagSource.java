@@ -1575,7 +1575,7 @@ final class StoreBackedDagSource implements DagSource {
         }
         var origin = original.withNumericTypes(numbers).withStringTypes(strings)
                 .withLegacyDecimalDeclarations(legacyDecimals);
-        var inputs = streamInputs(graph, from, stream, origin, new HashSet<>());
+        var inputs = new StreamColumnResolver(graph, stream, origin).inputs(from);
         if (inputs.isEmpty()) return null;
         NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
                 : NodeColumns.of(new TransformBody.Union(), inputs, null);
@@ -1621,45 +1621,63 @@ final class StoreBackedDagSource implements DagSource {
      * <p>An assembly publishes its own stream under its step id. Its model starts there, and the
      * streams it consumes stop there.
      */
-    private static NodeColumns streamColumnsAt(StreamGraph graph, FromRef from, String stream,
-            NodeColumns origin, Set<String> visiting) {
-        ViewBlock.Inline view = inlineViewNamed(graph.pipeline(), from);
-        if (view != null) {
-            NodeColumns upstream = streamColumnsAt(graph, view.from(), stream, origin, visiting);
-            return upstream == null ? null : NodeColumns.of(view, upstream);
-        }
-        List<NodeColumns> reached = new ArrayList<>();
-        for (String key : graph.upstreamsOf(from)) {
-            NodeColumns columns = streamColumnsAtKey(graph, key, stream, origin, visiting);
-            if (columns != null) reached.add(columns);
-        }
-        return reached.isEmpty() ? null : NodeColumns.merged(reached);
-    }
+    private static final class StreamColumnResolver {
+        private final StreamGraph graph;
+        private final String stream;
+        private final NodeColumns origin;
+        private final Set<String> visiting = new HashSet<>();
+        private final Map<String, NodeColumns> completed = new HashMap<>();
 
-    private static NodeColumns streamColumnsAtKey(StreamGraph graph, String key, String stream,
-            NodeColumns origin, Set<String> visiting) {
-        SourceVertex vertex = graph.vertices().get(key);
-        if (vertex != null) return vertex.stream().equals(stream) ? origin : null;
-        if (!(stepOf(graph.pipeline(), key) instanceof Step.Inline inline)) return null;
-        if (publishesOwnStream(inline.body())) return inline.id().equals(stream) ? origin : null;
-        if (!visiting.add(key)) return null;
-        try {
-            var inputs = streamInputs(graph, inline.from(), stream, origin, visiting);
-            return inputs.isEmpty() ? null : NodeColumns.of(inline.id(), inline.body(), inputs, null);
-        } finally {
-            // A shared ancestor must be visited again from another fork.
-            visiting.remove(key);
+        private StreamColumnResolver(StreamGraph graph, String stream, NodeColumns origin) {
+            this.graph = graph;
+            this.stream = stream;
+            this.origin = origin;
         }
-    }
 
-    private static Map<String, NodeColumns> streamInputs(StreamGraph graph, FromClause from, String stream,
-            NodeColumns origin, Set<String> visiting) {
-        Map<String, NodeColumns> inputs = new LinkedHashMap<>();
-        for (FromRef ref : refsOf(from)) {
-            NodeColumns columns = streamColumnsAt(graph, ref, stream, origin, visiting);
-            if (columns != null) inputs.put(Integer.toString(inputs.size()), columns);
+        private NodeColumns at(FromRef from) {
+            ViewBlock.Inline view = inlineViewNamed(graph.pipeline(), from);
+            if (view != null) {
+                NodeColumns upstream = at(view.from());
+                return upstream == null ? null : NodeColumns.of(view, upstream);
+            }
+            List<NodeColumns> reached = new ArrayList<>();
+            for (String key : graph.upstreamsOf(from)) {
+                NodeColumns columns = atKey(key);
+                if (columns != null) reached.add(columns);
+            }
+            return reached.isEmpty() ? null : NodeColumns.merged(reached);
         }
-        return inputs;
+
+        private NodeColumns atKey(String key) {
+            // A completed null means this producer does not carry the stream.
+            if (completed.containsKey(key)) return completed.get(key);
+            if (!visiting.add(key)) return null;
+            try {
+                NodeColumns columns = resolve(key);
+                completed.put(key, columns);
+                return columns;
+            } finally {
+                visiting.remove(key);
+            }
+        }
+
+        private NodeColumns resolve(String key) {
+            SourceVertex vertex = graph.vertices().get(key);
+            if (vertex != null) return vertex.stream().equals(stream) ? origin : null;
+            if (!(stepOf(graph.pipeline(), key) instanceof Step.Inline inline)) return null;
+            if (publishesOwnStream(inline.body())) return inline.id().equals(stream) ? origin : null;
+            var upstream = inputs(inline.from());
+            return upstream.isEmpty() ? null : NodeColumns.of(inline.id(), inline.body(), upstream, null);
+        }
+
+        private Map<String, NodeColumns> inputs(FromClause from) {
+            Map<String, NodeColumns> inputs = new LinkedHashMap<>();
+            for (FromRef ref : refsOf(from)) {
+                NodeColumns columns = at(ref);
+                if (columns != null) inputs.put(Integer.toString(inputs.size()), columns);
+            }
+            return inputs;
+        }
     }
 
     /**
@@ -3248,10 +3266,12 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private static TargetField mergeLandingField(TargetField first, TargetField second) {
-        return new TargetField(first.name(), Objects.equals(first.type(), second.type()) ? first.type() : null,
+        boolean sameNumericType = Objects.equals(first.numericType(), second.numericType());
+        String declaration = sameNumericType && Objects.equals(first.type(), second.type()) ? first.type() : null;
+        return new TargetField(first.name(), declaration,
                 first.primaryKey(),
                 first.inferredType() == second.inferredType() ? first.inferredType() : TapstateType.UNKNOWN,
-                Objects.equals(first.numericType(), second.numericType()) ? first.numericType() : null,
+                sameNumericType ? first.numericType() : null,
                 Objects.equals(first.stringType(), second.stringType()) ? first.stringType() : null);
     }
 
