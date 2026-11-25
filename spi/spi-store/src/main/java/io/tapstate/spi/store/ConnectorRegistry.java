@@ -58,6 +58,11 @@ public interface ConnectorRegistry {
                 .toList();
     }
 
+    /** Startup reads one connector's current registrations and admitted scope together. */
+    default List<ConnectorRegistration> findAllForCaptureStartup(String connectorId) {
+        return findAll(connectorId);
+    }
+
     /** The artifact bytes stored under a content hash, or empty if none is stored. */
     Optional<byte[]> artifact(String contentHash);
 

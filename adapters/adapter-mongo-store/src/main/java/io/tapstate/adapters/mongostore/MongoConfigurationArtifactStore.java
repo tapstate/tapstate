@@ -12,6 +12,7 @@ import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.PipelineConnectorNodes;
 import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -33,6 +34,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * Configuration resources in separate collections for each authoring kind. Every mutation writes the same
@@ -227,6 +229,30 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
 
     Optional<Resource> getInTransaction(ClientSession session, String id) {
         return Optional.ofNullable(find(session, id)).map(this::decode);
+    }
+
+    /** Materialize Pipeline and physical Source definitions under their published identities in one transaction. */
+    Map<String, Resource> startupDefinitions(ClientSession session, String pipelineId) {
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return Map.of();
+        var pipelineRow = collections.get("pipeline").find(session, new Document("_id", pipelineId)).first();
+        if (pipelineRow == null || !pipelineId.equals(pipelineRow.get("_id"))) return Map.of();
+        var decoded = decode(pipelineRow);
+        if (!(decoded instanceof PipelineResource pipeline)) return Map.of();
+        var ids = new java.util.LinkedHashSet<>(pipeline.sourceIds());
+        ids.add(pipelineId);
+        // Check all resource kinds together, including aliases and collisions, before reusing the bodies.
+        if (ids.size() > 16) return Map.of();
+        var keys = List.copyOf(ids);
+        var stages = MongoStartConfigRead.root();
+        MongoStartConfigRead.addArtifacts(stages, keys);
+        var rows = MongoStartConfigRead.artifacts(MongoStartConfigRead.snapshot(database, session, stages), keys);
+        if (rows.isEmpty() || rows.orElseThrow().size() != keys.size()) return Map.of();
+        var result = new LinkedHashMap<String, Resource>();
+        for (var row : rows.orElseThrow()) {
+            var resource = pipelineId.equals(row.get("_id")) ? pipeline : decode(row);
+            result.put(resource.id(), resource);
+        }
+        return result;
     }
 
     Map<String, Resource> preparationInputsInTransaction(ClientSession session, Set<String> ids) {
@@ -558,8 +584,67 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
+        return ordinarySourceBinding(id);
+    }
+
+    Optional<io.tapstate.spi.store.SourceBindingSnapshot> retainedCaptureSourceBinding(String id) {
+        var budget = sourceBindingBudget();
+        return snapshotSourceBinding(id, budget, () -> ordinarySourceBinding(id, budget));
+    }
+
+    @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBindingForSinkStartup(String id) {
+        var budget = sourceBindingBudget();
+        return snapshotSourceBinding(id, budget, () -> ordinarySourceBinding(id, budget));
+    }
+
+    private Optional<io.tapstate.spi.store.SourceBindingSnapshot> snapshotSourceBinding(String id, MongoReadBudget budget,
+            Supplier<Optional<io.tapstate.spi.store.SourceBindingSnapshot>> fallback) {
         Objects.requireNonNull(id, "id");
-        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) return fallback.get();
+        return StoreIo.call(() -> {
+            var stages = MongoStartConfigRead.root();
+            var bounded = new Document("$cond", List.of(
+                    new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), 64 * 1024)), "$$ROOT", false));
+            stages.add(new Document("$project", new Document("identity", bounded)));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.SCHEMA_MIGRATIONS, "schema", "config",
+                    new Document("value", bounded)));
+            MongoStartConfigRead.addArtifacts(stages, List.of(id));
+            if (ciphers instanceof SourceConfigCipherProvider.Snapshot)
+                stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.CLUSTER_KEYS, "sourceKey", "cluster"));
+            var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
+            var captured = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(selected).aggregate(stages).first();
+            var identity = captured != null && captured.get("identity") instanceof Document value ? value : null;
+            var schema = MongoStartConfigRead.row(captured, "schema", "config")
+                    .filter(value -> value.get("value") instanceof Document).map(value -> value.get("value", Document.class));
+            var resources = MongoStartConfigRead.artifacts(captured, List.of(id));
+            if (identity == null || schema.isEmpty() || resources.isEmpty() || resources.orElseThrow().size() != 1)
+                return fallback.get();
+            var state = MongoSourceIdentitySchema.read(identity, schema.orElseThrow(), ciphers.current().activeKeyId());
+            if (state == null || state.phase() != MongoSourceIdentitySchema.Phase.READY)
+                throw MongoSourceIdentitySchema.unavailable(id);
+            var stored = resources.orElseThrow().getFirst();
+            if (!"source".equals(stored.get("kind"))) return Optional.empty();
+            MongoSourceIdentity.read(stored);
+            var key = MongoStartConfigRead.boundedRow(captured, "sourceKey", "cluster");
+            var cipher = key != null && ciphers instanceof SourceConfigCipherProvider.Snapshot verifier
+                    ? verifier.requireCurrent(key) : ciphers.refresh(budget);
+            var source = (SourceResource) new EncryptedArtifactCodec(cipher).decode(stored);
+            budget.requireRemaining();
+            return Optional.of(new io.tapstate.spi.store.SourceBindingSnapshot(source, stored.getString("contentHash"),
+                    MongoSourceIdentity.read(stored).binding()));
+        });
+    }
+
+    private static MongoReadBudget sourceBindingBudget() {
+        return new MongoReadBudget(java.time.Duration.ofSeconds(5));
+    }
+
+    private Optional<io.tapstate.spi.store.SourceBindingSnapshot> ordinarySourceBinding(String id) {
+        return ordinarySourceBinding(id, sourceBindingBudget());
+    }
+
+    private Optional<io.tapstate.spi.store.SourceBindingSnapshot> ordinarySourceBinding(String id, MongoReadBudget budget) {
+        Objects.requireNonNull(id, "id");
         Document stored = budget.transaction(client, session -> {
             var state = MongoSourceIdentitySchema.read(session, database, ciphers.current().activeKeyId());
             if (state == null || state.phase() != MongoSourceIdentitySchema.Phase.READY) {
@@ -584,6 +669,11 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return MongoSourceIdentity.fence(session, database, expected, ciphers.current().activeKeyId());
     }
 
+    boolean fenceSourceBinding(ClientSession session,io.tapstate.spi.store.SourceBindingIdentity expected,MongoAlertWriteFacts facts,Document source) {
+        return MongoSourceIdentity.fence(session,database,expected,ciphers.current().activeKeyId(),facts.identity(),
+                facts.row(SystemCollections.SCHEMA_MIGRATIONS,"config"),source,facts.row(SystemCollections.CLUSTER_KEYS,"cluster"));
+    }
+
     @Override
     public List<Resource> list() {
         return readSnapshot(session -> documents(session).stream().map(this::decode).toList());
@@ -594,12 +684,160 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return readableInventory().resources();
     }
 
+    private record StartRoot(PipelineResource pipeline, String defaultSourceId) {}
+
+    private StartRoot startRoot(ClientSession session, String id) {
+        if (!MongoBindingReadFacts.supported(client)) return null;
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINES, "pipeline", id));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_BINDING, "binding", "cluster"));
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.STORAGE_SETUP, "setup", "cluster"));
+        stages.add(MongoStartConfigRead.boundedSingleton(SystemCollections.STORAGE_RECOVERY, "recovery"));
+        var defaultId = new Document("$arrayElemAt", List.of("$binding.value.defaultSourceId", 0));
+        var version = new Document("$arrayElemAt", List.of("$binding.value.bindingVersion", 0));
+        var globalId = new Document("bindingVersion", version).append("namespace", "pdk.global-state");
+        stages.add(joinStartRow(SystemCollections.SOURCES, "defaultSource", defaultId));
+        stages.add(joinStartRow(SystemCollections.PDK_NOTE_SCOPES, "global", globalId));
+        var otherKinds = List.of("pipeline", "transform", "view", "serve");
+        for (var kind : otherKinds) {
+            stages.add(new Document("$lookup", new Document("from", collection(kind).getNamespace().getCollectionName())
+                    .append("as", "occupied_" + kind).append("pipeline", List.of(new Document("$limit", 1),
+                            new Document("$project", new Document("_id", 0).append("present", new Document("$literal", true)))))));
+        }
+        var result = identity.aggregate(session, stages).first();
+        if (result == null || !(result.get("root") instanceof Document root) || !"cluster".equals(root.get("_id"))) return null;
+        var definition = MongoStartConfigRead.boundedRow(result, "pipeline", id);
+        var binding = MongoStartConfigRead.boundedRow(result, "binding", "cluster");
+        var setup = MongoStartConfigRead.boundedRow(result, "setup", "cluster");
+        var recovery = MongoStartConfigRead.boundedRow(result, "recovery", "cluster");
+        if (definition == null || setup == null || recovery == null || binding == null
+                || !(binding.get("defaultSourceId") instanceof String sourceId) || !(binding.get("bindingVersion") instanceof Long bindingVersion)
+                || !bindingVersion.equals(root.get("bindingVersion")) || bindingVersion <= 0) return null;
+        var source = MongoStartConfigRead.boundedRow(result, "defaultSource", sourceId);
+        var global = MongoStartConfigRead.boundedRow(result, "global", new Document("bindingVersion", bindingVersion).append("namespace", "pdk.global-state"));
+        if (source == null || global == null) return null;
+        requireKind(definition, "pipeline");
+        var pipeline = (PipelineResource) decode(definition);
+        // A populated foreign collection retains its own collation for the collision check.
+        boolean conflict = otherKinds.stream().anyMatch(kind -> !result.getList("occupied_" + kind, Document.class).isEmpty()
+                && collection(kind).find(session, new Document("_id", sourceId)).projection(new Document("_id", 1)).first() != null);
+        bindings.auditedObservationBinding(root, setup, binding, recovery, source, global, conflict);
+        return new StartRoot(pipeline, sourceId);
+    }
+
+    private static Document joinStartRow(SystemCollections table, String name, Document id) {
+        return new Document("$lookup", new Document("from", table.collectionName()).append("as", name)
+                .append("let", new Document("id", id)).append("pipeline", List.of(
+                        new Document("$match", new Document("$expr", new Document("$eq", List.of("$_id", "$$id")))),
+                        new Document("$limit", 2), new Document("$project", new Document("value", MongoStartConfigRead.boundedValue())))));
+    }
+
+    @Override public Optional<ReadableInventory> runtimeStartInventory(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return readSnapshot(session -> {
+            var captured = startRoot(session, pipelineId);
+            PipelineResource pipeline;
+            Optional<String> binding;
+            if (captured == null) {
+                var row = find(session, pipelineId, Set.of("pipeline"));
+                if (row == null || !pipelineId.equals(row.getString("_id"))) return Optional.empty();
+                pipeline = (PipelineResource) decode(row);
+                binding = bindings.loadForTransaction(session).map(io.tapstate.spi.store.StorageBinding::defaultSourceId);
+            } else {
+                pipeline = captured.pipeline();
+                binding = Optional.of(captured.defaultSourceId());
+            }
+            if (binding.isEmpty() && pipeline.view() != null) return Optional.empty();
+
+            var references = new LinkedHashMap<String, Resource>();
+            references.put(pipelineId, pipeline);
+            var pending = new java.util.ArrayDeque<Resource>();
+            pending.add(pipeline);
+            while (!pending.isEmpty()) {
+                var requested = new LinkedHashMap<String, Set<String>>();
+                for (var edge : io.tapstate.core.dsl.ReferenceGraph.declaredReferences(pending.removeFirst())) {
+                    var found = references.get(edge.id());
+                    if (found != null && !found.kind().equals(edge.kind())) return Optional.empty();
+                    if (found == null) requested.computeIfAbsent(edge.kind(), ignored -> new java.util.LinkedHashSet<>()).add(edge.id());
+                }
+                // The managed target can be used implicitly by an inline or referenced view.
+                if (pipeline.view() != null && binding.isPresent() && !references.containsKey(binding.orElseThrow())) {
+                    requested.computeIfAbsent("source", ignored -> new java.util.LinkedHashSet<>()).add(binding.orElseThrow());
+                }
+                for (var entry : requested.entrySet()) {
+                    var remaining = entry.getValue();
+                    try (var cursor = collection(entry.getKey())
+                            .find(session, new Document("_id", new Document("$in", List.copyOf(remaining)))).iterator()) {
+                        while (cursor.hasNext()) {
+                            var found = cursor.next();
+                            requireKind(found, entry.getKey());
+                            if (!remaining.remove(found.getString("_id"))) return Optional.empty();
+                            var decoded = decode(found);
+                            if (references.putIfAbsent(decoded.id(), decoded) != null) return Optional.empty();
+                            if (decoded instanceof io.tapstate.core.model.ServeResource) pending.add(decoded);
+                        }
+                    }
+                    if (!remaining.isEmpty()) return Optional.empty();
+                }
+            }
+            return Optional.of(new ReadableInventory(List.copyOf(references.values()), Optional.empty(), binding,
+                    references.keySet()));
+        });
+    }
+
     @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
         return definitionInventory(candidate, true);
     }
 
     @Override public Optional<ReadableInventory> startPlanningInventory(PipelineResource candidate) {
         return definitionInventory(candidate, false);
+    }
+
+    Optional<Resource> capturedStartDefinition(Document snapshot, String pipelineId) {
+        return MongoStartConfigRead.artifacts(snapshot, List.of(pipelineId))
+                .filter(rows -> rows.size() == 1).map(rows -> decode(rows.getFirst()));
+    }
+
+    Optional<ReadableInventory> capturedStartInventory(PipelineResource candidate,
+            io.tapstate.spi.store.CacheBusinessScope expected) {
+        if (candidate.serve() instanceof io.tapstate.core.model.ServeBlock.Use
+                || MongoValidationClaimObservation.lacksSnapshotRead(client)) return Optional.empty();
+        var refs = new java.util.LinkedHashSet<String>();
+        io.tapstate.core.dsl.ReferenceGraph.declaredReferences(candidate).forEach(edge -> refs.add(edge.id()));
+        // Both reserved IDs are read using the same snapshot as the published binding.
+        refs.add(io.tapstate.spi.store.StorageBinding.defaultSourceId(io.tapstate.spi.store.StorageBinding.Mode.OP));
+        refs.add(io.tapstate.spi.store.StorageBinding.defaultSourceId(io.tapstate.spi.store.StorageBinding.Mode.CLOUD));
+        if (refs.size() > 16) return Optional.empty();
+        var ids = List.copyOf(refs);
+        return StoreIo.call(() -> {
+            var stages = MongoStartConfigRead.root();
+            MongoStartConfigRead.addBinding(stages);
+            MongoStartConfigRead.addArtifacts(stages, ids);
+            var snapshot = MongoStartConfigRead.snapshot(database, stages);
+            var binding = MongoStartConfigRead.binding(snapshot, bindings, expected);
+            var rows = MongoStartConfigRead.artifacts(snapshot, ids);
+            if (binding.isEmpty() || rows.isEmpty()) return Optional.empty();
+            String managed = binding.orElseThrow().defaultSourceId();
+            Object managedHash = MongoStartConfigRead.row(snapshot, "binding", "cluster").orElseThrow().get("sourceHash");
+            var values = new ArrayList<Resource>();
+            var exact = new java.util.HashSet<String>();
+            for (var raw : rows.orElseThrow()) {
+                try {
+                    var value = decode(raw);
+                    exact.add(value.id());
+                    if (managed.equals(value.id()) && (!(value instanceof SourceResource)
+                            || !MongoStorageBindingStore.DEFAULT_ROLE.equals(raw.get("systemRole"))
+                            || !CanonicalHash.of(value).equals(managedHash))) return Optional.empty();
+                    values.add(value);
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+                    return Optional.empty();
+                }
+            }
+            if (!exact.contains(managed)) return Optional.empty();
+            return Optional.of(new ReadableInventory(values, Optional.empty(), Optional.of(managed), exact));
+        });
     }
 
     private Optional<ReadableInventory> definitionInventory(PipelineResource candidate, boolean includePipeline) {

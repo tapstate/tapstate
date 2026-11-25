@@ -3,17 +3,15 @@ package io.tapstate.app;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ObservationStore;
 
-import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-/** In-memory {@link ObservationStore} double for the convergence wiring tests; insertion-ordered. */
+/** Concurrent {@link ObservationStore} double for the convergence wiring tests. */
 final class InMemoryObservationStore implements ObservationStore {
 
-    private final Map<String, Observation> docs = new LinkedHashMap<>();
-    private final Set<String> failingSaves = new HashSet<>();
+    private final Map<String, Observation> docs = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<String> failingSaves = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     void failSaveFor(String pipelineId) {
         failingSaves.add(pipelineId);

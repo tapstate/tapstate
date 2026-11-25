@@ -173,7 +173,12 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
     }
     @Override public Opening opening() {
         var startup = new ScopedSinkStateProvider.WriterStartup();
-        return (member, local) -> forWriter(member, local, startup);
+        return new Opening() {
+            public SinkWriter open(int member, int local) { return forWriter(member, local, startup); }
+            public int maximumConcurrentRemainingOpens() {
+                return configured != null && startup.independentArtifact() ? 2 : 1;
+            }
+        };
     }
     private SinkWriter forWriter(int memberIndex,int localIndex,ScopedSinkStateProvider.WriterStartup startup) {
         if(memberIndex<0 || localIndex<0)throw new IllegalArgumentException("invalid writer coordinates");

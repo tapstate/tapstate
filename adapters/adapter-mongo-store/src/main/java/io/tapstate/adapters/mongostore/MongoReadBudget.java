@@ -53,9 +53,10 @@ public final class MongoReadBudget {
 
     <T> T transaction(MongoClient client, Function<ClientSession, T> read) {
         if(!retryCallbacks)return maintenanceTransaction(client,read);
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.call(client, this, () -> StoreIo.call(() -> {
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
+                    MongoStructureFailureScope.beginCallback();
                     remainingMillis();
                     T value = read.apply(session);
                     remainingMillis();
@@ -64,7 +65,7 @@ public final class MongoReadBudget {
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true))
                         .timeout(operationMillis(), TimeUnit.MILLISECONDS).build());
             }
-        });
+        }));
     }
     /** Private control flow carries no driver response, message or cause across the store boundary. */
     static final class MaintenanceConflict extends RuntimeException {
@@ -72,7 +73,7 @@ public final class MongoReadBudget {
     }
     /** Bounded maintenance yields on a conflict; it never lets callback retries hide work from its budget. */
     <T> T maintenanceTransaction(MongoClient client,Function<ClientSession,T> action) {
-        return StoreIo.call(()->{
+        return MongoStructureFailureScope.call(client, this, () -> StoreIo.call(()->{
             try(var session=client.startSession()) {
                 session.startTransaction(TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true)).timeout(operationMillis(),TimeUnit.MILLISECONDS).build());
@@ -82,7 +83,7 @@ public final class MongoReadBudget {
                             && (mongo.getCode()==112 || mongo.hasErrorLabel("TransientTransactionError")))throw new MaintenanceConflict();
                     throw failure;}
             }
-        });
+        }));
     }
 
 }

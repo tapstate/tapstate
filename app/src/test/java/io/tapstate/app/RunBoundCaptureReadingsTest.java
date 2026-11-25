@@ -20,6 +20,25 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class RunBoundCaptureReadingsTest {
+    @Test void oneSampleKeepsTheOriginalRunAndRejectsReplacementWithoutReusingFacts() {
+        var captures = mock(PipelineCaptureCoordinator.class);
+        var run = mock(PipelineCaptureCoordinator.class);
+        var selected = new AtomicReference<>(Optional.of(ORIGINAL));
+        when(captures.forRun(SCOPE, CLAIM, ORIGINAL)).thenReturn(run);
+        var sample = new io.tapstate.runtime.scheduler.CaptureMeasurements(
+                SnapshotReading.NONE, SnapshotReading.NONE, null, Optional.of(Map.of("orders", "acked")));
+        when(run.measurements("flow", null, BEGAN)).thenReturn(sample);
+        var readings = new RunBoundCaptureReadings(captures, ignored -> selected.get(), ignored -> CaptureReading.NONE);
+        assertThat(readings.measurements("flow", null, BEGAN)).isSameAs(sample);
+        when(run.measurements("flow", null, BEGAN)).thenAnswer(call -> {
+            selected.set(Optional.empty());
+            return sample;
+        });
+        assertThatThrownBy(() -> readings.measurements("flow", null, BEGAN)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
+        assertThat(readings.measurements("flow", null, BEGAN)).isSameAs(io.tapstate.runtime.scheduler.CaptureMeasurements.NONE);
+        verify(run, times(2)).measurements("flow", null, BEGAN);
+    }
     private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster", 1, "cache", "flow", 7);
     private static final WorkloadClaimFence CLAIM = new WorkloadClaimFence(
             new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "flow"),

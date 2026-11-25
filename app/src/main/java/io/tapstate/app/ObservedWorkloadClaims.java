@@ -19,6 +19,37 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
         Bounded(DeadlineWorkloadClaimStore bounded,BiConsumer<Boolean,Throwable> observer){super(bounded,observer);this.bounded=bounded;}
         public <T>T withDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withDeadline(deadline,active,operation);}
         public <T>T withRenewalDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withRenewalDeadline(deadline,active,operation);}
+        @Override public <T> T withClaimAcquisition(WorkloadClaimKey key, Runnable active, Supplier<T> operation) {
+            return bounded.withClaimAcquisition(key, active, operation);
+        }
+        @Override public <T> T withClaimAcquisitionDeadline(WorkloadClaimKey key, long deadline, Runnable active, Supplier<T> operation) {
+            return bounded.withClaimAcquisitionDeadline(key, deadline, active, operation);
+        }
+        @Override public <T> T withInitialPipelineAcquisition(WorkloadClaimKey key, long deadline, Runnable active,
+                Supplier<T> operation) {
+            return bounded.withInitialPipelineAcquisition(key, deadline, active, operation);
+        }
+        @Override public <T> T withInitialCaptureAcquisition(WorkloadClaimKey key,Runnable active,Supplier<T> operation) {
+            return bounded.withInitialCaptureAcquisition(key,active,operation);
+        }
+        @Override public <T> T withInitialCaptureAcquisition(WorkloadClaimKey key,long deadline,Runnable active,Supplier<T> operation) {
+            return bounded.withInitialCaptureAcquisition(key,deadline,active,operation);
+        }
+        @Override public <T> T withNodeSessionDeadline(WorkloadClaimKey key, long deadline, Runnable active,
+                Supplier<T> operation) {
+            return bounded.withNodeSessionDeadline(key, deadline, active, operation);
+        }
+        public <T> T withRenewalDeadline(WorkloadClaimKey key, long deadline, Runnable active, Supplier<T> operation) {
+            return bounded.withRenewalDeadline(key, deadline, active, operation);
+        }
+        @Override public <T> T withRenewalDeadline(WorkloadClaimKey key, java.util.Set<WorkloadClaimKey> recoveries,
+                long deadline, Runnable active, Supplier<T> operation) {
+            return bounded.withRenewalDeadline(key, recoveries, deadline, active, operation);
+        }
+        @Override public Optional<WorkloadClaimReading> confirmNodeSession(WorkloadClaimKey key,
+                long deadline, Runnable active) {
+            return super.call(false, () -> bounded.confirmNodeSession(key, deadline, active));
+        }
         public void awaitQuiescence(long deadline){bounded.awaitQuiescence(deadline);}
     }
     private <T>T call(boolean write,Supplier<T> action){
@@ -30,6 +61,12 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
     private void report(boolean write,Throwable failure){try{observer.accept(write,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Storage operation collection is degraded");}}
     public WorkloadClaimAttempt acquire(WorkloadClaimKey key,WorkloadOwner owner,long revision,Duration ttl){return call(true,()->delegate.acquire(key,owner,revision,ttl));}
     public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope scope,WorkloadOwner owner,long revision,Duration ttl){return call(true,()->delegate.acquirePipeline(scope,owner,revision,ttl));}
+    @Override public WorkloadClaimAttempt acquireProcessNode(WorkloadClaimKey key, WorkloadOwner owner, Duration proofWindow) {
+        return call(true, () -> delegate.acquireProcessNode(key, owner, proofWindow));
+    }
+    @Override public WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision) {
+        return call(true, () -> delegate.acquireNodeBackedCapture(key, node, revision));
+    }
     @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node, long revision) {
         return call(true, () -> delegate.acquireNodeBackedPipeline(scope, node, revision));
     }

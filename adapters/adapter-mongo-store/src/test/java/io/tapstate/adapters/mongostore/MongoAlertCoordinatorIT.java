@@ -5,6 +5,7 @@ import io.tapstate.core.alerting.*;
 import io.tapstate.core.alerting.AlertConfiguration.*;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.spi.store.*;
 import io.tapstate.spi.store.AlertStore.*;
 import io.tapstate.testsupport.RequiresDocker;
@@ -20,6 +21,228 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void alertWriteFactsReuseOnlyRowsWithTheRequestedIdentity() {
+        withStore(f -> {
+            var seeded = businessFacts(f);
+            assertThat(accept(f, seeded)).isEqualTo(Outcome.STAGED);
+            f.domain.artifacts().create(source("other-source"));
+            var key = seeded.head().snapshot().rule().key();
+            var rule = seeded.head().binding().ruleIdentity();
+            var instanceId = MongoAlertStateCodec.key(key);
+            var ruleId = MongoAlertConfigurationCodec.key(rule.scope(), rule.id());
+            try (var client = MongoClients.create(MONGO.getReplicaSetUrl()); var session = client.startSession()) {
+                var db = client.getDatabase(f.db().getName());
+                session.startTransaction();
+                try {
+                    var captured = MongoAlertWriteFacts.read(db, session, new MongoAlertWriteFacts.Request(key, rule));
+                    assertThat(captured).isNotNull();
+                    assertThat(captured.identity()).containsEntry("clusterId", SCOPE.clusterId());
+                    assertThat(captured.row(SystemCollections.SOURCES, "orders")).containsEntry("_id", "orders");
+                    assertThat(captured.row(SystemCollections.SOURCES, "other-source")).containsEntry("_id", "other-source");
+                    assertThat(captured.row(SystemCollections.SOURCES, "missing")).isNull();
+                    assertThat(captured.row(SystemCollections.ALERT_INSTANCES, instanceId)).containsEntry("_id", instanceId);
+                    assertThat(captured.row(SystemCollections.ALERT_RULES, ruleId)).containsEntry("_id", ruleId);
+                    assertThat(captured.empty(SystemCollections.PIPELINES)).isTrue();
+
+                    var pipeline = new AlarmKey(SCOPE, new AlarmKey.Resource("pipeline", "missing", UUID_A),
+                            "pipeline.runtime-failed", UUID_A);
+                    var withoutRule = MongoAlertWriteFacts.read(db, session, new MongoAlertWriteFacts.Request(pipeline, null));
+                    assertThat(withoutRule).isNotNull();
+                    assertThat(withoutRule.row(SystemCollections.ALERT_INSTANCES, MongoAlertStateCodec.key(pipeline))).isNull();
+                    assertThat(withoutRule.row(SystemCollections.ALERT_INSTANCES, instanceId)).containsEntry("_id", instanceId);
+                    assertThat(MongoAlertWriteFacts.read(client.getDatabase("missing_alert_write_facts"), session, null)).isNull();
+                } finally {
+                    session.abortTransaction();
+                }
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"source","global","recovery","key","schema","foreign-collision"})
+    void runtimeWriteFactsPreserveTheOriginalAuthorityFailure(String damage) {
+        withStore(f->{
+            var facts=businessFacts(f);bindForPolling(f);
+            var business=f.domain.bindings().cachePreparation().orElseThrow().businessScope();
+            var producer=new PipelineIntentSnapshot(new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"original-pipeline",1),1,new DesiredState("original-pipeline",io.tapstate.core.lifecycle.PipelineState.STOPPED,"definition"));
+            var command=new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,facts.head,List.of(),null,new EvaluationProof(producer,()->{})),List.of(),List.of());
+            switch(damage){
+                case "source" -> SystemCollections.SOURCES.on(f.db).deleteOne(new Document("_id","views"));
+                case "global" -> SystemCollections.PDK_NOTE_SCOPES.on(f.db).deleteMany(new Document());
+                case "recovery" -> SystemCollections.STORAGE_RECOVERY.on(f.db).insertOne(new Document("_id","foreign"));
+                case "key" -> SystemCollections.CLUSTER_KEYS.on(f.db).deleteMany(new Document());
+                case "schema" -> SystemCollections.SCHEMA_MIGRATIONS.on(f.db).deleteMany(new Document());
+                case "foreign-collision" -> {
+                    SystemCollections.PIPELINES.on(f.db).drop();
+                    f.db.createCollection(SystemCollections.PIPELINES.collectionName(),new com.mongodb.client.model.CreateCollectionOptions()
+                            .collation(com.mongodb.client.model.Collation.builder().locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                    SystemCollections.PIPELINES.on(f.db).insertOne(new Document("_id","VIEWS").append("kind","pipeline"));
+                }
+                default -> throw new AssertionError(damage);
+            }
+            var original=org.assertj.core.api.Assertions.catchThrowable(()->f.store.commitAsCaller(command,f.access));
+            var optimized=org.assertj.core.api.Assertions.catchThrowable(()->f.store.commit(command));
+            assertThat(original).isInstanceOf(TapstateException.class);
+            assertThat(optimized).isInstanceOfSatisfying(TapstateException.class,error->{
+                assertThat(error.code()).isEqualTo(((TapstateException)original).code());
+                assertThat(error.args()).isEqualTo(((TapstateException)original).args());
+            });
+            assertThat(SystemCollections.ALERT_INSTANCES.on(f.db).countDocuments()).isZero();
+        });
+    }
+
+    @Test void staleBackgroundPlanRefusesBeforeHostReadsOrSharedWrites() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var planned = f.store.planning().version();
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            versions.updateOne(new Document("_id", ConfigurationVersion.ID),
+                    new Document("$inc", new Document(ConfigurationVersion.ALERT_FENCE, 1L)));
+            var beforeVersion = versions.find().first();
+            var beforeKey = SystemCollections.CLUSTER_KEYS.on(f.db).find().first();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,
+                        new StateChange(0, null, facts.head, List.of(), null),
+                        List.of(new IntentChange(null, facts.intent)),
+                        List.of(new ScheduleChange(null, facts.schedule)), planned))).isEqualTo(Outcome.CONFLICT);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(commands).containsExactly("find:configuration_version", "abortTransaction:");
+            assertThat(versions.find().first()).isEqualTo(beforeVersion);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(f.db).find().first()).isEqualTo(beforeKey);
+            assertThat(f.store.evaluationStates(null, 10).rows()).isEmpty();
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).isEmpty();
+        });
+    }
+
+    @Test void validBackgroundPlanReadsOneVersionAndPreservesAtomicFences() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var planned = f.store.planning().version();
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            var beforeKey = SystemCollections.CLUSTER_KEYS.on(f.db).find().first();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,
+                        new StateChange(0, null, facts.head, List.of(), null),
+                        List.of(new IntentChange(null, facts.intent)),
+                        List.of(new ScheduleChange(null, facts.schedule)), planned))).isEqualTo(Outcome.STAGED);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(Collections.frequency(commands, "find:configuration_version")).isEqualTo(1);
+            assertThat(commands.indexOf("update:cluster_keys")).isGreaterThan(commands.indexOf("find:schema_migrations"));
+            assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(planned.alertFence() + 1);
+            assertThat(versions.find().first().getLong("revision")).isEqualTo(planned.configurationRevision());
+            assertThat(SystemCollections.CLUSTER_KEYS.on(f.db).find().first().getLong("sourceWriteFence"))
+                    .isEqualTo(beforeKey.getLong("sourceWriteFence") + Collections.frequency(commands, "update:cluster_keys"));
+            assertThat(f.store.evaluationStates(null, 10).rows()).hasSize(1);
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).hasSize(1);
+        });
+    }
+
+    @Test void concurrentVersionChangeRollsBackThenRefusesBeforeAnotherHostRead() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var planned = f.store.planning().version();
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            var beforeKey = SystemCollections.CLUSTER_KEYS.on(f.db).find().first();
+            var commands = new ArrayList<String>();
+            var injected = new java.util.concurrent.atomic.AtomicBoolean();
+            var observer = new AtomicReference<java.util.function.BiConsumer<String,String>>();
+            observer.set((command, collection) -> {
+                commands.add(command + ":" + collection);
+                if (command.equals("aggregate") && collection.equals("cluster_identity") && injected.compareAndSet(false, true)) {
+                    MongoCommandObservation.COLLECTIONS.remove();
+                    try {
+                        versions.updateOne(new Document("_id", ConfigurationVersion.ID),
+                                new Document("$inc", new Document(ConfigurationVersion.ALERT_FENCE, 1L)));
+                    } finally { MongoCommandObservation.COLLECTIONS.set(observer.get()); }
+                }
+            });
+            MongoCommandObservation.COLLECTIONS.set(observer.get());
+            try {
+                assertThat(f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,
+                        new StateChange(0, null, facts.head, List.of(), null),
+                        List.of(new IntentChange(null, facts.intent)),
+                        List.of(new ScheduleChange(null, facts.schedule)), planned))).isEqualTo(Outcome.CONFLICT);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(injected).isTrue();
+            assertThat(Collections.frequency(commands, "aggregate:cluster_identity")).isEqualTo(1);
+            assertThat(Collections.frequency(commands, "find:configuration_version")).isEqualTo(2);
+            assertThat(Collections.frequency(commands, "update:cluster_keys")).isEqualTo(1);
+            assertThat(commands.subList(commands.lastIndexOf("find:configuration_version"), commands.size()))
+                    .containsExactly("find:configuration_version", "abortTransaction:");
+            assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(planned.alertFence() + 1);
+            assertThat(versions.find().first().getLong("revision")).isEqualTo(planned.configurationRevision());
+            assertThat(SystemCollections.CLUSTER_KEYS.on(f.db).find().first()).isEqualTo(beforeKey);
+            assertThat(f.store.evaluationStates(null, 10).rows()).isEmpty();
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).isEmpty();
+        });
+    }
+
+    @Test void backgroundKeyConflictRetriesAfterHostValidation() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var keys = SystemCollections.CLUSTER_KEYS.on(f.db);
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            var beforeKey = keys.find().first();
+            var beforeVersion = versions.find().first();
+            var commands = new ArrayList<String>();
+            try (var control = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var admin = control.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of("update"))
+                                .append("namespace", f.db.getName() + ".cluster_keys")
+                                .append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))));
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+                try { assertThat(accept(f, facts)).isEqualTo(Outcome.STAGED); }
+                finally {
+                    MongoCommandObservation.COLLECTIONS.remove();
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+            }
+            int aborted = commands.indexOf("abortTransaction:");
+            assertThat(aborted).isPositive();
+            assertThat(commands.subList(0, aborted)).contains("update:cluster_keys")
+                    .contains("aggregate:cluster_identity", "find:schema_migrations", "find:configuration_version")
+                    .doesNotContain("listIndexes:sources");
+            assertThat(commands.indexOf("update:cluster_keys")).isGreaterThan(commands.indexOf("find:schema_migrations"));
+            long committedKeyWrites = commands.subList(aborted + 1, commands.size()).stream()
+                    .filter("update:cluster_keys"::equals).count();
+            assertThat(committedKeyWrites).isPositive();
+            assertThat((long) Collections.frequency(commands, "update:cluster_keys")).isEqualTo(committedKeyWrites + 1);
+            assertThat(keys.find().first().getLong("sourceWriteFence")).isEqualTo(beforeKey.getLong("sourceWriteFence") + committedKeyWrites);
+            assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE))
+                    .isEqualTo(beforeVersion.getLong(ConfigurationVersion.ALERT_FENCE) + 1);
+            assertThat(versions.find().first().getLong("revision")).isEqualTo(beforeVersion.getLong("revision"));
+            assertThat(f.store.evaluationStates(null, 10).rows()).hasSize(1);
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).hasSize(1);
+        });
+    }
+
+    @Test void backgroundCommitPreservesFencesWhenTheHostIsStale() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var keys = SystemCollections.CLUSTER_KEYS.on(f.db);
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            var beforeKey = keys.find().first();
+            var beforeVersion = versions.find().first();
+            var stale = new Host(SCOPE, new StorageSetupScope(SCOPE.clusterId(), "installation-a", "old-operation", 1),
+                    AlertChannelPolicy.Deployment.ON_PREM, () -> {}).withChannels(Set.of(EMAIL));
+            var store = f.domain.alerts(stale, BuiltinAlarmTypes.catalog(), f.clock);
+            assertThatThrownBy(() -> store.commit(new Commit(CommitKind.STATE_AND_PLAN,
+                    new StateChange(0, null, facts.head, List.of(), null), List.of(new IntentChange(null, facts.intent)),
+                    List.of(new ScheduleChange(null, facts.schedule)))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(keys.find().first()).isEqualTo(beforeKey);
+            assertThat(versions.find().first()).isEqualTo(beforeVersion);
+            assertThat(f.store.evaluationStates(null, 10).rows()).isEmpty();
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).isEmpty();
+        });
+    }
+
     @Test void deliveryEmptyPollUsesTheSameHostAggregateAndSeesTheNextIntent() {
         withStore(f -> {
             bindForPolling(f);
@@ -211,6 +434,7 @@ class MongoAlertCoordinatorIT {
             var overflow=f.store.evaluationSnapshot(null,50);assertThat(overflow.rules().rows()).hasSize(1000);assertThat(overflow.rules().nextId()).isNotNull();
         });
     }
+
     @Test void unsupportedBuiltinFormatThreeCannotBlockCompatibleDeliveryPages(){
         withStore(f->{var facts=businessFacts(f);accept(f,facts);var unknown=MongoAlertDeliveryCodec.write(facts.intent(),1);
             unknown.get("_id",Document.class).put("deliveryId","future-builtin-format-three");unknown.put("formatVersion",3);
@@ -244,11 +468,28 @@ class MongoAlertCoordinatorIT {
             var binding=new AlertIntent.Member(rule,1,secondIdentity,facts.head.binding().sourceBindingRevision());
             var head=new AlertStateRecord.Head(snapshot,POLICY.deployment(),AlertOwnership.unclaimed(),null,false,episode,binding);
             f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,head,List.of(),null),List.of(),List.of()));
+            var reads = new HashMap<String, Integer>();
+            var sourceBatches = new java.util.concurrent.atomic.AtomicInteger();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) reads.merge(collection, 1, Integer::sum);
+                if (command.equals("aggregate") && collection.equals(SystemCollections.SOURCES.collectionName()))
+                    sourceBatches.incrementAndGet();
+            });
+            try {
+                var page = f.store.evaluationStates(null, 10);
+                assertThat(page.rows()).hasSize(2);
+                assertThat(sourceBatches).hasValue(1);
+                assertThat(reads.getOrDefault(SystemCollections.SOURCES.collectionName(), 0)).isLessThanOrEqualTo(1);
+                assertThat(reads.get(SystemCollections.ALERT_INSTANCES.collectionName())).isEqualTo(1);
+                assertThat(reads.get(SystemCollections.ALERT_EPISODES.collectionName())).isEqualTo(1);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
             var first=f.store.evaluationStates(null,1);assertThat(first.rows()).hasSize(1);assertThat(first.next()).isNotNull();
             var second=f.store.evaluationStates(first.next(),1);assertThat(second.rows()).hasSize(1);assertThat(second.next()).isNull();
             assertThat(first.rows().getFirst().value().snapshot().rule().key()).isNotEqualTo(second.rows().getFirst().value().snapshot().rule().key());
             assertThat(List.of(first.rows().getFirst().value().snapshot().rule().key(),second.rows().getFirst().value().snapshot().rule().key()))
                     .containsExactlyInAnyOrder(original.key(),key);
+            SystemCollections.ALERT_EPISODES.on(f.db).deleteOne(new Document("_id.alarm", MongoAlertStateCodec.key(key)));
+            assertThatThrownBy(() -> f.store.evaluationStates(null, 10)).isInstanceOf(TapstateException.class);
         });
     }
     @Test void recoveryPageDiscoversOriginalResourceRemovalAndRetirementRechecksIt() {

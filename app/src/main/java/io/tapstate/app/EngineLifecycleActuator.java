@@ -129,6 +129,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         return new ScopedEngineLifecycleActuator(pass, engine, dagSource, captureCoordinator, actuation,
                 defaultDatabase, connectors, clock, ports, scopedSubmissions);
     }
+    boolean hasPendingSubmission(String pipeline) { return scopedSubmissions.hasPending(pipeline); }
+
     void requireResolvedSubmission(String pipeline, Optional<OperatorRunManifest> captured) {
         scopedSubmissions.observed(pipeline, captured.orElse(null));
     }

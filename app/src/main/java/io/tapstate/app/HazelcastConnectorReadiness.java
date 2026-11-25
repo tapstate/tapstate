@@ -186,7 +186,7 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                     continue;
                 }
                 try {
-                    loaded.add(Loaded.of(hashes.containsKey(connector)?provisioner.resolve(connector,hashes.get(connector)):provisioner.resolve(connector), connector));
+                    loaded.add(Loaded.of(provisioner.resolveForReadiness(connector, hashes.get(connector)), connector));
                 } catch (RuntimeException failed) {
                     loaded.add(Loaded.failed(connector, reasonOf(failed)));
                 }
