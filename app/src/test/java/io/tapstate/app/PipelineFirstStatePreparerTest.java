@@ -63,6 +63,13 @@ class PipelineFirstStatePreparerTest {
         assertThat(cache.original).isNull();
     }
 
+    @Test void startAdmissionLeavesRetainedCacheVerificationToTheOwner() {
+        configuration.facts = complete();
+        var inputs = new io.tapstate.spi.store.PipelinePreparationInputs("a".repeat(64), Map.of(), Map.of(), List.of());
+        preparer().prepareForStartIntent(SCOPE, inputs);
+        assertThat(calls).containsExactly("read");
+    }
+
     @Test void firstPreparationUsesOneNodeAndOneGrantAndCompletesOnlyAfterItsCacheReceipt() {
         assertThat(preparer().prepare(SCOPE)).isEqualTo(complete());
         assertThat(calls).containsExactly("read", "node", "issue", "reserve", "consume", "seed", "require-issued", "complete");

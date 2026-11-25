@@ -53,7 +53,7 @@ public final class NestColdLayerWatch {
      * stopped or just resumed being served from memory. Namespaces of this pipeline that are not in
      * {@code readings} are forgotten.
      */
-    public void saw(String pipelineId, Map<String, NestStateReading> readings) {
+    public synchronized void saw(String pipelineId, Map<String, NestStateReading> readings) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(readings, "readings");
         List<Runnable> notices = new ArrayList<>();
@@ -81,7 +81,7 @@ public final class NestColdLayerWatch {
     }
 
     /** Which namespaces are currently held, as pipeline and namespace together — what a caller asserts on. */
-    Set<String> watching() {
+    synchronized Set<String> watching() {
         Set<String> held = new HashSet<>();
         synchronized (byPipeline) {
             byPipeline.forEach((pipelineId, namespaces) ->

@@ -43,6 +43,8 @@ public interface AlertStore {
     }
     /** Ephemeral producer proof. The guard is pure; its lease was read before entering CONFIG. */
     record EvaluationProof(PipelineIntentSnapshot pipeline,Runnable requireCurrent) {
+        /** Pure local guard retained by an original Pipeline-owned operational producer. */
+        public interface PipelineOperationGuard extends Runnable { }
         public static EvaluationProof operation(Runnable pureOriginal){return new EvaluationProof(null,pureOriginal);}
         public EvaluationProof { Objects.requireNonNull(requireCurrent);if(pipeline!=null && pipeline.deleted())throw new IllegalArgumentException("deleted producer intent"); }
     }

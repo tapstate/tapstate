@@ -179,11 +179,13 @@ class MongoValidationAdmissionStoreIT {
         }
     }
 
-    @Test void ordinaryAccessDoesNotCreateMissingCollections() {
+    @Test void reservationAndPublicationRespectNormalMongoCollectionBehavior() {
         try (var f = new Fixture()) {
             var request = f.start(ValidationMode.FULL, 1, "missing"); f.reports().drop();
-            assertThatThrownBy(() -> f.first.reserve(request)).isInstanceOf(TapstateException.class).hasMessageContaining("validation-collection");
+            assertThat(f.first.reserve(request)).isEqualTo(Reservation.RESERVED);
             assertThat(f.database.listCollectionNames()).doesNotContain("validation_reports");
+            assertThat(f.first.open(request)).isEqualTo(Birth.CREATED);
+            assertThat(f.reports().find(new Document("_id", MongoValidationAdmissionStore.reportId(request.run()))).first()).isNotNull();
         }
     }
 

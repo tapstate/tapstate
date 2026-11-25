@@ -76,6 +76,20 @@ final class ConfigurationVersion {
                         .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "cluster")),
                                 new Document("$project", new Document("clusterId", 1).append("layoutId", 1))))
                         .append("as", "identity")))).first();
+        return requireNoValidationMaintenance(row, operation, versions, originalDatabase);
+    }
+
+    static void advanceStart(ClientSession session, MongoCollection<Document> versions,
+            com.mongodb.client.MongoDatabase database, Document version, Document schema, Document identity) {
+        long revision = revision(version);
+        var captured = new Document("revision", revision)
+                .append("schema", schema == null ? java.util.List.of() : java.util.List.of(schema))
+                .append("identity", java.util.List.of(identity));
+        advanceRaw(session, versions, requireNoValidationMaintenance(captured, null, versions, database));
+    }
+
+    private static long requireNoValidationMaintenance(Document row, String operation,
+            MongoCollection<Document> versions, com.mongodb.client.MongoDatabase originalDatabase) {
         long revision = revision(row);
         var schemas = row.getList("schema", Document.class);
         if (schemas.isEmpty()) { if (operation != null) throw MongoValidationSchema.refused(); return revision; }
@@ -124,17 +138,32 @@ final class ConfigurationVersion {
 
     /** Pure alerts contend with every authoring/token/user mutation of this same document. */
     static long advanceAlert(ClientSession session, MongoCollection<Document> versions) {
+        return advanceAlert(session, versions, alertWritePreimage(session, versions));
+    }
+
+    static Document alertWritePreimage(ClientSession session, MongoCollection<Document> versions) {
         MongoAlertStateStore.requireTransaction(session);
         Document current = versions.find(session, new Document("_id", ID)).first();
-        validateAlertState(current, true);
-        long fence = (Long) current.get(ALERT_FENCE);
-        if (fence >= Long.MAX_VALUE - 1) { throw unreadable(ALERT_FENCE); }
+        requireAlertWriteHeadroom(current);
+        return current;
+    }
+
+    /** The preimage belongs to this same callback; the actual write still arbitrates concurrent changes. */
+    static long advanceAlert(ClientSession session, MongoCollection<Document> versions, Document current) {
+        MongoAlertStateStore.requireTransaction(session);
+        requireAlertWriteHeadroom(current);
+        long fence = current.getLong(ALERT_FENCE);
         if (versions.updateOne(session, new Document("_id", ID).append("revision", current.get("revision"))
                         .append(ALERT_FENCE, fence), new Document("$inc", new Document(ALERT_FENCE, 1L)))
                 .getModifiedCount() != 1) {
             throw new IllegalStateException("alert fence changed within one transaction snapshot");
         }
         return fence + 1;
+    }
+
+    private static void requireAlertWriteHeadroom(Document current) {
+        validateAlertState(current, true);
+        if (current.getLong(ALERT_FENCE) >= Long.MAX_VALUE - 1) throw unreadable(ALERT_FENCE);
     }
 
     /** Only an explicit, same-session component preparation may enroll an absent counter. */
