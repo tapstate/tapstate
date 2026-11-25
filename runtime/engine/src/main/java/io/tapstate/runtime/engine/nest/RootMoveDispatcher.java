@@ -1,14 +1,18 @@
 package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.jet.core.AbstractProcessor;
+import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.jet.datamodel.Tuple2;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
+import io.tapstate.runtime.engine.StageTimer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -18,7 +22,8 @@ import java.util.Map;
 import java.util.Set;
 
 /** One ordered root input. Only conflicting root changes wait for a subtree to reach its new owner. */
-final class RootMoveDispatcher extends AbstractProcessor {
+final class RootMoveDispatcher extends AbstractProcessor implements Staged {
+    private StageTimer timer = StageTimer.none(Stage.NEST);
     private static final int CAPACITY = DrainFolding.MAX_KEYS_HELD;
     private record Row(Envelope event, List<Object> from, List<Object> to) {
         boolean moves() { return !from.equals(to); }
@@ -46,13 +51,25 @@ final class RootMoveDispatcher extends AbstractProcessor {
         bounds = axes == null ? null : new LevelBounds(chains, axes, this::lowestHeld);
     }
 
+    @Override public Stage stage() { return Stage.NEST; }
+
     @Override protected void init(Processor.Context context) {
+        timer = StageTimer.of(stage(), context);
         notices = new RootMoveAcks.Inbox(context.hazelcastInstance());
     }
 
     @Override public void close() { if (notices != null) notices.close(); }
 
     @Override public boolean isCooperative() { return false; }
+
+    @Override public void process(int ordinal, Inbox inbox) {
+        long started = timer.begin();
+        try {
+            super.process(ordinal, inbox);
+        } finally {
+            timer.end(started);
+        }
+    }
 
     @Override protected boolean tryProcess(int ordinal, Object item) {
         if (!pump()) return false;
