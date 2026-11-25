@@ -223,11 +223,11 @@ class PipelineHistoryApiTest {
     @Test
     void returnsCdcDeliveryForConfirmedChangesAndOmitsTheReadingWhenIdle() {
         history().append(new RateSample("pl1", Instant.parse("2026-07-12T11:58:00Z"),
-                Map.of("records.out", 100L, CdcDeliveryTotals.COUNT, 0L, CdcDeliveryTotals.TOTAL_MILLIS, 0L),
+                Map.of("records.out", 100L, CdcDeliveryTotals.COUNT_METRIC, 0L, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 0L),
                 Map.of(), COUNTING_SINCE));
         for (String at : List.of("2026-07-12T11:59:00Z", "2026-07-12T11:59:30Z")) {
             history().append(new RateSample("pl1", Instant.parse(at),
-                    Map.of("records.out", 102L, CdcDeliveryTotals.COUNT, 2L, CdcDeliveryTotals.TOTAL_MILLIS, 900L),
+                    Map.of("records.out", 102L, CdcDeliveryTotals.COUNT_METRIC, 2L, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 900L),
                     Map.of(), COUNTING_SINCE));
         }
 

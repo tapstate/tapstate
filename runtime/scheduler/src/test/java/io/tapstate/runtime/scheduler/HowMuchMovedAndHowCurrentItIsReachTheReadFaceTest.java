@@ -496,8 +496,8 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
         assertThat(sample.countingSince()).isEqualTo(STARTED);
         assertThat(sample.counters())
                 .containsEntry("records.out", 23L)
-                .containsEntry(CdcDeliveryTotals.COUNT, 3L)
-                .containsEntry(CdcDeliveryTotals.TOTAL_MILLIS, 750L);
+                .containsEntry(CdcDeliveryTotals.COUNT_METRIC, 3L)
+                .containsEntry(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 750L);
     }
 
     private List<MetricFact> facts(DeliveryReading reading, Instant at) {

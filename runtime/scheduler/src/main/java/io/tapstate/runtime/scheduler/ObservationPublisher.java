@@ -216,6 +216,8 @@ public final class ObservationPublisher {
     private static final String JOIN_RECOMPUTE_ROWS_METRIC = "tapstate.pipeline.join.recompute.rows";
     private static final String JOIN_RECOMPUTE_ROWS_TOTAL_METRIC = "tapstate.pipeline.join.recompute.rows.total";
 
+    private static final String RECORD_UNIT = "{record}";
+
     /**
      * The three measurements of a pipeline's movement that carry their dimensions as attributes rather
      * than in their names. Their names are the canonical ones a monitoring backend sees; how the flat
@@ -1236,7 +1238,7 @@ public final class ObservationPublisher {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
-                .ifPresent(count -> facts.add(readAt(pipelineId, RECORDS_DRIVEN_METRIC, "{record}", at, count)));
+                .ifPresent(count -> facts.add(readAt(pipelineId, RECORDS_DRIVEN_METRIC, RECORD_UNIT, at, count)));
         // One point per chain that reported a reading, so a chain keeping up and a chain that has stalled
         // stay distinguishable; a chain that reported none is absent rather than zero, which would read as
         // the healthy end of the same scale. The distance is dimensionless: what it counts is a position's
@@ -1289,7 +1291,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         readingsAt(pipelineId, NEST_BACKFILL_TIME_METRIC, "ms", at, NEST_NAMESPACE_ATTRIBUTE, backfillMillis)
                 .ifPresent(facts::add);
-        readingsAt(pipelineId, NEST_PENDING_HIGH_WATER_METRIC, "{record}", at, NEST_NAMESPACE_ATTRIBUTE,
+        readingsAt(pipelineId, NEST_PENDING_HIGH_WATER_METRIC, RECORD_UNIT, at, NEST_NAMESPACE_ATTRIBUTE,
                 pendingHighWater).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
@@ -1576,7 +1578,7 @@ public final class ObservationPublisher {
             });
         }
         if (!rows.isEmpty()) {
-            facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, "{record}", rows));
+            facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, RECORD_UNIT, rows));
         }
         if (!payload.isEmpty()) {
             facts.add(new MetricFact(BYTES_METRIC, MetricType.COUNTER, "By", payload));
@@ -1594,9 +1596,9 @@ public final class ObservationPublisher {
         if (delivered.cdcDelivery() != null) {
             var cdc = delivered.cdcDelivery();
             var scope = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId);
-            facts.add(MetricFact.single(CdcDeliveryTotals.COUNT, MetricType.COUNTER, "{record}",
+            facts.add(MetricFact.single(CdcDeliveryTotals.COUNT_METRIC, MetricType.COUNTER, RECORD_UNIT,
                     MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.count())));
-            facts.add(MetricFact.single(CdcDeliveryTotals.TOTAL_MILLIS, MetricType.COUNTER, "ms",
+            facts.add(MetricFact.single(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, MetricType.COUNTER, "ms",
                     MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.totalMillis())));
         }
         // The distribution accumulates from the same start as the counts: it is over the same rows.

@@ -58,8 +58,8 @@ public enum CardinalityBudget {
     LAG("tapstate.pipeline.lag", MetricAttributes.TABLE_ID, 1_000, Fold.HIGHEST),
     RECORD_DELIVERY_DURATION("tapstate.pipeline.record.delivery.duration", MetricAttributes.TABLE_ID, 1_000,
             Fold.ADDED),
-    CDC_DELIVERY_COUNT(CdcDeliveryTotals.COUNT, null, 1, Fold.ADDED),
-    CDC_DELIVERY_TOTAL_MILLIS(CdcDeliveryTotals.TOTAL_MILLIS, null, 1, Fold.ADDED),
+    CDC_DELIVERY_COUNT(CdcDeliveryTotals.COUNT_METRIC, null, 1, Fold.ADDED),
+    CDC_DELIVERY_TOTAL_MILLIS(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, null, 1, Fold.ADDED),
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
     SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),

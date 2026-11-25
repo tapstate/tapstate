@@ -339,38 +339,41 @@ public final class PipelineHistoryQueryService {
         int segment = 0;
         StartReason reason = initialReason;
         for (Entry current : entries) {
-            Point point;
-            StartReason boundary = previous == null ? null : boundary(previous.sample(), current.sample());
-            var cdc = HistoryAggregator.cdcDelta(previous == null ? null : previous.sample(),
-                    current.sample(), from, boundary);
-            var cdcReading = HistoryAggregator.cdcReading(cdc.count(), cdc.totalMillis());
+            RateSample left = previous == null ? null : previous.sample();
+            RateSample right = current.sample();
+            StartReason boundary = left == null ? null : boundary(left, right);
             if (boundary != null) {
                 segment++;
                 reason = boundary;
                 if (boundary == StartReason.GAP) {
-                    Instant gapStart = max(from, previous.sample().observedAt());
-                    Instant gapEnd = min(to, current.sample().observedAt());
+                    Instant gapStart = max(from, left.observedAt());
+                    Instant gapEnd = min(to, right.observedAt());
                     if (gapStart.isBefore(gapEnd)) {
                         gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
                     }
                 }
-                point = new Point(current.sample().observedAt(), current.sample().observedAt(),
-                        null, null, lag(current.sample(), tables), cdcReading);
-            } else if (previous == null) {
-                point = new Point(current.sample().observedAt(), current.sample().observedAt(),
-                        null, null, lag(current.sample(), tables), cdcReading);
-            } else {
-                Rate records = rawRate(previous.sample(), current.sample(), HistoryAggregator.RECORDS_OUT);
-                Rate bytes = rawRate(previous.sample(), current.sample(), HistoryAggregator.BYTES_OUT);
-                Instant start = records == null && bytes == null
-                        ? current.sample().observedAt() : previous.sample().observedAt();
-                point = new Point(start, current.sample().observedAt(), records, bytes,
-                        lag(current.sample(), tables), cdcReading);
             }
-            points.add(new Emitted(point, segment, reason, current.key(), current.sample().observedAt()));
+            Point point = rawPoint(left, right, boundary, from, tables);
+            points.add(new Emitted(point, segment, reason, current.key(), right.observedAt()));
             previous = current;
         }
         return new Projection(points, gaps);
+    }
+
+    private static Point rawPoint(RateSample left, RateSample right, StartReason boundary,
+            Instant from, List<String> tables) {
+        var cdc = HistoryAggregator.cdcDelta(left, right, from, boundary);
+        var cdcReading = HistoryAggregator.cdcReading(cdc.count(), cdc.totalMillis());
+        Instant end = right.observedAt();
+        List<Lag> lag = lag(right, tables);
+        if (left == null || boundary != null) {
+            return new Point(end, end, null, null, lag, cdcReading);
+        }
+
+        Rate records = rawRate(left, right, HistoryAggregator.RECORDS_OUT);
+        Rate bytes = rawRate(left, right, HistoryAggregator.BYTES_OUT);
+        Instant start = records == null && bytes == null ? end : left.observedAt();
+        return new Point(start, end, records, bytes, lag, cdcReading);
     }
 
     private StartReason boundary(RateSample left, RateSample right) {

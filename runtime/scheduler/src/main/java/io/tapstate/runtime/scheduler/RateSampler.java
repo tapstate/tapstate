@@ -186,7 +186,7 @@ public final class RateSampler {
             }
         });
         for (MetricFact fact : observation.facts()) {
-            if (CdcDeliveryTotals.COUNT.equals(fact.name()) || CdcDeliveryTotals.TOTAL_MILLIS.equals(fact.name())) {
+            if (CdcDeliveryTotals.COUNT_METRIC.equals(fact.name()) || CdcDeliveryTotals.TOTAL_MILLIS_METRIC.equals(fact.name())) {
                 counters.put(fact.name(), fact.points().getFirst().value());
             }
         }

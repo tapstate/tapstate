@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Publishes a sink's delivery readings as run statistics of the job it belongs to, one per table and
@@ -65,7 +66,7 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> waitingByName = new HashMap<>();
     static final String CDC_COUNT = "cdcDeliveryCount";
     static final String CDC_TOTAL_MILLIS = "cdcDeliveryTotalMillis";
-    private volatile CdcDeliveryTotals cdcDelivery;
+    private final AtomicReference<CdcDeliveryTotals> cdcDelivery = new AtomicReference<>();
     private JobStatistic since;
 
     @Override
@@ -109,12 +110,12 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     @Override
     public void cdcDelivered(CdcDeliveryTotals totals) {
-        cdcDelivery = totals;
+        cdcDelivery.set(totals);
     }
 
     void collectCdcDelivery(MetricDescriptor descriptor, MetricsCollectionContext context) {
         // Jet samples on another thread. Use one immutable reading for both numbers in this scrape.
-        CdcDeliveryTotals snapshot = cdcDelivery;
+        CdcDeliveryTotals snapshot = cdcDelivery.get();
         if (snapshot != null) {
             descriptor.withTag(MetricTags.USER, "true");
             context.collect(descriptor, CDC_COUNT, ProbeLevel.INFO, ProbeUnit.COUNT, snapshot.count());

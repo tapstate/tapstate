@@ -146,7 +146,7 @@ class HistoryResolutionAggregationTest {
 
     private static RateSample cdcSample(String at, long count, long totalMillis) {
         return new RateSample("orders", Instant.parse(at), Map.of("records.out", count,
-                CdcDeliveryTotals.COUNT, count, CdcDeliveryTotals.TOTAL_MILLIS, totalMillis),
+                CdcDeliveryTotals.COUNT_METRIC, count, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, totalMillis),
                 Map.of(), COUNTING_SINCE);
     }
 }
