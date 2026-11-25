@@ -20,6 +20,39 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 class ThreeLayerObservationTest {
     @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aStopAfterAnUnpreparedFirstStartLeavesARealRetryOrPendingClear(boolean purge) {
+        var f = new Fixture();
+        var preparation = new PipelinePreparation("pipeline", 1,
+                PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var header = new AtomicReference<>(new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.RUNNING, "hash")),
+                Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1));
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
+                .thenAnswer(call -> Map.of("pipeline", header.get()));
+        var memory = new InMemoryStorePort();
+        memory.artifacts().save(new PipelineResource("pipeline", null, List.of(), null, null, null, null, null));
+        var artifacts = new ArtifactQueryService(memory.artifacts());
+        var catalog = new PipelineCatalogService(artifacts, new PipelineDraftService(mock(PipelineDraftStore.class)),
+                new PipelineObservationQueryService(artifacts, f.port.observations()), f.port);
+        assertThat(catalog.find("pipeline").orElseThrow().status().displayState())
+                .isEqualTo(PipelineCatalogItem.UiState.FAILED);
+
+        header.set(new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.STOPPED, "hash", purge)),
+                Optional.empty(), false, Optional.empty(), 2));
+        var detail = catalog.find("pipeline").orElseThrow();
+        assertThat(detail.status().displayState()).isEqualTo(purge
+                ? PipelineCatalogItem.UiState.STOPPING : PipelineCatalogItem.UiState.NOT_STARTED);
+        assertThat(detail.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(detail.status().stopState()).isEqualTo(purge ? PipelineCatalogItem.StopState.CLEARING : null);
+        assertThat(detail.status().observedState()).isNull();
+        assertThat(detail.status().failure()).isNull();
+        assertThat(catalog.list()).containsExactly(detail);
+        verifyNoInteractions(f.cache);
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
     void aPurgeInProgressRemainsStoppingWithoutReusingItsRetiredObservation(boolean recoveredCache) {
         var f = new Fixture();
         if (recoveredCache) when(f.recoveries.read("pipeline")).thenReturn(Optional.of(

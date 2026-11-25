@@ -158,11 +158,17 @@ public final class PipelineCatalogService {
         PipelineState effective = effectiveState(engineState, observation, stateFacts, checkpoint);
         var intent = readIntent(id, hasArtifact, stateFacts);
         PipelineState target = intent.desired() == null ? null : intent.desired().targetState();
+        // Deferred preparation can be stopped before it creates any runtime state to converge.
+        boolean stoppedBeforeFirstRun = target == PipelineState.STOPPED && !intent.desired().purgeState()
+                && stateFacts != null && stateFacts.scope() == null && checkpoint == PipelineState.NEW
+                && observation == null;
         boolean recoveryAtRest = needsRecovery
                 && (observed == null || observed == PipelineState.NEW || observed == PipelineState.STOPPED);
-        PipelineCatalogItem.DisplayState state = recoveryAtRest
-                ? asDisplayState(observed)
+        PipelineCatalogItem.DisplayState state = recoveryAtRest ? asDisplayState(observed)
                 : displayState(target, effective, intent.failure() == null);
+        if (stoppedBeforeFirstRun) {
+            state = PipelineCatalogItem.DisplayState.NEW;
+        }
 
         return new PipelineCatalogItem.Status(
                 runtimeState(engineState, observation, stateFacts, checkpoint, effective, state),
