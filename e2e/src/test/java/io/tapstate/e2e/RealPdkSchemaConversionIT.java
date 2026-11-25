@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -134,7 +135,8 @@ class RealPdkSchemaConversionIT {
             control.lifecycle(pipeline, LifecycleVerb.RESUME);
             awaitRows(mongo, target, control, pipeline, Map.of(1L, "updated", 2L, "inserted", 4L, "resumed"));
             assertTypes(mongo.documents(target, "orders"));
-            assertThat(control.errorCount(pipeline)).contains(0L);
+            assertThat(Await.answered("the first post-resume error count", Duration.ofSeconds(10),
+                    () -> control.errorCount(pipeline))).isZero();
         }
     }
 

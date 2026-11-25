@@ -120,8 +120,13 @@ class LifecycleObservationIsolationIT {
             Supplier<Reading> read = () -> read(control, dbB);
             var vm = attach(server.output());
             try {
-                for (var mode : List.of(Mode.LIFECYCLE_STOP, Mode.LIFECYCLE_STOP)) {
-                    if (control.state(A).filter(io.tapstate.core.lifecycle.PipelineState.RUNNING::equals).isEmpty()) {
+                for (int round = 1; round <= 2; round++) {
+                    var mode = Mode.LIFECYCLE_STOP;
+                    if (round == 2) {
+                        System.out.println("A before waiting for the first stop: " + control.state(A));
+                        Await.until("A has completed the first stop", START,
+                                () -> control.state(A).filter(io.tapstate.core.lifecycle.PipelineState.STOPPED::equals).isPresent(),
+                                () -> "A=" + control.state(A));
                         control.lifecycle(A, LifecycleVerb.START);
                         Await.until("A is running again for the second stop", START,
                                 () -> control.state(A).filter(io.tapstate.core.lifecycle.PipelineState.RUNNING::equals).isPresent(),

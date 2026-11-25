@@ -494,9 +494,19 @@ else
 fi
 workflow="$here/../workflows/join-perf.yml"
 has "the shared Join workflow checks out the requested commit" join-perf 'ref:.*inputs[.]source-sha'
-has "the shared Join workflow runs all eleven scenarios" join-perf 'joinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5'
-has "the shared Join workflow runs all three tiers" join-perf 'joinperf.tiers=hot,mixed,cold'
-has "the shared Join workflow requires the complete result" join-perf 'rows.*-lt 34'
+has "the shared Join workflow invokes the matrix runner" join-perf 'run: bash [.]github/scripts/join-perf[.]sh$'
+join_runner="$here/join-perf.sh"
+if grep -Eq '^[[:space:]]*-Djoinperf[.]scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5[[:space:]]' "$join_runner"; then
+  ok "the Join runner runs all eleven scenarios"
+else
+  bad "the Join runner runs all eleven scenarios" "the runner has an incomplete scenario set"
+fi
+if grep -Eq '^[[:space:]]*-Djoinperf[.]tiers=hot,mixed,cold[[:space:]]' "$join_runner"; then
+  ok "the Join runner runs all three tiers"
+else
+  bad "the Join runner runs all three tiers" "the runner has an incomplete tier set"
+fi
+has "the shared Join workflow requires the complete result" join-perf 'rows.*-ne 34'
 hasnt "the shared Join workflow cannot ignore a failing suite" join-perf 'continue-on-error:'
 workflow="$release_workflow"
 

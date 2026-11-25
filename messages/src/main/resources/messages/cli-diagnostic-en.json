@@ -250,5 +250,13 @@
   "TS0330063": {
     "message": "The stream stopped after {attempts} consecutive attachments ended without a frame.",
     "solution": "Check the stream endpoint and network path, then reconnect. This does not establish whether the pipeline is running or failed."
+  },
+  "TS0330064": {
+    "message": "The full-screen workbench needs an interactive terminal.",
+    "solution": "Run bare tapstate from a terminal. Use a command with a business verb for output that can be piped or redirected."
+  },
+  "TS0330065": {
+    "message": "The full-screen workbench could not initialize this terminal.",
+    "solution": "Use a supported interactive terminal and retry."
   }
 }
