@@ -1,9 +1,11 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.core.logging.PipelineAttribution;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Duration;
 import java.time.Instant;
@@ -379,7 +381,7 @@ final class ProcessObservationWriter implements AutoCloseable {
             Stage stage = batch.get(index);
             try {
                 RuntimeException failure = results.get(index);
-                inPipeline(stage.pipeline(), () -> {
+                inPipeline(stage.pass.scope(), () -> {
                     if (failure == null) {
                         try {
                             stage.active.run();
@@ -457,6 +459,18 @@ final class ProcessObservationWriter implements AutoCloseable {
         int attempt = Long.compare(historyAttempts.getOrDefault(left.pipeline(), Long.MIN_VALUE),
                 historyAttempts.getOrDefault(right.pipeline(), Long.MIN_VALUE));
         return attempt != 0 ? attempt : left.observedAt().compareTo(right.observedAt());
+    }
+
+    private static void inPipeline(PipelineIntentScope scope, Runnable action) {
+        String generationKey = PipelineAttribution.STATE_GENERATION_MDC_KEY;
+        String previous = MDC.get(generationKey);
+        MDC.put(generationKey, Long.toString(scope.stateGeneration()));
+        try {
+            inPipeline(scope.pipelineId(), action);
+        } finally {
+            if (previous == null) MDC.remove(generationKey);
+            else MDC.put(generationKey, previous);
+        }
     }
 
     private static void inPipeline(String pipeline, Runnable action) {
