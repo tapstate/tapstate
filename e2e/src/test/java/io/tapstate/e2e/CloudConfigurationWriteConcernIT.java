@@ -120,7 +120,10 @@ class CloudConfigurationWriteConcernIT {
             assertThat(schema.get("alerting", Document.class))
                     .containsEntry("operationId", OPERATION).containsEntry("installedVersion", 7);
             var rules = SystemCollections.ALERT_RULES.on(target).find().into(new java.util.ArrayList<>());
-            assertThat(rules).hasSize(5).allSatisfy(row -> assertThat(row.get("_id", Document.class))
+            assertThat(rules).extracting(row -> row.get("body", Document.class).getString("typeId"))
+                    .containsExactlyInAnyOrder("pipeline.failed", "pipeline.observation-stale",
+                            "source.connection-failed", "cluster.storage-unavailable");
+            assertThat(rules).allSatisfy(row -> assertThat(row.get("_id", Document.class))
                     .containsEntry("authorityId", ORGANIZATION).containsEntry("clusterId", CLUSTER));
             assertThat(Files.readString(server.output())).doesNotContain(TOKEN, uri, "Cloud configuration initialization failed");
         } finally {
