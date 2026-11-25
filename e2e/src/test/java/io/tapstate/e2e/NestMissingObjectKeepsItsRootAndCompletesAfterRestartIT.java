@@ -7,6 +7,7 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.spi.store.ProcessNodeSession;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -50,8 +51,10 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
         try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
                 var observer = MongoClients.create(storage.cacheUri())) {
             var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(observer.getDatabase(storage.cacheDatabase()));
+            var processOwned = java.util.Date.from(ProcessNodeSession.PROCESS_OWNED);
             var liveNodeSessions = new Document("_id.resourceType", "NODE_SESSION")
-                    .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+                    .append("$or", List.of(new Document("leaseUntil", processOwned),
+                            new Document("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")))));
             Document originalSession;
             ServerHandle first = tier.launch(storage, plugins);
             try (first) {
@@ -92,6 +95,7 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
             var endedSession = new Document(sessionKey)
                     .append("ownerBootId", originalSession.getString("ownerBootId"))
                     .append("claimGeneration", originalSession.get("claimGeneration"))
+                    .append("leaseUntil", new Document("$ne", processOwned))
                     .append("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")));
             assertThat(claims.countDocuments(endedSession))
                     .as("the original node session is no longer live on the CACHE server before restart")
