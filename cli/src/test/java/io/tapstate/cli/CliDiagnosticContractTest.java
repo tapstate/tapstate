@@ -21,16 +21,11 @@ class CliDiagnosticContractTest {
             assertThat(code.severity()).isEqualTo(code == CliError.START_CHECKS_NOT_RUN || code == CliError.VERSION_MISMATCH
                     ? Severity.WARNING : Severity.ERROR);
             assertThat(code.code()).matches("TS033(?!0000)[0-9]{4}");
-            boolean hasLegacyKey = code != CliError.WORKBENCH_NEEDS_A_TERMINAL && code != CliError.WORKBENCH_UNAVAILABLE;
-            if (hasLegacyKey) {
-                var historical = catalog.render(legacy, params);
-                if (!Set.of(CliError.REQUEST_FAILED, CliError.CONNECTION_LOST, CliError.STREAM_NO_FRAMES).contains(code)) {
-                    assertThat(catalog.render(code.code(), params).message()).isEqualTo(historical.message());
-                }
-                if (historical.solution() != null) {
-                    assertThat(catalog.render(code.code(), params).solution()).isEqualTo(historical.solution());
-                }
-            }
+            boolean migrated = !Set.of(CliError.REQUEST_FAILED, CliError.CONNECTION_LOST, CliError.STREAM_NO_FRAMES,
+                    CliError.WORKBENCH_NEEDS_A_TERMINAL, CliError.WORKBENCH_UNAVAILABLE).contains(code);
+            if (migrated) assertThat(catalog.render(code.code(), params).message()).isEqualTo(catalog.render(legacy, params).message());
+            if (catalog.render(legacy, params).solution() != null)
+                assertThat(catalog.render(code.code(), params).solution()).isEqualTo(catalog.render(legacy, params).solution());
             var messages = new HashSet<String>();
             for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
                 var text = catalog.render(code.code(), params, locale);
