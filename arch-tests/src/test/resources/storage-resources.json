@@ -26,6 +26,15 @@
         "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding."
       ]
     },
+    "pipeline-resume-metric-continuation": {
+      "goal": "Continue the known cumulative native metrics of a rebuilding RESUME while retaining the original counter starts and the existing execution authority.",
+      "entry": "Reopen the same CACHE and reconcile the original prepared Pipeline. Read the optional handoff from the scoped checkpoint and accept it only for the original intent revision and the actual Jet execution verified through its original manifest and the current full claim. No continuation after loss of that CACHE is promised.",
+      "prerequisites": [
+        "The PAUSE state transition freezes the last qualified RUNNING observation selected by original scope, checkpoint epoch and full claim. It records the observed old Jet Job identity, only job-origin cumulative counters and histograms with stable point attributes and explicit starts, and no instantaneous readings. A genuine rebuilding RESUME activates the candidate for that old Job and original intent revision. Ordinary START, stamped START, replacement after a clearing stop, deletion, and superseding intent invalidate inapplicable handoffs.",
+        "Only an execution advance granted by the existing allocator can bind the successor fence. Sampling validates the live native Job and its producer start before applying the fixed baseline to each native cumulative reading. Repeated sampling of the same native values gives the same totals. A missing optional field in an earlier checkpoint carries no qualified baseline. Old binaries must be removed from the CACHE writer set before writing the field. Binary downgrade against CACHE containing the field is unsupported.",
+        "A genuinely absent prior observation remains unknown. An encoded handoff over the bound emits the existing DOCUMENT_TOO_LARGE diagnostic and leaves the affected continuation metrics unavailable. It never publishes an invented total, truncates a known total or blocks command acceptance, Jet admission or row delivery. Store unavailability follows the existing fenced transaction retry policy."
+      ]
+    },
     "authentication": {
       "goal": "Re-enter through the original account or Cloud identity without resurrecting old sessions.",
       "entry": "Original OP login or Cloud exchange after native authentication preparation.",
@@ -3453,26 +3462,28 @@
     },
     {
       "id": "mongo.cache.pipeline_state",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "pipeline_state"
       ],
-      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope.",
+      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope, with an optional private resume metric handoff. Freeze the candidate with the existing PAUSE checkpoint compare-and-set; bind the original rebuilding intent at the existing RESUME state transition and update the successor in the existing allocator transaction that also updates the checkpoint write fence. Reuse the full old scope, epoch and claim to read the exact observation within the original CACHE client/session. Jet termination, capture admission and Job submission stay outside those transactions. Ordinary HTTP and steady-state sampling use existing commands. A qualifying PAUSE transaction attempt adds at most one find by complete observation key, without any independent write, transaction, lease or allocation.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore"
+        "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore",
+        "io.tapstate.adapters.mongostore.MongoCacheWorkloadClaimStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore"
       ],
-      "recovery": "runtime-state",
+      "recovery": "pipeline-resume-metric-continuation",
       "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "At most one optional handoff per existing Pipeline checkpoint, holding one applied baseline and one pause candidate, with a strict one MiB combined encoded BSON limit including metadata, metric names, attributes and values. Existing metric cardinality limits still apply. No new collection, index, per-record growth, attempt history or extra cleanup task.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "app/src/test/java/io/tapstate/app/ScopedResumeMetricsTest.java"
       ]
     },
     {
