@@ -20,6 +20,10 @@ final class PdkReadRetry {
         if (failure instanceof Error || failure instanceof InterruptedException || failure instanceof CancellationException) {
             return Optional.empty();
         }
+        if (method == PDKMethod.SOURCE_STREAM_READ && "mysql".equals(connector.connectorId())
+                && mysqlRequiresFullRowImage(failure)) {
+            return Optional.empty();
+        }
         var hook = connector.functions().getErrorHandleFunction();
         RetryOptions options;
         try {
@@ -48,6 +52,20 @@ final class PdkReadRetry {
         } catch (RuntimeException rejected) {
             if (rejected != failure) failure.addSuppressed(rejected);
         }
+    }
+
+    private static boolean mysqlRequiresFullRowImage(Throwable failure) {
+        var visited = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
+        for (Throwable cause = failure; cause != null && visited.add(cause); cause = cause.getCause()) {
+            // Debezium is loaded by the connector. The PDK wrapper carries no structured error code here.
+            if ("io.debezium.DebeziumException".equals(cause.getClass().getName())
+                    && cause.getMessage() != null
+                    && cause.getMessage().startsWith("The MySQL server is not configured to use a FULL binlog_row_image,")
+                    && cause.getMessage().contains("binlog_row_image=FULL")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean defaultRetry(Throwable failure) {
