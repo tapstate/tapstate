@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -81,6 +82,81 @@ class BoundedPipelinePreviewIT {
                     .isEqualTo(List.of(Map.of("ORDER_ID", "order-1", "company", "Northwind")));
             assertThat(control.artifactIds()).doesNotContain(SOURCE_ID, PIPELINE_ID, "preview_target");
             assertThat(source.resolve("preview-target")).doesNotExist();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"join", "nest"})
+    void aMapAfterAStatefulStepMaterializesOnItsRenamedKey(String operator, @TempDir Path directory)
+            throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,customer_id,amount\norder-1,customer-1,12\n");
+            Files.writeString(source.resolve("customers.csv"), "id,name\ncustomer-1,Northwind\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+
+            String assembly = operator.equals("join") ? """
+                  - id: assembled_orders
+                    type: join
+                    from: { o: orders, c: customers }
+                    engine: builtin
+                    sql: |
+                      SELECT o.id AS id, o.customer_id AS customer_id, o.amount AS amount
+                      FROM o JOIN c ON o.customer_id = c.id
+                """ : """
+                  - id: assembled_orders
+                    type: nest
+                    from: { o: orders, c: customers }
+                    root:
+                      from: o
+                      key: [ id ]
+                      embed:
+                        - { from: c, on: { id: customer_id }, as: object, path: customer }
+                """;
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: preview_pipeline
+                    source: preview_source
+                    transforms:
+                    """ + assembly + """
+                      - id: projected_orders
+                        type: map
+                        from: assembled_orders
+                        fields:
+                          order_key: $id
+                          customer_id: false
+                          customer: false
+                          tag: x
+                          amount: "=int(after.amount)"
+                    serve:
+                      from: projected_orders
+                      sync: [{ id: preview_sync, source: preview_target }]
+                    """;
+            List<Map<String, Object>> events = control.preview(PIPELINE_ID, "preview_sync", 1,
+                    SAMPLE_ID + "-projected-" + operator, List.of(
+                            new ControlPlane.PreviewDraft("source.tap.yml", """
+                                    version: tapstate/v1
+                                    kind: source
+                                    id: preview_source
+                                    connector: e2e_file
+                                    config: { uri: "%s" }
+                                    mode: cdc
+                                    tables: [ orders, customers ]
+                                    """.formatted(source)),
+                            new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline),
+                            new ControlPlane.PreviewDraft("target.tap.yml",
+                                    targetYaml(source.resolve("preview-target")))));
+
+            assertThat(events).extracting(event -> event.get("kind"))
+                    .as("%s preview events: %s", operator, events)
+                    .endsWith("result.completed", "run.completed");
+            assertThat(documents(payload(events, "result.completed")))
+                    .isEqualTo(List.of(Map.of("order_key", "order-1", "tag", "x", "amount", 12L)));
         }
     }
 
