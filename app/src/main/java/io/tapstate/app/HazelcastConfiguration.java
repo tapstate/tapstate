@@ -342,7 +342,7 @@ class HazelcastConfiguration {
         member.getCluster().addMembershipListener(new DepartedMemberTransactions(store));
     }
 
-    /** Destroys the same lease that kept the reserved identity live during member creation. */
+    /** Stops the member before releasing the same lease that kept its identity live during startup. */
     @Bean(destroyMethod = "close")
     NodeSessionLease nodeSessionLease(HazelcastInstance member) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
