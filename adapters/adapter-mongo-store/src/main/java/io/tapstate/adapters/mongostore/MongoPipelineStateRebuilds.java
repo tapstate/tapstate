@@ -314,8 +314,9 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
 
     /** Reads the receipt from the mapping already loaded with the current intent. */
     static boolean completedStopClear(Document mapping, PipelinePreparation prepared, PipelineIntentSnapshot intent) {
-        if (intent.desired().targetState() != PipelineState.STOPPED || intent.desired().purgeState()
-                || !prepared.scope().equals(intent.scope())
+        if (prepared.phase() != PipelinePreparation.Phase.COMPLETE
+                || intent.desired().targetState() != PipelineState.STOPPED || intent.desired().purgeState()
+                || !intent.scope().equals(prepared.scope())
                 || !(mapping.get("stateRebuild") instanceof Document annex)
                 || !Integer.valueOf(2).equals(annex.get("formatVersion"))
                 || !(annex.get("result") instanceof Document result)

@@ -121,6 +121,8 @@ class StopClearsEverythingButTheTargetIT {
                     () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
                     () -> String.valueOf(control.state(pipelineId)));
 
+            assertThat(control.pipelineStatus(pipelineId)).containsEntry("stopState", "CLEARED");
+
             // The pipeline's private recovery cursor is gone; shared source history belongs to the pool.
             assertThat(documents.consumersOf(chainId)).doesNotContain(consumerId);
             assertThat(documents.consumerOffset(chainId, consumerId)).isNull();
