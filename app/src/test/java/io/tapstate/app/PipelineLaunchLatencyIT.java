@@ -199,7 +199,7 @@ class PipelineLaunchLatencyIT {
                     }
                     String running = "launch-" + (samples - 1);
                     var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
-                    if (blockPriorObservation || restartPlanning) {
+                    if ((blockPriorObservation || restartPlanning) && !blockMaintenance) {
                         request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
                                 .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
@@ -217,6 +217,12 @@ class PipelineLaunchLatencyIT {
                             : blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
                             : new PositionReadBarrier(publisher,"launch-0") : null;
                          var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                        if (blockMaintenance) {
+                            // Capture owners retain their SRS ports at creation. Install the barrier first.
+                            request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
+                            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
+                                    .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
+                        }
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
                                 .as("the prior Pipeline must enter the selected observation, maintenance or proof barrier").isTrue();
                         var admin = raw.getDatabase("admin");
@@ -252,6 +258,11 @@ class PipelineLaunchLatencyIT {
                                     System.out.println("INDEPENDENT_TARGET_ROW_VISIBLE_MS "
                                             + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
                                 }
+                            }
+                            if (!blockPriorObservation && !restartPlanning) {
+                                // Engine readiness may precede the asynchronous observation write.
+                                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
+                                        .until(() -> diagnostics.slowPublication().isPresent());
                             }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
                     }
@@ -427,7 +438,7 @@ class PipelineLaunchLatencyIT {
                         var ports = delegate.srs(scope, guard);
                         var chains = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
                                 new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> {
-                                    if (method.getName().equals("load") && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                    if (method.getName().equals("load") && Thread.currentThread().getName().startsWith("tapstate-capture-owner-")) {
                                         blocked.set(true); entered.countDown();
                                         try { release.await(); }
                                         catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
@@ -439,7 +450,7 @@ class PipelineLaunchLatencyIT {
                         var consumers = (SrsConsumerStore) java.lang.reflect.Proxy.newProxyInstance(SrsConsumerStore.class.getClassLoader(),
                                 new Class<?>[]{SrsConsumerStore.class}, (proxy, method, arguments) -> {
                                     if (method.getName().equals("attachedWithChain")
-                                            && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                            && Thread.currentThread().getName().startsWith("tapstate-capture-owner-")) {
                                         blocked.set(true); entered.countDown();
                                         try { release.await(); }
                                         catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
