@@ -136,6 +136,11 @@ public final class CliErrorDefinitions {
     public static final ProductErrorDefinition STREAM_NO_FRAMES =
             DEFINITIONS.define(63, Severity.ERROR, Set.of("attempts"));
 
+    public static final ProductErrorDefinition WORKBENCH_NEEDS_A_TERMINAL =
+            DEFINITIONS.define(64, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition WORKBENCH_UNAVAILABLE =
+            DEFINITIONS.define(65, Severity.ERROR, Set.of());
+
     private CliErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
