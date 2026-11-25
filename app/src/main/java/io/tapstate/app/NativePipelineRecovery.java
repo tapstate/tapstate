@@ -97,12 +97,12 @@ final class NativePipelineRecovery {
 
     Map<String,String> inspectCaptured(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
         requireAvailable();String id=pass.scope().pipelineId();pass.requirePipeline(id);
-        if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
         var authored=StoredArtifacts.requirePipeline(snapshot,id);
         var pipeline=PipelineInlining.inline(authored,snapshot);
         var sources=new LinkedHashMap<String,SourceResource>();
         for(String source:pipeline.sourceIds())sources.put(source,StoredArtifacts.requireSource(snapshot,source));
         preparer.verifyRetainedSources(pass.scope(),models.preparationInputs(pass.scope(),authored,pipeline,sources));
+        if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
         var summary=configuration.cacheRecoveries().read(id);
         if(summary.isEmpty())return Map.of();
         if(!summary.orElseThrow().targetScope().equals(pass.scope()))throw fenced();

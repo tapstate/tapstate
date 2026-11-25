@@ -48,6 +48,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         try(var f=new Fixture()){
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
             assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+            verify(f.snapshots,timeout(3000)).recordCount("input","orders",1,1);
             run.stopCapture("flow",false);
             assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
         }

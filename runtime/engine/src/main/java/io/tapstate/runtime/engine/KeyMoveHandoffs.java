@@ -7,6 +7,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Admission for one ordered producer and one execution of a conflict domain. Keys must include the
@@ -28,7 +29,7 @@ public final class KeyMoveHandoffs<K> {
     private final Map<K, Input> orderedTails = new HashMap<>();
     // Handoff lets the next operator compute. Target submission has its own, longer-lived tail.
     private final Map<K, Input> writeTails = new HashMap<>();
-    private volatile Throwable failure;
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
 
     public KeyMoveHandoffs(int capacity) {
         if (capacity < 1) throw new IllegalArgumentException("capacity must be positive");
@@ -39,7 +40,7 @@ public final class KeyMoveHandoffs<K> {
     public synchronized Input tryRegister(K before, K after) {
         Objects.requireNonNull(before);
         Objects.requireNonNull(after);
-        if (failure != null) throw new IllegalStateException("execution ended", failure);
+        requireActive();
         if (live.size() == capacity) return null;
         boolean move = !before.equals(after);
         CompletableFuture<Void> ready;
@@ -83,8 +84,7 @@ public final class KeyMoveHandoffs<K> {
     public void abort(Throwable cause) {
         Set<Input> retired;
         synchronized (this) {
-            if (failure != null) return;
-            failure = Objects.requireNonNull(cause);
+            if (!failure.compareAndSet(null, Objects.requireNonNull(cause))) return;
             retired = Set.copyOf(live);
             live.clear();
             pending.clear();
@@ -94,6 +94,11 @@ public final class KeyMoveHandoffs<K> {
         retired.forEach(input -> input.ready.completeExceptionally(cause));
         retired.forEach(input -> input.handed.completeExceptionally(cause));
         retired.forEach(input -> input.settled.completeExceptionally(cause));
+    }
+
+    private void requireActive() {
+        Throwable cause = failure.get();
+        if (cause != null) throw new IllegalStateException("execution ended", cause);
     }
 
     private void releaseKey(K key, Input input) {
@@ -136,7 +141,7 @@ public final class KeyMoveHandoffs<K> {
             return new Receipt() {
                 @Override
                 public boolean mayWrite() {
-                    if (failure != null) throw new IllegalStateException("execution ended", failure);
+                    requireActive();
                     return mayWrite.isDone() && !mayWrite.isCompletedExceptionally();
                 }
 

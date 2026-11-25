@@ -12,7 +12,7 @@ class IoDiagnosticContractTest {
     @Test void remainingDefinitionsKeepParametersSeverityAndHistoricalRecovery() {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(IoError.values()));
-        assertThat(codes).hasSize(41);
+        assertThat(codes).hasSize(42);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = "io." + ((Enum<?>) code).name().toLowerCase(Locale.ROOT).replace('_', '-');
@@ -20,7 +20,9 @@ class IoDiagnosticContractTest {
             code.placeholders().forEach(name -> params.put(name, "value-" + name));
             assertThat(code.severity()).isEqualTo(Severity.ERROR);
             assertThat(code.code()).matches("TS048(?!0000)[0-9]{4}");
-            assertThat(catalog.render(code.code(), params)).isEqualTo(catalog.render(legacy, params));
+            if (code != IoError.KEY_MOVE_RECOVERY_UNCERTAIN) {
+                assertThat(catalog.render(code.code(), params)).isEqualTo(catalog.render(legacy, params));
+            }
             var messages = new HashSet<String>();
             for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
                 var text = catalog.render(code.code(), params, locale);

@@ -54,6 +54,7 @@ class NativeRetainedSelectionGuardTest {
 
         verify(preparer).verifyRetainedSources(scope,expected);
         verify(preparer,never()).prepare(any(PipelineIntentScope.class),any(PipelinePreparationInputs.class));
+        verify(configuration,never()).keyMoveWindows();
         verify(summaries,never()).read(anyString());
         verifyNoInteractions(engine,captures,connectors,store);
     }
