@@ -30,6 +30,13 @@ class RealConnectorNativeStorageSetupIT {
                 ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
+            var ordinary = control.sourceRequest("GET", "/api/sources/views", null, null, 200);
+            assertThat(ordinary.body()).doesNotContain("user:unused");
+            var connection = control.sourceRequest("POST", "/api/state-store/views/connection-uri", null, null, 200);
+            assertThat(connection.headers().firstValue("Cache-Control")).hasValueSatisfying(value ->
+                    assertThat(value).contains("no-store"));
+            assertThat(io.tapstate.core.common.JsonReader.parse(connection.body()))
+                    .isEqualTo(java.util.Map.of("uri", target.config().get("uri")));
             var snapshot = new LinkedHashMap<Object,Object>(control.storageStatus());
             assertThat(snapshot).containsEntry("businessPhase", "READY").containsEntry("defaultSourceId", "views");
             assertThat(((java.util.Map<?,?>)snapshot.get("applicationDataVerification")).get("status")).isEqualTo("UNKNOWN");

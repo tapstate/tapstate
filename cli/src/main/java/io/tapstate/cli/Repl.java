@@ -1,5 +1,26 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.catalog.ConfigField;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.canonical.CanonicalWriter;
+import org.jline.builtins.InteractiveCommandGroup;
+import org.jline.builtins.PosixCommandGroup;
+import org.jline.shell.Command;
+import org.jline.shell.Shell;
+import org.jline.shell.ShellBuilder;
+import org.jline.shell.impl.DefaultCommandDispatcher;
+import org.jline.shell.impl.SimpleCommandGroup;
+import org.jline.utils.AttributedStringBuilder;
+import org.jline.utils.AttributedStyle;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.LinkedHashSet;
+import java.util.HexFormat;
+
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.Interpolator;
@@ -168,6 +189,9 @@ final class Repl {
                     io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCE_LIMIT_REACHED.code());
 
     /** The word that keeps everything, and the words that only say "do not ask me". */
+    private static final String WORKBENCH_REMOTE_REJECTED_CODE = "workbench.remote-rejected";
+    private static final String WORKBENCH_REMOTE_REJECTED_MESSAGE = "Request rejected";
+
     private static final String KEEP_STATE = "--keep-state";
     private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
     private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--yes", "--non-interactive");
@@ -377,6 +401,860 @@ final class Repl {
     /** The current session workspace. */
     Path workdir() {
         return workdir;
+    }
+
+    /** Registers one connector jar or the direct jar children of a connector directory for the workbench. */
+    private synchronized WorkbenchActionGateway.ConnectorRegisterResult registerConnectorFromWorkbench(Path input) {
+        if (!session.isConnected() || !session.isAuthenticated()) {
+            return new WorkbenchActionGateway.ConnectorRegisterResult.Unavailable();
+        }
+        Path artifactPath = (input.isAbsolute() ? input : workdir.resolve(input)).normalize();
+        if (!Files.exists(artifactPath)) {
+            return new WorkbenchActionGateway.ConnectorRegisterResult.Rejected(
+                    "Connector path does not exist: " + input);
+        }
+        List<Path> artifacts;
+        if (Files.isDirectory(artifactPath)) {
+            try (Stream<Path> entries = Files.list(artifactPath)) {
+                artifacts = entries.filter(Files::isRegularFile)
+                        .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
+                        .sorted()
+                        .toList();
+            } catch (IOException unavailable) {
+                return new WorkbenchActionGateway.ConnectorRegisterResult.Rejected(
+                        "Cannot read connector directory: " + unavailable.getMessage());
+            }
+            if (artifacts.isEmpty()) {
+                return new WorkbenchActionGateway.ConnectorRegisterResult.Rejected(
+                        "No connector jars found in " + input);
+            }
+        } else {
+            artifacts = List.of(artifactPath);
+        }
+
+        int registered = 0;
+        int alreadyRegistered = 0;
+        List<String> failures = new ArrayList<>();
+        for (Path artifactPathEntry : artifacts) {
+            byte[] artifact;
+            try {
+                artifact = Files.readAllBytes(artifactPathEntry);
+            } catch (IOException unreadable) {
+                failures.add(artifactPathEntry.getFileName() + ": " + unreadable.getMessage());
+                continue;
+            }
+            byte[] upload = artifact;
+            ConnectorRegisterOutcome outcome = withFailover(
+                    () -> controlPlane.register(session.landingNode(), session.credential(), upload),
+                    candidate -> candidate instanceof ConnectorRegisterOutcome.Unreachable);
+            switch (outcome) {
+                case ConnectorRegisterOutcome.Registered result -> {
+                    if (result.connector().newlyRegistered()) {
+                        registered++;
+                    } else {
+                        alreadyRegistered++;
+                    }
+                }
+                case ConnectorRegisterOutcome.Rejected result ->
+                        failures.add(artifactPathEntry.getFileName() + ": " + result.message());
+                case ConnectorRegisterOutcome.TimedOut ignored ->
+                        failures.add(artifactPathEntry.getFileName() + ": request timed out");
+                case ConnectorRegisterOutcome.Unreachable ignored -> {
+                    return new WorkbenchActionGateway.ConnectorRegisterResult.Unreachable();
+                }
+            }
+        }
+        return new WorkbenchActionGateway.ConnectorRegisterResult.Registered(
+                registered, alreadyRegistered, failures);
+    }
+
+    /** The structured, silent read boundary used by the full-screen workbench. */
+    WorkbenchDataSource workbenchDataSource() {
+        return this::loadWorkbenchSnapshot;
+    }
+
+    /** The typed context and authentication boundary used by the full-screen workbench. */
+    WorkbenchActionGateway workbenchActionGateway() {
+        return new WorkbenchActionGateway() {
+            @Override
+            public List<ContextOption> contexts() {
+                return workbenchContextOptions();
+            }
+
+            @Override
+            public ContextResult selectContext(String name) {
+                return selectWorkbenchContext(name);
+            }
+
+            @Override
+            public ContextResult createContext(String name, URI server, boolean verifyTls) {
+                return createWorkbenchContext(name, server, verifyTls);
+            }
+
+            @Override
+            public ContextDeleteResult deleteContext(String name) {
+                return deleteWorkbenchContext(name);
+            }
+
+            @Override
+            public LoginResult login(LoginRequest request, SecretBuffer password) {
+                return loginFromWorkbench(request, password);
+            }
+
+            @Override
+            public FileReadResult readWorkspaceFile(Path relativePath) {
+                try {
+                    Path file = resolveWorkbenchFile(relativePath);
+                    return new FileReadResult.Loaded(relativePath.normalize(), Files.readString(file));
+                } catch (IOException | RuntimeException unavailable) {
+                    return new FileReadResult.Unavailable();
+                }
+            }
+
+            @Override
+            public FileWriteResult writeWorkspaceFile(Path relativePath, String content) {
+                try {
+                    Path file = resolveWorkbenchFile(relativePath);
+                    Files.writeString(file, content);
+                    return new FileWriteResult.Saved();
+                } catch (IOException | RuntimeException unavailable) {
+                    return new FileWriteResult.Unavailable();
+                }
+            }
+
+            @Override
+            public SourceCatalogResult sourceCatalog() {
+                try {
+                    TapstateCatalog catalog = TapstateCatalog.load();
+                    List<SourceConnector> connectors = catalog.ids().stream()
+                            .map(id -> new SourceConnector(id, SourceScaffold.modes(catalog.byId(id)),
+                                    catalog.byId(id).config().stream().map(Repl::sourceConfigField).toList()))
+                            .toList();
+                    return new SourceCatalogResult.Ready(new SourceCatalog(connectors));
+                } catch (RuntimeException unavailable) {
+                    return new SourceCatalogResult.Unavailable();
+                }
+            }
+
+            @Override
+            public ConnectorRegisterResult registerConnector(Path path) {
+                return registerConnectorFromWorkbench(path);
+            }
+
+            @Override
+            public SourcePreviewResult previewSource(SourceDraft draft) {
+                try {
+                    return new SourcePreviewResult.Ready(canonicalSource(draft));
+                } catch (RuntimeException rejected) {
+                    return new SourcePreviewResult.Rejected("Source draft is not valid");
+                }
+            }
+
+            @Override
+            public SourceCreateResult createSource(SourceCreateRequest request) {
+                try {
+                    Path relativePath = Path.of("source", request.id() + ".tap.yml");
+                    Path target = resolveWorkbenchNewFile(relativePath);
+                    try {
+                        Files.writeString(target, request.canonicalYaml(), java.nio.file.StandardOpenOption.CREATE_NEW);
+                    } catch (java.nio.file.FileAlreadyExistsException exists) {
+                        return new SourceCreateResult.Exists(relativePath);
+                    }
+                    return new SourceCreateResult.Created(relativePath, request.canonicalYaml());
+                } catch (IllegalArgumentException rejected) {
+                    return new SourceCreateResult.Rejected("Source draft is not valid");
+                } catch (IOException unavailable) {
+                    return new SourceCreateResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelinePreviewResult previewPipeline(PipelineDraft draft) {
+                try {
+                    return new PipelinePreviewResult.Ready(canonicalPipeline(draft));
+                } catch (RuntimeException rejected) {
+                    return new PipelinePreviewResult.Rejected("Pipeline draft is not valid");
+                }
+            }
+
+            @Override
+            public PipelineCreateResult createPipeline(PipelineCreateRequest request) {
+                try {
+                    Path relativePath = Path.of("pipeline", request.id() + ".tap.yml");
+                    Path target = resolveWorkbenchNewFile(relativePath);
+                    try {
+                        Files.writeString(target, request.canonicalYaml(), java.nio.file.StandardOpenOption.CREATE_NEW);
+                    } catch (java.nio.file.FileAlreadyExistsException exists) {
+                        return new PipelineCreateResult.Exists(relativePath);
+                    }
+                    return new PipelineCreateResult.Created(relativePath, request.canonicalYaml());
+                } catch (IllegalArgumentException rejected) {
+                    return new PipelineCreateResult.Rejected("Pipeline draft is not valid");
+                } catch (IOException unavailable) {
+                    return new PipelineCreateResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelineApplyResult applyPipelines(PipelineApplyRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineApplyResult.Unavailable();
+                }
+                try {
+                    Map<String, LocalDraft> draftsById = new LinkedHashMap<>();
+                    for (Path relativePath : request.relativePaths()) {
+                        if (relativePath.getNameCount() < 2 || !"pipeline".equals(relativePath.getName(0).toString())) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-path", "Only Pipeline workspace files can be applied here");
+                        }
+                        LocalDraft draft = draft(relativePath.normalize().toString(), resolveWorkbenchFile(relativePath), env);
+                        Resource resource = new DslParser().parse(draft.content());
+                        if (!(resource instanceof PipelineResource)) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-kind", "The selected file is not a valid Pipeline artifact");
+                        }
+                        if (draftsById.putIfAbsent(resource.id(), draft) != null) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-duplicate", "More than one local Pipeline has the same id");
+                        }
+                    }
+                    ListOutcome listed = withFailover(() -> controlPlane.list(
+                            session.landingNode(), session.credential(), "pipeline"),
+                            outcome -> outcome instanceof ListOutcome.Unreachable);
+                    if (listed instanceof ListOutcome.Rejected rejected) {
+                        return new PipelineApplyResult.Rejected(rejected.code(), rejected.message());
+                    }
+                    if (listed instanceof ListOutcome.Unreachable) {
+                        return new PipelineApplyResult.Unreachable();
+                    }
+                    Map<String, RemoteArtifact> remoteById = ((ListOutcome.Listed) listed).artifacts().stream()
+                            .collect(java.util.stream.Collectors.toMap(RemoteArtifact::id, artifact -> artifact,
+                                    (left, right) -> left, LinkedHashMap::new));
+                    List<LocalDraft> guarded = new ArrayList<>(draftsById.size());
+                    for (Map.Entry<String, LocalDraft> entry : draftsById.entrySet()) {
+                        RemoteArtifact remote = remoteById.get(entry.getKey());
+                        if (remote == null) {
+                            guarded.add(entry.getValue());
+                        } else if (!remote.readable() || remote.canonicalForm() == null) {
+                            return new PipelineApplyResult.Rejected(
+                                    "cli.pipeline-apply-unreadable", "A remote Pipeline cannot be read for safe update");
+                        } else {
+                            guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
+                                    remote.contentHash()));
+                        }
+                    }
+                    ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
+                            session.landingNode(), session.credential(), guarded),
+                            value -> value instanceof ApplyOutcome.Unreachable);
+                    return switch (outcome) {
+                        case ApplyOutcome.Applied applied -> new PipelineApplyResult.Applied(applied.items().stream()
+                                .filter(item -> "pipeline".equals(item.kind()))
+                                .map(item -> new SourceApplyItem(item.id(), item.change())).toList());
+                        case ApplyOutcome.Rejected rejected -> new PipelineApplyResult.Rejected(
+                                rejected.code(), rejected.message());
+                        case ApplyOutcome.Unreachable ignored -> new PipelineApplyResult.Unreachable();
+                    };
+                } catch (DslException rejected) {
+                    return new PipelineApplyResult.Rejected(rejected.code().code(), "A local Pipeline is not valid");
+                } catch (IOException | RuntimeException unavailable) {
+                    return new PipelineApplyResult.Unavailable();
+                }
+            }
+
+            @Override
+            public PipelineLifecycleResult changePipelineLifecycle(PipelineLifecycleRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLifecycleResult.Unavailable();
+                }
+                LifecycleOutcome outcome = withFailover(() -> controlPlane.lifecycle(
+                        session.landingNode(), session.credential(), request.pipelineId(), request.verb(), null),
+                        value -> value instanceof LifecycleOutcome.Unreachable);
+                return switch (outcome) {
+                    case LifecycleOutcome.Accepted accepted -> new PipelineLifecycleResult.Changed(accepted.targetState());
+                    case LifecycleOutcome.Rejected rejected -> new PipelineLifecycleResult.Rejected(
+                            rejected.code(), rejected.message());
+                    case LifecycleOutcome.Unreachable ignored -> new PipelineLifecycleResult.Unreachable();
+                };
+            }
+
+            @Override
+            public PipelineStatusResult readPipelineStatus(PipelineStatusRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineStatusResult.Unavailable();
+                }
+                StatusOutcome outcome = withFailover(() -> controlPlane.status(
+                        session.landingNode(), session.credential(), request.pipelineId()),
+                        value -> value instanceof StatusOutcome.Unreachable);
+                return switch (outcome) {
+                    case StatusOutcome.Found found -> new PipelineStatusResult.Available(
+                            found.pipelineId(), found.state(),
+                            Optional.ofNullable(found.failureCode()), Optional.ofNullable(found.failureMessage()));
+                    case StatusOutcome.Rejected rejected -> new PipelineStatusResult.Rejected(
+                            request.pipelineId(), rejected.code(), rejected.message());
+                    case StatusOutcome.Unreachable ignored -> new PipelineStatusResult.Unreachable();
+                    case StatusOutcome.NoObservation ignored -> new PipelineStatusResult.Unavailable();
+                };
+            }
+
+            @Override
+            public PipelineMetricsResult readPipelineMetrics(PipelineMetricsRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineMetricsResult.Unavailable();
+                }
+                MetricsOutcome outcome = withFailover(() -> controlPlane.metrics(
+                        session.landingNode(), session.credential(), request.pipelineId()),
+                        value -> value instanceof MetricsOutcome.Unreachable);
+                return switch (outcome) {
+                    case MetricsOutcome.Found found -> new PipelineMetricsResult.Available(
+                            found.pipelineId(), found.metrics(), found.targetAckedPosition(),
+                            found.positionsNotCollected(), found.facts());
+                    case MetricsOutcome.Rejected rejected -> new PipelineMetricsResult.Rejected(
+                            request.pipelineId(), rejected.code(), rejected.message());
+                    case MetricsOutcome.Unreachable ignored -> new PipelineMetricsResult.Unreachable();
+                };
+            }
+
+            @Override
+            public LogsOutcome readPipelineLogs(String pipelineId, RemoteLogCursor after) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new LogsOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logs(
+                        session.landingNode(), session.credential(), pipelineId, after),
+                        value -> value instanceof LogsOutcome.Unreachable);
+            }
+
+            @Override
+            public PipelineLogLevelOutcome setPipelineLogLevel(String pipelineId, String level) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLogLevelOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logLevel(
+                        session.landingNode(), session.credential(), pipelineId, level),
+                        value -> value instanceof PipelineLogLevelOutcome.Unreachable);
+            }
+
+            @Override
+            public PipelineLogLevelOutcome readPipelineLogLevel(String pipelineId) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new PipelineLogLevelOutcome.Unreachable();
+                }
+                return withFailover(() -> controlPlane.logLevel(
+                        session.landingNode(), session.credential(), pipelineId),
+                        value -> value instanceof PipelineLogLevelOutcome.Unreachable);
+            }
+
+            @Override
+            public String followPipelineLogs(String pipelineId, RemoteLogCursor after, LogStream sink,
+                    java.util.function.BooleanSupplier stop) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return "unavailable";
+                }
+                return controlPlane.followLogs(session.landingNode(), session.credential(), pipelineId, after, sink, stop);
+            }
+
+            @Override
+            public SourceApplyResult applySources(SourceApplyRequest request) {
+                if (!session.isConnected() || !session.isAuthenticated()) {
+                    return new SourceApplyResult.Unavailable();
+                }
+                try {
+                    List<LocalDraft> drafts = new ArrayList<>();
+                    Map<String, LocalDraft> draftsById = new LinkedHashMap<>();
+                    for (Path relativePath : request.relativePaths()) {
+                        Path file = resolveWorkbenchFile(relativePath);
+                        if (relativePath.getNameCount() < 2 || !"source".equals(relativePath.getName(0).toString())) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-path", "Only Source workspace files can be applied here");
+                        }
+                        LocalDraft draft = draft(relativePath.normalize().toString(), file, env);
+                        Resource resource = new DslParser().parse(draft.content());
+                        if (!(resource instanceof SourceResource)) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-kind", "The selected file is not a valid Source artifact");
+                        }
+                        if (draftsById.putIfAbsent(resource.id(), draft) != null) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-duplicate", "More than one local Source has the same id");
+                        }
+                        drafts.add(draft);
+                    }
+                    ListOutcome listed = withFailover(() -> controlPlane.list(
+                            session.landingNode(), session.credential(), "source"),
+                            outcome -> outcome instanceof ListOutcome.Unreachable);
+                    if (listed instanceof ListOutcome.Rejected rejected) {
+                        return new SourceApplyResult.Rejected(rejected.code(), rejected.message());
+                    }
+                    if (listed instanceof ListOutcome.Unreachable) {
+                        return new SourceApplyResult.Unreachable();
+                    }
+                    Map<String, RemoteArtifact> remoteById = ((ListOutcome.Listed) listed).artifacts().stream()
+                            .collect(java.util.stream.Collectors.toMap(RemoteArtifact::id, artifact -> artifact,
+                                    (left, right) -> left, LinkedHashMap::new));
+                    List<LocalDraft> guarded = new ArrayList<>(drafts.size());
+                    for (Map.Entry<String, LocalDraft> entry : draftsById.entrySet()) {
+                        RemoteArtifact remote = remoteById.get(entry.getKey());
+                        if (remote == null) {
+                            guarded.add(entry.getValue());
+                        } else if (!remote.readable() || remote.canonicalForm() == null) {
+                            return new SourceApplyResult.Rejected(
+                                    "cli.source-apply-unreadable", "A remote Source cannot be read for safe update");
+                        } else {
+                            guarded.add(new LocalDraft(entry.getValue().source(), entry.getValue().content(),
+                                    remote.contentHash()));
+                        }
+                    }
+                    ApplyOutcome outcome = withFailover(() -> controlPlane.apply(
+                            session.landingNode(), session.credential(), guarded),
+                            value -> value instanceof ApplyOutcome.Unreachable);
+                    return switch (outcome) {
+                        case ApplyOutcome.Applied applied -> new SourceApplyResult.Applied(applied.items().stream()
+                                .filter(item -> "source".equals(item.kind()))
+                                .map(item -> new SourceApplyItem(item.id(), item.change())).toList());
+                        case ApplyOutcome.Rejected rejected -> new SourceApplyResult.Rejected(
+                                rejected.code(), rejected.message());
+                        case ApplyOutcome.Unreachable ignored -> new SourceApplyResult.Unreachable();
+                    };
+                } catch (DslException rejected) {
+                    return new SourceApplyResult.Rejected(rejected.code().code(), "A local Source is not valid");
+                } catch (IOException | RuntimeException unavailable) {
+                    return new SourceApplyResult.Unavailable();
+                }
+            }
+        };
+    }
+
+    private String canonicalSource(WorkbenchActionGateway.SourceDraft draft) {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        var mode = SourceScaffold.resolveMode(catalog, draft.connector(), draft.mode());
+        SourceResource source = SourceScaffold.build(catalog, draft.connector(), draft.mode(),
+                SourceScaffold.tableRefs(draft.tables(), mode), draft.id(), draft.config());
+        return new CanonicalWriter().write(source);
+    }
+
+    private String canonicalPipeline(WorkbenchActionGateway.PipelineDraft draft) {
+        PipelineResource pipeline = new PipelineResource(draft.id(), null, List.of(SourceRef.bare(draft.sourceId())), null,
+                new ViewBlock.Inline("view", FromRef.regex(".*"), null, null), null, null, null);
+        return new CanonicalWriter().write(pipeline);
+    }
+
+    private static WorkbenchActionGateway.SourceConfigField sourceConfigField(ConfigField field) {
+        String label = field.label().getOrDefault("en_US", field.name());
+        Optional<WorkbenchActionGateway.SourceConfigVisibility> visibleWhen = field.visibleWhen() == null
+                ? Optional.empty()
+                : Optional.of(new WorkbenchActionGateway.SourceConfigVisibility(
+                        field.visibleWhen().controllingField(), field.visibleWhen().equalsAnyOf()));
+        return new WorkbenchActionGateway.SourceConfigField(
+                field.name(), field.type(), label, field.defaultValue(), field.secret(),
+                field.options().stream().map(option -> new WorkbenchActionGateway.SourceConfigOption(
+                        option.value(), option.label().getOrDefault("en_US", option.value()))).toList(), visibleWhen);
+    }
+
+    private Path resolveWorkbenchFile(Path relativePath) throws IOException {
+        Objects.requireNonNull(relativePath, "relativePath");
+        Path normalized = relativePath.normalize();
+        if (normalized.isAbsolute() || normalized.startsWith("..")) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        Path root = workdir.toRealPath();
+        Path file = root.resolve(normalized).toRealPath();
+        if (!file.startsWith(root) || !Files.isRegularFile(file)) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        return file;
+    }
+
+    private Path resolveWorkbenchNewFile(Path relativePath) throws IOException {
+        Objects.requireNonNull(relativePath, "relativePath");
+        Path normalized = relativePath.normalize();
+        if (normalized.isAbsolute() || normalized.startsWith("..") || normalized.getNameCount() != 2) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        Path root = workdir.toRealPath();
+        Path parent = root.resolve(normalized.getParent());
+        Files.createDirectories(parent);
+        Path realParent = parent.toRealPath();
+        if (!realParent.startsWith(root)) {
+            throw new IOException("Workspace file path is outside the workspace");
+        }
+        return realParent.resolve(normalized.getFileName());
+    }
+
+    private synchronized List<WorkbenchActionGateway.ContextOption> workbenchContextOptions() {
+        if (contextManager == null) {
+            return List.of();
+        }
+        try {
+            return contextManager.suggestions().stream()
+                    .map(choice -> new WorkbenchActionGateway.ContextOption(
+                            choice.name(), choice.suggested()))
+                    .toList();
+        } catch (RuntimeException unavailable) {
+            return List.of();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextResult selectWorkbenchContext(String name) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+        try {
+            ContextManager.ContextChoice choice = contextManager.suggestions().stream()
+                    .filter(candidate -> candidate.name().equals(name))
+                    .findFirst()
+                    .orElse(null);
+            if (choice == null) {
+                return new WorkbenchActionGateway.ContextResult.Unavailable();
+            }
+            ResolvedContext.Named selected = new ResolvedContext.Named(
+                    choice.name(), choice.definition(), ResolvedContext.Source.EXPLICIT);
+            contextManager.choose(name);
+            session.disconnect();
+            namedContext = selected;
+            WorkbenchRemoteState failure = prepareWorkbenchContext(
+                    selected, new RefreshRequest.CancellationToken());
+            if (failure instanceof WorkbenchRemoteState.Offline) {
+                return new WorkbenchActionGateway.ContextResult.Offline(name);
+            }
+            if (failure != null) {
+                return new WorkbenchActionGateway.ContextResult.Unavailable();
+            }
+            return new WorkbenchActionGateway.ContextResult.Ready(name, session.isAuthenticated());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextResult createWorkbenchContext(
+            String name, URI server, boolean verifyTls) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+        try {
+            ContextDefinition definition = contextManager.create(name, List.of(server), verifyTls);
+            contextManager.bind(workdir, name);
+            contextManager.choose(name);
+            session.disconnect();
+            namedContext = new ResolvedContext.Named(
+                    name, definition, ResolvedContext.Source.EXPLICIT);
+            return new WorkbenchActionGateway.ContextResult.Ready(name, false);
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.ContextDeleteResult deleteWorkbenchContext(String name) {
+        if (contextManager == null) {
+            return new WorkbenchActionGateway.ContextDeleteResult.Unavailable();
+        }
+        try {
+            contextManager.delete(name);
+            if (namedContext != null && namedContext.name().equals(name)) {
+                session.disconnect();
+                namedContext = null;
+            }
+            return new WorkbenchActionGateway.ContextDeleteResult.Deleted(name);
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.ContextDeleteResult.Unavailable();
+        }
+    }
+
+    private synchronized WorkbenchActionGateway.LoginResult loginFromWorkbench(
+            WorkbenchActionGateway.LoginRequest request, SecretBuffer password) {
+        Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(password, "password");
+        if (machineToken != null) {
+            password.close();
+            return new WorkbenchActionGateway.LoginResult.Unavailable();
+        }
+        try {
+            if (request.server().isPresent()) {
+                URI server = request.server().orElseThrow();
+                if (!controlPlane.isHealthy(server)) {
+                    return new WorkbenchActionGateway.LoginResult.Unreachable();
+                }
+                namedContext = null;
+                session.disconnect();
+                session.connect(List.of(server), server, controlPlane.serverVersion(server));
+            }
+            if (!session.isConnected() && (namedContext == null || authService == null)) {
+                return new WorkbenchActionGateway.LoginResult.Unavailable();
+            }
+            if (namedContext == null || authService == null) {
+                IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
+                return password.consume(secret -> switch (verified.withCredential(
+                        secret, (node, credential) -> controlPlane.login(
+                                node, request.username(), credential))) {
+                    case LoginOutcome.Success success -> {
+                        session.reland(verified.seed());
+                        session.authenticate(
+                                success.token(), request.username(), null, session.seeds());
+                        yield new WorkbenchActionGateway.LoginResult.SignedIn(request.username());
+                    }
+                    case LoginOutcome.Rejected rejected ->
+                            new WorkbenchActionGateway.LoginResult.Rejected(rejected.code());
+                    case LoginOutcome.Unreachable ignored ->
+                            new WorkbenchActionGateway.LoginResult.Unreachable();
+                });
+            }
+            return password.consume(secret -> switch (authService.login(
+                    namedContext, request.username(), secret, true)) {
+                case AuthService.LoginResult.Success success -> {
+                    AuthService.ActiveSession active = success.session();
+                    session.connect(namedContext.definition().seeds(), active.seed(), null);
+                    session.authenticate(
+                            active.accessToken(),
+                            active.record().principal(),
+                            null,
+                            namedContext.definition().seeds());
+                    yield new WorkbenchActionGateway.LoginResult.SignedIn(
+                            active.record().principal());
+                }
+                case AuthService.LoginResult.Rejected rejected ->
+                        new WorkbenchActionGateway.LoginResult.Rejected(rejected.code());
+                case AuthService.LoginResult.Unreachable ignored ->
+                        new WorkbenchActionGateway.LoginResult.Unreachable();
+            });
+        } catch (RuntimeException unavailable) {
+            return new WorkbenchActionGateway.LoginResult.Unavailable();
+        } finally {
+            password.close();
+        }
+    }
+
+    private WorkbenchSnapshot loadWorkbenchSnapshot(
+            long contextGeneration,
+            long requestSequence,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        cancellationToken.throwIfCancelled();
+        Path workspaceRoot = workdir;
+        List<WorkspaceScan.Artifact> localArtifacts = WorkspaceScan.of(workspaceRoot);
+        cancellationToken.throwIfCancelled();
+
+        WorkbenchContextSelection selection = resolveWorkbenchContext(workspaceRoot);
+        WorkbenchRemoteListing remote = loadWorkbenchRemote(selection, cancellationToken);
+        cancellationToken.throwIfCancelled();
+
+        return WorkbenchProjection.project(
+                contextGeneration,
+                requestSequence,
+                workbenchSession(workspaceRoot, selection.context()),
+                localArtifacts,
+                remote.state(),
+                remote.artifacts());
+    }
+
+    private WorkbenchContextSelection resolveWorkbenchContext(Path workspaceRoot) {
+        if (namedContext != null) {
+            return new WorkbenchContextSelection(Optional.of(namedContext), null);
+        }
+        if (session.isConnected() || contextResolver == null) {
+            return new WorkbenchContextSelection(Optional.empty(), null);
+        }
+        try {
+            Optional<ResolvedContext> resolved = contextResolver.resolve(null, explicitContext, workspaceRoot);
+            Optional<ResolvedContext.Named> named = resolved
+                    .filter(ResolvedContext.Named.class::isInstance)
+                    .map(ResolvedContext.Named.class::cast);
+            return new WorkbenchContextSelection(named, null);
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            return new WorkbenchContextSelection(
+                    Optional.empty(),
+                    new WorkbenchRemoteState.Diagnostic(failure.code(), Map.of()));
+        }
+    }
+
+    private WorkbenchRemoteListing loadWorkbenchRemote(
+            WorkbenchContextSelection selection,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        if (selection.diagnostic() != null) {
+            return new WorkbenchRemoteListing(selection.diagnostic(), List.of());
+        }
+        if (!session.isConnected() && selection.context().isPresent()) {
+            WorkbenchRemoteState preparationFailure = prepareWorkbenchContext(
+                    selection.context().orElseThrow(), cancellationToken);
+            if (preparationFailure != null) {
+                return new WorkbenchRemoteListing(preparationFailure, List.of());
+            }
+        }
+        if (!session.isConnected()) {
+            WorkbenchRemoteState state = selection.context().isPresent()
+                    ? new WorkbenchRemoteState.Offline()
+                    : new WorkbenchRemoteState.NotConfigured();
+            return new WorkbenchRemoteListing(state, List.of());
+        }
+        if (!session.isAuthenticated()) {
+            return new WorkbenchRemoteListing(new WorkbenchRemoteState.SignedOut(), List.of());
+        }
+
+        cancellationToken.throwIfCancelled();
+        URI failedLanding = session.landingNode();
+        ListOutcome outcome = controlPlane.list(failedLanding, session.credential(), null);
+        if (outcome instanceof ListOutcome.Unreachable) {
+            cancellationToken.throwIfCancelled();
+            if (silentWorkbenchFailover(failedLanding, cancellationToken)) {
+                cancellationToken.throwIfCancelled();
+                outcome = controlPlane.list(session.landingNode(), session.credential(), null);
+            }
+        }
+        cancellationToken.throwIfCancelled();
+        return switch (outcome) {
+            case ListOutcome.Listed listed -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Available(listed.artifacts().size()), listed.artifacts());
+            case ListOutcome.Rejected ignored -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Rejected(
+                            WORKBENCH_REMOTE_REJECTED_CODE,
+                            WORKBENCH_REMOTE_REJECTED_MESSAGE),
+                    List.of());
+            case ListOutcome.Unreachable ignored -> new WorkbenchRemoteListing(
+                    new WorkbenchRemoteState.Offline(), List.of());
+        };
+    }
+
+    private WorkbenchRemoteState prepareWorkbenchContext(
+            ResolvedContext.Named context,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        cancellationToken.throwIfCancelled();
+        try {
+            if (machineToken != null) {
+                IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(context.definition(), null);
+                mutateWorkbenchSession(cancellationToken, () -> {
+                    session.connect(context.definition().seeds(), verified.seed(), null);
+                    session.authenticateMachine(machineToken, context.definition().seeds());
+                    namedContext = context;
+                });
+                return null;
+            }
+
+            if (authService != null) {
+                Optional<AuthService.ActiveSession> resumed = authService.resume(context);
+                cancellationToken.throwIfCancelled();
+                if (resumed.isPresent()) {
+                    AuthService.ActiveSession active = resumed.orElseThrow();
+                    mutateWorkbenchSession(cancellationToken, () -> {
+                        session.connect(context.definition().seeds(), active.seed(), null);
+                        session.authenticate(
+                                active.accessToken(),
+                                active.record().principal(),
+                                null,
+                                context.definition().seeds());
+                        namedContext = context;
+                    });
+                    return null;
+                }
+            }
+
+            IssuerBinding.Verified verified = new IssuerBinding(controlPlane).verify(context.definition(), null);
+            mutateWorkbenchSession(cancellationToken, () -> {
+                session.connect(context.definition().seeds(), verified.seed(), null);
+                namedContext = context;
+            });
+            return null;
+        } catch (io.tapstate.core.common.TapstateException failure) {
+            cancellationToken.throwIfCancelled();
+            if (isWorkbenchOffline(failure)) {
+                return new WorkbenchRemoteState.Offline();
+            }
+            return new WorkbenchRemoteState.Diagnostic(failure.code(), Map.of());
+        }
+    }
+
+    private static boolean isWorkbenchOffline(io.tapstate.core.common.TapstateException failure) {
+        return failure.code() == CliError.ISSUER_DISCOVERY_FAILED
+                || failure.code() == CliError.AUTH_SESSION_UNREACHABLE;
+    }
+
+    private boolean silentWorkbenchFailover(
+            URI failedLanding,
+            RefreshRequest.CancellationToken cancellationToken) throws InterruptedException {
+        if (!session.isConnected()) {
+            return false;
+        }
+        for (URI member : session.members()) {
+            cancellationToken.throwIfCancelled();
+            if (failedLanding.equals(member)) {
+                continue;
+            }
+            if (controlPlane.isHealthy(member)) {
+                mutateWorkbenchSession(cancellationToken, () -> session.reland(member));
+                return true;
+            }
+        }
+        mutateWorkbenchSession(cancellationToken, session::disconnect);
+        return false;
+    }
+
+    private static void mutateWorkbenchSession(
+            RefreshRequest.CancellationToken cancellationToken,
+            Runnable mutation) throws InterruptedException {
+        if (!cancellationToken.mutateIfActive(mutation)) {
+            cancellationToken.throwIfCancelled();
+        }
+    }
+
+    private WorkbenchSessionSnapshot workbenchSession(
+            Path workspaceRoot,
+            Optional<ResolvedContext.Named> selected) {
+        WorkbenchConnection connection = session.isConnected()
+                ? WorkbenchConnection.CONNECTED
+                : selected.isPresent() ? WorkbenchConnection.OFFLINE : WorkbenchConnection.NO_CONTEXT;
+        WorkbenchAuthentication authentication;
+        if (!session.isConnected()) {
+            authentication = WorkbenchAuthentication.NOT_APPLICABLE;
+        } else if (session.hasMachineCredential()) {
+            authentication = WorkbenchAuthentication.MACHINE;
+        } else if (session.isAuthenticated()) {
+            authentication = WorkbenchAuthentication.SIGNED_IN;
+        } else {
+            authentication = WorkbenchAuthentication.SIGNED_OUT;
+        }
+        return new WorkbenchSessionSnapshot(
+                workspaceRoot,
+                selected.map(ResolvedContext.Named::name),
+                selected.map(ResolvedContext.Named::source),
+                connection,
+                authentication,
+                Optional.ofNullable(session.principal()),
+                safeLandingNode(session.landingNode()),
+                session.versions());
+    }
+
+    private static Optional<URI> safeLandingNode(URI endpoint) {
+        if (endpoint == null || endpoint.getHost() == null) {
+            return Optional.empty();
+        }
+        String scheme = endpoint.getScheme();
+        if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(new URI(
+                    scheme.toLowerCase(Locale.ROOT),
+                    null,
+                    endpoint.getHost().toLowerCase(Locale.ROOT),
+                    endpoint.getPort(),
+                    null,
+                    null,
+                    null));
+        } catch (URISyntaxException invalid) {
+            return Optional.empty();
+        }
+    }
+
+    private record WorkbenchContextSelection(
+            Optional<ResolvedContext.Named> context,
+            WorkbenchRemoteState.Diagnostic diagnostic) {
+    }
+
+    private record WorkbenchRemoteListing(
+            WorkbenchRemoteState state,
+            List<RemoteArtifact> artifacts) {
+        private WorkbenchRemoteListing {
+            artifacts = List.copyOf(artifacts);
+        }
     }
 
     /** The current connection state. */
@@ -6605,6 +7483,100 @@ final class Repl {
             builder.completer(completer);
         }
         return builder.build();
+    }
+
+    /** Runs the command session in a caller-owned virtual terminal. */
+    void runEmbeddedShell(Terminal terminal) {
+        PrintWriter previousOut = commandLine.getOut();
+        PrintWriter previousErr = commandLine.getErr();
+        Prompter previousPrompter = prompter;
+        BooleanSupplier previousTerminal = this.terminal;
+        IntSupplier previousScreenWidth = this.screenWidth;
+        commandLine.setOut(terminal.writer());
+        commandLine.setErr(terminal.writer());
+        this.terminal = () -> true;
+        this.screenWidth = () -> terminal.getWidth() > 0 ? terminal.getWidth() : DEFAULT_SCREEN_WIDTH;
+        this.prompter = new JLinePrompter(terminal, false);
+        try (Shell shell = buildEmbeddedShell(terminal)) {
+            shell.run();
+        } catch (Exception failure) {
+            terminal.writer().println("Shell crashed: " + failure.getClass().getSimpleName() + ": " + failure.getMessage());
+            terminal.writer().flush();
+        } finally {
+            commandLine.setOut(previousOut);
+            commandLine.setErr(previousErr);
+            this.prompter = previousPrompter;
+            this.terminal = previousTerminal;
+            this.screenWidth = previousScreenWidth;
+        }
+    }
+
+    private Shell buildEmbeddedShell(Terminal terminal) throws IOException {
+        return Shell.builder()
+                .terminal(terminal)
+                .prompt(Repl::embeddedPrompt)
+                .groups(tapstateCommandGroup(), new PosixCommandGroup(), new InteractiveCommandGroup())
+                .helpCommands(true)
+                .commandHighlighter(false)
+                .variable(LineReader.LIST_MAX, 50)
+                .onReaderReady((reader, dispatcher) -> {
+                    if (dispatcher instanceof DefaultCommandDispatcher commandDispatcher) {
+                        commandDispatcher.session().setWorkingDirectory(workdir);
+                    }
+                    terminal.handle(Terminal.Signal.INT, signal -> cancelStream());
+                })
+                .build();
+    }
+
+    private SimpleCommandGroup tapstateCommandGroup() {
+        LinkedHashSet<String> names = new LinkedHashSet<>(commandLine.getSubcommands().keySet());
+        names.addAll(List.of("connect", "disconnect", "login", "logout", ":ctx", "version"));
+        names.removeAll(Set.of(
+                "help", "exit", "quit", "cd", "pwd", "echo", "cat", "ls", "grep", "head", "tail", "wc",
+                "sort", "date", "sleep", "clear", "nano", "less", "more", "history"));
+        List<Command> commands = names.stream().map(this::tapstateCommand).toList();
+        return new SimpleCommandGroup("Tapstate", commands);
+    }
+
+    private Command tapstateCommand(String name) {
+        return new Command() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public String description() {
+                CommandLine child = commandLine.getSubcommands().get(name);
+                if (child == null) {
+                    return "Tapstate interactive command";
+                }
+                String[] description = child.getCommandSpec().usageMessage().description();
+                return description.length == 0 ? "Tapstate command" : description[0];
+            }
+
+            @Override
+            public Object execute(org.jline.shell.CommandSession session, String[] arguments) {
+                List<String> words = new ArrayList<>(arguments.length + 1);
+                words.add(name);
+                words.addAll(List.of(arguments));
+                dispatch(words);
+                session.setLastExitCode(lastExitCode);
+                return null;
+            }
+        };
+    }
+
+    private static String embeddedPrompt() {
+        return new AttributedStringBuilder()
+                .append("tapstate", AttributedStyle.DEFAULT.bold().foregroundRgb(0x4FACBC))
+                .append("> ", AttributedStyle.DEFAULT)
+                .toAnsi();
+    }
+
+    /** The command table's diagnostic stream, shared with the workbench startup boundary. */
+    PrintWriter errorOutput() {
+        return commandLine.getErr();
     }
 
     /** Runs the interactive read loop until {@code exit} / {@code quit} or end-of-input. */
