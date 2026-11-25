@@ -75,6 +75,7 @@ class DefaultCopyPrimaryKeyUpdateIT {
                     .isPresent(), () -> control.pipelineStatus(PIPELINE).toString());
 
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
+            assertThat(sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (2, 'k1', 99)")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_OTHER SET STATUS='after' WHERE ID=1")).isEqualTo(1);
 
             Await.until("the composite row to move to its new key and the unrelated update to reach MongoDB", () -> {
@@ -85,7 +86,8 @@ class DefaultCopyPrimaryKeyUpdateIT {
                         .isNotEqualTo(PipelineState.FAILED.name());
                 return mongo.fetch(target, COMPOSITE, UPDATED_KEY)
                         .filter(row -> "21".equals(String.valueOf(row.get("VAL")))).isPresent()
-                        && mongo.fetch(target, COMPOSITE, ORIGINAL_KEY).isEmpty()
+                        && mongo.fetch(target, COMPOSITE, ORIGINAL_KEY)
+                                .filter(row -> "99".equals(String.valueOf(row.get("VAL")))).isPresent()
                         && other.filter(row -> "after".equals(row.get("STATUS"))).isPresent();
             }, () -> control.pipelineStatus(PIPELINE)
                     + " composite row at original key " + mongo.fetch(target, COMPOSITE, ORIGINAL_KEY)
