@@ -4259,7 +4259,7 @@
     {
       "id": "user.workspace",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "USER_OUTPUT",
       "layer": "USER",
       "database": "LOCAL",
