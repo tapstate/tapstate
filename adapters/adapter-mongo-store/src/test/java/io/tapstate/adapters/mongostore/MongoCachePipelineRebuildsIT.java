@@ -1050,12 +1050,79 @@ class MongoCachePipelineRebuildsIT {
             assertThat(bindings.loadCurrent("flow")).isEmpty();
             var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.config);
             var key = new Document("_id", "flow");
+            var retiring = f.mapping();
+            mappings.updateOne(key, new Document("$set", new Document("operationId", "different-retirement")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.PIPELINE_INTENT_FENCED);
+            mappings.replaceOne(key, retiring);
             mappings.updateOne(key, new Document("$set", new Document("connectorBindings", "damaged")));
             assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
             mappings.updateOne(key, new Document("$unset", new Document("connectorBindings", "")));
             assertCode(() -> intents.compareAndSet(f.scope, revision + 1, desired), IoError.PIPELINE_INTENT_FENCED);
 
             f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business, ACTIVE).retire(pending, f.node));
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+        });
+    }
+
+    @Test void connectorVersionsRemainReadableDuringRebuildAndRejectDamagedWitnesses() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var bindings = intents.connectorBindings();
+            assertThat(bindings.loadCurrent("missing-pipeline")).isEmpty();
+            var original = intents.load("flow").orElseThrow();
+            var active = bindings.seed(original, List.of());
+            assertThat(bindings.loadCurrent("flow")).contains(active);
+            assertThat(bindings.loadAll()).containsEntry("flow", active);
+
+            var pending = f.pending(0);
+            var request = pending.request();
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+            assertThat(f.configuration.rebuilds().pending("flow", request.inputs(), request.dependencyHashes()))
+                    .hasValueSatisfying(value -> assertThat(value.preparationId()).isEqualTo(pending.preparationId()));
+
+            var table = SystemCollections.OPERATOR_GENERATIONS.on(f.config);
+            var key = new Document("_id", "flow");
+            var rebuilding = f.mapping();
+            var annex = rebuilding.get("stateRebuild", Document.class);
+            var claim = annex.get("originalClaim", Document.class);
+            var badScope = MongoPipelinePreparationFacts.scope(request.targetScope());
+            var badTarget = MongoPipelinePreparationFacts.scope(request.originalScope());
+            var changes = Map.<String, Object>ofEntries(
+                    Map.entry("operationId", "different-rebuild"),
+                    Map.entry("intentRevision", original.intentRevision() + 1),
+                    Map.entry("originalScope", badScope),
+                    Map.entry("targetScope", badTarget),
+                    Map.entry("confirmationHash", "invalid"),
+                    Map.entry("originalStateEpoch", -1L),
+                    Map.entry("preparationId", "invalid"),
+                    Map.entry("previousPreparationId", UUID.randomUUID().toString()),
+                    Map.entry("formatVersion", 3),
+                    Map.entry("inputClosureHash", "invalid"),
+                    Map.entry("originalClaim", new Document(claim).append("clusterId", "other-cluster")));
+            for (var change : changes.entrySet()) {
+                var damaged = new Document(annex).append(change.getKey(), change.getValue());
+                table.updateOne(key, new Document("$set", new Document("stateRebuild", damaged)));
+                assertThatThrownBy(() -> bindings.loadCurrent("flow"))
+                        .as("invalid rebuild witness field %s", change.getKey())
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            }
+            for (String field : List.of("claimGeneration", "executionGeneration", "topologyRevision")) {
+                var damagedClaim = new Document(claim).append(field, "invalid");
+                var damaged = new Document(annex).append("originalClaim", damagedClaim);
+                table.updateOne(key, new Document("$set", new Document("stateRebuild", damaged)));
+                assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
+            }
+            table.updateOne(key, new Document("$unset", new Document("stateRebuild", "")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
+            table.replaceOne(key, rebuilding);
+            table.updateOne(key, new Document("$set", new Document("stateGeneration", f.scope.stateGeneration() + 1))
+                    .append("$unset", new Document("connectorBindings", "")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.PIPELINE_INTENT_FENCED);
+            table.replaceOne(key, rebuilding);
+            table.updateOne(key, new Document("$set", new Document("phase", "RETIRED")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.PIPELINE_INTENT_FENCED);
+            table.replaceOne(key, rebuilding);
             assertThat(bindings.loadCurrent("flow")).isEmpty();
         });
     }
