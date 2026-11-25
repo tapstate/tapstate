@@ -53,6 +53,12 @@ final class StoreBackedPipelineChains implements PipelineChains {
         return progressChainsOf(pipelineId, storePort.artifacts(), source -> SourceDiscovery.model(storePort, source), null);
     }
 
+    NativeStartProgress startProgress(PipelineResource pipeline, io.tapstate.spi.store.PipelineIntentScope scope,
+            ArtifactStore artifacts, Function<SourceResource,SourceModel> models, Supplier<SrsStores> stores) {
+        if (!(storePort instanceof ThreeLayerStorePort nativeStore)) throw new IllegalStateException("native start progress requires native stores");
+        return new NativeStartProgress(nativeStore,pipeline,scope,artifacts,models,stores);
+    }
+
     List<String> progressChainsOf(String pipelineId, ArtifactStore artifacts, Function<SourceResource, SourceModel> models,
             Supplier<SrsStores> stores) {
         return resolutions(pipelineId, true, artifacts, models, stores).stream()

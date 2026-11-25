@@ -14,7 +14,7 @@ import java.util.UUID;
 
 /** A target's operator identity and schema are independent of the default cache's runtime authority. */
 final class MongoCacheOperatorDatabases {
-    private static final List<SystemCollections> TABLES = List.of(SystemCollections.CACHE_IDENTITY,
+    static final List<SystemCollections> TABLES = List.of(SystemCollections.CACHE_IDENTITY,
             SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_NEST_SHAPES);
     private MongoCacheOperatorDatabases() {}
 
@@ -76,6 +76,11 @@ final class MongoCacheOperatorDatabases {
         if (binding == null) throw MongoCachePipelineAccess.fenced();
         var structure = new MongoCacheMetadataStructure(target, MongoRateHistoryStore.DEFAULT_RETENTION);
         for (var table : TABLES) structure.verifyFacet(table);
+        return requireOwner(session, target, binding);
+    }
+
+    static String requireOwner(ClientSession session, MongoDatabase target, OperatorDatabaseBinding binding) {
+        if (binding == null) throw MongoCachePipelineAccess.fenced();
         var identities = SystemCollections.CACHE_IDENTITY.on(target);
         if (!identity(target, binding).equals(identities.find(session, new Document("_id", "operator")).first())
                 || identities.countDocuments(session) != 1) throw unavailable();

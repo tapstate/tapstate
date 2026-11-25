@@ -44,6 +44,51 @@ class StoreBackedDagSourceScopedModelTest {
         assertThat(f.store.derivedSchemas().pinned("p", "widen")).isEmpty();
     }
 
+    @Test void connectorReadinessUsesTheValidatedCapturedSinkSetOnce() {
+        var f = fixture(false);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var selected = new AtomicReference<java.util.Set<String>>();
+        var prepared = f.source.prepareStart(f.pass(() -> {}), "default", (connectors, hashes) -> {
+            calls.incrementAndGet();
+            selected.set(connectors);
+            assertThat(connectors).containsExactly("mongodb");
+            assertThat(hashes).isEmpty();
+            assertThat(f.views.writes).isEmpty();
+            f.store.artifacts().save(new SourceResource("dest", null, "replacement", Map.of(),
+                    null, null, null, null));
+        });
+        assertThat(calls).hasValue(1);
+        assertThat(prepared.sinkConnectors().values()).containsExactlyElementsOf(selected.get());
+        assertThat(prepared.artifactSnapshot().orElseThrow().get("dest")).get()
+                .isInstanceOfSatisfying(SourceResource.class, target -> assertThat(target.connector()).isEqualTo("mongodb"));
+    }
+
+    @Test void aReplacedDefinitionCannotDispatchConnectorReadiness() {
+        var f = fixture(false);
+        var pass = f.pass(() -> {});
+        f.store.artifacts().save(pipeline(false, "replacement"));
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        assertThatThrownBy(() -> f.source.prepareStart(pass, "default", (connectors, hashes) -> calls.incrementAndGet()))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
+        assertThat(calls).hasValue(0);
+    }
+
+    @Test void theReadinessOverloadPreservesExistingScopedDagImplementations() {
+        var f = fixture(false);
+        var pass = f.pass(() -> {});
+        var prepared = f.source.prepareStart(pass, "default");
+        var legacy = org.mockito.Mockito.mock(DagSource.class, org.mockito.Mockito.CALLS_REAL_METHODS);
+        org.mockito.Mockito.doReturn(prepared).when(legacy).prepareStart(pass, "default");
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        assertThat(legacy.prepareStart(pass, "default", (connectors, hashes) -> {
+            calls.incrementAndGet();
+            assertThat(connectors).containsExactly("mongodb");
+            assertThat(hashes).isEqualTo(prepared.connectorHashes());
+        })).isSameAs(prepared);
+        assertThat(calls).hasValue(1);
+    }
+
     @Test void startRetainsTheDefinitionCapturedBeforeAnotherApply() {
         var f = fixture(false); var pass = f.pass(() -> {});
         var prepared = f.source.prepareStart(pass, "default");
@@ -380,6 +425,7 @@ class StoreBackedDagSourceScopedModelTest {
         var notes=org.mockito.Mockito.mock(RequiredNoteStore.class);
         org.mockito.Mockito.when(notes.guardedBy(org.mockito.ArgumentMatchers.any())).thenReturn(notes);
         org.mockito.Mockito.when(notes.open(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0),5));
+        org.mockito.Mockito.when(notes.openPipelineScopes(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenCallRealMethod();
         org.mockito.Mockito.when(notes.prepareOrigin(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any())).thenAnswer(call -> call.getArgument(1));
         var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"synthetic.NotLoaded","2.0.8",null,null,"a".repeat(64),false);
         var source=new StoreBackedDagSource(f.store,new StoreBackedDagSource.PdkSinkWriterBinder(notes,id -> ref));

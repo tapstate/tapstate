@@ -70,7 +70,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     static final AtomicLong LEASE_LOSSES = new AtomicLong();
 
     enum Validation {
-        TRANSACTION, LEASE;
+        TRANSACTION, LEASE, EXECUTION;
 
         static Validation selected() {
             return "transaction".equals(System.getProperty(VALIDATION_PROPERTY)) ? TRANSACTION : LEASE;
@@ -84,6 +84,10 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     private record Lease(long deadlineNanos, boolean writes, String preparationId, long inventoryRevision) {}
 
     MongoCacheOperatorStateStore(MongoCachePipelineAccess access, OperatorPlacement placement) {
+        this(access, placement, false);
+    }
+
+    MongoCacheOperatorStateStore(MongoCachePipelineAccess access, OperatorPlacement placement, boolean executionBoundNest) {
         this.access = Objects.requireNonNull(access, "access"); this.placement = Objects.requireNonNull(placement, "placement");
         if (!access.scope.equals(placement.scope())) throw MongoCachePipelineAccess.fenced();
         target = access.operatorDatabase(placement.database(), placement.resource());
@@ -92,7 +96,8 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
                 .append("database", placement.database()).append("resource", placement.resource().name())
                 .append("stepId", OperatorStateText.encode(placement.stepId())).append("pathId", OperatorStateText.encode(placement.pathId())).append("namespace", OperatorStateText.encode(placement.namespace()));
         addressBytes = 1024L + 3L * address.toJson().length();
-        validation = Validation.selected();
+        var selected = Validation.selected();
+        validation = executionBoundNest && selected == Validation.LEASE ? Validation.EXECUTION : selected;
     }
 
     static SystemCollections table(OperatorPlacement.Resource resource) {
@@ -248,17 +253,17 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
      * mode validates every call instead, and opening is then a no-op.
      */
     void openLease() {
-        if (validation == Validation.LEASE) prove(access.originalClaim() != null);
+        if (validation != Validation.TRANSACTION) prove(access.originalClaim() != null);
     }
 
     private <T> T read(Function<ClientSession, T> action) {
         if (validation == Validation.TRANSACTION) return transaction(false, action);
-        return leased(false, proved -> access.leasedRead(committed, action));
+        return leased(false, proved -> access.leasedRead(committed, target, action));
     }
 
     private <T> T write(Function<ClientSession, T> action) {
         if (validation == Validation.TRANSACTION) return transaction(true, action);
-        return leased(true, proved -> access.leasedWrite(committed, session -> {
+        return leased(true, proved -> access.leasedWrite(committed, target, session -> {
             requireProvedInventory(session, proved);
             return action.apply(session);
         }));
@@ -276,13 +281,18 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
      */
     private <T> T leased(boolean writes, Function<Lease, T> operation) {
         Lease current = lease.get();
-        if (current == null || System.nanoTime() - current.deadlineNanos() >= 0 || (writes && !current.writes())) current = prove(writes);
+        if (!stands(current) || (writes && !current.writes())) current = prove(writes || validation == Validation.EXECUTION);
         try {
             return operation.apply(current);
         } catch (RuntimeException failure) {
             if (lease.compareAndSet(current, ended())) LEASE_LOSSES.incrementAndGet();
             throw failure;
         }
+    }
+
+    private boolean stands(Lease proof) {
+        return proof != null && proof.preparationId() != null
+                && (validation == Validation.EXECUTION || System.nanoTime() - proof.deadlineNanos() < 0);
     }
 
     /**
@@ -294,7 +304,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     private Lease prove(boolean writes) {
         synchronized (proving) {
             Lease standing = lease.get();
-            if (standing != null && System.nanoTime() - standing.deadlineNanos() < 0 && (standing.writes() || !writes)) return standing;
+            if (stands(standing) && (standing.writes() || !writes)) return standing;
             long startedAt = System.nanoTime();
             long maximum = TimeUnit.MILLISECONDS.toNanos(Math.max(1L, Long.getLong(LEASE_PROPERTY, DEFAULT_LEASE_MILLIS)));
             boolean claimed = access.originalClaim() != null;
@@ -314,7 +324,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             // Published only over the exact lease this proof started from. A proof that ran out while validating,
             // or whose starting lease a drop replaced meanwhile, serves only the operation it was proved for and
             // is never visible to another one, which proves again.
-            if (System.nanoTime() - proved.deadlineNanos() < 0) lease.compareAndSet(before, proved);
+            if (stands(proved)) lease.compareAndSet(before, proved);
             return proved;
         }
     }

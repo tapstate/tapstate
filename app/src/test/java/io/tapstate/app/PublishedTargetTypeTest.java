@@ -13,7 +13,6 @@ import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -191,14 +190,16 @@ class PublishedTargetTypeTest {
     @Test
     void aComputedDecimalWithTheSameTypeCannotBorrowAnOlderSourcesBounds() {
         TargetTable base = new TargetTable("orders", List.of(
-                new TargetField("amount", "decimal(10,2)", false)));
-        NodeColumns source = shared("amount", "DECIMAL NULL");
-        NodeColumns computed = source.withUnchangedFields(Set.of());
+                new TargetField("amount", "decimal(10,2)", false, TapstateType.DECIMAL)));
+        NodeColumns source = shared("amount", "DECIMAL NULL")
+                .withLegacyDecimalDeclarations(Map.of("amount", "decimal(10,2)"));
+        NodeColumns computed = NodeColumns.of(new TransformBody.MapProjection(Map.of("amount",
+                FieldRule.computed("has(after.amount) ? after.amount : before.amount"))), Map.of("in", source), null);
 
-        assertThat(typesOf(StoreBackedDagSource.publishedAs(base, source, source)))
-                .containsEntry("amount", "decimal(10,2)");
-        assertThat(typesOf(StoreBackedDagSource.publishedAs(base, computed, source)))
-                .containsEntry("amount", null);
+        assertThat(StoreBackedDagSource.publishedAs(base, source, source).fields())
+                .containsExactlyElementsOf(base.fields());
+        assertThat(StoreBackedDagSource.publishedAs(base, computed, source).fields())
+                .containsExactly(new TargetField("amount", null, false, TapstateType.DECIMAL));
     }
 
     /**

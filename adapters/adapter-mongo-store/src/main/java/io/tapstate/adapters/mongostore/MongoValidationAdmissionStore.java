@@ -283,10 +283,16 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         }
 
         private <T> T call(Function<ClientSession, T> action) {
-            return owner.transaction(() -> MongoValidationSchema.requireReady(owner.database, true), session -> {
-                if (!MongoValidationPreparations.validationEnabled(session, owner.database, owner.clusterId)) throw unreadable("schema");
-                MongoValidationSchema.requireMutationReady(owner.database, session);
-                return action.apply(session);
+            return MongoValidationSchema.duringDefinitionOperation(() -> {
+                var firstAttempt = new boolean[] {true};
+                return owner.transaction(() -> MongoValidationSchema.requireReady(owner.database, true), session -> {
+                    if (!firstAttempt[0]) MongoValidationSchema.refreshDefinitionSchema(owner.database);
+                    firstAttempt[0] = false;
+                    var schema = SystemCollections.SCHEMA_MIGRATIONS.on(owner.database)
+                            .find(session, new Document("_id", "config")).first();
+                    MongoValidationSchema.requireVerifiedDefinitionSchema(owner.database, schema, owner.clusterId);
+                    return action.apply(session);
+                });
             });
         }
         private void scope(Task task) { if (!owner.clusterId.equals(task.clusterId())) throw unreadable("task-cluster"); }
@@ -808,11 +814,11 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (validation != null && !validation.pipelineId().equals(pipeline) || recovery != null && !recovery.pipeline().equals(pipeline)) throw unreadable("pipeline");
     }
     <T> T transaction(Function<ClientSession, T> work) { return transaction(() -> {}, work); }
-    <T> T transaction(Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
-        return transaction(false, verifyAdditionalStructures, work);
+    <T> T transaction(Runnable requireAdditionalAuthority, Function<ClientSession, T> work) {
+        return transaction(false, requireAdditionalAuthority, work);
     }
-    private <T> T transaction(boolean admission, Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
-        return transaction(admission, verifyAdditionalStructures, work, false);
+    private <T> T transaction(boolean admission, Runnable requireAdditionalAuthority, Function<ClientSession, T> work) {
+        return transaction(admission, requireAdditionalAuthority, work, false);
     }
 
     void requireCountStartSnapshot(Start start) {
@@ -822,12 +828,13 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         }, true);
     }
 
-    private <T> T transaction(boolean admission, Runnable verifyAdditionalStructures, Function<ClientSession, T> work,
+    private <T> T transaction(boolean admission, Runnable requireAdditionalAuthority, Function<ClientSession, T> work,
             boolean countStartRead) {
-        return StoreIo.call(() -> {
-            requireActive.run(); verifyStructures(); verifyAdditionalStructures.run();
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            requireActive.run(); requireAdditionalAuthority.run();
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
+                    MongoStructureFailureScope.beginCallback();
                     requireActive.run();
                     if (countStartRead) validation.enterCountStartRead(client, database, session);
                     else {
@@ -841,22 +848,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                     var result = work.apply(session); requireActive.run(); return result;
                 }, TRANSACTION);
             }
-        });
-    }
-    private void verifyStructures() {
-        if (validation != null && validation.manualCount()) {
-            var names = java.util.List.of(SystemCollections.VALIDATION_TASKS.collectionName(),
-                    SystemCollections.VALIDATION_REPORTS.collectionName());
-            var collections = database.listCollections()
-                    .filter(new Document("name", new Document("$in", names)).append("type", "collection"))
-                    .into(new java.util.ArrayList<>());
-            if (collections.size() != names.size()) throw unreadable("validation-collection");
-            return;
-        }
-        for (var table : java.util.List.of(SystemCollections.VALIDATION_TASKS, SystemCollections.VALIDATION_REPORTS)) {
-            var row = database.listCollections().filter(new Document("name", table.collectionName())).first();
-            if (row == null || !"collection".equals(row.get("type"))) throw unreadable("validation-collection");
-        }
+        }));
     }
     record ScheduledUpgradeProgress(Document cursor, long initialized, String phase) {}
     static ScheduledUpgradeProgress advanceScheduledUpgradeTask(ClientSession session, MongoDatabase database, String cluster, String operation, Document upgrade) {

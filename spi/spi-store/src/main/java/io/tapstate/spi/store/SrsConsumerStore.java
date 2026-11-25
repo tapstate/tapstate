@@ -23,8 +23,70 @@ public interface SrsConsumerStore {
     SrsConsumerTopology attached(String miningChainId);
     record AttachedChain(SrsConsumerTopology topology, SrsChainState chain) {}
 
+    record PlanningProgress(SrsChainState chain, List<SrsConsumerProgress> consumers) {
+        public PlanningProgress { consumers = List.copyOf(consumers); }
+    }
+
+    /**
+     * Predicts a start using only the requested source consumers at the original pipeline generation.
+     * Native stores verify shared control and cursor identities in one snapshot without loading peer
+     * progress payloads. Missing retained history still refuses the read. Legacy facets compose reads.
+     * This result grants no capture, mutation or cleanup authority.
+     */
+    default Optional<PlanningProgress> planningProgress(PipelineIntentScope original, String chain, Set<String> sourceIds) {
+        var held = attachedWithChain(chain);
+        if (!held.topology().scope().equals(new CacheBusinessScope(original.clusterId(),original.bindingVersion(),original.cacheIncarnation()))
+                || !chain.equals(held.chain().miningChainId()))
+            throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        var selected = new java.util.ArrayList<SrsConsumerProgress>();
+        for (var member : held.topology().consumers()) {
+            if (!member.context().key().pipelineId().equals(original.pipelineId())
+                    || !sourceIds.contains(member.context().key().sourceId())) continue;
+            if (member.context().stateGeneration() != original.stateGeneration())
+                throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            selected.add(progress(member.context()).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                    IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", chain), null)));
+        }
+        return Optional.of(new PlanningProgress(held.chain(), selected));
+    }
+
+    /** Predicts only this start's load mode; complete chain integrity is verified during startup. */
+    default Optional<PlanningProgress> startLoadProgress(PipelineIntentScope original, String chain, Set<String> sourceIds) {
+        return planningProgress(original, chain, sourceIds);
+    }
+
     default AttachedChain attachedWithChain(String chain) {
         throw new UnsupportedOperationException("combined Capture topology is not supported");
+    }
+
+    /** Legacy facets compose their reads; native stores override this with one validated snapshot. */
+    default AttachedChain attachedWithChain(String chain, SrsChainStore chains) {
+        var topology = attached(chain);
+        var state = chains.load(chain).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null));
+        return new AttachedChain(topology, state);
+    }
+
+    /** Retention diagnoses a missing checkpoint before inspecting its consumer relations. */
+    default AttachedChain retentionSnapshot(String chain, SrsChainStore chains) {
+        var state = chains.load(chain).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null));
+        return new AttachedChain(attached(chain), state);
+    }
+
+    /** Native stores return confirmed floors from one snapshot; legacy facets abandon a changed relation. */
+    default Optional<Map<String, Long>> retentionFloors(String chain, SrsChainStore chains) {
+        var attached = retentionSnapshot(chain, chains);
+        var serving = attached.chain().servingTables();
+        var floors = new java.util.TreeMap<String, Long>();
+        for (var member : attached.topology().consumers()) {
+            if (java.util.Collections.disjoint(member.tables(), serving)) continue;
+            var held = progress(member.context());
+            if (held.isEmpty() || held.orElseThrow().membershipRevision() != member.revision()) return Optional.empty();
+            for (String table : member.tables()) if (serving.contains(table))
+                floors.merge(table, held.orElseThrow().ringDoneThrough().getOrDefault(table, -1L), Math::min);
+        }
+        return Optional.of(Map.copyOf(floors));
     }
 
     record ControlSnapshot(SrsConsumerTopology topology,SrsChainState chain,java.util.List<ConsumerOffset> cursors){
@@ -55,6 +117,44 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("Capture startup sampling is not supported");
     }
 
+    record StartupSnapshot(SrsChainState chain, SrsConsumerProgress progress,
+            Optional<Map<String, SrsModel>> published, Map<String, SrsLogBounds> bounds) {
+        public StartupSnapshot {
+            published = published.map(Map::copyOf);
+            bounds = Map.copyOf(bounds);
+        }
+    }
+
+    /**
+     * Reads the chain and original consumer in one snapshot. A nonempty selection also reads the
+     * published models and the boundaries of their missing arrivals. This grants no write authority.
+     */
+    default Optional<StartupSnapshot> startupSnapshot(SrsConsumerContext context, Map<String, String> ringsByTable) {
+        throw new UnsupportedOperationException("Capture startup sampling is not supported");
+    }
+
+    /** The same pre-open read supplies this consumer's progress and the shared table demand. */
+    record StartupPreparation(StartupSnapshot snapshot, SrsConsumerTopology topology) {}
+
+    default Optional<StartupPreparation> startupPreparation(SrsConsumerContext context, boolean verifyControlClosure) {
+        return startupSnapshot(context, Map.of(), verifyControlClosure).map(snapshot ->
+                new StartupPreparation(snapshot, attachedWithChain(context.key().miningChainId()).topology()));
+    }
+
+    record StartupAttachment(SrsConsumerMembership member, Optional<StartupPreparation> preparation) {}
+
+    /** A store may return the validated topology and retained progress from its committed attach. */
+    default Optional<StartupAttachment> attachAndPrepareForStartup(SrsConsumerContext context, Set<String> tables,
+            WorkloadClaimFence fence) {
+        return attachForStartup(context, tables, fence).map(member -> new StartupAttachment(member, Optional.empty()));
+    }
+
+    /** The first source on a shared chain also verifies its complete membership control closure. */
+    default Optional<StartupSnapshot> startupSnapshot(SrsConsumerContext context, Map<String, String> ringsByTable,
+            boolean verifyControlClosure) {
+        return startupSnapshot(context, ringsByTable);
+    }
+
     /** The exact progress committed by an admitted startup's conditional write. */
     default Optional<SrsConsumerProgress> startReadingAfterAndGet(SrsConsumerContext context, long membershipRevision,
             long expectedProgressRevision, Map<String, Long> sequences, WorkloadClaimFence fence) {
@@ -62,7 +162,16 @@ public interface SrsConsumerStore {
     }
 
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
+
+    /** Reads only this consumer for observation; a detached predecessor supplies no progress. */
+    default Optional<ConsumerOffset> observationCursor(SrsConsumerContext context) { return cursor(context); }
+
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
+
+    /** Reads the current consumer progress and validates any retained snapshot pin for startup. */
+    default Optional<SrsConsumerProgress> snapshotResumeProgress(SrsConsumerContext context) {
+        return progress(context);
+    }
 
     /** Stages one unused physical chain from an exact earlier consumer ACK under the replacement execution. */
     default Optional<SrsConsumerMembership> prepareConnectorHandoff(SrsConsumerProgress original,
@@ -160,6 +269,15 @@ public interface SrsConsumerStore {
                                 WorkloadClaimFence originalPipelineFence);
 
     /** Uses the original expected relation revision and Pipeline claim; existing progress is preserved. */
+    /** Reads or attaches the original retained consumer under this Start's execution fence. */
+    default Optional<SrsConsumerMembership> attachForStartup(SrsConsumerContext context, Set<String> tables,
+            WorkloadClaimFence fence) {
+        var held = find(context.key());
+        return held.filter(member -> !member.detached() && member.context().equals(context)
+                && member.tables().equals(tables) && member.commandFence().equals(fence))
+                .or(() -> attach(context, held.map(SrsConsumerMembership::revision).orElse(0L), tables, fence));
+    }
+
     Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables,
                                           WorkloadClaimFence originalPipelineFence);
 

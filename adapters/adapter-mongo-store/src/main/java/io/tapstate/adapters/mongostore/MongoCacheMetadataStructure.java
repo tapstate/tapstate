@@ -24,7 +24,7 @@ final class MongoCacheMetadataStructure {
             SystemCollections.CACHE_CONNECTOR_CATALOG, SystemCollections.CACHE_CONNECTOR_SPECS,
             SystemCollections.CACHE_CONNECTION_TEST_RESULTS,
             SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY);
-    private static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
+    static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
             SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
             SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS,
             SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,
@@ -121,10 +121,14 @@ final class MongoCacheMetadataStructure {
 
     void verifySrs() { verify(SRS_TABLES); }
 
-    void verifySrsRuntime() {
-        var tables = new java.util.ArrayList<>(SRS_TABLES);
-        tables.add(SystemCollections.CACHE_PIPELINE_STATE);
-        verify(tables);
+    private static void requireNamespaces(Set<String> required, Map<String, Document> existing) {
+        if (!existing.keySet().equals(required)) throw unreadable("collections");
+        for (var description : existing.values()) {
+            if (!"collection".equals(description.get("type"))) throw unreadable("collection-type");
+            Document options = description.get("options", Document.class);
+            if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries")))
+                throw unreadable("collection-options");
+        }
     }
 
     static boolean simpleCollations(MongoDatabase database, List<SystemCollections> tables) {
@@ -152,14 +156,8 @@ final class MongoCacheMetadataStructure {
         StoreIo.run(() -> {
             var required = names(tables);
             var existing = collections(required, remainingMillis);
-            if (!existing.keySet().equals(required)) throw unreadable("collections");
+            requireNamespaces(required, existing);
             for (var table : tables) {
-                for (String name : table.physicalNames()) {
-                    Document description = existing.get(name);
-                    if (!"collection".equals(description.get("type"))) throw unreadable("collection-type");
-                    Document options = description.get("options", Document.class);
-                    if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("collection-options");
-                }
                 var rows = readIndexes(table.indexTargetOn(metadataDatabase(remainingMillis)), remainingMillis != null);
                 verifyId(rows);
                 if (table != SystemCollections.CACHE_PIPELINE_RATE_HISTORY && rows.stream().anyMatch(row -> row.containsKey("expireAfterSeconds"))) throw unreadable("ttl-index");

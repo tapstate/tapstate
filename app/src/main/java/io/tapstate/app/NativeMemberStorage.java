@@ -16,6 +16,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final ClusterProperties properties;
     private final WorkloadClaimStore claims;
     private final SrsStores sources;
+    private final ClusterProperties.WorkloadLeases leases;
     // Publishes the startup lease handle; NodeSessionLease owns its atomic lease state.
     @SuppressWarnings("java:S3077")
     private volatile NodeSessionLease startupLease;
@@ -30,11 +31,13 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final CheckpointProgressWrites progressWrites = new CheckpointProgressWrites();
 
     NativeMemberStorage(StorageRuntime.Bound bound, MongoConfigurationDomain configuration, ClusterProperties properties,
-            WorkloadClaimStore claims, SrsStores sources) {
+            WorkloadClaimStore claims, SrsStores sources, ClusterProperties.WorkloadLeases leases) {
         this.bound = Objects.requireNonNull(bound); this.configuration = Objects.requireNonNull(configuration);
         this.properties = Objects.requireNonNull(properties); this.claims = Objects.requireNonNull(claims);
         this.sources = Objects.requireNonNull(sources);
+        this.leases = Objects.requireNonNull(leases);
     }
+    @Override public boolean processOwnsNode() { return leases == ClusterProperties.WorkloadLeases.NODE_BACKED; }
     @Override public synchronized void prepare(Config config, WorkloadClaim originalNode, long askedAt) {
         bound.requireBusiness();
         if (closed || authorization != null || originalNode == null) throw ThreeLayerStorePort.refused();
@@ -44,7 +47,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         config.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         config.getUserContext().put(SrsStoreViews.USER_CONTEXT_KEY, sourceViews());
         config.getUserContext().put(CheckpointProgressWrites.USER_CONTEXT_KEY, progressWrites);
-        maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization));
+        maps = OperatorMapBindings.prepare(config, new ScopedOperatorStateProvider(bound.cache(), authorization, leases == ClusterProperties.WorkloadLeases.NODE_BACKED));
         ScopedSinkStateProvider.bind(config, bound.cache(), configuration.requiredNotes());
         RequiredNestDeadLetter.bindTo(config, new ScopedRequiredDeadLetterProvider(configuration.requiredDeadLetters(), authorization));
     }
@@ -82,7 +85,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
             @Override public <T> T withCaptureStartup(CacheBusinessScope expected, java.util.function.Supplier<T> step) {
                 requireNode();
                 if (!expected.equals(bound.preparation().businessScope())) throw ThreeLayerStorePort.refused();
-                return bound.cache().withCaptureStartup(expected, step);
+                return step.get();
             }
 
             @Override public DirectChannelStore directChannels(CacheBusinessScope expected, Runnable active) {

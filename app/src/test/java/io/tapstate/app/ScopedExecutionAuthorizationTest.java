@@ -109,6 +109,28 @@ class ScopedExecutionAuthorizationTest {
         }
     }
 
+    @Test void aCommittedLocalRenewalCanBridgeAStaleReaderForTheOriginalWriter() {
+        var original = WorkloadClaimFence.from(run());
+        var fence = new ExecutionFence(FIRST, original);
+        try (var guard = guard(Duration.ofSeconds(1))) {
+            assertThat(guard.require(fence)).isEqualTo(original);
+            var writer = guard.localProofGuard(fence);
+            when(store.readPipeline(FIRST)).thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE,
+                    Map.of("detail", "MongoOperationTimeoutException"), null));
+            var local = new AtomicBoolean(true);
+            guard.useLocalWriterLease(current -> fence.equals(current) && local.get());
+            nanos.set(TTL.plusMillis(1).toNanos());
+            writer.run();
+            local.set(false);
+            assertThatThrownBy(writer::run).isInstanceOfSatisfying(TapstateException.class,
+                    refusal -> assertThat(refusal.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            local.set(true);
+            nodeActive.set(false);
+            assertThatThrownBy(writer::run).isInstanceOfSatisfying(TapstateException.class,
+                    refusal -> assertThat(refusal.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        }
+    }
+
     @Test void writerRecoveryStopsAtTheLastProvedLeaseDeadline() {
         var original = WorkloadClaimFence.from(run());
         var fence = new ExecutionFence(FIRST, original);
@@ -279,13 +301,21 @@ class ScopedExecutionAuthorizationTest {
     @Test void aReplyAfterTheOriginalLeaseBoundDoesNotAuthorize() {
         WorkloadClaim run = raw.advanceExecution(raw.acquire(KEY, OWNER, 7, Duration.ofMillis(100)).claim(),
                 7, Set.of("node-a")).orElseThrow();
+        var attempts = new AtomicInteger();
         try (var guard = guard()) {
             when(store.readPipeline(FIRST)).thenAnswer(call -> {
-                WorkloadClaimReading captured = raw.read(KEY).orElseThrow();
+                var captured = raw.read(KEY);
+                attempts.incrementAndGet();
+                raw.elapse(Duration.ofMillis(200));
                 nanos.addAndGet(Duration.ofMillis(200).toNanos());
-                return java.util.Optional.of(captured);
+                return captured;
             });
             assertThat(guard.authorized(new ExecutionFence(FIRST, WorkloadClaimFence.from(run)))).isFalse();
+            assertThat(attempts).hasValue(2);
+            assertThat(raw.read(KEY)).hasValueSatisfying(current -> {
+                assertThat(current.leased()).isFalse();
+                assertThat(current.claim().leaseUntil()).isEqualTo(run.leaseUntil());
+            });
         }
     }
 

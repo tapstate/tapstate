@@ -7,6 +7,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CachePreparation;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupStateStore;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -45,6 +46,8 @@ final class StorageRuntime implements AutoCloseable {
     private final AtomicReference<CompletableFuture<Void>> businessOpening =
             new AtomicReference<>(CompletableFuture.completedFuture(null));
     private volatile boolean cleanupUnknown;
+    private boolean cacheClosed;
+    private boolean configurationClosed;
     private final Runnable ownerActive;
 
     StorageRuntime(MongoConfigurationDomain configuration, Function<StorageBinding, MongoCacheDomain> connections) {
@@ -186,7 +189,7 @@ final class StorageRuntime implements AutoCloseable {
         if (cleanupUnknown) throw unavailable();
         verifyCompletedSetup(original);
         verifyRecoveryPublication(original, running);
-        original.requireAuthentication(); original.verifyBusiness();
+        original.requireAuthentication(); original.verifyRetainedBusiness();
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
         creatingBusiness.set(candidate);
         try {
@@ -281,6 +284,11 @@ final class StorageRuntime implements AutoCloseable {
             try { cache.verifyBusinessReady(preparation.businessScope()); requireActive(); businessReady = true; }
             catch (RuntimeException | Error unavailable) { businessReady = false; throw unavailable; }
         }
+        void verifyRetainedBusiness() {
+            requireActive();
+            try { cache.loadBusinessScope(preparation.businessScope()); requireActive(); businessReady = true; }
+            catch (RuntimeException | Error unavailable) { businessReady = false; throw unavailable; }
+        }
         void requireAuthentication() { requireActive(); if (!authReady) throw unavailable(); }
         void requireBusiness() { requireActive(); if (!businessReady) throw unavailable(); }
         @Override public String toString() { return "BoundStorageRuntime[redacted]"; }
@@ -302,8 +310,9 @@ final class StorageRuntime implements AutoCloseable {
                     creatingBusiness.compareAndSet(creating, null);
                 }
                 if (business != null) business.close();
-                if (bound != null) bound.cache.close();
-                if (configuration != null) configuration.close();
+                ShutdownAwait.all(List.of(
+                        () -> ShutdownAwait.stage("CACHE close", this::closeCache),
+                        () -> ShutdownAwait.stage("CONFIG close", this::closeConfiguration)));
                 closed = true;cleanupUnknown = false;
             } catch (Error error) { cleanupUnknown = true;throw error; }
             catch (Exception failure) {
@@ -311,6 +320,24 @@ final class StorageRuntime implements AutoCloseable {
                 var unavailable = unavailable();unavailable.addSuppressed(failure);throw unavailable;
             }
         });
+    }
+
+    void stopPublishedMemberAfterFailedClose() {
+        if (business instanceof NativeBusinessContext owner) owner.stopMemberAfterFailedClose();
+    }
+
+    private void closeCache() {
+        if (bound != null && !cacheClosed) {
+            bound.cache.close();
+            cacheClosed = true;
+        }
+    }
+
+    private void closeConfiguration() {
+        if (configuration != null && !configurationClosed) {
+            configuration.close();
+            configurationClosed = true;
+        }
     }
 
     private void closeCandidate(AutoCloseable candidate, Throwable failure) {

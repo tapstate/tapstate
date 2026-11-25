@@ -62,10 +62,14 @@ final class AlertNotificationPlanner {
         var discovered=seed.schedules().isEmpty()?initial:store.planning();
         var keys=discovered.schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
         int count=Math.min(32,keys.size());
+        var retained=discovered;
         for(int index=0;index<count;index++){var key=keys.get(Math.floorMod(offset+index,keys.size()));active.run();
             boolean done=false;for(int retry=0;retry<3;retry++){
-                var view=store.planning();isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
+                var view=retained==null?store.planning():retained;retained=view;isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
                 var changes=advance(view,row.get());if(changes.intents().isEmpty()&&changes.schedules().isEmpty()){done=true;break;}
+                // Any commit attempt may advance the version or observe a competing write.
+                // No proposal after it may reuse this tick's earlier snapshot.
+                retained=null;
                 if(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,changes.intents(),changes.schedules(),view.version()))!=AlertStore.Outcome.CONFLICT){done=true;break;}
             }if(!done)throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
         }
@@ -258,6 +262,7 @@ final class AlertNotificationPlanner {
     }
     private static TapstateException unavailableRule(){return new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-planning","field","rule-capability"),null);}
     private List<Destination> destinations(AlertStore.Planning view,AlertStateRecord.Head head) {
+        if(head!=null && AlertEvaluationHost.structureInspection(head.snapshot().rule().key().typeId()))return List.of();
         var host=view.host();var result=new ArrayList<Destination>();
         if(host.deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED){
             if(host.managedRoute()==null||host.managedTarget()==null||cloudOrigin==null)throw invalid("managed-planning-binding");
@@ -285,7 +290,8 @@ final class AlertNotificationPlanner {
                 .filter(Objects::nonNull).anyMatch(v->v.value().state().summary()==DeliveryEvidence.Outcome.ACCEPTED&&v.value().frozen().members().stream().anyMatch(m->m.episodeMember().equals(member.episodeMember())));
     }
     private static boolean bindingCurrent(AlertStore.Planning view,AlertIntent.Member member){return view.definitions().stream().filter(d->d instanceof AlertConfiguration.Rule).map(d->(AlertConfiguration.Rule)d).anyMatch(r->r.header().identity().equals(member.ruleIdentity())&&r.evaluationRevision()==member.evaluation().revision()&&r.matches(member.evaluation().key()));}
-    private boolean matches(Destination d,AlertStateRecord.Head head){return d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity());}
+    private boolean matches(Destination d,AlertStateRecord.Head head){return !AlertEvaluationHost.structureInspection(head.snapshot().rule().key().typeId())
+            && (d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity()));}
     private boolean muted(AlertStore.Planning view,Destination d,AlertStateRecord.Head head,Instant now){
         for(var def:view.definitions())if(def instanceof AlertConfiguration.Silence silence&&silence.matches(head.snapshot().rule().key(),now))return true;
         if(d.subscription()!=null){var policy=new AlertInhibitionPolicy(view.host().scope(),d.subscription().inhibition());

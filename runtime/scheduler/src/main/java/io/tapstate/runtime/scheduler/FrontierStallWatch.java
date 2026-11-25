@@ -61,7 +61,7 @@ public final class FrontierStallWatch {
      * chain that is pinned may report no distance, and a chain that reports one may not be pinned. Only
      * the pinned ones are judged here, each carrying whatever distance it has.
      */
-    public void saw(String pipelineId, Map<String, Long> stalls, Map<String, Long> gaps) {
+    public synchronized void saw(String pipelineId, Map<String, Long> stalls, Map<String, Long> gaps) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(stalls, "stalls");
         Objects.requireNonNull(gaps, "gaps");
@@ -94,7 +94,7 @@ public final class FrontierStallWatch {
     }
 
     /** Which chains are currently held, as pipeline and chain together — what a caller asserts on. */
-    Set<String> watching() {
+    synchronized Set<String> watching() {
         Set<String> held = new HashSet<>();
         synchronized (byPipeline) {
             byPipeline.forEach((pipelineId, chains) ->
