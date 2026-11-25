@@ -102,7 +102,6 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         try {
             Files.createDirectories(directory);
             Path staged = Files.createTempFile(directory, ".connector-", ".jar");
-            boolean complete = false;
             try {
                 try (var file = FileChannel.open(staged, StandardOpenOption.WRITE);
                         var output = Channels.newOutputStream(file)) {
@@ -116,13 +115,13 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
                     }
                     file.force(true);
                 }
-                complete = true;
                 return new StagedArtifact(staged);
-            } finally {
-                if (!complete) Files.deleteIfExists(staged);
+            } catch (IOException | RuntimeException | Error failure) {
+                deleteAfterFailure(staged, failure);
+                throw failure;
             }
         } catch (IOException error) {
-            throw loadFailure("upload");
+            throw loadFailure("upload", error);
         }
     }
 
@@ -135,12 +134,20 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             try {
                 return installStaged(file, origin, expectedId, expectedHash);
             } catch (IOException error) {
-                throw loadFailure(expectedId == null ? "upload" : expectedId);
+                throw loadFailure(expectedId == null ? "upload" : expectedId, error);
             }
         }
 
         @Override public void close() {
             discard(file);
+        }
+    }
+
+    private static void deleteAfterFailure(Path file, Throwable failure) {
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException | SecurityException cleanup) {
+            failure.addSuppressed(cleanup);
         }
     }
 
@@ -162,7 +169,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             Files.delete(artifact);
             return result;
         } catch (IOException error) {
-            throw artifactUnreadable(artifact);
+            throw artifactUnreadable(artifact, error);
         }
     }
 
@@ -181,7 +188,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
             bundled.put(sha256, file);
             return new RegistrationOutcome(selected.registration(), previous == null && newlyRegistered);
         } catch (IOException error) {
-            throw loadFailure(id);
+            throw loadFailure(id, error);
         }
     }
 
@@ -364,11 +371,13 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
                     file.force(true);
                 }
                 installStaged(staged, Origin.LEGACY_GRIDFS, id, hash);
-            } finally {
-                Files.deleteIfExists(staged);
+            } catch (IOException | RuntimeException | Error failure) {
+                deleteAfterFailure(staged, failure);
+                throw failure;
             }
+            Files.deleteIfExists(staged);
         } catch (IOException error) {
-            throw loadFailure(id);
+            throw loadFailure(id, error);
         }
     }
 
@@ -439,7 +448,7 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         try (var input = Files.newInputStream(value.file())) {
             install(input, value.metadata().origin(), id, hash);
         } catch (IOException error) {
-            throw loadFailure(id);
+            throw loadFailure(id, error);
         }
     }
 
@@ -544,7 +553,11 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
     }
 
     private static TapstateException loadFailure(String id) {
-        return new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", id), null);
+        return loadFailure(id, null);
+    }
+
+    private static TapstateException loadFailure(String id, IOException cause) {
+        return new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", id), cause);
     }
 
     private static TapstateException localUnavailable(String id, String hash) {

@@ -410,13 +410,17 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         try (var bytes = Files.newInputStream(artifact)) {
             return ContentHash.of(bytes);
         } catch (IOException failure) {
-            throw artifactUnreadable(artifact);
+            throw artifactUnreadable(artifact, failure);
         }
     }
 
     static TapstateException artifactUnreadable(Path artifact) {
+        return artifactUnreadable(artifact, null);
+    }
+
+    static TapstateException artifactUnreadable(Path artifact, IOException cause) {
         return new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
-                Map.of("artifact", artifact.getFileName().toString()), null);
+                Map.of("artifact", artifact.getFileName().toString()), cause);
     }
 
     private static void phase(String connectorId, String phase, long started) {

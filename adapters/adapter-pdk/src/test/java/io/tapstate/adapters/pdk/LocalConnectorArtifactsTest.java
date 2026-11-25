@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,6 +34,32 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class LocalConnectorArtifactsTest {
     @TempDir
     Path work;
+
+    @Test
+    void failedUploadKeepsTheReadFailureWhenStagingCleanupAlsoFails() throws IOException {
+        var installer = installer(new Cache(), (hash, output) -> false);
+        var original = new IOException("Upload stream interrupted");
+        var brokenUpload = new InputStream() {
+            @Override public int read() throws IOException {
+                try (var paths = Files.walk(work)) {
+                    var staged = paths.filter(path -> path.getFileName().toString().startsWith(".connector-"))
+                            .findFirst().orElseThrow();
+                    Files.delete(staged);
+                    Files.createDirectory(staged);
+                    Files.createFile(staged.resolve("keep"));
+                }
+                throw original;
+            }
+        };
+
+        assertThatThrownBy(() -> installer.stage(brokenUpload, bytes -> {}))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
+                    assertThat(failure.getCause()).isSameAs(original);
+                    assertThat(original.getSuppressed()).hasOnlyElementsOfType(java.nio.file.DirectoryNotEmptyException.class)
+                            .hasSize(1);
+                });
+    }
 
     @Test
     void distinctVersionsRemainAvailableByHashAfterAnOfflineCacheRebuild() throws IOException {
