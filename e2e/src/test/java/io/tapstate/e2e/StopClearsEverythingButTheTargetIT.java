@@ -12,6 +12,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -115,11 +116,9 @@ class StopClearsEverythingButTheTargetIT {
 
             long rowsBeforeTheStop = files.count(target, TABLE);
 
+            var original = NativePipelineScopes.current(storage, pipelineId);
             control.stop(pipelineId, true);
-            Await.until(
-                    pipelineId + " to reach " + PipelineState.STOPPED,
-                    () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
-                    () -> String.valueOf(control.state(pipelineId)));
+            NativePipelineScopes.awaitCleared(control, storage, original, Duration.ofSeconds(90));
 
             assertThat(control.pipelineStatus(pipelineId)).containsEntry("stopState", "CLEARED");
 
