@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
+import io.tapstate.core.common.NumericType;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -28,6 +30,7 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -41,9 +44,9 @@ import org.junit.jupiter.api.Test;
  * where the nest's documents land: in the root's table, matched on the root's key, and routed among a sink's
  * writers by that table and key.
  *
- * <p>The sink is told about the nest's own stream, as for any nest, and no row arriving from this one is on it.
- * Told nothing more, its writers fall back to a bare table name carrying no key, and a sink running several
- * writers - the default - has no target to route the rows by and fails the run on the first of them.
+ * <p>The sink must resolve the model by the original stream ID on each forwarded row. Otherwise,
+ * the writers fall back to a bare table name carrying no key, and a sink running several writers
+ * has no target to route the rows by.
  *
  * <p>The root's key here is not the table's primary key, so a sink that took the table's own model for these rows
  * - matching re-sent rows on a key the nest did not declare - is told apart from one that lands them as the nest's
@@ -100,6 +103,73 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
                 capturing(new AtomicReference<>())).plannedDagFor(PIPELINE, null);
 
         assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, List.of("id")));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void preparesOneTargetForTheDirectAndProjectedNestRoutes(boolean rename) {
+        Map<String, FieldRule> rules = rename ? Map.of("display_name", FieldRule.rename("name"))
+                : Map.of("name", FieldRule.drop());
+        Step project = Step.inline("project", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(rules), null);
+        InMemoryStorePort store = seedStore(List.of(rootOnly(STEP, "id"), project),
+                FromClause.list(FromRef.literal(TABLE), FromRef.literal("project")));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturing(bound)).plannedDagFor(PIPELINE, null);
+
+        var factory = new PdkSinkWriterFactory("fake", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL,
+                bound.get(), new PipelineNode(PIPELINE, "sync_1"));
+        assertThat(factory.preparationInputs(new PipelineIntentScope("cluster", 1L, "cache", PIPELINE, 1L)))
+                .as("the physical target roster for both routes").hasSize(1);
+        assertThat(bound.get()).containsOnlyKeys(TABLE);
+        List<String> fields = rename ? List.of("id", "cust_no", "name", "display_name")
+                : List.of("id", "cust_no", "name");
+        assertThat(bound.get().get(TABLE).fields()).extracting(TargetField::name).containsExactlyElementsOf(fields);
+        assertThat(planned.shape().sinkTargetsOf(SINK))
+                .containsOnly(Map.entry(TABLE, new SinkTarget(TABLE, List.of("id"))));
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void conflictingDecimalDescriptorsCannotFallBackToOneRoutesSpelling(boolean directFirst) {
+        Step project = Step.inline("project", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(Map.of("amount", FieldRule.computed("after.other_amount"))), null);
+        FromRef direct = FromRef.literal(TABLE);
+        FromRef projected = FromRef.literal("project");
+        InMemoryStorePort store = seedStore(List.of(rootOnly(STEP, "id"), project),
+                directFirst ? FromClause.list(direct, projected) : FromClause.list(projected, direct));
+        NumericType wider = new NumericType(null, true, false, null, null, null, 12, 3);
+        store.schemas().save(new DiscoveredSourceModel(SOURCE, "fake", 1L, new SourceModel(List.of(
+                new SourceTable(TABLE, List.of(new SourceField("id", "int"),
+                        new SourceField("amount", "decimal(10,2)", TapstateType.DECIMAL),
+                        new SourceField("other_amount", "decimal(12,3)", TapstateType.DECIMAL, null, wider)),
+                        List.of("id"), List.of())))));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(store, capturing(bound)).dagFor(PIPELINE);
+
+        assertThat(bound.get().get(TABLE).fields()).filteredOn(field -> field.name().equals("amount"))
+                .singleElement().satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.DECIMAL);
+                    assertThat(field.type()).isNull();
+                    assertThat(field.numericType()).isNull();
+                });
+    }
+
+    @Test
+    void aProjectionAfterNestPreservesTheDeclaredCompositeKeyOrder() {
+        List<String> key = List.of("id", "cust_no");
+        Step project = Step.inline("project", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(Map.of("cust_no", FieldRule.computed("after.cust_no"))), null);
+        InMemoryStorePort store = seedStore(List.of(rootOnly(STEP, "id", "cust_no"), project),
+                FromClause.list(FromRef.literal(TABLE), FromRef.literal("project")), key);
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+
+        DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturing(bound)).plannedDagFor(PIPELINE, null);
+
+        assertThat(bound.get()).containsOnlyKeys(TABLE);
+        assertThat(bound.get().get(TABLE).fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactlyElementsOf(key);
+        assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, key));
     }
 
     @org.junit.jupiter.params.ParameterizedTest
@@ -175,12 +245,16 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
     }
 
     /** A nest over the table with nothing to assemble, keyed on {@code key}. */
-    private static Step rootOnly(String id, String key) {
+    private static Step rootOnly(String id, String... key) {
         return Step.inline(id, FromClause.aliases(Map.of("c", FromRef.literal(TABLE))),
                 new TransformBody.Nest(null, null, new NestRoot("c", List.of(key), null, null, List.of())), null);
     }
 
     private static InMemoryStorePort seedStore(List<Step> steps, FromClause served) {
+        return seedStore(steps, served, List.of("id"));
+    }
+
+    private static InMemoryStorePort seedStore(List<Step> steps, FromClause served, List<String> key) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null));
@@ -194,7 +268,7 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         store.schemas().save(new DiscoveredSourceModel(SOURCE, "fake", 0L, new SourceModel(List.of(
                 new SourceTable(TABLE, List.of(new SourceField("id", "int"), new SourceField("cust_no", "string"),
-                        new SourceField("name", "string")), List.of("id"), List.of())))));
+                        new SourceField("name", "string")), key, List.of())))));
         return store;
     }
 }
