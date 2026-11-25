@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.alerting.*;
@@ -14,7 +15,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -23,6 +26,8 @@ import javax.net.ssl.SSLContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import static org.assertj.core.api.Assertions.*;
 
 class CloudAlertSdkChannelTest {
@@ -125,10 +130,10 @@ class CloudAlertSdkChannelTest {
                 "delivery-1", "attempt-1", Instant.now().plusSeconds(10), "application/json",
                 CloudAlertNotificationWire.encode(message, "delivery-1"));
         String delivery = "312345678901234567890123";
-        handler = (exchange, sent) -> reply(exchange, 200, JSON.writeValueAsString(java.util.Map.of(
-                "code", "ok", "opId", "email-request", "data", java.util.Map.of(
-                        "id", delivery, "orgId", ORG, "channel", "EMAIL",
-                        "recipient", "owner@example.test", "status", "PENDING"))));
+        var response = JSON.createObjectNode().put("code", "ok").put("opId", "email-request");
+        response.putObject("data").put("id", delivery).put("orgId", ORG).put("channel", "EMAIL")
+                .put("recipient", "owner@example.test").put("status", "PENDING");
+        handler = (exchange, sent) -> reply(exchange, 200, response.toString());
         try (var channel = new CloudAlertSdkChannel(AlertChannelPolicy.Deployment.CLOUD_MANAGED, destination, origin,
                 "fixture-token", ORG, new InetAddress[]{InetAddress.getLoopbackAddress()}, SSLContext.getDefault(),
                 Clock.systemUTC(), Duration.ofSeconds(3), true)) {
@@ -141,15 +146,29 @@ class CloudAlertSdkChannelTest {
             assertThat(body.get().has("recipient")).isFalse();
             assertThat(auth.get()).isEqualTo("Bearer fixture-token");
 
-            handler = (exchange, sent) -> reply(exchange, 200, JSON.writeValueAsString(java.util.Map.of(
-                    "code", "ok", "opId", "email-request", "data", java.util.Map.of(
-                            "id", delivery, "orgId", ORG, "channel", "EMAIL",
-                            "recipient", "owner@example.test", "status", "QUEUED"))));
-            var invalid = channel.send(request);
-            assertThat(invalid.outcome()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
-            assertThat(invalid.receipt()).isNull();
+            var invalidFacts = Map.of("channel", "SMS", "status", "QUEUED", "recipient", " ",
+                    "orgId", EVENT, "id", "invalid-id");
+            var incorrectReceipts = new LinkedHashMap<String, ObjectNode>();
+            invalidFacts.forEach((field, value) -> {
+                var incorrect = response.deepCopy();
+                ((ObjectNode) incorrect.get("data")).put(field, value);
+                incorrectReceipts.put("invalid " + field, incorrect);
+            });
+            for (String field : List.of("recipient", "status", "orgId")) {
+                var incorrect = response.deepCopy();
+                ((ObjectNode) incorrect.get("data")).remove(field);
+                incorrectReceipts.put("missing " + field, incorrect);
+            }
+            incorrectReceipts.put("missing receipt", JSON.createObjectNode().put("code", "ok"));
+            incorrectReceipts.put("error response", response.deepCopy().put("code", "rejected"));
+            for (var incorrect : incorrectReceipts.entrySet()) {
+                handler = (exchange, sent) -> reply(exchange, 200, incorrect.getValue().toString());
+                var invalid = channel.send(request);
+                assertThat(invalid.outcome()).as(incorrect.getKey()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
+                assertThat(invalid.receipt()).isNull();
+            }
+            assertThat(calls).hasValue(1 + incorrectReceipts.size());
         }
-        assertThat(calls).hasValue(2);
     }
     @Test void malformedStagedEmailPayloadDoesNotReachCloud() throws Exception {
         var destination = new NotificationChannel.Destination(new AlarmKey.Scope(ORG, CLUSTER),
@@ -162,6 +181,29 @@ class CloudAlertSdkChannelTest {
                 "fixture-token", ORG, new InetAddress[]{InetAddress.getLoopbackAddress()}, SSLContext.getDefault(),
                 Clock.systemUTC(), Duration.ofSeconds(3), true)) {
             assertThatThrownBy(() -> channel.send(request)).isInstanceOf(TapstateException.class);
+        }
+        assertThat(calls).hasValue(0);
+    }
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            type       | "other.event"
+            dedupeKey  | "invalid"
+            subject    | 7
+            occurredAt | 7
+            occurredAt | "invalid-date"
+            severity   | null
+            payload    | []
+            payload    | {"wireVersion":999}
+            """)
+    void malformedStagedEventPayloadDoesNotReachCloud(String field, String replacement) throws Exception {
+        var original = request();
+        var envelope = (ObjectNode) JSON.readTree(original.payload());
+        envelope.set(field, JSON.readTree(replacement));
+        var malformed = new NotificationChannel.Request(original.destination(), original.purpose(),
+                original.deliveryId(), original.attemptId(), original.deadline(), original.contentType(),
+                JSON.writeValueAsBytes(envelope));
+        try (var channel = channel(Duration.ofSeconds(2))) {
+            assertThatThrownBy(() -> channel.send(malformed)).isInstanceOf(TapstateException.class);
         }
         assertThat(calls).hasValue(0);
     }

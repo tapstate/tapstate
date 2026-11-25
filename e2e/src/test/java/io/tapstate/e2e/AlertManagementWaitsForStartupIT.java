@@ -41,7 +41,8 @@ class AlertManagementWaitsForStartupIT {
             var types = (List<?>) control.alert("catalog", Map.of()).get("types");
             assertThat(types.stream().map(value -> (String) ((Map<?, ?>) value).get("id")))
                     .containsExactlyInAnyOrder("pipeline.failed", "pipeline.observation-stale",
-                            "source.connection-failed", "cluster.storage-unavailable");
+                            "source.connection-failed", "cluster.storage-unavailable",
+                            "cluster.config-structure-drift", "cluster.cache-structure-drift");
         }
     }
 
