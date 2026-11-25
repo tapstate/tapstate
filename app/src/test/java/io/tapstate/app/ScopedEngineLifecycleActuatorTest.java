@@ -315,6 +315,7 @@ class ScopedEngineLifecycleActuatorTest {
         var stopPass = new PipelineConvergencePass(stopIntent, held.get(), views, () -> {});
         new ScopedEngineLifecycleActuator(stopPass, engine, dags, captures, ownership, "cache",
                 ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).stop("p", false);
+        verify(dags).retireCoveredKeyMoves(stopPass);
         assertThat(registry.originals(SCOPE)).isEmpty();
         assertThat(releasedHot).containsAll(installed);
         assertThat(installed).hasSize(2);

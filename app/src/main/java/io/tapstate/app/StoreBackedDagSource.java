@@ -155,8 +155,13 @@ final class StoreBackedDagSource implements DagSource {
         default SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models) {
             return models;
         }
+        default void retireCoveredKeyMoves(PipelineConvergencePass pass) {}
         CapturedStartGuard NONE=(pass,artifacts,models) -> Map.of();
     }
+    @Override public void retireCoveredKeyMoves(PipelineConvergencePass pass) {
+        capturedStartGuard.retireCoveredKeyMoves(pass);
+    }
+
     private final CapturedStartGuard capturedStartGuard;
     private final java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads;
     private final java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> initialReceipts;

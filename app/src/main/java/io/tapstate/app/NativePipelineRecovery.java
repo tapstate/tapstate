@@ -73,6 +73,10 @@ final class NativePipelineRecovery {
             @Override public Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
                 return inspectCaptured(pass,snapshot,models);
             }
+            @Override public void retireCoveredKeyMoves(PipelineConvergencePass pass) {
+                requireAvailable();
+                retireCovered(pass);
+            }
             @Override public SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
                 requireAvailable();pass.requirePipeline(pass.scope().pipelineId());
                 var retained=captures.retainedPlanningModels(pass,snapshot,models);
@@ -81,14 +85,19 @@ final class NativePipelineRecovery {
         };
     }
 
+    private boolean retireCovered(PipelineConvergencePass pass) {
+        var id = pass.scope().pipelineId();
+        var windows = configuration.keyMoveWindows();
+        var retained = windows.read(id);
+        if (retained.isEmpty()) return true;
+        var window = retained.get();
+        return window.scope().equals(pass.scope()) && views instanceof SrsStoreViews sources
+                && KeyMoveRecovery.retire(windows, window, sources, () -> pass.requirePipeline(id));
+    }
+
     Map<String,String> inspectCaptured(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
         requireAvailable();String id=pass.scope().pipelineId();pass.requirePipeline(id);
-        var windows = configuration.keyMoveWindows();
-        windows.read(id).ifPresent(window -> {
-            if (!window.scope().equals(pass.scope()) || !(views instanceof SrsStoreViews sources)
-                    || !KeyMoveRecovery.retire(windows, window, sources, () -> pass.requirePipeline(id)))
-                throw PipelineKeyMoveWindows.unresolved(id);
-        });
+        if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
         var authored=StoredArtifacts.requirePipeline(snapshot,id);
         var pipeline=PipelineInlining.inline(authored,snapshot);
         var sources=new LinkedHashMap<String,SourceResource>();

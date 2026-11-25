@@ -27,6 +27,9 @@ import java.util.function.Function;
  */
 interface DagSource {
 
+    /** Inspect the original durable progress before capture shutdown can rotate its source epoch. */
+    default void retireCoveredKeyMoves(PipelineConvergencePass pass) {}
+
     /**
      * Captures and validates the pipeline revision this start will use, then returns a deferred builder.
      * The deferment lets an outstanding teardown finish before DAG construction reads or records shape
