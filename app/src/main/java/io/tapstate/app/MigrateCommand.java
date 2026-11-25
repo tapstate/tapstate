@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.migration.MigrationRunner;
@@ -15,12 +16,12 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.ConfigurableEnvironment;
 
 import java.io.PrintStream;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 
 /**
- * The read-only look at the system data, run as a mode of the server binary rather than as a command
- * of the CLI.
+ * Offline inspection and explicit CONFIG maintenance run through the server binary.
  *
  * <p>Two reasons, and the second is the one that decided it. The CLI is compiled ahead of time and does
  * not carry a store driver, so it could not open the store to answer. And the moment these questions
@@ -28,8 +29,8 @@ import java.util.List;
  * this build does not know, or because another member has been holding the migration lock for twenty
  * minutes. A tool that only runs when the server runs is not there when it is needed.
  *
- * <p>It writes nothing, ever: it opens the store the way a start does, stops before the migration, and
- * reads. That is why the connection exposes reaching the store separately from bringing it forward.
+ * <p>Its inspection modes remain read-only. The explicit CONFIG component preparation mode records
+ * one identity marker without starting the server.
  */
 final class MigrateCommand {
 
@@ -39,6 +40,7 @@ final class MigrateCommand {
     private static final String STATUS = "--status";
     private static final String DRY_RUN = "--dry-run";
     private static final String LIST = "--list";
+    private static final String PREPARE_COMPONENT_IDENTITY = "--prepare-config-component-identity";
 
     /** Exit code when a coded diagnostic was reported, matching the rest of the binary. */
     private static final int EXIT_CODED_DIAGNOSTIC = 1;
@@ -72,7 +74,16 @@ final class MigrateCommand {
             MongoProperties properties = context.getBean(MongoProperties.class);
             CloudRuntimeSettings cloud = CloudRuntimeSettings.resolve(
                     context.getBean(CloudProperties.class), context.getEnvironment().getProperty("CLUSTER_ID"));
-            report(args, properties, cloud, out);
+            var given = Arrays.asList(args);
+            if (given.contains(PREPARE_COMPONENT_IDENTITY)) {
+                if (given.contains(STATUS) || given.contains(DRY_RUN) || given.contains(LIST)) {
+                    throw new TapstateException(BootError.MIGRATION_MODE_CONFLICT, java.util.Map.of(), null);
+                }
+                boolean recorded = prepareComponentIdentity(properties, cloud, context.getEnvironment());
+                out.println(recorded ? "CONFIG component identity recorded." : "CONFIG component identity requires no update.");
+            } else {
+                report(args, properties, cloud, out);
+            }
             return 0;
         } catch (TapstateException e) {
             MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(e.code(), e.args());
@@ -82,6 +93,26 @@ final class MigrateCommand {
             }
             return e.code().severity() == Severity.ERROR ? EXIT_CODED_DIAGNOSTIC : 0;
         }
+    }
+
+    private static boolean prepareComponentIdentity(MongoProperties properties, CloudRuntimeSettings cloud,
+            ConfigurableEnvironment environment) {
+        String directory = environment.getProperty(OnPremInstallation.DIRECTORY_PROPERTY);
+        if (!cloud.cloud() && directory != null && !directory.isBlank()) {
+            InstallationFiles files;
+            try { files = new InstallationFiles(Path.of(directory)); }
+            catch (java.nio.file.InvalidPathException invalid) { throw InstallationFiles.refused(); }
+            return files.locked(() -> {
+                var stage = files.stage();
+                if (!OnPremInstallation.configurationHash(OnPremInstallation.connection(files)).equals(stage.configurationHash()))
+                    throw InstallationFiles.refused();
+                return MongoConfigurationDomain.prepareConfigComponentIdentity(OnPremInstallation.settings(files, properties),
+                        stage.scope().clusterId());
+            });
+        }
+        return MongoConfigurationDomain.prepareConfigComponentIdentity(new MongoConnectionSettings(
+                cloud.metadataUri(properties.getUri()), properties.getTlsCaFile(), properties.getServerSelectionTimeout()),
+                cloud.cloud() ? cloud.clusterId() : null);
     }
 
     private static void report(

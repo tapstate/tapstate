@@ -65,19 +65,6 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
 
     void verify() {
         StoreIo.run(() -> {
-            var existing = drafts.listIndexes().into(new ArrayList<>());
-            // No index may expire necessary authoring data or its anti-resurrection revision.
-            if (existing.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) {
-                throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-drafts", "field", "index"), null);
-            }
-            for (var declared : SystemCollections.CONFIG_PIPELINE_DRAFTS.indexes()) {
-                var index = existing.stream().filter(candidate -> declared.indexName().equals(candidate.get("name"))).findFirst().orElse(null);
-                if (index == null || !new Document(declared.keys().getFirst(), 1).equals(index.get("key"))
-                        || Boolean.TRUE.equals(index.get("unique")) || index.containsKey("partialFilterExpression")
-                        || Boolean.TRUE.equals(index.get("sparse")) || Boolean.TRUE.equals(index.get("hidden"))) {
-                    throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-drafts", "field", "index"), null);
-                }
-            }
             try (var cursor = drafts.find().iterator()) {
                 while (cursor.hasNext()) codec.verify(cursor.next());
             }

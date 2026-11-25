@@ -170,15 +170,21 @@ final class StorageRoot implements AutoCloseable {
     }
 
     Optional<CredentialAuthentication> authenticateCredentials(String presented) {
-        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ENTRY)) {
-            if(!replacements.enter())throw StorageRuntime.unavailable();
-            try{return authenticateCredentialsOwned(presented);}finally{replacements.leave();}
-        }
+        return authenticateCredentials(presented, io.tapstate.control.core.CredentialAuthenticator.Request.ORDINARY);
     }
-    private Optional<CredentialAuthentication> authenticateCredentialsOwned(String presented) {
-        requireOpen();
-        try { return authentication.credentials().authenticateContext(presented); }
-        catch (TapstateException failure) { throw initializationDiagnostic(failure); }
+
+    Optional<CredentialAuthentication> authenticateCredentials(String presented, io.tapstate.control.core.CredentialAuthenticator.Request request) {
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ENTRY)) {
+            if (!replacements.enter()) throw StorageRuntime.unavailable();
+            try {
+                requireOpen();
+                return authentication.credentials().authenticateContext(presented, request);
+            } catch (TapstateException failure) {
+                throw initializationDiagnostic(failure);
+            } finally {
+                replacements.leave();
+            }
+        }
     }
 
     Phase phase() { requireOpen(); return phase; }
@@ -267,7 +273,7 @@ final class StorageRoot implements AutoCloseable {
         if (!configuration.bindings().load().filter(binding::equals).isPresent()
                 || !configuration.bindings().cachePreparation().filter(preparation::equals).isPresent())
             throw StorageRuntime.unavailable();
-        original.verifyAuthentication(); original.verifyBusiness();
+        original.verifyAuthentication(); original.verifyRetainedBusiness();
         if (cloud.cloud()) authentication.managed(); else authentication.local();
         if (runtime != selected || selected.boundForObservation().orElseThrow(StorageRuntime::unavailable) != original)
             throw StorageRuntime.unavailable();

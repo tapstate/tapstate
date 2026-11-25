@@ -72,6 +72,7 @@ final class MongoCacheIdentity {
 
     private void requireStoppedClaims(ClientSession session, io.tapstate.spi.store.CacheBusinessScope business) {
         var unsafe = new Document("_id.clusterId", business.clusterId()).append("$or", java.util.List.of(
+                new Document("leaseUntil", java.util.Date.from(io.tapstate.spi.store.ProcessNodeSession.PROCESS_OWNED)),
                 new Document("leaseUntil", new Document("$not", new Document("$type", "date"))),
                 new Document("$expr", new Document("$gt", java.util.List.of("$leaseUntil", "$$NOW")))));
         if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, unsafe)
@@ -99,6 +100,7 @@ final class MongoCacheIdentity {
             }
         });
         MongoValidationSchema.requireReady(database, false);
+        MongoValidationSchema.verify(database, MongoValidationSchema.CACHE);
     }
 
     /** The retained first transaction is also the continuation boundary after an interrupted upgrade. */
@@ -131,7 +133,7 @@ final class MongoCacheIdentity {
         return marker;
     }
     <T> T transaction(Function<ClientSession, T> operation) {
-        return StoreIo.call(() -> rawTransaction(operation));
+        return MongoStructureFailureScope.call(client, null, () -> StoreIo.call(() -> rawTransaction(operation)));
     }
 
     <T> T transaction(MongoReadBudget budget, Function<ClientSession, T> operation) {
@@ -140,7 +142,10 @@ final class MongoCacheIdentity {
 
     private <T> T rawTransaction(Function<ClientSession, T> operation) {
         try (var session = client.startSession()) {
-            return session.withTransaction(() -> operation.apply(session), TRANSACTION);
+            return session.withTransaction(() -> {
+                MongoStructureFailureScope.beginCallback();
+                return operation.apply(session);
+            }, TRANSACTION);
         }
     }
 
@@ -148,6 +153,38 @@ final class MongoCacheIdentity {
         Document row = requireIdentity(session);
         if (!READY.equals(row.get("authPhase"))) throw fenced();
         requireSchema(session, READY, AUTH_VERSION, row.getString("authPreparationId"));
+    }
+
+    void requireRequestReady(MongoReadBudget budget) {
+        if (MongoValidationClaimObservation.lacksSnapshotRead(client)) {
+            transaction(budget, session -> { requireReady(session); return null; });
+            return;
+        }
+        StoreIo.run(() -> {
+            budget.requireRemaining();
+            var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
+            var row = SystemCollections.CACHE_IDENTITY.on(selected).aggregate(java.util.List.of(
+                    new Document("$match", new Document("_id", "cluster")),
+                    new Document("$project", new Document("identity", "$$ROOT")),
+                    new Document("$lookup", new Document("from", schemas.getNamespace().getCollectionName())
+                            .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "auth")),
+                                    new Document("$limit", 2)))
+                            .append("as", "schema")))).first();
+            if (row != null) {
+                var records = row.getList("schema", Document.class);
+                if (!"cluster".equals(row.get("identity", Document.class).get("_id"))
+                        || records.size() > 1 || (!records.isEmpty() && !"auth".equals(records.getFirst().get("_id")))) {
+                    transaction(budget, session -> { requireReady(session); return null; });
+                    return;
+                }
+            }
+            var admitted = checkedIdentity(row == null ? null : row.get("identity", Document.class));
+            if (!READY.equals(admitted.get("authPhase"))) throw fenced();
+            var markers = row.getList("schema", Document.class);
+            requireSchema(markers.isEmpty() ? null : markers.getFirst(), READY, AUTH_VERSION,
+                    admitted.getString("authPreparationId"));
+            budget.requireRemaining();
+        });
     }
 
     /** Every security-changing request competes with generation publication on this same cache document. */

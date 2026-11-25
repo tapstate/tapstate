@@ -189,7 +189,7 @@ final class StorageRuntime implements AutoCloseable {
         if (cleanupUnknown) throw unavailable();
         verifyCompletedSetup(original);
         verifyRecoveryPublication(original, running);
-        original.requireAuthentication(); original.verifyBusiness();
+        original.requireAuthentication(); original.verifyRetainedBusiness();
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
         creatingBusiness.set(candidate);
         try {
@@ -282,6 +282,11 @@ final class StorageRuntime implements AutoCloseable {
         void verifyBusiness() {
             requireActive();
             try { cache.verifyBusinessReady(preparation.businessScope()); requireActive(); businessReady = true; }
+            catch (RuntimeException | Error unavailable) { businessReady = false; throw unavailable; }
+        }
+        void verifyRetainedBusiness() {
+            requireActive();
+            try { cache.loadBusinessScope(preparation.businessScope()); requireActive(); businessReady = true; }
             catch (RuntimeException | Error unavailable) { businessReady = false; throw unavailable; }
         }
         void requireAuthentication() { requireActive(); if (!authReady) throw unavailable(); }

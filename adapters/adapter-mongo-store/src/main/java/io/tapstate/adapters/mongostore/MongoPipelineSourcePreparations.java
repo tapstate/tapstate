@@ -97,7 +97,7 @@ final class MongoPipelineSourcePreparations {
         var expected = new HashMap<Document,DirectChannelPreparation>();
         for (var channel : inputs.directChannels()) expected.put(MongoDirectChannelRecords.id(channel.context()),channel);
         var business = new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation());
-        var direct = new MongoDirectChannelStore(client,database,business,active,MongoRateHistoryStore.DEFAULT_RETENTION);
+        var direct = new MongoDirectChannelStore(client,database,business,active);
         for (var row : SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(session,offsets(scope))) {
             var original = expected.remove(row.get("_id",Document.class)); if (original == null) throw rebuild(scope);
             var actual = MongoDirectChannelRecords.progress(row); if (!original.tables().equals(actual.tables())) throw rebuild(scope);

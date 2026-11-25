@@ -17,7 +17,6 @@ class ClusterProperties {
     private String id;
     private String nodeId;
     private Profile profile = Profile.SINGLE;
-    private boolean profileConfigured;
     private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);
@@ -48,10 +47,13 @@ class ClusterProperties {
 
     void setProfile(Profile profile) {
         this.profile = profile;
-        profileConfigured = true;
     }
 
-    boolean explicitSingle() { return profileConfigured && profile == Profile.SINGLE; }
+    enum WorkloadLeases { INDEPENDENT, NODE_BACKED }
+
+    WorkloadLeases workloadLeases(boolean cloud, boolean op) {
+        return !cloud && op && profile == Profile.SINGLE ? WorkloadLeases.NODE_BACKED : WorkloadLeases.INDEPENDENT;
+    }
 
     int getBootstrapMinMembers() {
         return bootstrapMinMembers;

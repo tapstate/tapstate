@@ -73,6 +73,12 @@ public class Bootstrap {
             return;
         }
         SpringApplication app = new SpringApplication(Bootstrap.class);
+        var exitStatus = new java.util.concurrent.atomic.AtomicInteger();
+        app.addInitializers(context -> context.getBeanFactory().registerSingleton("singleMemberProcessExit",
+                (SingleMemberGuard.ProcessExit) () -> {
+                    exitStatus.set(EXIT_CODED_DIAGNOSTIC);
+                    System.exit(EXIT_CODED_DIAGNOSTIC);
+                }));
         // Logging is configured by this event, but context refresh (including connector creation)
         // has not begun. Record the choice once in both operational appenders, even if refresh fails.
         app.addListeners((ApplicationListener<ApplicationPreparedEvent>) event -> timeZone.log(log));
@@ -84,7 +90,7 @@ public class Bootstrap {
         ConfigurableApplicationContext context = app.run(args);
         // run() returns only after all startup runners and the application-ready event complete.
         log.info("Tapstate application is ready");
-        new GracefulShutdown(context::close, Runtime.getRuntime()::halt).install();
+        new GracefulShutdown(context::close, ignored -> Runtime.getRuntime().halt(exitStatus.get())).install();
     }
 
     /** The explicitly owned storage domains and connector bridge used by the production assembly. */

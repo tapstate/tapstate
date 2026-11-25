@@ -39,6 +39,10 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     private final Path cacheDir;
     private final Path seedDir;
     private final boolean loadSeedInPlace;
+    private record Inspection(String hash, boolean defaultTest) {}
+    private final Map<Inspection, IntrospectedConnector> inspections = new java.util.LinkedHashMap<>(16, 0.75f, true);
+    private final Map<String, String> stagedHints = new java.util.LinkedHashMap<>(16, 0.75f, true);
+    private static final int MAX_INSPECTIONS = 32;
 
     public RegistryConnectorProvisioner(
             ConnectorRegistry registry, ConnectorIntrospector introspector, Path cacheDir) {
@@ -62,22 +66,87 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
 
     @Override
     public ConnectorRef resolve(String connectorId) {
-        return materialize(connectorId, resolveRegistration(connectorId), false);
+        var result = materialize(connectorId, resolveRegistration(connectorId), false);
+        if (seedDir != null) rememberStaged(connectorId, result.contentHash());
+        return result;
     }
 
-    @Override public ConnectorRef resolveCaptureStartup(String connectorId) {
-        return materialize(connectorId, selectRegistration(connectorId, registry.findAll(connectorId)), false);
+    @Override
+    public ConnectorRef resolveForReadiness(String connectorId, String retainedHash) {
+        if (seedDir == null || retainedHash != null && !retainedHash.matches("[a-f0-9]{64}")) {
+            return ConnectorProvisioner.super.resolveForReadiness(connectorId, retainedHash);
+        }
+        String hint;
+        synchronized (stagedHints) {
+            hint = retainedHash == null ? stagedHints.get(connectorId) : retainedHash;
+        }
+        if (hint == null) return ConnectorProvisioner.super.resolveForReadiness(connectorId, retainedHash);
+        Path target = verifiedStagedPath(connectorId, hint);
+        if (target == null) return ConnectorProvisioner.super.resolveForReadiness(connectorId, retainedHash);
+
+        // Only the fresh registration, after verification of local bytes, can admit the artifact.
+        var registrations = registry.findAll(connectorId);
+        var registration = retainedHash == null
+                ? selectRegistration(connectorId, registrations)
+                : selectExact(connectorId, retainedHash, registrations);
+        var result = hint.equals(registration.contentHash())
+                ? loaded(connectorId, registration, target, false)
+                : materialize(connectorId, registration, retainedHash != null);
+        if (retainedHash == null) rememberStaged(connectorId, result.contentHash());
+        return result;
+    }
+
+    private Path verifiedStagedPath(String connectorId, String hash) {
+        try {
+            if (loadSeedInPlace) return seedFile(connectorId, hash);
+            Path path = cacheDir.resolve(hash + ".jar");
+            return Files.exists(path) ? validatedCache(connectorId, hash, path) : null;
+        } catch (IOException | TapstateException unavailable) {
+            // A stale hint cannot decide which registration the normal path is allowed to stage.
+            return null;
+        }
+    }
+
+    private void rememberStaged(String connectorId, String hash) {
+        synchronized (stagedHints) {
+            stagedHints.put(connectorId, hash);
+            while (stagedHints.size() > MAX_INSPECTIONS) stagedHints.remove(stagedHints.keySet().iterator().next());
+        }
+    }
+
+    @Override public ConnectorRef resolveCaptureStartup(String connectorId) { return resolveStartup(connectorId); }
+
+    @Override public ConnectorRef resolveStartup(String connectorId) { return startup(connectorId, null); }
+
+    @Override public ConnectorRef resolveStartup(String connectorId, String retainedHash) {
+        if (retainedHash == null || !retainedHash.matches("[a-f0-9]{64}"))
+            return ConnectorProvisioner.super.resolveStartup(connectorId, retainedHash);
+        return startup(connectorId, retainedHash);
+    }
+
+    private ConnectorRef startup(String connectorId, String retainedHash) {
+        String hint;
+        synchronized (stagedHints) { hint = retainedHash == null ? stagedHints.get(connectorId) : retainedHash; }
+        var verified = hint == null ? null : verifiedStagedPath(connectorId, hint);
+        var registrations = registry.findAllForCaptureStartup(connectorId);
+        var registration = retainedHash == null ? selectRegistration(connectorId, registrations)
+                : selectExact(connectorId, retainedHash, registrations);
+        var result = verified != null && hint.equals(registration.contentHash())
+                ? loaded(connectorId, registration, verified, false)
+                : materialize(connectorId, registration, retainedHash != null, false, true);
+        if (retainedHash == null) rememberStaged(connectorId, result.contentHash());
+        return result;
     }
 
     @Override public ConnectorRef revalidateCaptureStartup(String connectorId, ConnectorRef captured) {
         var hash = captured.contentHash();
         if (hash == null || !hash.matches("[a-f0-9]{64}")) return ConnectorProvisioner.super.revalidateCaptureStartup(connectorId, captured);
-        var matches = registry.findAll(connectorId).stream()
+        var matches = registry.findAllForCaptureStartup(connectorId).stream()
                 .filter(row -> connectorId.equals(row.connectorId()) && hash.equals(row.contentHash())).toList();
         if (matches.size() != 1) throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
         var target = cacheDir.resolve(hash + ".jar");
         if (!captured.classpath().equals(List.of(target)) || !Files.exists(target))
-            return materialize(connectorId, matches.getFirst(), true);
+            return materialize(connectorId, matches.getFirst(), true, false, true);
         validatedCache(connectorId, hash, target);
         return captured;
     }
@@ -91,31 +160,62 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         if (contentHash == null || !contentHash.matches("[a-f0-9]{64}")) {
             throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }
-        List<ConnectorRegistration> matches = registry.findAll(connectorId).stream()
+        return materialize(connectorId, selectExact(connectorId, contentHash, registry.findAll(connectorId)), true);
+    }
+
+    private static ConnectorRegistration selectExact(String connectorId, String contentHash,
+            List<ConnectorRegistration> registrations) {
+        List<ConnectorRegistration> matches = registrations.stream()
                 .filter(registration -> contentHash.equals(registration.contentHash())).toList();
         if (matches.size() != 1) {
             throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
         }
-        return materialize(connectorId, matches.getFirst(), true);
+        return matches.getFirst();
     }
 
     private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash) {
         return materialize(connectorId, registration, retainedHash, false);
     }
     private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash, boolean defaultTest) {
+        return materialize(connectorId, registration, retainedHash, defaultTest, false);
+    }
+
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash,
+            boolean defaultTest, boolean startup) {
         Path staged = stage(connectorId, registration.contentHash());
         if (seedDir != null) {
             // Local bytes grant no authority: recheck the original selector after staging.
             // A retained hash can coexist with other versions; ID-only resolution cannot.
-            List<ConnectorRegistration> current = registry.findAll(connectorId).stream()
+            var registrations = startup ? registry.findAllForCaptureStartup(connectorId) : registry.findAll(connectorId);
+            List<ConnectorRegistration> current = registrations.stream()
                     .filter(candidate -> !retainedHash || candidate.contentHash().equals(registration.contentHash())).toList();
             if (current.size() != 1 || !current.getFirst().equals(registration))
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }
-        IntrospectedConnector introspected = defaultTest ? introspector.introspectDefaultTest(List.of(staged)) : introspector.introspect(List.of(staged));
+        return loaded(connectorId, registration, staged, defaultTest);
+    }
+
+    private ConnectorRef loaded(String connectorId, ConnectorRegistration registration, Path staged, boolean defaultTest) {
+        IntrospectedConnector introspected = inspectVerified(registration.contentHash(), staged, defaultTest);
         boolean shareSafe = registry.shareSafeCertification(connectorId, registration.contentHash()).isPresent();
         return new ConnectorRef(List.of(staged), introspected.className(), introspected.pdkApiVersion(), null,
                 introspected.spec(), registration.contentHash(), shareSafe);
+    }
+
+    /** Only immutable byte-derived descriptors are reused. Registration, bytes and certification stay live. */
+    private IntrospectedConnector inspectVerified(String hash, Path staged, boolean defaultTest) {
+        var key = new Inspection(hash, defaultTest);
+        synchronized (inspections) {
+            var known = inspections.get(key);
+            if (known != null) return known;
+        }
+        // Scanning and class loading never hold the cache monitor. Failures are never cached.
+        var inspected = defaultTest ? introspector.introspectDefaultTest(List.of(staged)) : introspector.introspect(List.of(staged));
+        synchronized (inspections) {
+            inspections.put(key, inspected);
+            while (inspections.size() > MAX_INSPECTIONS) inspections.remove(inspections.keySet().iterator().next());
+        }
+        return inspected;
     }
 
     @Override
