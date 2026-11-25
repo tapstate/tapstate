@@ -1,5 +1,10 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+import com.hazelcast.internal.metrics.ProbeLevel;
+import com.hazelcast.internal.metrics.ProbeUnit;
+import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramValue;
 import java.util.HashMap;
@@ -60,8 +65,7 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> waitingByName = new HashMap<>();
     static final String CDC_COUNT = "cdcDeliveryCount";
     static final String CDC_TOTAL_MILLIS = "cdcDeliveryTotalMillis";
-    private JobStatistic cdcCount;
-    private JobStatistic cdcTotalMillis;
+    private volatile CdcDeliveryTotals cdcDelivery;
     private JobStatistic since;
 
     @Override
@@ -105,12 +109,17 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     @Override
     public void cdcDelivered(CdcDeliveryTotals totals) {
-        if (cdcCount == null) {
-            cdcCount = new JobStatistic(CDC_COUNT);
-            cdcTotalMillis = new JobStatistic(CDC_TOTAL_MILLIS);
+        cdcDelivery = totals;
+    }
+
+    void collectCdcDelivery(MetricDescriptor descriptor, MetricsCollectionContext context) {
+        // Jet samples on another thread. Use one immutable reading for both numbers in this scrape.
+        CdcDeliveryTotals snapshot = cdcDelivery;
+        if (snapshot != null) {
+            descriptor.withTag(MetricTags.USER, "true");
+            context.collect(descriptor, CDC_COUNT, ProbeLevel.INFO, ProbeUnit.COUNT, snapshot.count());
+            context.collect(descriptor, CDC_TOTAL_MILLIS, ProbeLevel.INFO, ProbeUnit.MS, snapshot.totalMillis());
         }
-        cdcCount.set(totals.count());
-        cdcTotalMillis.set(totals.totalMillis());
     }
 
     @Override

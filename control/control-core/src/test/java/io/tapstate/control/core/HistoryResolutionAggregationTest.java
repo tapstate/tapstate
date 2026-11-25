@@ -118,6 +118,32 @@ class HistoryResolutionAggregationTest {
         assertThat(readings.getLast().averageMillis()).isZero();
     }
 
+    @Test
+    void orderedSamplesWithTheSameTimestampStillCountEachCdcDelivery() {
+        var store = new HistoryTestSupport.MutableHistory();
+        store.add(cdcSample("2026-09-21T10:00:00Z", 0, 0));
+        store.add(cdcSample("2026-09-21T10:01:00Z", 1, 100));
+        store.add(cdcSample("2026-09-21T10:01:00Z", 2, 300));
+        store.add(cdcSample("2026-09-21T10:02:00Z", 3, 600));
+
+        var history = service(store, 2, 25_000);
+        var raw = points(history.query(query("2026-09-21T10:00:00Z", "2026-09-21T10:05:00Z",
+                HistoryResolution.RAW, 20, List.of(), null)));
+        assertThat(raw).hasSize(4);
+        var sameTime = raw.get(2);
+        assertThat(sameTime.intervalEnd()).isEqualTo(raw.get(1).intervalEnd());
+        assertThat(sameTime.recordsOut()).isNull();
+        assertThat(sameTime.cdcDelivery().sampleCount()).isEqualTo(1);
+        assertThat(sameTime.cdcDelivery().averageMillis()).isEqualByComparingTo("200");
+
+        var buckets = points(history.query(query("2026-09-21T10:00:00Z", "2026-09-21T10:05:00Z",
+                HistoryResolution.PT5M, 20, List.of(), null)));
+        assertThat(buckets).singleElement().satisfies(point -> {
+            assertThat(point.cdcDelivery().sampleCount()).isEqualTo(3);
+            assertThat(point.cdcDelivery().averageMillis()).isEqualByComparingTo("200");
+        });
+    }
+
     private static RateSample cdcSample(String at, long count, long totalMillis) {
         return new RateSample("orders", Instant.parse(at), Map.of("records.out", count,
                 CdcDeliveryTotals.COUNT, count, CdcDeliveryTotals.TOTAL_MILLIS, totalMillis),

@@ -766,17 +766,39 @@ public final class Engine {
     /** CDC-only measurements, summed over writers in the same job. */
     public CdcDeliveryTotals cdcDelivery(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return null;
-        }
-        JobMetrics metrics = job.getMetrics();
+        return job == null ? null : cdcDeliveryIn(job.getMetrics());
+    }
+
+    static CdcDeliveryTotals cdcDeliveryIn(JobMetrics metrics) {
         var counts = metrics.get(JetDeliveryGauge.CDC_COUNT);
         var totals = metrics.get(JetDeliveryGauge.CDC_TOTAL_MILLIS);
         if (counts.isEmpty() || counts.size() != totals.size()) {
             return null;
         }
-        return new CdcDeliveryTotals(counts.stream().mapToLong(Measurement::value).sum(),
-                totals.stream().mapToLong(Measurement::value).sum());
+        Map<CdcWriterScrape, Long> millisByWriter = new HashMap<>();
+        for (Measurement total : totals) {
+            if (millisByWriter.put(CdcWriterScrape.of(total), total.value()) != null) {
+                return null;
+            }
+        }
+        long count = 0;
+        long millis = 0;
+        for (Measurement measurement : counts) {
+            Long total = millisByWriter.remove(CdcWriterScrape.of(measurement));
+            if (total == null) {
+                return null;
+            }
+            count += measurement.value();
+            millis += total;
+        }
+        return new CdcDeliveryTotals(count, millis);
+    }
+
+    private record CdcWriterScrape(String member, String execution, String vertex, String processor, long timestamp) {
+        static CdcWriterScrape of(Measurement measurement) {
+            return new CdcWriterScrape(measurement.tag(MetricTags.MEMBER), measurement.tag(MetricTags.EXECUTION),
+                    measurement.tag(MetricTags.VERTEX), measurement.tag(MetricTags.PROCESSOR), measurement.timestamp());
+        }
     }
 
     /**

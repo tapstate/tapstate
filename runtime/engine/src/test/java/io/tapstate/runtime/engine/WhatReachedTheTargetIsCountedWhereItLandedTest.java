@@ -92,6 +92,28 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.latestDurations().get("orders").count()).isEqualTo(6);
     }
 
+    @Test
+    void omits_partial_acknowledgements_from_cdc_and_resumes_with_the_next_complete_batch() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(writer, delivery, () -> now);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(row("orders", now - 300).withPosition(change),
+                update("orders", now - 600).withPosition(change)));
+        processor.process(0, inbox);
+        writer.completeNext(1);
+        processor.tryProcess();
+        assertThat(delivery.cdc).containsExactly(CdcDeliveryTotals.ZERO);
+
+        inbox.add(row("orders", now - 200).withPosition(change));
+        processor.process(0, inbox);
+        writer.completeAll();
+        drain(processor);
+        assertThat(delivery.cdc.getLast()).isEqualTo(new CdcDeliveryTotals(1, 200));
+    }
+
     /**
      * What is waiting in a writer is reported beside what settled: the rows taken in and not yet handed to the
      * writer, by the stream they came on, and the rows handed to it whose writes have not settled, by the table
@@ -529,21 +551,22 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
 
     /** Hands out futures the test settles by hand. */
     private static final class ManualWriter implements SinkWriter {
-        private final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
+        private final Map<CompletableFuture<WriteResult>, Integer> pending = new LinkedHashMap<>();
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             CompletableFuture<WriteResult> future = new CompletableFuture<>();
-            pending.add(future);
+            pending.put(future, records.size());
             return future;
         }
 
+        void completeNext(int accepted) {
+            pending.keySet().stream().filter(future -> !future.isDone()).findFirst().orElseThrow()
+                    .complete(new WriteResult(accepted));
+        }
+
         void completeAll() {
-            for (CompletableFuture<WriteResult> future : pending) {
-                if (!future.isDone()) {
-                    future.complete(new WriteResult(1));
-                }
-            }
+            pending.forEach((future, size) -> future.complete(new WriteResult(size)));
         }
 
         @Override

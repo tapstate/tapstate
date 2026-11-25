@@ -2,6 +2,9 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -74,7 +77,14 @@ import java.util.concurrent.CompletionException;
  * durable offset is the source's, not Jet's, so a restart replays from the source rather than
  * resuming a sink snapshot.
  */
-public final class SinkProcessor extends AbstractProcessor implements Staged {
+public final class SinkProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext context) {
+        if (supplied instanceof JetDeliveryGauge jobGauge) {
+            jobGauge.collectCdcDelivery(descriptor, context);
+        }
+    }
 
     @Override
     public Stage stage() {
@@ -538,8 +548,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // Tallied while the rows are still here and counted only once the write settles. Holding the
             // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
             // write; this keeps one number per table and operation in it instead.
-            inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
-                    firstOrder));
+            var positions = positionsOf(batch);
+            var delivered = DeliveredRows.of(batch);
+            int size = batch.size();
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder, size));
         }
         // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
         // backpressures upstream until reapSettled frees a slot on a later call.
@@ -785,8 +797,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             if (!batch.future().isDone()) {
                 return false;
             }
+            WriteResult result;
             try {
-                settle(batch.future()); // throws on a failed write, before any position advances
+                result = settle(batch.future()); // throws on a failed write, before any position advances
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
@@ -808,7 +821,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // this processor's queue and in flight at the target is part of that, not noise around it.
             long settledAt = clock.getAsLong();
             batch.delivered().foldDurationsInto(settledDurations, settledAt);
-            cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settledAt);
+            // A partial receipt only identifies a count. It cannot tell us which event times to sample.
+            if (result != null && result.written() == batch.size()) {
+                cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settledAt);
+            }
             reportDelivered(batch.delivered().tables());
             return true;
         });
@@ -902,9 +918,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * already raised (coded, for a real connector); the cause is rethrown as-is so it fails the job
      * unwrapped rather than buried in a {@link CompletionException}.
      */
-    private static void settle(CompletableFuture<WriteResult> future) {
+    private static WriteResult settle(CompletableFuture<WriteResult> future) {
         try {
-            future.join();
+            return future.join();
         } catch (CompletionException wrapper) {
             Throwable cause = wrapper.getCause();
             if (cause instanceof RuntimeException runtime) {
@@ -922,7 +938,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
     private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
-            DeliveredRows delivered, long firstOrder) {
+            DeliveredRows delivered, long firstOrder, int size) {
     }
 
     /** A row taken in and not yet handed to the writer, with the number it was taken in under. */

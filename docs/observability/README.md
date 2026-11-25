@@ -189,8 +189,9 @@ and it cannot say whether the source has more changes waiting.
 
 CDC delivery time measures the time from the source event timestamp to target acknowledgement.
 It counts only writes backed by incremental source positions. Full loads, mixed or unknown source
-positions, and missing or future timestamps are excluded. If a change produces multiple confirmed
-outputs, each output is one delivery. History differences the cumulative count and elapsed-time
+positions, and missing or future timestamps are excluded. A partially accepted batch is omitted
+because its receipt does not identify the events that were accepted. If a change produces multiple
+confirmed outputs, each output is one delivery. History differences the cumulative count and elapsed-time
 total for each usable observation pair. The right observation determines the bucket, and the mean
 is weighted by delivered records. No measurement is carried across a gap or counter restart.
 Points without confirmed CDC samples omit `cdcDelivery`. Old retained samples remain readable.

@@ -243,7 +243,7 @@ public final class HistoryAggregator {
                 return CdcDeliveryTotals.ZERO;
             }
         } else {
-            if (boundary != null || !left.observedAt().isBefore(right.observedAt()) || left.observedAt().isBefore(from)) {
+            if (boundary != null || left.observedAt().isAfter(right.observedAt()) || left.observedAt().isBefore(from)) {
                 return CdcDeliveryTotals.ZERO;
             }
             Long beforeCount = left.counters().get(CdcDeliveryTotals.COUNT);
