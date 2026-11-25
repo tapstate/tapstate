@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Exercise Git identities, unsafe mixed changes and every expensive workflow step."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -93,6 +95,17 @@ with tempfile.TemporaryDirectory() as directory:
     assert not scope.classify(root, 'pull_request', event)[0], 'foreign checkout must retain full CI'
 
 
+# Additional predicates already used by full CI; the route guard must always apply to the whole condition.
+FULL_CI_WRAPPERS = (
+    "startsWith(matrix.shard, 'e2e-')", 'always()', 'failure()', "github.event_name == 'pull_request'",
+    "steps.guard.outputs.run == 'true'",
+    "steps.guard.outputs.run == 'true' && steps.sonar-cache-key.outcome == 'success'",
+    "always() && steps.guard.outputs.run == 'true' && steps.analyze.outcome != 'skipped' "
+    "&& steps.analyze.outcome != '' && github.event_name == 'pull_request'",
+    "always() && steps.sonar-comment.outputs.findings_path != ''",
+)
+
+
 def workflow_contract(text):
     blocks = re.split(r'(?m)(?=^  [\w-]+:\s*$)', text.split('jobs:\n', 1)[1])
     jobs = {block.split(':', 1)[0].strip(): block for block in blocks if block.strip()}
@@ -105,12 +118,25 @@ def workflow_contract(text):
             assert 'needs: [shard-plan, snapshot-lock]' in block, role
         elif role not in ('shard-plan', 'build'):
             assert 'needs: shard-plan' in block, role
+        required = f"{selector} != 'true'"
+        accepted = {required}
+        accepted.update("${{ " + required + " && (" + wrapper + ") }}" for wrapper in FULL_CI_WRAPPERS)
         for step in re.split(r'(?m)(?=^      - )', block.split('    steps:\n', 1)[1]):
             if not step.strip():
                 continue
-            if any(marker in step for marker in ('actions/checkout@v4', 'id: scope', 'CI change-scope controls', 'Documentation-only CI')):
+            header = step.splitlines()[0].strip()
+            if header == '- uses: actions/checkout@v4':
                 continue
-            assert f"{selector} != 'true'" in step, (role, step.splitlines()[0])
+            if role == 'shard-plan' and header == '- name: Classify the original pull request diff':
+                continue
+            conditions = re.findall(r'^        if: (.+)$', step, re.MULTILINE)
+            if role in ('build', 'installer') and header == '- name: Documentation-only CI':
+                assert conditions == [f"{selector} == 'true'"], (role, header, conditions)
+                if role == 'installer':
+                    assert 'Installer checks were not evaluated' in step and '$GITHUB_STEP_SUMMARY' in step
+                continue
+            assert len(conditions) == 1 and conditions[0] in accepted, (role, header, conditions)
+    assert '- name: Documentation-only CI' in jobs['installer']
     # A failed full shard must still reach checkout and the aggregate evidence steps.
     pre_checkout = jobs['build'].split('- uses: actions/checkout@v4', 1)[0]
     for step in pre_checkout.split('      - ')[1:]:
@@ -124,8 +150,53 @@ def workflow_contract(text):
     assert 'not evaluated for documentation-only changes' in jobs['sonarqube']
 
 
+def check_planner_checkout(workflow):
+    block = workflow.split('      - name: Classify the original pull request diff\n', 1)[1]
+    script = textwrap.dedent(block.split('        run: |\n', 1)[1].split('\n      - ', 1)[0])
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        repo = tmp / 'repo'
+        repo.mkdir()
+        run(repo, 'init', '-q')
+        run(repo, 'config', 'user.name', 'Fixture')
+        run(repo, 'config', 'user.email', 'fixture@example.invalid')
+        run(repo, 'config', 'commit.gpgsign', 'false')
+        run(repo, 'commit', '--allow-empty', '-qm', 'Before the classifier exists')
+        bootstrap = run(repo, 'rev-parse', 'HEAD')
+        scripts = repo / '.github/scripts'
+        scripts.mkdir(parents=True)
+        (scripts / 'ci-change-scope.py').write_bytes((HERE / 'ci-change-scope.py').read_bytes())
+        # The stub records which revision supplied the smoke without nesting this fixture.
+        (scripts / 'ci-change-scope-smoke.py').write_text(
+            'import os\nfrom pathlib import Path\nPath(os.environ["SMOKE_MARKER"]).touch()\n')
+        (repo / '.github/workflows').mkdir()
+        (repo / '.github/workflows/ci.yml').write_text(workflow)
+        run(repo, 'add', '.')
+        run(repo, 'commit', '-qm', 'Reviewed routing rules')
+        base = run(repo, 'rev-parse', 'HEAD')
+        (repo / 'README.md').write_text('Documentation update\n')
+        run(repo, 'add', '.')
+        run(repo, 'commit', '-qm', 'Documentation')
+        head = run(repo, 'rev-parse', 'HEAD')
+        # The planner must still work independently of the copies in the checkout.
+        for path in scripts.glob('*.py'):
+            path.unlink()
+        marker = tmp / 'smoke-ran'
+        for revision, expected in ((bootstrap, False), (base, True)):
+            output = tmp / 'output'
+            event = tmp / 'event'
+            output.write_text('')
+            event.write_text(json.dumps({'pull_request': {'base': {'sha': revision}, 'head': {'sha': head}}}))
+            environment = os.environ | dict(GITHUB_EVENT_NAME='pull_request', SCOPE_BASE_SHA=revision,
+                GITHUB_EVENT_PATH=str(event), GITHUB_OUTPUT=str(output), RUNNER_TEMP=str(tmp), SMOKE_MARKER=str(marker))
+            subprocess.run(['bash', '-c', script], cwd=repo, env=environment, capture_output=True, check=True)
+            assert f'docs-only={str(expected).lower()}' in output.read_text().splitlines()
+            assert marker.exists() == expected
+
+
 workflow = (HERE.parent / 'workflows/ci.yml').read_text()
 workflow_contract(workflow)
+check_planner_checkout(workflow)
 bad = workflow.replace("needs.shard-plan.outputs.docs-only != 'true'", 'true', 1)
 try:
     workflow_contract(bad)

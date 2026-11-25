@@ -43,11 +43,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: CI change-scope controls
-        run: python3 .github/scripts/ci-change-scope-smoke.py
       - name: Classify the original pull request diff
         id: scope
-        run: python3 .github/scripts/ci-change-scope.py
+        env:
+          SCOPE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted=$(mktemp -d "$RUNNER_TEMP/ci-scope.XXXXXX")
+          if [[ "$GITHUB_EVENT_NAME" == pull_request && "$SCOPE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] &&
+             git archive "$SCOPE_BASE_SHA" -- .github/scripts/ci-change-scope.py \
+               .github/scripts/ci-change-scope-smoke.py .github/workflows/ci.yml | tar -x -C "$trusted" &&
+             python3 -I "$trusted/.github/scripts/ci-change-scope-smoke.py" &&
+             GITHUB_OUTPUT="$trusted/scope-output" python3 -I "$trusted/.github/scripts/ci-change-scope.py"; then
+            cat "$trusted/scope-output" >> "$GITHUB_OUTPUT"
+          else
+            echo 'CI scope: full CI selected (no verified PR base classifier)'
+            echo 'docs-only=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: CI change-scope controls
+        if: steps.scope.outputs.docs-only != 'true'
+        run: python3 .github/scripts/ci-change-scope-smoke.py
       - uses: actions/setup-java@v4
         if: steps.scope.outputs.docs-only != 'true'
         with:
@@ -804,6 +820,9 @@ jobs:
     # no network, and no Docker (the quickstart smoke stops before the live run phase).
     runs-on: ubuntu-latest
     steps:
+      - name: Documentation-only CI
+        if: needs.shard-plan.outputs.docs-only == 'true'
+        run: echo 'Installer checks were not evaluated for documentation-only changes.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         if: needs.shard-plan.outputs.docs-only != 'true'

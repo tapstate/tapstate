@@ -26,11 +26,13 @@ notice; manual trusted Sonar analysis remains a separate maintainer action.
 
 ## Prose-only pull requests
 
-The planner reads the original PR commit identities and complete Git diff.
+The planner uses the classifier and its controls from the event's base commit to
+inspect the original PR commit identities and complete Git diff. A base without
+those controls selects full CI.
 Changes limited to regular, non-executable root README, contribution, security,
 code-of-conduct or changelog pages, or Markdown pages under `docs/`, use the
 lightweight documentation route. Existing documentation and hygiene gates still
-run. The stable `build` and `sonarqube` checks explicitly report that compilation,
+run. The stable `installer`, `build` and `sonarqube` checks explicitly report that compilation,
 tests, images and analysis were not evaluated. No test or coverage receipts are
 invented for this route.
 

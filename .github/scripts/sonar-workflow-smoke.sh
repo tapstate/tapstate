@@ -86,7 +86,7 @@ for event,ref,expected in [('push','refs/heads/main',True),('pull_request','refs
                            ('push','refs/heads/ws/example',False),('push','refs/tags/other',False)]:
     assert subscribed(event,ref)==expected, (event,ref,'workflow trigger changed')
 docs_guard = "        if: needs.shard-plan.outputs.docs-only != 'true'"
-assert docs_guard in step(build,'Check secret availability'), 'every full-CI event evaluates secret availability'
+assert docs_guard in step(build,'Check secret availability').splitlines(), 'every full-CI event evaluates secret availability'
 for output, source in [('sonar-enabled','steps.guard.outputs.run'),('sonar-outcome','steps.analyze.outcome')]:
     assert '      '+output+': ${{ '+source+' }}' in build.splitlines(), 'analysis output binding changed: '+output
 for variable, output in [('SONAR_ENABLED','sonar-enabled'),('SONAR_OUTCOME','sonar-outcome')]:
@@ -95,7 +95,7 @@ assert 'needs: build' in reporter and 'always()' in reporter
 assert 'sonarqube-' in text and 'cancel-in-progress: true' not in text
 admit=step(build,'Admit the complete report and coverage set'); analyze=step(build,'Analyze admitted coverage')
 assert 'ci-aggregate.sh verify' in admit and '--artifacts' in admit and '--restore .' in admit
-assert docs_guard in admit and 'continue-on-error:' not in admit, 'admission must gate every full-CI analysis'
+assert docs_guard in admit.splitlines() and 'continue-on-error:' not in admit, 'admission must gate every full-CI analysis'
 assert len(re.findall(r'ci-aggregate\.sh verify|sonar-inputs\.sh', build))==1, 'artifact admission must execute exactly once'
 assert build.index('Admit the complete report and coverage set') < build.index('Merge coverage from every declared shard') < build.index('Analyze admitted coverage')
 assert 'mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" sonar:sonar' in analyze
