@@ -1,6 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
-import com.mongodb.MongoWriteException;
+import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
 import com.mongodb.WriteConcern;
@@ -11,6 +11,8 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineKeyMoveWindows;
+import org.bson.BsonBinary;
+import org.bson.BsonDocument;
 import org.bson.Document;
 
 import java.util.Map;
@@ -42,9 +44,40 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
         });
     }
 
-    private void requireCollection(String pipelineId) {
-        if (database.listCollections().filter(new Document("name", rows.getNamespace().getCollectionName())).first() == null)
+    private BsonBinary requireCollection(String pipelineId) {
+        var collection = database.withReadPreference(ReadPreference.primary()).listCollections(BsonDocument.class)
+                .filter(new Document("name", rows.getNamespace().getCollectionName())).first();
+        if (collection == null || !collection.isDocument("info") || !collection.getDocument("info").isBinary("uuid")) {
             throw PipelineKeyMoveWindows.unresolved(pipelineId);
+        }
+        return collection.getDocument("info").getBinary("uuid");
+    }
+
+    private boolean insertFirst(Window next) {
+        String pipeline = next.scope().pipelineId();
+        // Pin this insert to the namespace just inspected. An unqualified insert can recreate a
+        // dropped collection and erase the evidence that active pipelines lost their intervals.
+        var insert = new Document("insert", rows.getNamespace().getCollectionName())
+                .append("collectionUUID", requireCollection(pipeline)).append("documents", java.util.List.of(encode(next)))
+                .append("writeConcern", rows.getWriteConcern().asDocument());
+        Document result;
+        try {
+            result = database.runCommand(insert, ReadPreference.primary());
+        } catch (MongoException failure) {
+            if (failure.getCode() == 361 || failure.getCode() == 26) throw PipelineKeyMoveWindows.unresolved(pipeline);
+            throw failure;
+        }
+        if (result.containsKey("writeConcernError")) {
+            throw new MongoException(64, "key move admission was not acknowledged by a majority");
+        }
+        for (var error : result.getList("writeErrors", Document.class, java.util.List.of())) {
+            int code = error.getInteger("code");
+            if (code == 361 || code == 26) throw PipelineKeyMoveWindows.unresolved(pipeline);
+            if (code == 11000) return false;
+            throw new MongoException(code, "key move admission was refused");
+        }
+        if (!Integer.valueOf(1).equals(result.get("n"))) throw PipelineKeyMoveWindows.unresolved(pipeline);
+        return true;
     }
 
     @Override public Window arm(PipelineIntentScope scope, long executionId, String activation, Stream stream, Range changes,
@@ -82,11 +115,7 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
                         return next;
                     }
                 } else {
-                    requireCollection(scope.pipelineId());
-                    try {
-                        rows.insertOne(encode(next));
-                    } catch (MongoWriteException raced) {
-                        if (raced.getError().getCode() != 11000) throw raced;
+                    if (!insertFirst(next)) {
                         previous = read(scope.pipelineId());
                         continue;
                     }

@@ -106,6 +106,40 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void droppingTheCollectionDuringFirstAdmissionCannotRecreateIt() {
+        withConfiguration((domain, database, scope) -> {
+            var table = SystemCollections.PIPELINE_KEY_MOVE_WINDOWS;
+            var removed = new java.util.concurrent.atomic.AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("insert")
+                            && table.collectionName().equals(event.getCommand().getString("insert").getValue())
+                            && removed.compareAndSet(false, true)) {
+                        table.on(database).drop();
+                    }
+                }
+            };
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build();
+            var orders = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
+            var change = point(new io.tapstate.core.event.SourceOrder(1, 9));
+            try (var client = MongoClients.create(settings)) {
+                var windows = new MongoKeyMoveWindowStore(client.getDatabase(database.getName()), () -> {});
+                assertThatThrownBy(() -> windows.arm(scope, 42, "activation", orders, change, null, () -> {}))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+                assertThat(removed).isTrue();
+            }
+            try (var retained = MongoConfigurationDomain.openExisting(settings(database))) {
+                assertThatThrownBy(() -> retained.keyMoveWindows().requireClear(scope.pipelineId()))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+            }
+            assertThat(database.listCollectionNames()).doesNotContain(table.collectionName());
+        });
+    }
+
+    @Test
     void aRefusedExtensionRestoresOnlyTheRangeItActuallyExtended() {
         withConfiguration((domain, database, scope) -> {
             var windows = domain.keyMoveWindows();
