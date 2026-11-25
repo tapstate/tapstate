@@ -36,10 +36,12 @@ class SrsSnapshotPreparationTest {
         assertThat(f.pinned.models()).containsEntry("orders",model("orders",2).key()).containsEntry("quiet",model("quiet",2).key());
         assertThat(f.closedSessions).isOne();
     }
-    @Test void resumedSnapshotKeepsExactSavedReferencesAndAnchorWithoutQueryingNewHeads() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void resumedSnapshotKeepsExactSavedReferencesAndAnchorWithoutQueryingNewHeads(boolean reuse) {
         var f = new Fixture(); var saved = new SrsSnapshotPin(5,"original-seam",Map.of("orders",model("orders",2).key(),"quiet",model("quiet",2).key()));
         f.original = f.progress(saved,List.of("quiet")); f.forbidHeads = true;
-        var owner = f.owner(); var port = new Port(f,owner);
+        var owner = f.owner(reuse ? f.original : null); var port = new Port(f,owner);
         try (var load = SnapshotPhase.openPrepared(port,config(),owner)) {
             assertThat(port.selected).containsExactly("orders"); assertThat(owner.request().snapshotEpoch()).isEqualTo(5);
             assertThat(owner.request().replayAnchor()).isEqualTo(new SourcePosition("original-seam"));
@@ -48,6 +50,62 @@ class SrsSnapshotPreparationTest {
             assertThat(rows).singleElement().satisfies(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(5)));
         }
         assertThat(f.pinned).isEqualTo(saved); assertThat(f.headReads).isZero(); assertThat(f.exactReads).isOne();
+        assertThat(f.progressReads).isEqualTo(reuse ? 0 : 1);
+    }
+
+    @Test void aFreshArrivalReceiptCanBeReusedBeforeItsSnapshotIsPinned() {
+        var f = new Fixture();
+        var observed = f.original;
+        var preparation = f.owner(observed);
+        assertThat(f.progressReads).isZero();
+        try (var load = SnapshotPhase.openPrepared(new Port(f, preparation), config(), preparation)) {
+            assertThat(f.pinCalls).isOne();
+            assertThat(preparation.accepted()).isEqualTo(f.pinned);
+            var rows = new ArrayList<Envelope>();
+            load.read(rows::add, ignored -> {});
+            assertThat(rows).hasSize(2);
+        }
+        assertThat(f.progressReads).isZero();
+    }
+
+    @Test void anUnpinnedArrivalChangeAfterSamplingStillFailsTheOriginalPinCas() {
+        var f = new Fixture();
+        var observed = f.original;
+        f.currentRevision++;
+        var preparation = f.owner(observed);
+        assertThatThrownBy(() -> SnapshotPhase.openPrepared(new Port(f, preparation), config(), preparation))
+                .satisfies(SrsSnapshotPreparationTest::unavailable);
+        assertThat(f.progressReads).isZero();
+        assertThat(f.pinCalls).isOne();
+        assertThat(f.sourceReads).isZero();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void aSuppliedArrivalMustKeepItsOriginalContextAndMembership(boolean contextChanged) {
+        var f = new Fixture();
+        var original = f.original;
+        var context = contextChanged ? new SrsConsumerContext(RUN.context().key(), RUN.context().stateGeneration() + 1) : original.context();
+        var observed = new SrsConsumerProgress(context, original.membershipRevision() + (contextChanged ? 0 : 1),
+                original.revision(), original.cursor(), original.snapshot(), original.writerRun(), original.ringDoneThrough());
+        assertThatThrownBy(() -> f.owner(observed)).satisfies(SrsSnapshotPreparationTest::unavailable);
+        assertThat(f.progressReads).isZero();
+        assertThat(f.pinCalls).isZero();
+        assertThat(f.sourceReads).isZero();
+    }
+
+    @Test void aProgressChangeAfterTheStartupSampleRefusesTheRetainedPinBeforeRows() {
+        var f = new Fixture();
+        var saved = new SrsSnapshotPin(5, "original-seam", Map.of("orders", model("orders", 2).key(), "quiet", model("quiet", 2).key()));
+        var observed = f.progress(saved, List.of("quiet"));
+        f.currentRevision = observed.revision() + 1;
+        var preparation = f.owner(observed);
+        assertThatThrownBy(() -> SnapshotPhase.openPrepared(new Port(f, preparation), config(), preparation))
+                .satisfies(SrsSnapshotPreparationTest::unavailable);
+        assertThat(f.progressReads).isZero();
+        assertThat(f.pinCalls).isOne();
+        assertThat(f.sourceReads).isZero();
+        assertThat(f.closedSessions).isOne();
     }
 
     @Test void aNewConsumerUsesTheRetiredOriginsPendingModelsAndCutWithOnlyItsOwnPinAuthority() {
@@ -476,9 +534,11 @@ class SrsSnapshotPreparationTest {
                     snapshot == null ? null : snapshot.sourcePosition(),snapshot == null ? 0 : snapshot.snapshotEpoch(),Map.of(),ConsumerProgressKind.SRS);
             return new SrsConsumerProgress(RUN.context(),4,4,cursor,snapshot);
         }
-        SrsSnapshotPreparation owner() {
+        SrsSnapshotPreparation owner() { return owner(null); }
+        SrsSnapshotPreparation owner(SrsConsumerProgress retained) {
             return new SrsSnapshotPreparation((scope,guard) -> { assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run(); return new SrsStores(this,this,this,this); },RUN,
-                    Map.of("orders","ring-orders","quiet","ring-quiet"),7,() -> { if (!active.get()) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED,Map.of(),null); });
+                    Map.of("orders","ring-orders","quiet","ring-quiet"),7,() -> { if (!active.get()) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED,Map.of(),null); },
+                    null, java.time.Instant.EPOCH, retained);
         }
         @Override public Fixture guardedBy(Runnable guard) { guard.run(); return this; }
         @Override public Optional<SrsConsumerProgress> progress(SrsConsumerContext context) { assertThat(context).isEqualTo(RUN.context()); progressReads++; return Optional.of(original); }

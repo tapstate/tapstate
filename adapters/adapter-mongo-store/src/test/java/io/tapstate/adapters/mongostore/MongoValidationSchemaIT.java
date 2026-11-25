@@ -74,7 +74,7 @@ class MongoValidationSchemaIT {
         }
     }
 
-    @Test void publishedQueryIndexesAreRequiredAndOrdinaryOpenNeverRepairsThem() {
+    @Test void publishedQueryIndexesAreReportedByInspectionAndRequiredByPreparation() {
         try (var f = new Fixture(0)) {
             var original = f.configuration.bindings().cachePreparation().orElseThrow();
             f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
@@ -85,7 +85,15 @@ class MongoValidationSchemaIT {
                         .containsEntry("terminalMetadata.endedAt.nanos", -1);
             });
             reports.dropIndex("validation_reports_history");
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, "cluster")).isInstanceOf(TapstateException.class);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .anySatisfy(issue -> {
+                            assertThat(issue.index()).isEqualTo("validation_reports_history");
+                            assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                        });
+            }
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
             assertThat(reports.listIndexes()).noneMatch(index -> "validation_reports_history".equals(index.get("name")));
         }
     }
@@ -270,7 +278,14 @@ class MongoValidationSchemaIT {
     @Test void versionTwoMissingCollectionsOrIndexesNeverCauseDdlOnOpenOrReplay() {
         try (var f = new Fixture(1)) {
             var operation = f.upgrade(); SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, "cluster")).isInstanceOf(TapstateException.class);
+            try (var ordinary = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(ordinary.schemaVersion()).isEqualTo(2);
+                assertThat(ordinary.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .anySatisfy(issue -> {
+                            assertThat(issue.collection()).isEqualTo("validation_reports");
+                            assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.COLLECTION_MISSING);
+                        });
+            }
             assertThatThrownBy(() -> f.resume(operation)).isInstanceOf(TapstateException.class);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");
         }
@@ -332,7 +347,7 @@ class MongoValidationSchemaIT {
 
     @ParameterizedTest
     @ValueSource(strings = {"new-claims", "existing-claims", "new-control", "existing-control", "existing-config"})
-    void ordinaryNativeAccessRejectsMissingDeclaredIndexesWithoutRepair(String entry) {
+    void ordinaryNativeAccessLeavesMissingIndexesForInspection(String entry) {
         try (var f = new Fixture(1)) {
             f.upgrade();
             try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
@@ -345,15 +360,18 @@ class MongoValidationSchemaIT {
                 var run = f.reserveRun(reopened, complete, executing, "task", "run");
                 if (entry.equals("existing-config")) SystemCollections.VALIDATION_DIFFERENCES.on(f.configDb).dropIndex("validation_differences_report");
                 else SystemCollections.VALIDATION_RUNS.on(f.cacheDb).dropIndex("validation_runs_pipeline");
-                assertThatThrownBy(() -> {
-                    switch (entry) {
+                try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                    var result = switch (entry) {
                         case "new-claims" -> f.cache.validationClaims(complete).acquire(key, f.nodeOwner(), 1, TTL);
                         case "existing-claims" -> claims.renew(executing, TTL);
                         case "new-control" -> f.cache.validationControl(complete).join(run);
                         case "existing-control" -> control.join(run);
                         default -> preparations.read("flow0");
-                    }
-                }).isInstanceOf(TapstateException.class);
+                    };
+                    assertThat(result).isNotNull();
+                    assertThat((List<?>) diagnostics.snapshot().get("mongo_groups")).noneSatisfy(group ->
+                            assertThat(((java.util.Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+                }
                 if (entry.equals("existing-config")) assertThat(SystemCollections.VALIDATION_DIFFERENCES.on(f.configDb).listIndexes())
                         .noneMatch(row -> "validation_differences_report".equals(row.get("name")));
                 else assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).listIndexes())
@@ -851,7 +869,7 @@ class MongoValidationSchemaIT {
         }
     }
 
-    @Test void validationStartupReusesStructureOnlyWhileItsSchemaProofIsCurrent() {
+    @Test void validationStartupReusesOnlyItsCurrentSchemaProof() {
         try (var f = new Fixture(1)) {
             f.upgrade();
             var commands = new ArrayList<String>();
@@ -859,7 +877,7 @@ class MongoValidationSchemaIT {
             try {
                 MongoConfigurationDomain.duringValidationStartup(() -> {
                     f.configuration.validationTasks(() -> {});
-                    assertThat(commands).contains("listIndexes");
+                    assertThat(commands).containsExactly("find", "find");
                     commands.clear();
                     f.configuration.validationTasks(() -> {});
                     assertThat(commands).containsExactly("find", "find");
@@ -875,8 +893,8 @@ class MongoValidationSchemaIT {
                 MongoCommandObservation.CURRENT.remove();
             }
             SystemCollections.VALIDATION_TASKS.on(f.configDb).dropIndex("validation_tasks_pipeline_task");
-            assertThatThrownBy(() -> MongoConfigurationDomain.duringValidationStartup(() -> f.configuration.validationTasks(() -> {})))
-                    .isInstanceOf(TapstateException.class);
+            assertThat(MongoConfigurationDomain.duringValidationStartup(() -> f.configuration.validationTasks(() -> {})))
+                    .isNotNull();
         }
     }
 

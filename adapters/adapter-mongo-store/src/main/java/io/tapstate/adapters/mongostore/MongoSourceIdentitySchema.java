@@ -43,6 +43,10 @@ final class MongoSourceIdentitySchema {
                 .find(session, new Document("_id", "cluster")).first();
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(database)
                 .find(session, new Document("_id", "config")).first();
+        return read(identity, schema, expectedKeyId);
+    }
+
+    static State read(Document identity, Document schema, String expectedKeyId) {
         if (identity == null || !(identity.get("clusterId") instanceof String clusterId)
                 || !text(clusterId, 256) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || schema == null || !(schema.get("installedVersion") instanceof Integer installed)

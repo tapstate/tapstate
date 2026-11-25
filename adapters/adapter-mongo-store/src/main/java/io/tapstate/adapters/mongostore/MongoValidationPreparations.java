@@ -280,7 +280,7 @@ final class MongoValidationPreparations {
 
     static boolean validationEnabled(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster) {
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-        if (!MongoValidationSchema.configurationHasValidation(database, schema)) return false;
+        if (!MongoValidationSchema.configurationDeclaresValidation(schema)) return false;
         var marker = MongoValidationSchema.requireConfiguration(schema, "READY");
         if (!cluster.equals(MongoValidationSchema.scope(marker).clusterId())) throw unreadable(); return true;
     }

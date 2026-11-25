@@ -19,6 +19,9 @@ interface ExecutionPlanRecorder {
         }
 
         @Override
+        public boolean forgetIfPresent(String pipelineId) { return false; }
+
+        @Override
         public void forget(ExecutionPlan expected) {
         }
     };
@@ -31,6 +34,12 @@ interface ExecutionPlanRecorder {
      * {@link #last} answers with, so a run started later can say how it differs from it.
      */
     void forget(String pipelineId);
+
+    /** Returns whether a plan might have been retired. */
+    default boolean forgetIfPresent(String pipelineId) {
+        forget(pipelineId);
+        return true;
+    }
 
     /** Removes the current plan only if it is still this exact execution's plan. */
     void forget(ExecutionPlan expected);

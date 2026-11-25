@@ -122,5 +122,9 @@
   "TS0310031": {
     "message": "The development Web artifact is invalid: {reason}.",
     "solution": "Rebuild the intended supported development profile or use a verified release artifact."
+  },
+  "TS0310032": {
+    "message": "Choose either CONFIG component preparation or one migration inspection mode.",
+    "solution": "Run CONFIG component preparation and migration inspection separately."
   }
 }

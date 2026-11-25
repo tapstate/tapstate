@@ -48,6 +48,11 @@ final class ClusterMemberPreflight {
             }
             return null;
         }
+        if (cluster.getProfile() == ClusterProperties.Profile.SINGLE) {
+            org.slf4j.LoggerFactory.getLogger(ClusterMemberPreflight.class).error(
+                    "tapstate.cluster.profile=single conflicts with tapstate.hz.discovery.mode={}. For single-node OP use discovery NONE and bind to 127.0.0.1. For multiple members select a multi-member profile and configure discovery on every member.",
+                    hazelcast.getDiscovery().getMode());
+        }
         Optional<InetAddress> bound = literal(bindAddress);
         if (bound.isEmpty() || bound.get().isLoopbackAddress() || bound.get().isAnyLocalAddress()) {
             throw new TapstateException(BootError.MEMBER_BIND_ADDRESS_INVALID, Map.of(), null);
@@ -79,6 +84,9 @@ final class ClusterMemberPreflight {
         }
         memberships.read(id).ifPresent(stored -> {
             if (!id.equals(stored.clusterId()) || !stored.activeNodeIds().equals(Set.of(id))) {
+                org.slf4j.LoggerFactory.getLogger(ClusterMemberPreflight.class).error(
+                        "tapstate.cluster.profile=single cannot open cluster {} with committed members {}. Use the original multi-member profile and discovery, or configure an isolated single-node installation.",
+                        id, stored.activeNodeIds());
                 throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
             }
         });
@@ -179,13 +187,19 @@ final class ClusterMemberPreflight {
     /** Ordinary single-node startup cannot repair a missing configuration identity. */
     static Identity reserveExisting(Identity identity, ClusterProperties cluster, ClusterIdentityStore identities,
                                      WorkloadClaimStore claims, String bootId) {
+        return reserveExisting(identity, cluster, identities, claims, bootId, false);
+    }
+
+    static Identity reserveExisting(Identity identity, ClusterProperties cluster, ClusterIdentityStore identities,
+            WorkloadClaimStore claims, String bootId, boolean processOwned) {
         if (identities == null || claims == null) throw new TapstateException(BootError.COORDINATION_STORE_REQUIRED, Map.of(), null);
         ClusterIdentity existing = identities.find().orElseThrow(() -> new TapstateException(BootError.CLUSTER_ID_REQUIRED, Map.of(), null));
         if (!existing.clusterId().equals(identity.clusterId())) throw new TapstateException(BootError.CLUSTER_ID_MISMATCH,
                 Map.of("configured", identity.clusterId(), "stored", existing.clusterId()), null);
         WorkloadOwner owner = new WorkloadOwner(identity.nodeId(), bootId);
-        WorkloadClaimAttempt attempt = claims.acquire(new WorkloadClaimKey(identity.clusterId(), WorkloadClaimType.NODE_SESSION, identity.nodeId()),
-                owner, 0, cluster.getNodeSessionTtl());
+        var key = new WorkloadClaimKey(identity.clusterId(), WorkloadClaimType.NODE_SESSION, identity.nodeId());
+        WorkloadClaimAttempt attempt = processOwned ? claims.acquireProcessNode(key, owner, cluster.getNodeSessionTtl())
+                : claims.acquire(key, owner, 0, cluster.getNodeSessionTtl());
         if (!attempt.acquired()) throw new TapstateException(BootError.NODE_ID_IN_USE, Map.of("nodeId", identity.nodeId()), null);
         return new Identity(identity.clusterId(), identity.nodeId(), identity.controlUrl(), attempt.claim());
     }

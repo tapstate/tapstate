@@ -148,8 +148,7 @@ final class MongoAlertReads {
         var rows=SystemCollections.ALERT_INSTANCES.on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",lower).append("$lte",upper)))
                 .hintString("_id_").sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=rows.size()>limit;if(more)rows.removeLast();var values=new ArrayList<Stored<AlertStateRecord.Head>>();
-        for(var row:rows){var key=MongoAlertStateCodec.readKey(row.get("_id",Document.class));
-            var value=states.loadEnvelope(s,key).orElseThrow(()->unreadable("evaluation-head"));values.add(new Stored<>(value.revision(),value.value()));}
+        for(var value:states.loadEnvelopes(s,rows))values.add(new Stored<>(value.revision(),value.value()));
         return new EvaluationPage(values,more?values.getLast().value().snapshot().rule().key():null);
     }
     List<AlertIntent.Record> testWindow(ClientSession s,Instant now){
@@ -170,7 +169,7 @@ final class MongoAlertReads {
         var raw=SystemCollections.ALERT_INSTANCES.on(db).find(s,scopeFilter().append("formatVersion",new Document("$in",List.of(2,3,4))).append("status","FIRING"))
                 .hintString("alert_query_active").limit(maximum+1).into(new ArrayList<>());
         if(raw.size()>maximum)throw unreadable("inhibition-read-budget");var values=new ArrayList<AlertStateRecord.Head>();
-        for(var row:raw)values.add(states.loadEnvelope(s,MongoAlertStateCodec.readKey(row.get("_id",Document.class))).orElseThrow(()->unreadable("inhibition-head")).value());return List.copyOf(values);
+        for(var value:states.loadEnvelopes(s,raw))values.add(value.value());return List.copyOf(values);
     }
     private boolean isolated(ClientSession s,SystemCollections c,Set<Integer> supported,ReadAccess access){
         var filter=c==SystemCollections.ALERT_DELIVERY_INTENTS?and(scopeFilter(),new Document("$nor",List.of(MongoAlertEnvelopeSupport.intentFilter()))):scopeFilter().append("formatVersion",new Document("$nin",supported.stream().sorted().toList()));

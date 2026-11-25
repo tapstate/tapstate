@@ -66,15 +66,21 @@ final class MongoCachePipelineStateStore implements StateStore {
 
     /** Admit a Pipeline write before its transaction while preserving independent Pipeline progress. */
     static <T> T writeTransaction(MongoClient client, String pipeline, Supplier<T> operation) {
-        return writeOrderedTransaction(client, List.of(pipeline), operation);
+        return writeOrderedTransaction(client, List.of(pipeline), null, operation);
+    }
+
+    /** The original pin budget includes waiting for the checkpoint writer. */
+    static <T> T writeTransaction(MongoClient client, String pipeline, MongoReadBudget budget, Supplier<T> operation) {
+        return writeOrderedTransaction(client, List.of(pipeline), Objects.requireNonNull(budget, "budget"), operation);
     }
 
     /** A transaction touching several Pipelines acquires their lanes in one stable order. */
     static <T> T writeTransaction(MongoClient client, Collection<String> pipelines, Supplier<T> operation) {
-        return writeOrderedTransaction(client, List.copyOf(new TreeSet<>(pipelines)), operation);
+        return writeOrderedTransaction(client, List.copyOf(new TreeSet<>(pipelines)), null, operation);
     }
 
-    private static <T> T writeOrderedTransaction(MongoClient client, List<String> selected, Supplier<T> operation) {
+    private static <T> T writeOrderedTransaction(MongoClient client, List<String> selected, MongoReadBudget budget, Supplier<T> operation) {
+        if (budget != null) budget.requireRemaining();
         if (selected.isEmpty()) return operation.get();
         Writer writer;
         synchronized (WRITERS) {
@@ -87,9 +93,12 @@ final class MongoCachePipelineStateStore implements StateStore {
             int acquired = 0;
             try {
                 for (Lane lane : retained) {
-                    lane.transaction.lockInterruptibly();
+                    if (budget == null) lane.transaction.lockInterruptibly();
+                    else if (!lane.transaction.tryLock(budget.remainingMillis(), java.util.concurrent.TimeUnit.MILLISECONDS))
+                        throw unavailable("checkpoint writer deadline exceeded");
                     acquired++;
                 }
+                if (budget != null) budget.requireRemaining();
                 return operation.get();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -161,9 +170,8 @@ final class MongoCachePipelineStateStore implements StateStore {
     @Override public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
         access.requirePipeline(pipelineId); Objects.requireNonNull(nextStateJson, "stateJson"); Objects.requireNonNull(touchTime, "touchTime");
         if (expectedEpoch < 0) throw new IllegalArgumentException("expected epoch must be nonnegative");
-        return access.checkpointTransaction(session -> {
-            Document current = access.state(session);
-            access.proveClaim(session);
+        return access.checkpointWithPreparedState((session, current) -> {
+            access.proveClaim(session, true);
             long epoch = current.getLong("epoch");
             if (epoch != expectedEpoch) return new CasOutcome.Fenced(epoch);
             var values = new Document("stateJson", nextStateJson).append("touchMillis", touchTime.toEpochMilli());
@@ -180,12 +188,12 @@ final class MongoCachePipelineStateStore implements StateStore {
             CheckpointDoc.LeaseRecovery recovery, Instant at) {
         access.requirePipeline(pipelineId);
         return access.checkpointTransaction(session -> {
-            Document current = access.state(session);
+            Document current = access.state(session, true);
             var checkpoint = MongoStateStore.toCheckpoint(current);
             if (checkpoint.epoch() != expected.epoch()
                     || !Objects.equals(checkpoint.leaseRecovery(), expected.leaseRecovery()))
                 return new CasOutcome.Fenced(checkpoint.epoch());
-            access.proveClaim(session);
+            access.proveClaim(session, true);
             var value = new Document("intentRevision", recovery.intentRevision())
                     .append("failedExecution", recovery.failedExecution()).append("attempts", recovery.attempts())
                     .append("retryAfter", recovery.retryAfter().toEpochMilli());

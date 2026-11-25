@@ -84,7 +84,7 @@ class StorageRootConfiguration {
         return () -> root.runtime().configuration().map(io.tapstate.adapters.mongostore.MongoConfigurationDomain::schemaVersion).orElse(null);
     }
     @Bean CredentialAuthenticator credentialAuthenticator(StorageRoot root) {
-        return CredentialAuthenticator.scoped(root::authenticateCredentials);
+        return CredentialAuthenticator.scopedRequests(root::authenticateCredentials);
     }
     @Bean LocalAuthenticationContext.Provider localAuthenticationContexts(StorageRoot root) { return root::localAuthentication; }
     @Bean ManagedAuthenticationContext.Provider managedAuthenticationContexts(StorageRoot root) { return root::managedAuthentication; }
