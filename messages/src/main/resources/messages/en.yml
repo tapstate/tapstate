@@ -376,8 +376,8 @@ cli.verb-not-implemented:
   message: "The `{verb}` command is reserved but not implemented yet."
   solution: "Use the commands it will be built from in the meantime; `help` lists what this build can do."
 cli.repl-builtin-only:
-  message: "`{verb}` works inside the Tapstate session, not as a one-shot command."
-  solution: "Start `tapstate` with no arguments and type `{verb}` at the prompt; `help` lists the session commands."
+  message: "`{verb}` is an interactive action, not a one-shot command."
+  solution: "Start bare `tapstate` to open the workbench; `help` lists the interactive actions being migrated there."
 cli.mcp-unavailable:
   message: "The MCP sidecar is unavailable: {reason}."
   solution: "Install the complete Tapstate CLI bundle, including libexec/tapstate-mcp, and retry."
