@@ -9,13 +9,13 @@ import java.io.Serializable;
 import java.util.Objects;
 
 /** Execution-local commands that share the FIFO edge of the writer they address. */
-sealed interface SinkLaneCommand extends Serializable {
-    Object lane();
+sealed interface SinkLaneCommand {
+    String lane();
 
     SinkLaneAcks.Ticket reply();
 
     /** Confirms that every row preceding this command has been accepted by the target. */
-    record Fence(Object lane, SinkLaneAcks.Ticket reply) implements SinkLaneCommand {
+    record Fence(String lane, SinkLaneAcks.Ticket reply) implements SinkLaneCommand, Serializable {
         public Fence {
             Objects.requireNonNull(lane, "lane");
             Objects.requireNonNull(reply, "reply");
@@ -24,19 +24,19 @@ sealed interface SinkLaneCommand extends Serializable {
 
     /** Applies one native key update after its predecessor fences have been confirmed. */
     final class Move implements SinkLaneCommand, DataSerializable {
-        private Object lane;
+        private String lane;
         private Envelope row;
         private SinkLaneAcks.Ticket reply;
 
         public Move() {}
 
-        Move(Object lane, Envelope row, SinkLaneAcks.Ticket reply) {
+        Move(String lane, Envelope row, SinkLaneAcks.Ticket reply) {
             this.lane = Objects.requireNonNull(lane, "lane");
             this.row = Objects.requireNonNull(row, "row");
             this.reply = Objects.requireNonNull(reply, "reply");
         }
 
-        @Override public Object lane() { return lane; }
+        @Override public String lane() { return lane; }
         public Envelope row() { return row; }
         @Override public SinkLaneAcks.Ticket reply() { return reply; }
 

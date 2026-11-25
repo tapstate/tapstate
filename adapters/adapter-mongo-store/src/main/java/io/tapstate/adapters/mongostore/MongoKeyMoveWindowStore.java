@@ -70,8 +70,10 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
         if (result.containsKey("writeConcernError")) {
             throw new MongoException(64, "key move admission was not acknowledged by a majority");
         }
-        for (var error : result.getList("writeErrors", Document.class, java.util.List.of())) {
-            int code = error.getInteger("code");
+        // The command inserts one document, so the reply can carry only its write error.
+        var writeErrors = result.getList("writeErrors", Document.class, java.util.List.of());
+        if (!writeErrors.isEmpty()) {
+            int code = writeErrors.getFirst().getInteger("code");
             if (code == 361 || code == 26) throw PipelineKeyMoveWindows.unresolved(pipeline);
             if (code == 11000) return false;
             throw new MongoException(code, "key move admission was refused");

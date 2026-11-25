@@ -537,7 +537,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
         var move = (SinkLaneCommand.Move) command;
         var receipt = new KeyMoveHandoffs.Receipt() {
-            @Override public void queued() {}
+            @Override public void queued() {
+                // The router owns admission and is waiting for the target write acknowledgment.
+            }
             @Override public void written() { laneAcknowledgments.accept(move.reply()); }
         };
         queuedMove = new QueuedMove(nextOrder++, move.row(), receipt, List.of(move.row()), ignored -> false);

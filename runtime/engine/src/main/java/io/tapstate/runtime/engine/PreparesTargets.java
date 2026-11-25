@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.spi.sink.TargetKeyConstraints;
+import java.io.Serializable;
 import java.util.Map;
 
 /**
@@ -12,7 +13,7 @@ import java.util.Map;
  * <p>Once, and not by each writer: a sink runs several, and a table cleared by one after another has started
  * writing into it loses what the other wrote.
  */
-public interface PreparesTargets {
+public interface PreparesTargets extends Serializable {
 
     /**
      * Prepares every table this factory's writers will write, on the member coordinating an execution and before
