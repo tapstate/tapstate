@@ -63,27 +63,27 @@ class MongoPipelineIntentStoreIT {
             var orders = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
             var items = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("channel", "source2", "items", "capture");
             windows.requireClear("flow");
-            assertThatThrownBy(() -> windows.arm(scope, 40, "expired", orders, point(first),
+            assertThatThrownBy(() -> windows.arm(scope, 40, "expired", orders, point(first), null,
                     () -> { throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }))
                     .isInstanceOf(TapstateException.class);
             windows.requireClear("flow");
-            var initial = windows.arm(scope, 41, "activation", orders, point(first), () -> {});
-            windows.arm(scope, 41, "activation", orders, point(last), () -> {});
-            var current = windows.arm(scope, 41, "activation", items, point(other), () -> {});
+            var initial = windows.arm(scope, 41, "activation", orders, point(first), null, () -> {});
+            windows.arm(scope, 41, "activation", orders, point(last), initial, () -> {});
+            var current = windows.arm(scope, 41, "activation", items, point(other), initial, () -> {});
             assertThat(current.ranges().get(orders)).isEqualTo(new io.tapstate.spi.store.PipelineKeyMoveWindows.Range(3, 7, 12));
             var covered = Map.of(orders, last, items, other);
             try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
                 var takeover = reopened.keyMoveWindows();
                 assertThatThrownBy(() -> takeover.requireClear("flow")).isInstanceOfSatisfying(
                         TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
-                assertThatThrownBy(() -> takeover.arm(scope, 42, "replacement", orders, point(last), () -> {})).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> takeover.arm(scope, 42, "replacement", orders, point(last), null, () -> {})).isInstanceOf(TapstateException.class);
                 assertThat(takeover.read("flow")).contains(current);
             }
             assertThat(windows.retire(initial, covered, covered)).isFalse();
             assertThat(windows.retire(current, Map.of(orders, last), covered)).isFalse();
             assertThat(windows.retire(current, covered, Map.of(orders, first, items, other))).isFalse();
             assertThat(windows.retire(current, covered, covered)).isTrue();
-            var next = windows.arm(scope, 42, "replacement", orders, point(first), () -> {});
+            var next = windows.arm(scope, 42, "replacement", orders, point(first), null, () -> {});
             assertThat(windows.retire(current, covered, covered)).isFalse();
             assertThat(windows.read("flow")).contains(next);
         });

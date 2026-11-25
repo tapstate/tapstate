@@ -73,7 +73,7 @@ record ScopedKeyMoveGuard(ExecutionFence fence, List<String> keys,
 
         private void arm(PipelineKeyMoveWindows.Range changes) {
             authorization.require(fence);
-            open = windows.arm(fence.scope(), execution, activation, stream, changes, () -> authorization.requireFresh(fence));
+            open = windows.arm(fence.scope(), execution, activation, stream, changes, open, () -> authorization.requireFresh(fence));
         }
 
         @Override public void poll() {

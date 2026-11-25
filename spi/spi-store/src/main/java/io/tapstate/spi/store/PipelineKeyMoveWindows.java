@@ -41,7 +41,8 @@ public interface PipelineKeyMoveWindows {
     Optional<Window> read(String pipelineId);
 
     /** Must return durably before releasing a change to any operator. */
-    Window arm(PipelineIntentScope scope, long executionId, String activation, Stream stream, Range changes, Runnable verifyAuthority);
+    Window arm(PipelineIntentScope scope, long executionId, String activation, Stream stream, Range changes,
+            Window lastAdmission, Runnable verifyAuthority);
 
     /** The two floors come from separate authorities. Each must cover every affected stream. */
     boolean retire(Window observed, Map<Stream, SourceOrder> resumable, Map<Stream, SourceOrder> settled);

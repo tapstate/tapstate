@@ -36,10 +36,13 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
                 .map(MongoKeyMoveWindowStore::decode));
     }
 
-    @Override public Window arm(PipelineIntentScope scope, long executionId, String activation, Stream stream, Range changes, Runnable verifyAuthority) {
+    @Override public Window arm(PipelineIntentScope scope, long executionId, String activation, Stream stream, Range changes,
+            Window lastAdmission, Runnable verifyAuthority) {
         return StoreIo.call(() -> {
+            // A matching revision proves both the identity and all bounds used for this replacement.
+            // Most batches extend their own last admission without a second round trip.
+            var previous = Optional.ofNullable(lastAdmission);
             for (;;) {
-                var previous = read(scope.pipelineId());
                 var ranges = new LinkedHashMap<Stream, Range>();
                 if (previous.isPresent()) {
                     var open = previous.get();
@@ -54,7 +57,7 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
                 var next = new Window(scope, executionId, activation, UUID.randomUUID(), ranges);
                 active.run();
                 if (previous.isPresent()) {
-                    if (rows.replaceOne(match(previous.get()), encode(next)).getMatchedCount() == 1) {
+                    if (rows.replaceOne(encode(previous.get()), encode(next)).getMatchedCount() == 1) {
                         verifyAuthority.run();
                         return next;
                     }
@@ -63,6 +66,7 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
                         rows.insertOne(encode(next));
                     } catch (MongoWriteException raced) {
                         if (raced.getError().getCode() != 11000) throw raced;
+                        previous = read(scope.pipelineId());
                         continue;
                     }
                     try {
@@ -78,6 +82,7 @@ final class MongoKeyMoveWindowStore implements PipelineKeyMoveWindows {
                     }
                     return next;
                 }
+                previous = read(scope.pipelineId());
             }
         });
     }
