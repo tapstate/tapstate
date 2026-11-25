@@ -6,6 +6,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceKeyMovePreflight;
 import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.io.Serializable;
 import java.security.Permission;

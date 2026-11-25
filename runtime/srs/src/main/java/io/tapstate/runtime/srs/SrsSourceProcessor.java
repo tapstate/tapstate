@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceKeyMovePreflight;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.lifecycle.HoldsChangesForLoads;
@@ -63,7 +64,7 @@ import java.util.function.LongConsumer;
  * log and read-cursor sink are resolved on the
  * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads, io.tapstate.runtime.engine.SourceKeyMovePreflight {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads, SourceKeyMovePreflight {
 
     @Override
     public Stage stage() {
@@ -86,9 +87,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final RingTail ringTail;
     private final SourceChangeGuard.Factory changeGuardFactory;
     private SourceChangeGuard changeGuard;
-    private io.tapstate.runtime.engine.SourceKeyMovePreflight.Check preflight;
+    private SourceKeyMovePreflight.Check preflight;
 
-    @Override public void withKeyMovePreflight(io.tapstate.runtime.engine.SourceKeyMovePreflight.Check check) {
+    @Override public void withKeyMovePreflight(SourceKeyMovePreflight.Check check) {
         preflight = Objects.requireNonNull(check);
     }
     private int admittedRows;

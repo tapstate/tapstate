@@ -1,6 +1,5 @@
-package io.tapstate.runtime.engine;
+package io.tapstate.core.event;
 
-import io.tapstate.core.event.Envelope;
 import java.io.Serializable;
 
 /** A source checks a candidate move before recording its recovery interlock or emitting the batch. */

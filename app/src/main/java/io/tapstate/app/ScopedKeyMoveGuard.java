@@ -3,10 +3,10 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.core.Processor;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceKeyMovePreflight;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.srs.SourceChangeGuard;
-import io.tapstate.runtime.engine.SourceKeyMovePreflight;
 import io.tapstate.spi.store.*;
 
 import java.util.List;
