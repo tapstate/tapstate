@@ -69,6 +69,7 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
 
     private final HeapNestStore<RootAssembly> store = new HeapNestStore<>();
     private final NestBinding.NestStores stores = HeapNestStores.onHeap();
+    private com.hazelcast.core.HazelcastInstance member;
     private final TestOutbox outbox = new TestOutbox(128);
 
     @Test
@@ -166,6 +167,173 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
                 .containsExactly(FAR_ABOVE);
     }
 
+    @Test
+    void movingARootWithNoChildrenReleasesItsSourcePosition() throws Exception {
+        AssemblerProcessor leaving = assembler(store);
+        AssemblerProcessor arriving = assembler(new HeapNestStore<>());
+        feed(leaving, ROOT_ROWS, customer(1, "C1"));
+        feed(arriving, ROOT_ROWS, renamed("C1", "C2"));
+        feed(leaving, DEPARTURES, renamed("C1", "C2"));
+        arriving.tryProcess();
+        assertThat(boundsAfter(arriving, FAR_ABOVE)).endsWith(FAR_ABOVE);
+    }
+
+    @Test
+    void aReturnMoveCannotLeaveBeforeTheFirstOwnersChildArrives() throws Exception {
+        startMember();
+        exerciseReturnMove();
+    }
+
+    private void startMember() {
+        var config = new com.hazelcast.config.Config().setClusterName(java.util.UUID.randomUUID().toString());
+        var join = config.getNetworkConfig().getJoin();
+        join.getAutoDetectionConfig().setEnabled(false);
+        join.getMulticastConfig().setEnabled(false);
+        config.getNetworkConfig().setPort(0);
+        member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void closeMember() {
+        if (member != null) member.shutdown();
+    }
+
+    private void exerciseReturnMove() throws Exception {
+        var roots = stores.forAssembler(TOPOLOGY.assembler());
+        AssemblerProcessor a = assembler(roots);
+        AssemblerProcessor b = assembler(roots);
+        givenACustomerHoldingAPolicy("C1", a);
+        var outward = renamed("C1", "C2");
+        var back = renamed("C2", "C1").withOrder(at(MOVED_AT + 1));
+        var dispatch = new RootMoveDispatcher(TOPOLOGY.assembler(), NestSettings.defaults(), NestClock.SYSTEM, null, null);
+        var routed = new TestOutbox(new int[] {32, 32}, 32);
+        dispatch.init(routed, new TestProcessorContext().setHazelcastInstance(member));
+        var separate = customer(300, "unrelated");
+        dispatch.process(0, new TestInbox(List.of(outward, back, separate)));
+        List<Object> emitted = new ArrayList<>();
+        routed.drainQueueAndReset(0, emitted, false);
+        assertThat(emitted.stream().map(RootMoveAcks::payload)).containsExactly(com.hazelcast.jet.datamodel.Tuple2.tuple2(List.of("C1"), outward),
+                outward, separate);
+        feed(b, ROOT_ROWS, emitted.get(1));
+        feed(a, ROOT_ROWS, separate);
+        assertThat(roots.load(List.of("unrelated")).rootPresent()).isTrue();
+        feed(a, ROOT_ROWS, emitted.getFirst());
+        b.tryProcess();
+        dispatch.tryProcess();
+        routed.drainQueueAndReset(0, emitted, false);
+        assertThat(emitted.subList(3, 5).stream().map(RootMoveAcks::payload)).containsExactly(
+                com.hazelcast.jet.datamodel.Tuple2.tuple2(List.of("C2"), back), back);
+        feed(a, ROOT_ROWS, emitted.get(4));
+        feed(b, ROOT_ROWS, emitted.get(3));
+        a.tryProcess();
+        assertThat(roots.load(List.of("C1")).render(TOPOLOGY.slots()).orElseThrow().toString()).contains("PN-P1");
+        assertThat(boundsAfter(a, FAR_ABOVE)).endsWith(FAR_ABOVE);
+    }
+
+    @Test
+    void aLaterRootWaitsForTheChildAndReplayingTheMovePreservesBothReplacements() throws Exception {
+        startMember();
+        var roots = stores.forAssembler(TOPOLOGY.assembler());
+        var oldOwner = assembler(roots);
+        var newOwner = assembler(roots);
+        givenACustomerHoldingAPolicy("C1", oldOwner);
+        var move = renamed("C1", "C2");
+        var updated = Envelope.update(201, "customer", row("customer_id", "C2", "name", "n"),
+                row("customer_id", "C2", "name", "updated"), null).withOrder(at(201));
+        var replacement = customer(202, "C1");
+        var unrelated = customer(203, "C3");
+
+        var out = new TestOutbox(1);
+        var dispatcher = dispatcher(out);
+        var input = new TestInbox(List.of(move, updated, replacement, unrelated));
+        var released = new ArrayList<Object>();
+        for (int i = 0; i < 8 && released.size() < 3; i++) {
+            dispatcher.process(0, input);
+            dispatcher.tryProcess();
+            out.drainQueueAndReset(0, released, false);
+        }
+        assertThat(released.stream().map(RootMoveAcks::payload)).containsExactly(
+                com.hazelcast.jet.datamodel.Tuple2.tuple2(List.of("C1"), move), move, unrelated);
+        feed(newOwner, ROOT_ROWS, released.get(1));
+        dispatcher.tryProcess();
+        assertThat(out.queue(0)).isEmpty();
+        feed(oldOwner, ROOT_ROWS, released.get(0));
+        newOwner.tryProcess();
+        var next = new ArrayList<Object>();
+        for (int i = 0; i < 3; i++) {
+            dispatcher.tryProcess();
+            out.drainQueueAndReset(0, next, false);
+        }
+        assertThat(next).containsExactly(updated, replacement);
+        feed(newOwner, ROOT_ROWS, updated);
+        feed(oldOwner, ROOT_ROWS, replacement);
+        dispatcher.close();
+
+        var replayOut = new TestOutbox(8);
+        var reopened = dispatcher(replayOut);
+        reopened.process(0, new TestInbox(List.of(move)));
+        var halves = new ArrayList<Object>();
+        replayOut.drainQueueAndReset(0, halves, false);
+        assertThat(halves).hasSize(2);
+        feed(assembler(roots), ROOT_ROWS, halves.get(0));
+        feed(assembler(roots), ROOT_ROWS, halves.get(1));
+        assertThat(reopened.complete()).isTrue();
+        assertThat(roots.load(List.of("C1")).render(TOPOLOGY.slots()).orElseThrow().toString())
+                .doesNotContain("PN-P1");
+        assertThat(roots.load(List.of("C2")).render(TOPOLOGY.slots()).orElseThrow().toString())
+                .contains("updated", "PN-P1");
+        reopened.close();
+    }
+
+    @Test
+    void anUnfinishedMoveHoldsItsSettlementAndRetriesARefusedBoundBeforeLaterData() throws Exception {
+        startMember();
+        var out = new TestOutbox(1);
+        var processor = new RootMoveDispatcher(TOPOLOGY.assembler(), NestSettings.defaults(), NestClock.SYSTEM,
+                AXES, Map.of(0, List.of(CUSTOMERS)));
+        processor.init(out, new TestProcessorContext().setHazelcastInstance(member));
+        var move = renamed("C1", "C2");
+        var follow = customer(MOVED_AT + 1, "C1");
+        var inbox = new TestInbox(List.of(move, follow));
+        var rows = new ArrayList<Object>();
+        processor.process(0, inbox);
+        out.drainQueueAndReset(0, rows, false);
+        processor.process(0, inbox);
+        var mark = new Watermark(FAR_ABOVE, AXES.axisOf(CUSTOMERS));
+        assertThat(processor.tryProcessWatermark(0, mark)).isFalse();
+        out.drainQueueAndReset(0, rows, false);
+        var first = (com.hazelcast.jet.datamodel.Tuple2<?, ?>) rows.getFirst();
+        var ticket = (RootMoveAcks.Ticket) first.f0();
+        RootMoveAcks.acknowledge(member, TOPOLOGY.assembler(), ticket, true);
+        RootMoveAcks.acknowledge(member, TOPOLOGY.assembler(), ticket, false);
+        processor.tryProcessWatermark(0, mark);
+        var retried = new ArrayList<Object>();
+        out.drainQueueAndReset(0, retried, false);
+        assertThat(boundsIn(retried)).containsExactly(FrontierOrders.pack(CUSTOMERS, at(MOVED_AT)) - 1);
+        for (int i = 0; i < 5; i++) {
+            processor.tryProcessWatermark(0, mark);
+            out.drainQueueAndReset(0, retried, false);
+        }
+        assertThat(retried).contains(follow);
+        assertThat(boundsIn(retried)).endsWith(FAR_ABOVE);
+        processor.close();
+
+        var roomy = new TestOutbox(8);
+        processor = dispatcher(roomy);
+        processor.process(0, new TestInbox(List.of(move)));
+        var settled = new TestInbox(List.of(new io.tapstate.runtime.engine.SettledPositions(move.positions())));
+        processor.process(0, settled);
+        assertThat(settled.isEmpty()).isFalse();
+        processor.close();
+    }
+
+    private RootMoveDispatcher dispatcher(TestOutbox out) throws Exception {
+        var dispatcher = new RootMoveDispatcher(TOPOLOGY.assembler(), NestSettings.defaults(), NestClock.SYSTEM,
+                null, null);
+        dispatcher.init(out, new TestProcessorContext().setHazelcastInstance(member));
+        return dispatcher;
+    }
+
     private void givenACustomerHoldingAPolicy(String customerId, AssemblerProcessor processor) {
         feed(processor, ROOT_ROWS, customer(1, customerId));
         feed(processor, FROM_POLICIES, Envelope.insert(2, "policy",
@@ -181,6 +349,7 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
         AssemblerProcessor processor = new AssemblerProcessor(TOPOLOGY.assembler(), TOPOLOGY.slots(), documents,
                 "doc", AXES, CHAINS, ReplayFloor.NONE, NestSettings.defaults(), NestClock.SYSTEM,
                 NestSendPolicy.within(0), stores.forParking(TOPOLOGY.assembler()));
+        processor.withRootHandoverTransport(member);
         processor.init(outbox, new TestProcessorContext());
         return processor;
     }

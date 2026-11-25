@@ -158,6 +158,10 @@ public final class RootAssembly implements Serializable {
         return rootOrder != null && rootOrder.compareTo(order) > 0;
     }
 
+    boolean hasRootAt(SourceOrder order) {
+        return rootPresent && order.equals(rootOrder);
+    }
+
     boolean rootDeletedAt(SourceOrder order) {
         return !rootPresent && order.equals(rootOrder);
     }

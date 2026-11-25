@@ -244,6 +244,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * gone is ever recorded here.
      */
     private final Map<ParkedSubtree.At, Owed> owed = new LinkedHashMap<>();
+    private final Map<ParkedSubtree.At, RootMoveAcks.Ticket> awaitingRoot = new LinkedHashMap<>();
+    private com.hazelcast.core.HazelcastInstance member;
 
     /**
      * A document owed a hand-over: which key it is, and the source's time for the change that made it owed.
@@ -626,6 +628,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         this.logger = context.logger();
     }
 
+    AssemblerProcessor withRootHandoverTransport(com.hazelcast.core.HazelcastInstance originalMember) {
+        member = originalMember;
+        return this;
+    }
+
     // Times each drain of arrivals, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.NEST);
 
@@ -701,7 +708,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched,
             boolean ownedSnapshot) {
-        handle(edge, item, touched);
+        if (item instanceof Tuple2<?, ?> mail && mail.f0() instanceof RootMoveAcks.Ticket ticket) {
+            handleRootHandover(edge, mail.f1(), ticket, touched);
+        } else {
+            handle(edge, item, touched);
+        }
         inbox.remove();
         // Append settles each version; folding keeps at most one bounded drain of distinct roots.
         if (!sending.foldingAllowed() || touched.size() >= DrainFolding.MAX_KEYS_HELD) {
@@ -710,6 +721,35 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return flush();
         }
         return true;
+    }
+
+    private void handleRootHandover(NestInbound edge, Object payload, RootMoveAcks.Ticket ticket,
+            Map<Object, Touched> touched) {
+        boolean leaving = payload instanceof Tuple2<?, ?>;
+        Envelope event = leaving ? (Envelope) ((Tuple2<?, ?>) payload).f1() : (Envelope) payload;
+        var destination = NestKeys.valuesOf(event.after(), vertex.partitionKey(), vertex.mapName());
+        Object local = leaving ? ((Tuple2<?, ?>) payload).f0() : destination;
+        var order = NestKeys.orderOf(event);
+        Touched document = movedRoot(local, event, order, touched);
+        if (document == null) {
+            // The later root may still be part of the current drain. Return its credit only once
+            // that state is durable; never detach the replacement's children during replay.
+            var later = touched.get(local);
+            if (later == null) RootMoveAcks.acknowledge(member, vertex, ticket, leaving);
+            else later.confirmAfterSave(ticket, leaving);
+            return;
+        }
+        handle(edge, payload, touched);
+        if (!(leaving ? document.assembly.rootDeletedAt(order) : document.assembly.hasRootAt(order))) {
+            throw RootMoveAcks.unconfirmed(vertex);
+        }
+        var address = ParkedSubtree.At.ofRoot(destination);
+        if (!leaving && owed.containsKey(address)) {
+            awaitingRoot.put(address, ticket);
+        } else {
+            if (leaving) handedOver.remove(address);
+            document.confirmAfterSave(ticket, leaving);
+        }
     }
 
     /** Every namespace a slot with alternatives reads from, at any depth of the tree. */
@@ -1436,7 +1476,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * running and no error anywhere.
      */
     private void hand(ParkedSubtree.At at, List<NestElement> subtree, Map<String, ChainPosition> since) {
-        if (subtree.isEmpty()) {
+        if (subtree.isEmpty() && !at.pathId().isEmpty()) {
             return;
         }
         ParkedSubtree held = parking.load(at);
@@ -1546,6 +1586,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 // half that would complete it may never be worked at all, and a document held for something
                 // that is not coming is one nothing ever sends - the same silence holding it back was for.
                 if (now - entry.getValue().awaitedSince() >= migrationProtection) {
+                    if (awaitingRoot.containsKey(entry.getKey())) throw RootMoveAcks.unconfirmed(vertex);
                     RootAssembly asItStands = store.load(key);
                     if (asItStands != null) {
                         Touched document = landed.computeIfAbsent(key,
@@ -1584,7 +1625,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         // Only once the documents holding those rows have been stored, for the reason collect gives: between
         // the two writes the rows exist in one place, and it must not be the one being emptied.
-        taken.forEach(this::letGoOf);
+        taken.forEach((address, pieces) -> {
+            letGoOf(address, pieces);
+            var ticket = awaitingRoot.remove(address);
+            if (ticket != null) RootMoveAcks.acknowledge(member, vertex, ticket, false);
+        });
     }
 
     /**
@@ -1687,6 +1732,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             }
         });
         writes.flush();
+        for (var document : touched.values()) {
+            if (document.handover != null) {
+                RootMoveAcks.acknowledge(member, vertex, document.handover, document.leaving);
+                document.handover = null;
+            }
+        }
     }
 
     private void settleRendered(Object key, Touched document, Map<String, Object> rendered,
@@ -2267,9 +2318,16 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         private final boolean heldNothing;
 
         private boolean rootDeleted;
+        private RootMoveAcks.Ticket handover;
+        private boolean leaving;
         private long emissionBytes = -1;
         private long inputBytes = -1;
         private long ts;
+
+        private void confirmAfterSave(RootMoveAcks.Ticket ticket, boolean departure) {
+            handover = ticket;
+            leaving = departure;
+        }
 
         private Touched(RootAssembly assembly, boolean heldNothing) {
             this.assembly = assembly;
