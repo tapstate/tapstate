@@ -1368,8 +1368,8 @@
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
         "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation.",
         "An explicit start handoff has the original stopped execution, exact active binding and a locally verified candidate. A failed candidate leaves the effective binding and original durable progress intact."
-        ]
-      },
+      ]
+    },
     "validation-report-product-codes": {
       "goal": "Retain original validation configuration, one-time report birth rights and complete retained observations without recreating old runs.",
       "entry": "Restore the original matching CONFIG backup; explicitly prepare or upgrade the validation schema before admitting work.",
@@ -1397,6 +1397,14 @@
       "prerequisites": [
         "Version 1 stores a revision, a global enabled flag, interval and maximum duration, and optional overrides keyed by registered operation.",
         "An unconfigured cluster uses enabled, 60 seconds between attempts, and an 8 hour retry window."
+      ]
+    },
+    "pipeline-key-move-window": {
+      "goal": "Stop an ambiguous default-mode recovery before replay mutates operator state or sends a target write.",
+      "entry": "Read the original pipeline window at admission, before delivering source changes. An unresolved window from another execution blocks automatic replay and preserves the last safe source position.",
+      "prerequisites": [
+        "Original CONFIG binding, pipeline identity, and generation are known.",
+        "Clear a window only after the source recovery cut and affected downstream completions cover it and outstanding writes are settled. A reconciled full rebuild must establish a new safe starting point."
       ]
     }
   },
@@ -1704,6 +1712,10 @@
     "operation-retry-policy-v1": {
       "atomicDomain": "CONFIG",
       "fencing": "A save conditionally replaces the complete singleton against its original revision in the bound CONFIG database. All override fields and the revision are committed together. Runtime attempts use the published policy without writing to CONFIG."
+    },
+    "pipeline-key-move-window": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Register or extend the window with majority acknowledgement before releasing a hazardous operation. Scope, originating execution and an exact revision fence its modification or removal. Source checkpoints and target commits are separate atomic domains."
     }
   },
   "resources": [
@@ -3159,6 +3171,30 @@
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineIntentStoreIT.java",
         "app/src/test/java/io/tapstate/app/PipelineFirstStatePreparerIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.pipeline_key_move_windows",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "pipeline_key_move_windows"
+      ],
+      "responsibility": "Hold one unresolved key-move interval per pipeline with the original generation and source bounds. Stores no business images or target commit receipts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoKeyMoveWindowStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoKeyMoveWindowStore"
+      ],
+      "recovery": "pipeline-key-move-window",
+      "consistency": "pipeline-key-move-window",
+      "growth": "At most one unresolved document per pipeline; bounds are coalesced per participating source chain, independent of event count. Remove after safe recovery coverage.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineIntentStoreIT.java"
       ]
     },
     {

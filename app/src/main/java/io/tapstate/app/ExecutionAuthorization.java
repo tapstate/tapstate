@@ -219,6 +219,15 @@ final class ExecutionAuthorization implements AutoCloseable {
      * The exact live claim behind this member's answer, or {@code null} on an unfenced single-node member.
      * Refuses with a diagnosis when the member may no longer act for {@code fence}'s run.
      */
+    void requireFresh(ExecutionFence fence) {
+        require(fence);
+        long before = nanoTime.getAsLong();
+        var current = claims.readPipeline(fence.scope());
+        if (current.isEmpty() || !matches(WorkloadClaimFence.from(current.get().claim()), fence)
+                || nanoTime.getAsLong() - before >= current.get().leaseRemaining().toNanos()
+                || !nodeActive.getAsBoolean() || closed.get()) throw writerRefused(fence);
+    }
+
     WorkloadClaimFence require(ExecutionFence fence) {
         if (!fenced && (fence == null || fence.scope() == null)) {
             return null;

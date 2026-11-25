@@ -668,6 +668,36 @@ class SrsSourceProcessorTest {
         }
     }
 
+    @Test
+    void aRefusedKeyMoveBatchCannotEmitThePrecedingOldKeyOrAnyWatermark() throws Exception {
+        String ring = "direct.key-move-admission";
+        var buffer = new SnapshotBuffer();
+        var original = Map.<String,Object>of("id", 1);
+        buffer.append(PIPELINE, ring, Envelope.insert(1, "orders", original, null)
+                .withPosition(new ChainPosition(new SourceOrder(1, 1), null)));
+        buffer.append(PIPELINE, ring, Envelope.update(2, "orders", original, Map.of("id", 2), null)
+                .withPosition(new ChainPosition(new SourceOrder(1, 2), null)));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        try {
+            SourceChangeGuard.Factory guard = context -> new SourceChangeGuard() {
+                @Override public void beforeBatch(Iterable<Envelope> rows) {
+                    assertThat(rows).extracting(Envelope::op).containsExactly(Op.INSERT, Op.UPDATE);
+                    throw new IllegalStateException("registration interrupted");
+                }
+                @Override public void poll() {}
+            };
+            var meta = SrsSourceProcessor.directMetaSupplier(PIPELINE, ring, "orders", 1L, RECORDED_STAMP,
+                    SourcePlacement.anyMember(), 2, guard);
+            withOneSlotOutbox(meta, (processor, outbox) -> {
+                org.assertj.core.api.Assertions.assertThatThrownBy(processor::complete)
+                        .hasMessage("registration interrupted");
+                assertThat(outbox.queue(0)).isEmpty();
+            });
+        } finally {
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+        }
+    }
+
     private void assertTwoRowsPerBound(ProcessorMetaSupplier meta) throws Exception {
         withOneSlotOutbox(meta, (processor, outbox) -> {
             List<Object> emitted = new ArrayList<>();

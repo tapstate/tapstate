@@ -90,6 +90,9 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition SOURCE_IDENTITY_EXHAUSTED =
             DEFINITIONS.define(41, Severity.ERROR, Set.of("id"));
 
+    public static final ProductErrorDefinition KEY_MOVE_RECOVERY_UNCERTAIN =
+            DEFINITIONS.define(42, Severity.ERROR, Set.of("pipeline"));
+
     private IoErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

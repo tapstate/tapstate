@@ -49,6 +49,46 @@ class MongoPipelineIntentStoreIT {
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final String HASH = CanonicalHash.of(pipeline());
 
+    private static io.tapstate.spi.store.PipelineKeyMoveWindows.Range point(io.tapstate.core.event.SourceOrder order) {
+        return new io.tapstate.spi.store.PipelineKeyMoveWindows.Range(order.epoch(), order.seq(), order.seq());
+    }
+
+    @Test
+    void replayStopsBeforeReuseAndBothDurableFloorsMustCoverTheExactInterval() {
+        withConfiguration((domain, database, scope) -> {
+            var windows = domain.keyMoveWindows();
+            var first = new io.tapstate.core.event.SourceOrder(3, 7);
+            var last = new io.tapstate.core.event.SourceOrder(3, 12);
+            var other = new io.tapstate.core.event.SourceOrder(1, 2);
+            var orders = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
+            var items = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("channel", "source2", "items", "capture");
+            windows.requireClear("flow");
+            assertThatThrownBy(() -> windows.arm(scope, 40, "expired", orders, point(first),
+                    () -> { throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }))
+                    .isInstanceOf(TapstateException.class);
+            windows.requireClear("flow");
+            var initial = windows.arm(scope, 41, "activation", orders, point(first), () -> {});
+            windows.arm(scope, 41, "activation", orders, point(last), () -> {});
+            var current = windows.arm(scope, 41, "activation", items, point(other), () -> {});
+            assertThat(current.ranges().get(orders)).isEqualTo(new io.tapstate.spi.store.PipelineKeyMoveWindows.Range(3, 7, 12));
+            var covered = Map.of(orders, last, items, other);
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                var takeover = reopened.keyMoveWindows();
+                assertThatThrownBy(() -> takeover.requireClear("flow")).isInstanceOfSatisfying(
+                        TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+                assertThatThrownBy(() -> takeover.arm(scope, 42, "replacement", orders, point(last), () -> {})).isInstanceOf(TapstateException.class);
+                assertThat(takeover.read("flow")).contains(current);
+            }
+            assertThat(windows.retire(initial, covered, covered)).isFalse();
+            assertThat(windows.retire(current, Map.of(orders, last), covered)).isFalse();
+            assertThat(windows.retire(current, covered, Map.of(orders, first, items, other))).isFalse();
+            assertThat(windows.retire(current, covered, covered)).isTrue();
+            var next = windows.arm(scope, 42, "replacement", orders, point(first), () -> {});
+            assertThat(windows.retire(current, covered, covered)).isFalse();
+            assertThat(windows.read("flow")).contains(next);
+        });
+    }
+
     @Test
     void aPreparedArtifactHandoffPreservesTheOriginalBindingWhenItsStartIsSuperseded() {
         withConfiguration((domain, database, scope) -> {

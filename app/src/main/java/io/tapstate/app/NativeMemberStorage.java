@@ -41,6 +41,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         initialDeadline = askedAt + properties.getNodeSessionTtl().toNanos();
         authorization = ExecutionAuthorization.scoped(bound.preparation().businessScope(), claims,
                 properties.getWorkloadClaimRenewInterval(), System::nanoTime, this::nodeActive);
+        config.getUserContext().put(ScopedKeyMoveGuard.STORE_KEY, configuration.keyMoveWindows());
         config.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         config.getUserContext().put(SrsStoreViews.USER_CONTEXT_KEY, sourceViews());
         config.getUserContext().put(CheckpointProgressWrites.USER_CONTEXT_KEY, progressWrites);

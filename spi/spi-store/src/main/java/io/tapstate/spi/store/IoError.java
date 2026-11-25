@@ -176,7 +176,9 @@ public enum IoError implements TapstateErrorCode {
     SOURCE_IDENTITY_UNAVAILABLE(IoErrorDefinitions.SOURCE_IDENTITY_UNAVAILABLE),
 
     /** A necessary Source lifecycle revision cannot advance without wrapping or losing ordering. */
-    SOURCE_IDENTITY_EXHAUSTED(IoErrorDefinitions.SOURCE_IDENTITY_EXHAUSTED);
+    SOURCE_IDENTITY_EXHAUSTED(IoErrorDefinitions.SOURCE_IDENTITY_EXHAUSTED),
+
+    KEY_MOVE_RECOVERY_UNCERTAIN(IoErrorDefinitions.KEY_MOVE_RECOVERY_UNCERTAIN);
 
     private final ProductErrorDefinition definition;
 

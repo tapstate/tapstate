@@ -3909,17 +3909,24 @@ final class StoreBackedDagSource implements DagSource {
                         order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
             }
             if (!captureBindings.snapshots().isEmpty()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            var model = modelForVertex(vertex);
+            var table = model == null ? null : discoveredTable(model, vertex.table());
+            if (table == null) throw new TapstateException(IoError.PIPELINE_CAPTURE_IDENTITY_UNPROVEN, Map.of("pipeline", vertex.pipelineId()), null);
+            String physical = vertex.resolution().chainId().value();
+            var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream(physical, vertex.sourceId(), vertex.table(),
+                    direct ? captureBindings.requireDirect(vertex.sourceId(), physical, vertex.table()).context().captureId() : null);
+            var guard = new ScopedKeyMoveGuard(captureBindings.original(), table.primaryKey(), stream);
             if (direct) {
                 var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
                 return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.loadEpoch(),
                         order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
-                        readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())));
+                        readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())), guard);
             }
             var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
             return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
                     source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
                     order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
-                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.artifactId())));
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.artifactId())), guard);
         }
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(

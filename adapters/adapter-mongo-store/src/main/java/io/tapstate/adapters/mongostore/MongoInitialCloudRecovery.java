@@ -46,7 +46,7 @@ final class MongoInitialCloudRecovery {
                 SystemCollections.CONFIGURATION_IMPORTS, SystemCollections.CONFIG_NEST_DEAD_LETTERS}) {
             if (!existing.contains(installed.collectionName())) throw MongoCachePipelineAccess.fenced();
         }
-        for (var table : new SystemCollections[]{SystemCollections.PIPELINES, SystemCollections.PIPELINE_INTENTS,
+        for (var table : new SystemCollections[]{SystemCollections.PIPELINES, SystemCollections.PIPELINE_INTENTS, SystemCollections.PIPELINE_KEY_MOVE_WINDOWS,
                 SystemCollections.CAPTURE_PREPARATIONS, SystemCollections.OPERATOR_GENERATIONS, SystemCollections.CONFIG_PIPELINE_LAYOUTS,
                 SystemCollections.CONFIG_PIPELINE_DRAFTS, SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS,
                 SystemCollections.SERVE_DEFINITIONS, SystemCollections.PDK_NOTES,

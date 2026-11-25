@@ -166,5 +166,9 @@
   "TS0480041": {
     "message": "The lifecycle revision of Source '{id}' cannot advance.",
     "solution": "Replace the Source through its supported lifecycle after preserving required state. Do not reset its identity or counters in place."
+  },
+  "TS0480042": {
+    "message": "Pipeline '{pipeline}' stopped before replay because a primary-key change may have reached its target.",
+    "solution": "Check the old and new keys and the saved source position before resuming from a verified baseline."
   }
 }

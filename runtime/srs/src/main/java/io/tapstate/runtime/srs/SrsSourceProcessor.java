@@ -84,6 +84,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final long epoch;
     private final SourceBoundStamp stamp;
     private final RingTail ringTail;
+    private final SourceChangeGuard.Factory changeGuardFactory;
+    private SourceChangeGuard changeGuard;
+    private boolean batchAdmitted;
     private final boolean bounded;
     // The most changes one pass reads from the ring and sends on before yielding: the batch the source's author
     // asked for, which is how many rows it hands on at a time - never how many the connector fetches.
@@ -137,7 +140,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private long nextLookNanos;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
-            SourceBoundStamp stamp, RingTail ringTail, int readBatch, boolean bounded) {
+            SourceBoundStamp stamp, RingTail ringTail, int readBatch, boolean bounded, SourceChangeGuard.Factory guard) {
+        this.changeGuardFactory = guard;
         this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
@@ -172,6 +176,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             }
         }
         try {
+            if (changeGuardFactory != null) changeGuard = changeGuardFactory.open(context);
             initialize(context);
         } catch (RuntimeException | Error failure) {
             if (failures != null) failures.accept(failure);
@@ -256,6 +261,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     @Override
     public boolean complete() {
         try {
+            if (changeGuard != null) changeGuard.poll();
             return drain();
         } catch (RuntimeException | Error failure) {
             if (failures != null) failures.accept(failure);
@@ -577,12 +583,17 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // A private hand-off can supply several output batches in one drain. Its read position
         // already names the last of them, so intermediate bounds must come from emitted rows.
         boolean directCdc = ringTail == null && !bounded && stamp != null && !awaitingSnapshot && !snapshotBoundDue;
+        if (!pending.isEmpty() && !batchAdmitted && changeGuard != null) {
+            changeGuard.beforeBatch(pending);
+            batchAdmitted = true;
+        }
         while (!pending.isEmpty()) {
             Envelope row = pending.peek();
             if (!tryEmit(row)) {
                 return false;
             }
             pending.remove();
+            if (pending.isEmpty()) batchAdmitted = false;
             if (directCdc && ++directRowsSinceBound == readBatch) {
                 directRowsSinceBound = 0;
                 stampAt(row.position().order());
@@ -645,6 +656,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
             SourceBoundStamp stamp, SourcePlacement placement, int readBatch) {
+        return metaSupplier(pipelineId, ringName, src, start, resumeAfter, epoch, publisherFactory, stamp, placement, readBatch, null);
+    }
+
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourceBoundStamp stamp, SourcePlacement placement, int readBatch, SourceChangeGuard.Factory guard) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -658,7 +675,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a source reads at least one change a pass, got " + readBatch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp,
-                new RingTail(start, resumeAfter, publisherFactory), readBatch, false);
+                new RingTail(start, resumeAfter, publisherFactory), readBatch, false, guard);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -672,12 +689,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
             String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
             SourcePlacement placement) {
-        return bufferMetaSupplier(pipelineId, ringName, src, epoch, stamp, placement, BatchSpec.DEFAULT_MAX_RECORDS, true);
+        return bufferMetaSupplier(pipelineId, ringName, src, epoch, stamp, placement, BatchSpec.DEFAULT_MAX_RECORDS, true, null);
     }
 
     private static ProcessorMetaSupplier bufferMetaSupplier(
             String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
-            SourcePlacement placement, int readBatch, boolean bounded) {
+            SourcePlacement placement, int readBatch, boolean bounded, SourceChangeGuard.Factory guard) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -686,7 +703,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null,
-                readBatch, bounded);
+                readBatch, bounded, guard);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -699,8 +716,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     /** A direct source using the configured CDC output batch size. */
     public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
             long epoch, SourceBoundStamp stamp, SourcePlacement placement, int readBatch) {
+        return directMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, readBatch, null);
+    }
+
+    public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
+            long epoch, SourceBoundStamp stamp, SourcePlacement placement, int readBatch, SourceChangeGuard.Factory guard) {
         if (readBatch < 1) throw new IllegalArgumentException("a source reads at least one change a pass");
-        return bufferMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, readBatch, false);
+        return bufferMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, readBatch, false, guard);
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */

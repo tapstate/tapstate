@@ -83,6 +83,12 @@ final class NativePipelineRecovery {
 
     Map<String,String> inspectCaptured(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
         requireAvailable();String id=pass.scope().pipelineId();pass.requirePipeline(id);
+        var windows = configuration.keyMoveWindows();
+        windows.read(id).ifPresent(window -> {
+            if (!window.scope().equals(pass.scope()) || !(views instanceof SrsStoreViews sources)
+                    || !KeyMoveRecovery.retire(windows, window, sources, () -> pass.requirePipeline(id)))
+                throw PipelineKeyMoveWindows.unresolved(id);
+        });
         var authored=StoredArtifacts.requirePipeline(snapshot,id);
         var pipeline=PipelineInlining.inline(authored,snapshot);
         var sources=new LinkedHashMap<String,SourceResource>();
