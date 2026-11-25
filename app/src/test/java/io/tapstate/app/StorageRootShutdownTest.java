@@ -137,6 +137,44 @@ class StorageRootShutdownTest {
         verifyNoMoreInteractions(candidate, candidateAuthentication);
     }
 
+    @Test void closingStopsRecoveryWorkerPublishedDuringCoordinatorDrain() throws Exception {
+        var root = root();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (var recovery = Executors.newSingleThreadExecutor();
+                var coordinator = Executors.newSingleThreadExecutor()) {
+            var admitted = coordinator.submit(() -> root.coordinateInstallation(() -> {
+                entered.countDown();
+                try {
+                    assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+                ReflectionTestUtils.setField(root, "recoveryWorker", recovery);
+                return null;
+            }));
+            try {
+                assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                var closing = new java.util.concurrent.FutureTask<Void>(() -> {
+                    ShutdownAwait.within(Duration.ofSeconds(3), root::close);
+                    return null;
+                });
+                var caller = Thread.ofPlatform().daemon().start(closing);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(1))
+                        .until(() -> caller.getState() == Thread.State.TIMED_WAITING);
+                release.countDown();
+                admitted.get(2, TimeUnit.SECONDS);
+                closing.get(4, TimeUnit.SECONDS);
+                assertThat(recovery.isTerminated()).isTrue();
+            } finally {
+                release.countDown();
+            }
+        } finally {
+            root.close();
+        }
+    }
+
     private static StorageRoot root() {
         var mongo = new MongoProperties();
         mongo.setUri(null);

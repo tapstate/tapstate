@@ -47,6 +47,7 @@ final class StorageRoot implements AutoCloseable {
     // Publishes the immutable operation identity for read-only activation projections.
     @SuppressWarnings("java:S3077")
     private volatile StorageBindingCommit setupInvocation;
+    private final Object recoveryWorkerLock = new Object();
     private java.util.concurrent.ExecutorService recoveryWorker;
     private final Object activationLock = new Object();
     private java.util.concurrent.ExecutorService activationWorker;
@@ -848,10 +849,7 @@ final class StorageRoot implements AutoCloseable {
         if (recoveryQueued) return;
         long acceptedRevision=pipeline?pipelineRecovery(original.originalScope()).acceptedIntentRevision(original):-1;
         NativeBusinessContext sharedRuntime=shared?sharedBusiness(original.originalScope()):null;
-        if (recoveryWorker == null) recoveryWorker = java.util.concurrent.Executors.newSingleThreadExecutor(
-                Thread.ofPlatform().daemon(true).name("cache-recovery").factory());
-        recoveryQueued = true; recoveryFailed = false; recoveryFailure = null;
-        recoveryWorker.execute(() -> {
+        enqueueRecovery(() -> {
             if(shared) {
                 try {
                     sharedRuntime.awaitAvailability();
@@ -876,6 +874,18 @@ final class StorageRoot implements AutoCloseable {
                 finally { recoveryQueued = false; }
             }
         });
+    }
+
+    private void enqueueRecovery(Runnable work) {
+        synchronized (recoveryWorkerLock) {
+            if (closeRequested) throw StorageRuntime.unavailable();
+            if (recoveryWorker == null) recoveryWorker = java.util.concurrent.Executors.newSingleThreadExecutor(
+                    Thread.ofPlatform().daemon(true).name("cache-recovery").factory());
+            recoveryQueued = true;
+            recoveryFailed = false;
+            recoveryFailure = null;
+            recoveryWorker.execute(work);
+        }
     }
 
     private boolean isInitialRecovery(StorageRecoveryCommands.Plan original) {
@@ -1104,13 +1114,21 @@ final class StorageRoot implements AutoCloseable {
     }
 
     private void drainCoordinators(long deadline) {
-        if (recoveryWorker != null) recoveryWorker.shutdown();
         ShutdownAwait.all(List.of(
                 () -> replacements.await(deadline),
+                () -> drainRecoveryWorker(deadline),
                 () -> { if (authenticationWorker != null) ShutdownAwait.executor(authenticationWorker, deadline); },
-                () -> { if (activationWorker != null) ShutdownAwait.executor(activationWorker, deadline); },
-                () -> { if (recoveryWorker != null) ShutdownAwait.executor(recoveryWorker, deadline); }));
+                () -> { if (activationWorker != null) ShutdownAwait.executor(activationWorker, deadline); }));
         if (initialization != null) initialization.close();
+    }
+
+    private void drainRecoveryWorker(long deadline) {
+        java.util.concurrent.ExecutorService worker;
+        synchronized (recoveryWorkerLock) {
+            worker = recoveryWorker;
+            if (worker != null) worker.shutdown();
+        }
+        if (worker != null) ShutdownAwait.executor(worker, deadline);
     }
 
     private void closeUnpublishedOwners() {
