@@ -223,10 +223,11 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
         Objects.requireNonNull(node);
         if(validation==null||!pipeline.equals(validation.pipelineId())||node.key().type()!=WorkloadClaimType.NODE_SESSION
                 ||!scope.clusterId().equals(node.key().clusterId()))throw fenced();
-        return StoreIo.call(()->{
-            requireActive.run();validation.require(false);requireCollection(database);MongoValidationSchema.requireReady(database,false);
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            requireActive.run();validation.require(false);MongoValidationSchema.requireReady(database,false);
             try(var session=client.startSession()){
                 var answer=session.withTransaction(()->{
+                    MongoStructureFailureScope.beginCallback();
                     requireActive.run();requireReadingNode(session,node);
                     new MongoCacheBusinessIdentity(database,scope).requireAdmissionState(session);
                     var control=control(session,pipeline);
@@ -239,7 +240,7 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
                 },TRANSACTION);
                 validation.require(false);requireActive.run();return answer;
             }
-        });
+        }));
     }
     private void requireReadingNode(ClientSession session,WorkloadClaimFence expected){
         var found=new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).read(expected.key());
@@ -412,13 +413,12 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
     private <T> T transaction(ValidationOwner owner, boolean admission, Runnable configFence,
             java.util.function.BiFunction<ClientSession, Document, T> work) {
         if (!scope.clusterId().equals(owner.clusterId())) throw fenced();
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             requireActive.run();
-            // Manual COUNT checks the collection again inside the actual write transaction.
-            if (configFence == null) requireCollection(database);
             requireValidationAuthority(owner, admission, configFence);
             try (var session = client.startSession()) {
                 var committed = session.withTransaction(() -> {
+                    MongoStructureFailureScope.beginCallback();
                     requireActive.run();
                     // Prove the latest live tenure before any read pins a snapshot. Every later domain
                     // and preparation check is in this transaction and rolls the witness back on failure.
@@ -452,7 +452,7 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
                 requireValidationAuthority(owner, admission, configFence);
                 return committed;
             }
-        });
+        }));
     }
 
     private void requireValidationAuthority(ValidationOwner owner, boolean admission, Runnable configFence) {
@@ -518,7 +518,6 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
 
     private static Document preparedClaimControl(ClientSession session, MongoDatabase database, Document claim, WorkloadClaimKey key,
             CacheBusinessScope scope, MongoValidationPreparationFacts.Subject expected, boolean admission, boolean reuseClaim) {
-        requireCollection(database);
         if (claim != null && claim.get("validationPreparation") instanceof Document independent && Integer.valueOf(2).equals(independent.get("formatVersion"))) {
             if (expected == null || !expected.scope().equals(scope) || !key.equals(ValidationClaims.key(scope.clusterId(), expected.pipelineId()))
                     || !(claim.get("fencedValidationWrites") instanceof Long writes) || writes < 0 || writes == Long.MAX_VALUE) throw fenced();
@@ -707,10 +706,6 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
             .append("taskId", id.taskId()).append("runId", id.runId()).append("mode", id.mode().name()).append("specHash", id.specHash())
             .append("keyMappingRevision", id.keyMappingRevision()).append("comparisonRulesVersion", id.comparisonRulesVersion()).append("countingGeneration", run.countingGeneration()); }
     static Document scope(CacheBusinessScope scope) { return new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation()); }
-    static void requireCollection(MongoDatabase database) {
-        var found = database.listCollections().filter(new Document("name", SystemCollections.VALIDATION_RUNS.collectionName())).first();
-        if (found == null || !"collection".equals(found.get("type"))) throw unreadable("validation-runs");
-    }
     private static void bounded(Document value, int maximum) {
         try (var output = new BasicOutputBuffer(); var writer = new BsonBinaryWriter(output)) {
             new DocumentCodec().encode(writer, value, EncoderContext.builder().build()); if (output.getSize() > maximum) throw limit();

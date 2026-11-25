@@ -27,6 +27,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -167,6 +177,204 @@ class SinkAckMetaSupplierTest {
 
         @Override
         public void close() {
+        }
+    }
+    @Test void independentOpensRemainBoundedAndReturnedProcessorsKeepTheirOriginalSlots() throws Exception {
+        var secondReturned = new CountDownLatch(1); var releaseFirst = new CountDownLatch(1);
+        var recorder = new OpeningRecorder(4) {
+            @Override protected SinkWriter openOwned(int member, int index) throws Exception {
+                if (index == 1) assertThat(releaseFirst.await(2, TimeUnit.SECONDS)).isTrue();
+                var opened = super.openOwned(member, index);
+                if (index == 2) secondReturned.countDown();
+                return opened;
+            }
+        };
+        recorder.expectClosed(4);
+        try (var calls = Executors.newSingleThreadExecutor()) {
+            var result = calls.submit(() -> openingSupplier(recorder).get(4));
+            try {
+                assertThat(secondReturned.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> result.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            } finally { releaseFirst.countDown(); }
+            var processors = result.get(2, TimeUnit.SECONDS);
+            assertThat(recorder.maximum).hasValue(2);
+            assertThat(recorder.members).containsOnly(0);
+            for (Processor processor : processors) {
+                var sink = (SinkProcessor) processor;
+                sink.init(new TestOutbox(new int[] {}, 128), new TestProcessorContext());
+                feed(sink, at("src", "t1")); drain(sink);
+            }
+            assertThat(recorder.received).containsExactly(0, 1, 2, 3);
+            for (Processor processor : processors) processor.close();
+        }
+        awaitClosed(recorder);
+    }
+
+    @Test void anOpeningFailureClosesEverySuccessfulIndependentResult() throws Exception {
+        var failure = new IllegalStateException("indexed open refused");
+        var others = new CountDownLatch(2);
+        var recorder = new OpeningRecorder(3) {
+            @Override protected SinkWriter openOwned(int member, int index) throws Exception {
+                if (index == 1) { assertThat(others.await(2, TimeUnit.SECONDS)).isTrue(); throw failure; }
+                var opened = super.openOwned(member, index);
+                if (index > 1) others.countDown();
+                return opened;
+            }
+        };
+        recorder.expectClosed(3);
+        assertThatThrownBy(() -> openingSupplier(recorder).get(4)).isSameAs(failure);
+        awaitClosed(recorder);
+        assertThat(recorder.writers).hasSize(3);
+        assertThat(recorder.closed).hasValue(3);
+    }
+
+    @Test void aLateUninterruptibleResultIsClosedInsteadOfEscapingTheFailedOpening() throws Exception {
+        var failure = new IllegalStateException("first indexed open refused");
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var returned = new CountDownLatch(1);
+        var recorder = new OpeningRecorder(2) {
+            @Override protected SinkWriter openOwned(int member, int index) throws Exception {
+                if (index == 1) { assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue(); throw failure; }
+                if (index == 2) {
+                    entered.countDown();
+                    while (release.getCount() != 0) { try { release.await(); } catch (InterruptedException ignored) { } }
+                }
+                if (index == 3) throw failure;
+                var opened = super.openOwned(member, index);
+                if (index == 2) returned.countDown();
+                return opened;
+            }
+        };
+        recorder.expectClosed(2);
+        try {
+            assertThatThrownBy(() -> openingSupplier(recorder).get(4)).isSameAs(failure);
+            assertThat(returned.getCount()).isOne();
+            assertThat(recorder.writers.get(0).ended).isTrue();
+        } finally { release.countDown(); }
+        assertThat(returned.await(2, TimeUnit.SECONDS)).isTrue();
+        awaitClosed(recorder);
+    }
+
+    @Test void anInterruptedCollectorDoesNotReturnOrLeakLateWriters() throws Exception {
+        var entered = new CountDownLatch(2); var release = new CountDownLatch(1);
+        var recorder = new OpeningRecorder(2) {
+            @Override protected SinkWriter openOwned(int member, int index) throws Exception {
+                if (index > 0) {
+                    entered.countDown();
+                    while (release.getCount() != 0) { try { release.await(); } catch (InterruptedException ignored) { } }
+                }
+                if (index == 3) throw new java.util.concurrent.CancellationException();
+                return super.openOwned(member, index);
+            }
+        };
+        recorder.expectClosed(3);
+        var thrown = new AtomicReference<Throwable>();
+        var caller = new Thread(() -> {
+            try { openingSupplier(recorder).get(4); } catch (Throwable failure) { thrown.set(failure); }
+        });
+        caller.start();
+        try {
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            recorder.writers.get(0).clearInterruptOnClose = true;
+            caller.interrupt(); caller.join(2000);
+            assertThat(caller.isAlive()).isFalse();
+            assertThat(thrown.get()).isInstanceOf(InterruptedException.class);
+            assertThat(caller.isInterrupted()).isTrue();
+        } finally { release.countDown(); }
+        awaitClosed(recorder);
+    }
+
+    @Test void aFrontierFailureClosesWarmAndUnclaimedParallelWriters() throws Exception {
+        var failure = new IllegalStateException("frontier construction refused");
+        var recorder = new OpeningRecorder(2); var calls = new AtomicInteger();
+        assertThatThrownBy(() -> openingSupplier(recorder, () -> {
+            if (calls.incrementAndGet() == 3) throw failure;
+            return null;
+        }).get(4)).isSameAs(failure);
+        assertThat(recorder.writers).hasSize(4);
+        assertThat(recorder.closed).hasValue(4);
+    }
+
+    @Test void failurePriorityUsesTheOriginalSlotRatherThanCompletionOrder() throws Exception {
+        var first = new IllegalStateException("first slot refused");
+        var later = new IllegalStateException("later slot refused");
+        var laterFailed = new CountDownLatch(1); var releaseFirst = new CountDownLatch(1); var lastReturned = new CountDownLatch(1);
+        var recorder = new OpeningRecorder(2) {
+            @Override protected SinkWriter openOwned(int member, int index) throws Exception {
+                if (index == 1) { assertThat(releaseFirst.await(2, TimeUnit.SECONDS)).isTrue(); throw first; }
+                if (index == 2) { laterFailed.countDown(); throw later; }
+                var opened = super.openOwned(member, index);
+                if (index == 3) lastReturned.countDown();
+                return opened;
+            }
+        };
+        recorder.expectClosed(2);
+        try (var calls = Executors.newSingleThreadExecutor()) {
+            var result = calls.submit(() -> openingSupplier(recorder).get(4));
+            try {
+                assertThat(laterFailed.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThat(lastReturned.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> result.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            } finally { releaseFirst.countDown(); }
+            assertThatThrownBy(() -> result.get(2, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class).hasCause(first);
+        }
+        awaitClosed(recorder);
+        assertThat(first.getSuppressed()).contains(later);
+    }
+
+    private static void awaitClosed(OpeningRecorder recorder) throws InterruptedException {
+        assertThat(recorder.allClosed.await(2, TimeUnit.SECONDS)).isTrue();
+        assertThat(recorder.closed.get()).isEqualTo(recorder.writers.size());
+    }
+
+    private ProcessorSupplier openingSupplier(OpeningRecorder recorder) throws Exception { return openingSupplier(recorder, null); }
+
+    private ProcessorSupplier openingSupplier(OpeningRecorder recorder, SupplierEx<SinkFrontier> frontier) throws Exception {
+        var meta = SinkProcessor.nativeMetaSupplier("sink", recorder, frontier == null ? null : ignored -> null,
+                frontier == null ? () -> null : frontier, null, 1, 100, 0, Map.of());
+        var address = member.getCluster().getLocalMember().getAddress();
+        meta.init(new TestProcessorMetaSupplierContext().setHazelcastInstance(member).setTotalParallelism(4).setLocalParallelism(4));
+        var supplier = meta.get(List.of(address)).apply(address);
+        supplier.init(new TestProcessorSupplierContext().setHazelcastInstance(member));
+        return supplier;
+    }
+
+    private static class OpeningRecorder implements IndexedSinkWriterFactory {
+        final int concurrency;
+        final Map<Integer, OpeningWriter> writers = new ConcurrentHashMap<>();
+        final java.util.Set<Integer> members = ConcurrentHashMap.newKeySet();
+        final List<Integer> received = new CopyOnWriteArrayList<>();
+        final AtomicInteger active = new AtomicInteger(), maximum = new AtomicInteger(), closed = new AtomicInteger();
+        volatile CountDownLatch allClosed = new CountDownLatch(0);
+        OpeningRecorder(int concurrency) { this.concurrency = concurrency; }
+        void expectClosed(int count) { allClosed = new CountDownLatch(count); }
+        public SinkWriter getEx() throws Exception { return forWriter(0, 0); }
+        public final SinkWriter forWriter(int member, int index) throws Exception {
+            if (index != 0) assertThat(writers).containsKey(0);
+            members.add(member); int count = active.incrementAndGet(); maximum.accumulateAndGet(count, Math::max);
+            try { return openOwned(member, index); } finally { active.decrementAndGet(); }
+        }
+        protected SinkWriter openOwned(int member, int index) throws Exception {
+            var writer = new OpeningWriter(index, this); writers.put(index, writer); return writer;
+        }
+        public Opening opening() {
+            return new Opening() {
+                public SinkWriter open(int member, int index) throws Exception { return forWriter(member, index); }
+                public int maximumConcurrentRemainingOpens() { return concurrency; }
+            };
+        }
+    }
+
+    private static final class OpeningWriter implements SinkWriter {
+        final int index; final OpeningRecorder owner; final AtomicBoolean ended = new AtomicBoolean();
+        volatile boolean clearInterruptOnClose;
+        OpeningWriter(int index, OpeningRecorder owner) { this.index = index; this.owner = owner; }
+        public CompletionStage<WriteResult> write(List<Envelope> rows) {
+            owner.received.add(index); return CompletableFuture.completedFuture(new WriteResult(rows.size()));
+        }
+        public void close() {
+            if (!ended.compareAndSet(false, true)) throw new AssertionError("writer closed twice");
+            owner.closed.incrementAndGet(); owner.allClosed.countDown();
+            if (clearInterruptOnClose) Thread.interrupted();
         }
     }
 }

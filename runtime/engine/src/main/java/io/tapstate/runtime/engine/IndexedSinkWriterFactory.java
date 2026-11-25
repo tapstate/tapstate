@@ -10,6 +10,9 @@ public interface IndexedSinkWriterFactory extends SupplierEx<SinkWriter> {
     @FunctionalInterface
     interface Opening {
         SinkWriter open(int memberIndex, int localIndex) throws Exception;
+
+        /** Allows bounded overlap for independent remaining opens after the first establishes this batch's facts. */
+        default int maximumConcurrentRemainingOpens() { return 1; }
     }
 
     /** The facts shared by one member's synchronous call to open its processors. */

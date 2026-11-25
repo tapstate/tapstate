@@ -52,10 +52,34 @@ class CaptureExecutionAuthorizationTest {
         }
     }
     @Test void aSlowCaptureReadCannotPublishAnAlreadySpentMonotonicProof() {
+        var reads = new AtomicInteger();
         when(claims.read(CAPTURE.key())).thenAnswer(call -> {
-            nanos.set(Duration.ofSeconds(6).toNanos()); return Optional.of(new WorkloadClaimReading(CAPTURE,Duration.ofSeconds(5)));
+            long remaining = Math.max(0, Duration.ofSeconds(5).toNanos() - nanos.get());
+            reads.incrementAndGet();
+            nanos.addAndGet(Duration.ofSeconds(6).toNanos());
+            return remaining == 0 ? Optional.empty() : Optional.of(new WorkloadClaimReading(CAPTURE, Duration.ofNanos(remaining)));
         });
-        try (var guard = guard()) { refused(() -> guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE))); }
+        try (var guard = guard()) {
+            refused(() -> guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE)));
+            assertThat(reads).hasValue(2);
+        }
+    }
+
+    @Test void aSpentReplyCanBeReplacedByAConfirmedRenewedSameFence() {
+        var reads = new AtomicInteger();
+        var renewed = new WorkloadClaim(CAPTURE.key(), CAPTURE.owner(), CAPTURE.claimGeneration(),
+                CAPTURE.executionGeneration(), CAPTURE.topologyRevision(), CAPTURE.leaseUntil().plusSeconds(6));
+        when(claims.read(CAPTURE.key())).thenAnswer(call -> {
+            if (reads.getAndIncrement() == 0) {
+                nanos.addAndGet(Duration.ofSeconds(6).toNanos());
+                return Optional.of(new WorkloadClaimReading(CAPTURE, Duration.ofSeconds(5)));
+            }
+            return Optional.of(new WorkloadClaimReading(renewed, Duration.ofSeconds(5)));
+        });
+        try (var guard = guard()) {
+            assertThat(guard.requireCapture(SCOPE, WorkloadClaimFence.from(CAPTURE))).isEqualTo(WorkloadClaimFence.from(renewed));
+            assertThat(reads).hasValue(2);
+        }
     }
     @Test void movedOwnerGenerationTopologyOrMissingClaimCannotAuthorizeTheOriginalCapture() {
         for (var changed : List.of(claim(WorkloadClaimType.CAPTURE,new WorkloadOwner("other","boot"),1,0,2),

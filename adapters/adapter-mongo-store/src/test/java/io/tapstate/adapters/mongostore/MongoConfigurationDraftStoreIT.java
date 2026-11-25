@@ -614,8 +614,9 @@ class MongoConfigurationDraftStoreIT {
     void ordinaryOpenNeverRecreatesADeletedDraftIndex() {
         withConfiguration((domain, database) -> {
             SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).dropIndex("pipeline_drafts_revision");
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(database), "cluster-a"))
-                    .satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                assertThat(reopened.drafts().list()).isEmpty();
+            }
             assertThat(IndexEnsure.existing(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database),
                     SystemCollections.CONFIG_PIPELINE_DRAFTS.indexes().getFirst())).isNull();
         });
@@ -623,7 +624,7 @@ class MongoConfigurationDraftStoreIT {
 
     @ParameterizedTest
     @ValueSource(strings = {"ttl", "extra-ttl", "partial", "sparse", "hidden"})
-    void unsafeDraftIndexesAreRefusedWithoutRepair(String option) {
+    void unsafeDraftIndexesAreReportedByInspectionWithoutRepair(String option) {
         withConfiguration((domain, database) -> {
             var collection = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
             String name = option.equals("extra-ttl") ? "extra_unsafe_ttl" : "pipeline_drafts_updated_at";
@@ -638,8 +639,14 @@ class MongoConfigurationDraftStoreIT {
             }
             collection.createIndex(new Document("updatedAt", option.equals("extra-ttl") ? -1 : 1), options);
             var before = collection.listIndexes().into(new java.util.ArrayList<>());
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(database), "cluster-a"))
-                    .satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                assertThat(reopened.drafts().list()).isEmpty();
+                assertThat(reopened.inspectStructure(new MongoReadBudget(java.time.Duration.ofSeconds(5))))
+                        .anySatisfy(issue -> {
+                            assertThat(issue.collection()).isEqualTo(SystemCollections.CONFIG_PIPELINE_DRAFTS.collectionName());
+                            assertThat(issue.index()).isEqualTo(name);
+                        });
+            }
             assertThat(collection.listIndexes().into(new java.util.ArrayList<>())).isEqualTo(before);
         });
     }

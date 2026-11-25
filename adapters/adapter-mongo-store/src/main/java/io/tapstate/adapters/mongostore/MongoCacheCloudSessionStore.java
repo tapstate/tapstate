@@ -31,19 +31,13 @@ final class MongoCacheCloudSessionStore implements CloudSessionStore {
             "secretHash", "userId", "scope", "revoked", "createdAt", "lastUsedAt", "idleExpiresAt");
     private static final Set<String> DENIAL = Set.of("_id", "formatVersion", "issuer", "organizationId", "clusterId", "jwtId", "revokedAt");
     private final MongoCacheIdentity facts;
-    private final Runnable requireStructures;
     private final MongoCollection<Document> sessions;
     private final MongoCollection<Document> revocations;
     private final MongoReadBudget budget;
 
-    MongoCacheCloudSessionStore(MongoCacheIdentity facts, MongoDatabase database, Runnable requireStructures) {
-        this(facts, database, requireStructures, null);
-    }
-
-    MongoCacheCloudSessionStore(MongoCacheIdentity facts, MongoDatabase database, Runnable requireStructures, MongoReadBudget budget) {
+    MongoCacheCloudSessionStore(MongoCacheIdentity facts, MongoDatabase database, MongoReadBudget budget) {
         this.budget = budget;
         this.facts = Objects.requireNonNull(facts, "facts");
-        this.requireStructures = Objects.requireNonNull(requireStructures, "requireStructures");
         if (facts.scope().mode() != StorageBinding.Mode.CLOUD) throw new IllegalArgumentException("Cloud sessions require a managed cache scope");
         this.sessions = SystemCollections.CLOUD_SESSIONS.on(database);
         this.revocations = SystemCollections.CLOUD_REVOCATIONS.on(database);
@@ -174,12 +168,7 @@ final class MongoCacheCloudSessionStore implements CloudSessionStore {
         Objects.requireNonNull(now, "now");
     }
     private <T> T transaction(Function<ClientSession, T> operation) {
-        Function<ClientSession, T> verified = session -> {
-            // Check structure before the session's first command; retries retain the original scope.
-            requireStructures.run();
-            return operation.apply(session);
-        };
-        return budget == null ? facts.transaction(verified) : facts.transaction(budget, verified);
+        return budget == null ? facts.transaction(operation) : facts.transaction(budget, operation);
     }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cloud-session", "field", "session"), null); }
 }

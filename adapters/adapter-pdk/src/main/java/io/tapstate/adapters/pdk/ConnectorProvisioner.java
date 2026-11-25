@@ -32,6 +32,16 @@ public interface ConnectorProvisioner {
         return ref;
     }
 
+    /** Checks a member's current readiness, optionally requiring the exact retained hash. */
+    default ConnectorRef resolveForReadiness(String connectorId, String retainedHash) {
+        return retainedHash == null ? resolve(connectorId) : resolve(connectorId, retainedHash);
+    }
+
+    /** Resolves one startup artifact while retaining ordinary selection and exact-hash rules. */
+    default ConnectorRef resolveStartup(String connectorId) { return resolve(connectorId); }
+
+    default ConnectorRef resolveStartup(String connectorId, String contentHash) { return resolve(connectorId, contentHash); }
+
     /** Opens the original artifact authorized by this durable note origin. */
     default ConnectorRef resolveRetained(RequiredNoteStore notes, RequiredNoteScope scope, RequiredNoteOrigin origin) {
         return resolve(origin.connectorId(), origin.artifactHash());

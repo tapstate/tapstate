@@ -343,18 +343,30 @@ class MongoCacheSessionStoresIT {
     }
 
     @Test
-    void missingAuthNamespaceIsRefusedBeforeNormalOperationsCanRecreateIt() {
+    void missingAuthNamespacesFollowOrdinaryMongoReadsAndWrites() {
         withCache(StorageBinding.Mode.OP, (root, database, binding, scope) -> {
-            var sessions = root.sessions(scope); SystemCollections.OP_SESSIONS.on(database).drop();
-            assertThatThrownBy(() -> sessions.save(op("late"))).satisfies(MongoCacheSessionStoresIT::unreadable);
-            assertThat(database.listCollectionNames().into(new ArrayList<>())).doesNotContain("op_sessions");
+            var sessions = root.sessions(scope);
+            SystemCollections.OP_SESSIONS.on(database).drop();
+            assertThat(sessions.find("late")).isEmpty();
+            sessions.save(op("late"));
+            assertThat(sessions.find("late")).contains(op("late"));
+            assertThat(SystemCollections.OP_SESSIONS.on(database).listIndexes().into(new ArrayList<>()))
+                    .extracting(index -> index.getString("name")).containsExactly("_id_");
         });
         withCache(StorageBinding.Mode.CLOUD, (root, database, binding, scope) -> {
-            var sessions = root.cloudSessions(scope); SystemCollections.CLOUD_REVOCATIONS.on(database).drop();
-            assertThatThrownBy(() -> sessions.create(cloud("late"))).satisfies(MongoCacheSessionStoresIT::unreadable);
-            assertThatThrownBy(() -> sessions.invalidate(CLOUD, "late", CREATED)).satisfies(MongoCacheSessionStoresIT::unreadable);
-            assertThat(database.listCollectionNames().into(new ArrayList<>())).doesNotContain("cloud_revocations");
-            assertThat(SystemCollections.CLOUD_SESSIONS.on(database).countDocuments()).isZero();
+            var sessions = root.cloudSessions(scope);
+            sessions.invalidate(CLOUD, "late", CREATED);
+            assertThat(sessions.create(cloud("late"))).isFalse();
+            SystemCollections.CLOUD_REVOCATIONS.on(database).drop();
+            assertThat(sessions.create(cloud("late"))).isTrue();
+            assertThat(sessions.authenticate(CLOUD, "late", HASH, CREATED, CREATED.plusSeconds(60))).isPresent();
+            assertThat(root.inspectStructure(scope, new MongoReadBudget(java.time.Duration.ofSeconds(5))))
+                    .anySatisfy(difference -> {
+                        assertThat(difference.collection()).isEqualTo("cloud_revocations");
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.COLLECTION_MISSING);
+                    });
+            sessions.invalidate(CLOUD, "late", CREATED);
+            assertThat(sessions.authenticate(CLOUD, "late", HASH, CREATED, CREATED.plusSeconds(60))).isEmpty();
         });
     }
 

@@ -211,6 +211,17 @@ class PeriodicObservationsTest {
         }
     }
 
+    @org.junit.jupiter.api.Test void invalidatingATicketDoesNotPretendItsWorkerHasFinished() throws Exception {
+        var entered = new CountDownLatch(1);var release = new CountDownLatch(1);
+        try (var observations = new PeriodicObservations(1, 2)) {
+            observations.offer("orders", "old", current -> hold(entered, release));
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            observations.discard("orders");assertThat(observations.idle("orders")).isFalse();
+            release.countDown();
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> observations.idle("orders"));
+        } finally { release.countDown(); }
+    }
+
     private static void hold(CountDownLatch entered, CountDownLatch release) {
         entered.countDown();
         try {

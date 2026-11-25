@@ -17,13 +17,7 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * The inspection mode of the server binary, against a real store.
- *
- * <p>What every case here is really checking is that it stays read-only. It exists to be run on an
- * installation the server is refusing to start against, so an operator reaching for it is already in
- * trouble; a command that quietly created a collection or built an index while answering would be
- * changing the thing under investigation, and the person running it would have no way to know.
+/** Tests read-only inspection modes and explicit CONFIG marker preparation against a real store.
  */
 @RequiresDocker
 class MigrateCommandIT {
@@ -120,6 +114,34 @@ class MigrateCommandIT {
         assertThat(output.exitCode).isEqualTo(1);
         assertThat(output.err).contains("Cannot reach the store");
         assertThat(output.err).doesNotContain("com.mongodb");
+    }
+
+    @Test
+    void explicitConfigPreparationBackfillsTheExistingMarkerWithoutStartingTheServer() {
+        String database = "migrate_component_identity";
+        drop(database);
+        var settings = new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(database), null, java.time.Duration.ofSeconds(5));
+        try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                settings, "cluster", "installation", "setup", 1)) {
+            assertThat(configuration.clusterId()).isEqualTo("cluster");
+        }
+        var markers = client().getDatabase(database).getCollection("schema_migrations");
+        var key = new org.bson.Document("_id", "config");
+        markers.updateOne(key, new org.bson.Document("$unset", new org.bson.Document("aiOnly", "")));
+        var old = markers.find(key).first();
+        String flag = "--prepare-config-component-identity";
+
+        var conflicting = run("migrate", "--dry-run", flag, uriArgument(database));
+        assertThat(conflicting.exitCode()).isEqualTo(1);
+        assertThat(conflicting.err()).contains("Choose either CONFIG component preparation or one migration inspection mode");
+        assertThat(markers.find(key).first()).isEqualTo(old);
+        var migration = run("migrate", flag, uriArgument(database));
+        assertThat(migration.exitCode()).as(migration.err()).isZero();
+        assertThat(migration.out()).contains("CONFIG component identity recorded");
+        assertThat(markers.find(key).first()).isEqualTo(new org.bson.Document(old).append("aiOnly", true));
+        var replay = run("migrate", flag, uriArgument(database));
+        assertThat(replay.exitCode()).as(replay.err()).isZero();
+        assertThat(replay.out()).contains("requires no update");
     }
 
     // ---- fixtures ----

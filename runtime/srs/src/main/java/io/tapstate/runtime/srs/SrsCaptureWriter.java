@@ -116,9 +116,25 @@ public final class SrsCaptureWriter implements AutoCloseable {
                 throw new SrsBaselineModelMismatch(opened.miningChainId(), mismatch);
             throw unavailable(mismatch);
         }
+        var observations = new LinkedHashMap<SrsModelKey, SrsModelStore.InitialObservation>();
         for (var entry : actual.entrySet()) {
-            if (!published.containsKey(entry.getKey()))
-                publishPreparedTable(entry.getKey(), entry.getValue(), comparison);
+            if (!published.containsKey(entry.getKey())) {
+                var key = new SrsModelKey(opened.miningChainId(), entry.getKey(), scope.cacheIncarnation(), opened.epoch(), 0);
+                observations.put(key, new SrsModelStore.InitialObservation(
+                        SrsRingbuffer.ringName(opened.miningChainId(), entry.getKey()), entry.getValue()));
+            }
+        }
+        if (!observations.isEmpty()) {
+            var saved = models.publishObservedInitials(observations, fence, comparison);
+            requireActive();
+            for (var entry : observations.entrySet()) {
+                var model = saved.get(entry.getKey());
+                if (model == null || !model.key().equals(entry.getKey())
+                        || !model.ringName().equals(entry.getValue().ring())
+                        || !comparison.acceptsObservation(model.table(), entry.getValue().table()))
+                    throw unavailable(entry.getKey().table());
+            }
+            for (var entry : observations.entrySet()) recordPreparedModel(entry.getKey().table(), saved.get(entry.getKey()));
         }
         requireActive();
         if (completeSelection && started.get()) streamPrepared = true;
@@ -126,13 +142,19 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     private String validatePreparedTables(
             Map<String, SourceTable> actual, SourceModelComparison comparison) {
+        var keys = new java.util.HashSet<SrsModelKey>();
+        for (String table : actual.keySet()) {
+            var baseline = baselineModel(table);
+            if (baseline != null) keys.add(baseline);
+        }
+        var baselines = models.requireAll(keys);
         String mismatch = null;
         for (var entry : actual.entrySet()) {
             String table = entry.getKey();
             var baseline = baselineModel(table);
             if (baseline != null
                     && !comparison.acceptsObservation(
-                            models.require(baseline).table(), entry.getValue())) mismatch = table;
+                            baselines.get(baseline).table(), entry.getValue())) mismatch = table;
             SrsModel held = published.get(table);
             if (held != null && !comparison.acceptsObservation(held.table(), entry.getValue()))
                 throw unavailable(table);
@@ -163,22 +185,8 @@ public final class SrsCaptureWriter implements AutoCloseable {
         }
     }
 
-    private void publishPreparedTable(
-            String table, SourceTable actual, SourceModelComparison comparison) {
-        String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
-        var key =
-                new SrsModelKey(
-                        opened.miningChainId(), table, scope.cacheIncarnation(), opened.epoch(), 0);
-        // Publication, rather than a historical lookup of an unpublished key, owns context
-        // creation/reuse.
-        SrsModel saved =
-                comparison == SourceModelComparison.DECLARED_STRUCTURE
-                        ? models.publishInitial(key, ring, actual, fence)
-                        : models.publishObservedInitial(key, ring, actual, fence, comparison);
-        if (!saved.key().equals(key)
-                || !saved.ringName().equals(ring)
-                || !comparison.acceptsObservation(saved.table(), actual)) throw unavailable(table);
-        requireActive();
+    private void recordPreparedModel(String table, SrsModel saved) {
+        var key = saved.key();
         published.put(table, saved);
         SrsTableCheckpoint prior =
                 opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);

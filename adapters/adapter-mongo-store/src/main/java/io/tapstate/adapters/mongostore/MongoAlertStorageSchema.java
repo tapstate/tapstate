@@ -72,6 +72,32 @@ final class MongoAlertStorageSchema {
         return marker == null ? 0 : marker.getInteger("installedVersion");
     }
 
+    Document loadAuthorityMarker(MongoReadBudget budget) {
+        return budget.transaction(client, session -> {
+            if (verifyKeyMaterial != null) return marker(session, budget);
+            requireActive.run();
+            budget.remainingMillis();
+            var stages = MongoStartConfigRead.root();
+            stages.add(new Document("$project", new Document("clusterId", 1).append("layoutId", 1)));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CLUSTER_KEYS, "key", "cluster",
+                    new Document("keyId", 1)));
+            var bounded = new Document("_id", 1).append("value", MongoStartConfigRead.boundedValue());
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.SCHEMA_MIGRATIONS, "schema", "config", bounded));
+            stages.add(MongoValidationClaimObservation.lookup(SystemCollections.CONFIGURATION_VERSION, "version", ConfigurationVersion.ID, bounded));
+            var row = MongoStartConfigRead.snapshot(database, session, stages);
+            if (row == null || !"cluster".equals(row.get("_id"))) return marker(session, budget);
+            var keys = MongoStartConfigRead.row(row, "key", "cluster").orElse(null);
+            var schema = MongoStartConfigRead.boundedRow(row, "schema", "config");
+            var counter = MongoStartConfigRead.boundedRow(row, "version", ConfigurationVersion.ID);
+            if (keys == null || schema == null || counter == null) return marker(session, budget);
+            if (!clusterId.equals(row.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId")))
+                throw unreadable("identity");
+            if (!keyId.equals(keys.get("keyId"))) throw unreadable("key-binding");
+            requireConfigVersion(schema);
+            return verifyAuthorityState(schema, counter, clusterId, keyId);
+        });
+    }
+
     Document loadVerifiedMarker(MongoReadBudget budget) {
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
@@ -111,8 +137,9 @@ final class MongoAlertStorageSchema {
     }
 
     private int prepareAll(String operationId,MongoReadBudget budget) {
-        prepareOperational(operationId,budget);
-        prepareNodes(budget);
+        Document verified = prepareOperational(operationId,budget);
+        if (verified.getInteger("installedVersion") == VERSION) return VERSION;
+        prepareNodes(verified,budget);
         budget.transaction(client,session->{
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-node-preparation");
@@ -122,26 +149,27 @@ final class MongoAlertStorageSchema {
             replaceMarker(session,original,new Document(original).append("installedVersion",DOMAIN_VERSION));
             return null;
         });
-        budget.transaction(client,session->{
+        int installed = budget.transaction(client,session->{
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-rule-binding-preparation");
             int version=original.getInteger("installedVersion");
-            if(version==VERSION)return null;
+            if(version==VERSION)return VERSION;
             if(version!=DOMAIN_VERSION)throw unreadable("rule-binding-preparation");
             replaceMarker(session,original,new Document(original).append("installedVersion",VERSION));
-            return null;
+            return VERSION;
         });
-        return load(budget);
+        requireActive.run(); budget.remainingMillis();
+        return installed;
     }
 
     /** Explicit preparation; an already installed feature is verified without rewriting its original operation. */
-    private int prepareOperational(String operationId, MongoReadBudget budget) {
+    private Document prepareOperational(String operationId, MongoReadBudget budget) {
         requireOperation(operationId);
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
             requireActive.run();
             Document existing = verifiedMarker(budget);
-            if (existing != null && existing.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return existing.getInteger("installedVersion"); }
+            if (existing != null && existing.getInteger("installedVersion")>=OPERATIONAL_VERSION) { return existing; }
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
                     requireActive.run();
@@ -182,12 +210,11 @@ final class MongoAlertStorageSchema {
                         .timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build());
             }
             prepareQueries(operationId, budget);
-            int installed = load(budget); requireActive.run(); budget.remainingMillis(); return installed;
+            Document installed = verifiedMarker(budget); requireActive.run(); budget.remainingMillis(); return installed;
         });
     }
 
-    private void prepareNodes(MongoReadBudget budget) {
-        Document retained=verifiedMarker(budget);
+    private void prepareNodes(Document retained, MongoReadBudget budget) {
         if(retained==null)throw unreadable("missing-query-preparation");
         if(retained.getInteger("installedVersion")>=NODE_VERSION)return;
         budget.transaction(client,session->{
@@ -202,9 +229,12 @@ final class MongoAlertStorageSchema {
             replaceMarker(session,original,new Document(original).append(QUERY,next));return null;
         });
         for(int attempt=0;attempt<3;attempt++) {
-            Document current=verifiedMarker(budget);
+            Document current=budget.transaction(client,session -> marker(session,budget));
             if(current==null)throw unreadable("missing-query-preparation");
-            if(current.getInteger("installedVersion")>=NODE_VERSION)return;
+            if(current.getInteger("installedVersion")>=NODE_VERSION) {
+                verify(budget,Structures.READY,2);
+                return;
+            }
             Document progress=current.get(QUERY,Document.class);int cursor=progress.getInteger("nextIndex");
             if(cursor==BASE_QUERY_COUNT) {
                 MongoAlertNodeLifecycleStore.prepareNamespace(budget.database(database).withWriteConcern(WriteConcern.MAJORITY.withJournal(true)));
@@ -223,6 +253,7 @@ final class MongoAlertStorageSchema {
                 if(cursor==QUERY_INDEXES.size()){next.put("phase","READY");updated.put("installedVersion",NODE_VERSION);}
                 replaceMarker(session,original,updated);return null;
             });
+            if (cursor == QUERY_INDEXES.size()) return;
         }
         throw unreadable("node-query-progress");
     }
@@ -334,11 +365,15 @@ final class MongoAlertStorageSchema {
         if (verifyKeyMaterial == null) keys = keyQuery.projection(new Document("keyId", 1)).first();
         if (keys == null || !keyId.equals(keys.get("keyId"))) { throw unreadable("key-binding"); }
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(reads).find(session, new Document("_id", "config")).first();
-        if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
-                || installed < 1 || installed > MongoConfigurationDomain.SCHEMA_VERSION) { throw unreadable("config-version"); }
+        requireConfigVersion(schema);
         Document counter = SystemCollections.CONFIGURATION_VERSION.on(reads)
                 .find(session, new Document("_id", ConfigurationVersion.ID)).first();
         return verifyAuthorityState(schema, counter, clusterId, keyId);
+    }
+
+    private static void requireConfigVersion(Document schema) {
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
+                || installed < 1 || installed > MongoConfigurationDomain.SCHEMA_VERSION) throw unreadable("config-version");
     }
 
     /** Load-only validation also runs on ordinary CONFIG reopen; it never reenrolls missing facts. */
@@ -378,7 +413,7 @@ final class MongoAlertStorageSchema {
         var found = new HashMap<String, Document>();
         for (Document row : MongoCollectionMetadata.matching(budget.database(database), names, true)) {
             budget.remainingMillis();
-            if (found.put(row.getString("name"), row) != null) {
+            if (!(row.get("name") instanceof String name) || !names.contains(name) || found.put(name, row) != null) {
                 throw unreadable("collection-metadata");
             }
         }

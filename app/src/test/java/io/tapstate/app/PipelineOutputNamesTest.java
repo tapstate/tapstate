@@ -21,6 +21,97 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PipelineOutputNamesTest {
     @Test
+    void artifactListSharesSourceModelsWithinItsPageAndRefreshesThemOnTheNextRequest() {
+        var store = sources();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: shared
+                connector: mongodb
+                config: {uri: "mongodb://localhost/shared"}
+                tables: ["/order.*/"]
+                """));
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("shared", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of())))));
+        for (String id : List.of("a", "b", "c")) store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: shared
+                serve:
+                  from: shared
+                  sync: [{id: sink, source: target}]
+                """.formatted(id)));
+        var query = new ArtifactQueryService(store.artifacts());
+        var resolver = new StoreBackedPipelineOutputNames(store, false);
+        var service = new PipelineViewService(query, new PipelineRepresentation(), null, resolver);
+        int before = store.schemaStore().reads();
+        var first = service.list(0, 3);
+        assertThat(first).extracting(PipelineView::id).containsExactly("a", "b", "c");
+        assertThat(store.schemaStore().reads() - before).as("one shared discovery per artifact page").isEqualTo(1);
+        for (var view : first) {
+            var pipeline = (PipelineResource) store.artifacts().get(view.id()).orElseThrow();
+            assertThat(view.outputTargets()).isEqualTo(resolver.resolve(pipeline));
+        }
+        before = store.schemaStore().reads();
+        assertThat(service.list(1, 1)).extracting(PipelineView::id).containsExactly("b");
+        assertThat(store.schemaStore().reads() - before).as("a later request rereads the shared discovery").isEqualTo(1);
+        before = store.schemaStore().reads();
+        assertThat(service.list(10, 2)).isEmpty();
+        assertThat(store.schemaStore().reads()).isEqualTo(before);
+    }
+
+    @Test
+    void artifactPagesKeepPartialOutputsAndReferencedArtifactDiagnostics() {
+        var store = sources();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/missing.*/"]
+                """));
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: partial
+                source: [src, unknown]
+                serve:
+                  from: [src.orders, unknown]
+                  sync: [{id: sink, source: target}]
+                """));
+        var resolver = new StoreBackedPipelineOutputNames(store, false);
+        var expected = new java.util.LinkedHashMap<String, PipelineOutputNames.Result>();
+        for (var resource : store.artifacts().list()) if (resource instanceof PipelineResource pipeline)
+            expected.put(pipeline.id(), resolver.resolve(pipeline));
+        var query = new ArtifactQueryService(store.artifacts());
+        var listed = new PipelineViewService(query, new PipelineRepresentation(), null, resolver).list(0, 10);
+        assertThat(listed).hasSize(1);
+        for (var view : listed) assertThat(view.outputTargets()).isEqualTo(expected.get(view.id()));
+        assertThat(expected.get("partial").outputs()).hasSize(1);
+        assertThat(expected.get("partial").unresolved()).isNotEmpty();
+        for (String reference : List.of("missing", "src")) {
+            var damaged = sources();
+            var pipeline = (PipelineResource) parser.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: use-%s
+                    source: src
+                    serve: {use: %s, from: orders}
+                    """.formatted(reference, reference));
+            damaged.artifacts().save(pipeline);
+            var original = new StoreBackedPipelineOutputNames(damaged, false);
+            var failure = org.assertj.core.api.Assertions.catchThrowable(() -> original.resolve(pipeline));
+            assertThat(failure).isNotNull();
+            var service = new PipelineViewService(new ArtifactQueryService(damaged.artifacts()), new PipelineRepresentation(), null, original);
+            assertThatThrownBy(() -> service.list(0, 10)).isExactlyInstanceOf(failure.getClass()).hasMessage(failure.getMessage());
+        }
+    }
+
+    @Test
     void undiscoveredUnwindListsOnlyItsDeclaredOutputWhileStartStillRequiresDiscovery() {
         var store = sources();
         var pipeline = pipeline(store, """

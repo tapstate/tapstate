@@ -123,6 +123,11 @@
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+    </dependency>
     <!-- Validation parses declared JSON text with bounded streaming tokens and exact numbers.
          This does not replace the connector framework's own parser provider. -->
     <dependency>

@@ -10,5 +10,6 @@ interface MemberStorage {
     default void prepare(Config config, WorkloadClaim originalNode, long askedAt, NodeSessionLease startupLease) {
         prepare(config, originalNode, askedAt);
     }
+    default boolean processOwnsNode() { return false; }
     void joined(HazelcastInstance member);
 }
