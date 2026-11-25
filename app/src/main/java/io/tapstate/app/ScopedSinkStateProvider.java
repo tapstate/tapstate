@@ -29,10 +29,14 @@ final class ScopedSinkStateProvider {
     }
     static final class WriterStartup {
         private ConnectorRef artifact;
-        private java.util.Optional<SourceBindingSnapshot> monitoredSource;
+        private java.util.Optional<SourceBindingSnapshot> monitoredSource = java.util.Optional.empty();
+        private boolean sourceMonitored;
         synchronized java.util.Optional<SourceBindingSnapshot> monitoredSource(
                 java.util.function.Supplier<java.util.Optional<SourceBindingSnapshot>> read) {
-            if (monitoredSource == null) monitoredSource = read.get();
+            if (!sourceMonitored) {
+                monitoredSource = java.util.Objects.requireNonNull(read.get());
+                sourceMonitored = true;
+            }
             return monitoredSource;
         }
         boolean independentArtifact() { return artifact != null && !artifact.shareSafe(); }

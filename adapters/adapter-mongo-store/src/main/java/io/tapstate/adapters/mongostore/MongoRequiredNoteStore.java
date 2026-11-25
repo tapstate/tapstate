@@ -1015,7 +1015,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         var origin = snapshot.getList("noteOrigin", Document.class).getFirst().get("value", Document.class);
         if (!scopeId(owner).equals(metadata.get("_id")) || !scopeId(owner).equals(origin.get("_id"))) throw unavailable();
         var token = scopeOf(owner, metadata);
-        if (retainedOrigin(token, metadata, origin) == null) throw unavailable();
+        retainedOrigin(token, metadata, origin);
         var seen = new HashSet<Document>();
         for (var captured : snapshot.getList("noteCarries", Document.class)) {
             var row = captured.get("value", Document.class);

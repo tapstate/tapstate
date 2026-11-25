@@ -15,6 +15,7 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Captures attribution during an operation and inspects only after its transaction has closed. */
 final class MongoStructureFailureScope {
@@ -88,17 +89,16 @@ final class MongoStructureFailureScope {
     }
 
     static final class CommandObserver implements CommandListener {
-        private volatile MongoClient client;
+        private final AtomicReference<MongoClient> client = new AtomicReference<>();
 
         void bind(MongoClient original) {
-            if (client != null) throw new IllegalStateException("command observer already bound");
-            client = original;
+            if (!client.compareAndSet(null, original)) throw new IllegalStateException("command observer already bound");
             OBSERVED_CLIENTS.add(original);
         }
 
         @Override public void commandStarted(CommandStartedEvent event) {
             for (var scope = CURRENT.get(); scope != null; scope = scope.parent)
-                if (scope.client == client) scope.startedCommands++;
+                if (scope.client == client.get()) scope.startedCommands++;
         }
     }
 

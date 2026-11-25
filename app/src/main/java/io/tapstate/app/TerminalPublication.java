@@ -31,7 +31,10 @@ record TerminalPublication(PipelineIntentScope scope, long intentRevision, long 
         void leave() { if (retained.decrementAndGet() < 0) throw new IllegalStateException("negative terminal work count"); }
         boolean idle() { return retained.get() <= 0; }
         boolean sealed() { return retained.get() < 0; }
-        boolean seal() { return !failed && (retained.compareAndSet(0, -1) || sealed()) && !failed; }
+        boolean seal() {
+            if (failed || !retained.compareAndSet(0, -1) && !sealed()) return false;
+            return !failed;
+        }
         void reopen() { retained.compareAndSet(-1, 0); }
     }
 

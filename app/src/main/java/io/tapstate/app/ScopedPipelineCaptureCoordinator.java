@@ -879,7 +879,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (source.handoff != null) finishArtifactHandoff(session, source,
                 source.srs.chains().load(source.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused));
         if (source.freshFull != null) {
-            source.srs.chains().load(source.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            if (source.srs.chains().load(source.prepared.chainId()).isEmpty()) throw refused();
             waiting.remove(context.key());
             return Optional.empty();
         }

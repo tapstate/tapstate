@@ -21,6 +21,43 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void alertWriteFactsReuseOnlyRowsWithTheRequestedIdentity() {
+        withStore(f -> {
+            var seeded = businessFacts(f);
+            assertThat(accept(f, seeded)).isEqualTo(Outcome.STAGED);
+            f.domain.artifacts().create(source("other-source"));
+            var key = seeded.head().snapshot().rule().key();
+            var rule = seeded.head().binding().ruleIdentity();
+            var instanceId = MongoAlertStateCodec.key(key);
+            var ruleId = MongoAlertConfigurationCodec.key(rule.scope(), rule.id());
+            try (var client = MongoClients.create(MONGO.getReplicaSetUrl()); var session = client.startSession()) {
+                var db = client.getDatabase(f.db().getName());
+                session.startTransaction();
+                try {
+                    var captured = MongoAlertWriteFacts.read(db, session, new MongoAlertWriteFacts.Request(key, rule));
+                    assertThat(captured).isNotNull();
+                    assertThat(captured.identity()).containsEntry("clusterId", SCOPE.clusterId());
+                    assertThat(captured.row(SystemCollections.SOURCES, "orders")).containsEntry("_id", "orders");
+                    assertThat(captured.row(SystemCollections.SOURCES, "other-source")).containsEntry("_id", "other-source");
+                    assertThat(captured.row(SystemCollections.SOURCES, "missing")).isNull();
+                    assertThat(captured.row(SystemCollections.ALERT_INSTANCES, instanceId)).containsEntry("_id", instanceId);
+                    assertThat(captured.row(SystemCollections.ALERT_RULES, ruleId)).containsEntry("_id", ruleId);
+                    assertThat(captured.empty(SystemCollections.PIPELINES)).isTrue();
+
+                    var pipeline = new AlarmKey(SCOPE, new AlarmKey.Resource("pipeline", "missing", UUID_A),
+                            "pipeline.runtime-failed", UUID_A);
+                    var withoutRule = MongoAlertWriteFacts.read(db, session, new MongoAlertWriteFacts.Request(pipeline, null));
+                    assertThat(withoutRule).isNotNull();
+                    assertThat(withoutRule.row(SystemCollections.ALERT_INSTANCES, MongoAlertStateCodec.key(pipeline))).isNull();
+                    assertThat(withoutRule.row(SystemCollections.ALERT_INSTANCES, instanceId)).containsEntry("_id", instanceId);
+                    assertThat(MongoAlertWriteFacts.read(client.getDatabase("missing_alert_write_facts"), session, null)).isNull();
+                } finally {
+                    session.abortTransaction();
+                }
+            }
+        });
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings={"source","global","recovery","key","schema","foreign-collision"})
     void runtimeWriteFactsPreserveTheOriginalAuthorityFailure(String damage) {

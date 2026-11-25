@@ -358,9 +358,9 @@ class PipelineLaunchLatencyIT {
                 }
             }
             if (member != null) {
-                assertThat(Hazelcast.getAllHazelcastInstances())
+                assertThat(Hazelcast.getAllHazelcastInstances().contains(member))
                         .as("the launch fixture must release its own member when the context closes")
-                        .doesNotContain(member);
+                        .isFalse();
             }
         }
     }

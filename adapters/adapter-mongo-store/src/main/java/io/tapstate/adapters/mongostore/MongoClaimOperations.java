@@ -497,7 +497,19 @@ final class MongoClaimOperations {
             this.session = session;
             this.originalClient = originalClient;
             admission = MongoCacheAdmissionQueue.current(originalClient);
-            if (admission != null) admission.retainTransaction(this, deadline -> recoverAdmission(this, deadline));
+            if (admission != null) admission.retainTransaction(this, this::recoverAdmission);
+        }
+
+        private synchronized Call<Void> cleanup(long deadline) {
+            if (!transactions.contains(this)) return null;
+            if (cleanup == null || cleanup.result.isDone())
+                cleanup = submit(deadline, () -> {}, () -> { abort(this, budget()); return null; }, true, workers, null);
+            return cleanup;
+        }
+
+        private void recoverAdmission(long deadline) {
+            var pending = cleanup(deadline);
+            if (pending != null) result(pending, deadline);
         }
 
         void capture() {
@@ -574,17 +586,6 @@ final class MongoClaimOperations {
         if (!previouslyReleased && transaction.admission != null) transaction.admission.transactionFinished(transaction, transaction.commitAcknowledged);
     }
 
-    private void recoverAdmission(Transaction transaction, long deadline) {
-        Call<Void> cleanup;
-        synchronized (transaction) {
-            if (!transactions.contains(transaction)) return;
-            if (transaction.cleanup == null || transaction.cleanup.result.isDone())
-                transaction.cleanup = submit(deadline, () -> {}, () -> { abort(transaction, budget()); return null; }, true, workers, null);
-            cleanup = transaction.cleanup;
-        }
-        result(cleanup, deadline);
-    }
-
     /** A driver callback restart after commit first reconciles the previous exact transaction. */
     static final class RetryAfterCommit extends RuntimeException {
         RetryAfterCommit(){super(null,null,false,false);}
@@ -651,14 +652,8 @@ final class MongoClaimOperations {
             var unresolved = new ArrayList<>(transactions);
             if (unresolved.isEmpty()) return;
             for (var transaction : unresolved) {
-                Call<Void> cleanup;
-                synchronized (transaction) {
-                    if (!transactions.contains(transaction)) continue;
-                    if (transaction.cleanup == null || transaction.cleanup.result.isDone())
-                        transaction.cleanup = submit(deadline,()->{}, () -> { abort(transaction, budget()); return null; },true,workers,null);
-                    cleanup = transaction.cleanup;
-                }
-                result(cleanup, deadline);
+                var cleanup = transaction.cleanup(deadline);
+                if (cleanup != null) result(cleanup, deadline);
             }
         }
     }

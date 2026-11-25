@@ -97,11 +97,12 @@ final class ExecutionAuthorization implements AutoCloseable {
     private final ScheduledExecutorService refresher;
     private final ThreadPoolExecutor proofReaders;
     private final Map<ReadKey, ScopedProof> scopedProofs = new ConcurrentHashMap<>();
-    private volatile Predicate<ExecutionFence> localWriterLease = fence -> false;
+    private final java.util.concurrent.atomic.AtomicReference<Predicate<ExecutionFence>> localWriterLease =
+            new java.util.concurrent.atomic.AtomicReference<>(fence -> false);
 
     /** Single-node OP can reuse the same member's already-acknowledged original renewal. */
     void useLocalWriterLease(Predicate<ExecutionFence> lease) {
-        localWriterLease = Objects.requireNonNull(lease, "lease");
+        localWriterLease.set(Objects.requireNonNull(lease, "lease"));
     }
 
     private record ProofResult(Entry entry, boolean denied) {}
@@ -368,7 +369,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         proof.lastUsed = System.nanoTime();
         var entry = requireWriterLease(fence, proof);
         long now = nanoTime.getAsLong();
-        if (now - entry.deadlineNanos() < 0 || localWriterLease.test(fence)) return;
+        if (now - entry.deadlineNanos() < 0 || localWriterLease.get().test(fence)) return;
         if (now - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);
         throw new WriterProofUnavailable(proof, entry.leaseDeadlineNanos());
     }
@@ -402,7 +403,7 @@ final class ExecutionAuthorization implements AutoCloseable {
             while (true) {
                 if (scopedProofs.get(key) != proof) throw writerRefused(fence);
                 var entry = requireWriterLease(fence, proof);
-                if (localWriterLease.test(fence)) break;
+                if (localWriterLease.get().test(fence)) break;
                 long now = nanoTime.getAsLong();
                 long left = unavailable.leaseDeadline - now;
                 if (left <= 0 || now - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);

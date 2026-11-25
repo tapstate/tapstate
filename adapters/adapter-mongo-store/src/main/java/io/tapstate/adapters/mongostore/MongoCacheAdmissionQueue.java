@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongConsumer;
 import java.util.function.Supplier;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Local turns for one CACHE identity; Mongo transactions retain every authoritative fence. */
 final class MongoCacheAdmissionQueue {
@@ -159,26 +160,30 @@ final class MongoCacheAdmissionQueue {
     }
 
     static final class Observer implements CommandListener {
-        private volatile MongoClient client;
-        void bind(MongoClient original) { if (client != null) throw new IllegalStateException("admission observer already bound"); client = original; OBSERVED.add(original); }
+        private final AtomicReference<MongoClient> client = new AtomicReference<>();
+        void bind(MongoClient original) {
+            if (!client.compareAndSet(null, original)) throw new IllegalStateException("admission observer already bound");
+            OBSERVED.add(original);
+        }
         @Override public void commandStarted(CommandStartedEvent event) {
-            if (client == null || TRACKED.isEmpty()) return;
+            var ownerClient = client.get();
+            if (ownerClient == null || TRACKED.isEmpty()) return;
             var command = event.getCommand();
             if (!(command.get("lsid") instanceof BsonDocument session) || !command.containsKey("txnNumber")) return;
-            var key = new TransactionKey(client, session, command.getNumber("txnNumber").longValue());
+            var key = new TransactionKey(ownerClient, session, command.getNumber("txnNumber").longValue());
             var owner = TRACKED.get(key); if (owner == null) return;
             owner.driverCommandStarted(key.number());
             if (event.getCommandName().equals("commitTransaction") || event.getCommandName().equals("abortTransaction"))
-                FINALIZATIONS.put(new RequestKey(client, event.getConnectionDescription().getConnectionId(), event.getRequestId()),
+                FINALIZATIONS.put(new RequestKey(ownerClient, event.getConnectionDescription().getConnectionId(), event.getRequestId()),
                         new Finalization(key, owner, event.getCommandName().equals("commitTransaction")));
         }
         @Override public void commandSucceeded(CommandSucceededEvent event) {
-            var ending = FINALIZATIONS.remove(new RequestKey(client, event.getConnectionDescription().getConnectionId(), event.getRequestId()));
+            var ending = FINALIZATIONS.remove(new RequestKey(client.get(), event.getConnectionDescription().getConnectionId(), event.getRequestId()));
             if (ending != null && !event.getResponse().containsKey("writeConcernError"))
                 ending.owner().driverEnded(ending.key().number(), ending.commit(), 0);
         }
         @Override public void commandFailed(CommandFailedEvent event) {
-            var ending = FINALIZATIONS.remove(new RequestKey(client, event.getConnectionDescription().getConnectionId(), event.getRequestId()));
+            var ending = FINALIZATIONS.remove(new RequestKey(client.get(), event.getConnectionDescription().getConnectionId(), event.getRequestId()));
             if (ending != null && !ending.commit() && event.getThrowable() instanceof com.mongodb.MongoCommandException failed
                     && (failed.getCode() == 251 || failed.getCode() == 256) && !failed.getResponse().containsKey("writeConcernError"))
                 ending.owner().driverEnded(ending.key().number(), false, failed.getCode());

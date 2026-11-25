@@ -21,7 +21,8 @@ public final class PdkSinkPreparations {
     private final boolean fullLoad;
     public static final class OpeningFacts {
         private final java.util.Set<SinkPreparationStore.Input> ready = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        private volatile SharedSinkConnectors.NoteIdentity notes;
+        private final java.util.concurrent.atomic.AtomicReference<SharedSinkConnectors.NoteIdentity> notes =
+                new java.util.concurrent.atomic.AtomicReference<>();
     }
     private final OpeningFacts opening;
     private final WorkloadClaimFence execution;
@@ -81,8 +82,8 @@ public final class PdkSinkPreparations {
             throw new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",scope.pipelineId()),null);
         opening.ready.addAll(inputs);
     }
-    SharedSinkConnectors.NoteIdentity openedNotes() { return opening.notes; }
-    void rememberOpenedNotes(SharedSinkConnectors.NoteIdentity notes) { opening.notes = notes; }
+    SharedSinkConnectors.NoteIdentity openedNotes() { return opening.notes.get(); }
+    void rememberOpenedNotes(SharedSinkConnectors.NoteIdentity notes) { opening.notes.set(notes); }
     private SinkPreparationStore.Input input(TargetTable target){return input(scope,node,purpose,policy,fullLoad,target);}
     public static SinkPreparationStore.Input input(PipelineIntentScope scope,PipelineNode node,PipelineNode.Purpose purpose,
             OnFullLoad policy,boolean fullLoad,TargetTable target) {

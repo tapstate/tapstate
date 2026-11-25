@@ -30,7 +30,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final com.mongodb.client.MongoDatabase database;
     private final MongoClaimOperations claimOperations;
     private final MongoStructureProof structures = new MongoStructureProof();
-    private volatile Set<SystemCollections> inspectedCollections = Set.of();
+    private final java.util.concurrent.atomic.AtomicReference<Set<SystemCollections>> inspectedCollections =
+            new java.util.concurrent.atomic.AtomicReference<>(Set.of());
     private final MongoSrsControlProofs srsControlProofs = new MongoSrsControlProofs();
     private final Duration rateRetention;
     private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
@@ -276,7 +277,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         businessActive();
         final long inspectionGeneration;
         synchronized (structures) {
-            inspectedCollections = Set.of();
+            inspectedCollections.set(Set.of());
             structures.clear();
             inspectionGeneration = structures.currentGeneration();
         }
@@ -312,7 +313,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 || result.stream().anyMatch(difference -> database.getName().equals(difference.database())
                         && table.physicalNames().contains(difference.collection())));
         synchronized (structures) {
-            if (structures.currentGeneration() == inspectionGeneration) inspectedCollections = Set.copyOf(eligible);
+            if (structures.currentGeneration() == inspectionGeneration) inspectedCollections.set(Set.copyOf(eligible));
         }
         return List.copyOf(result);
     }
@@ -550,16 +551,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     private boolean canBatchSrsControlSnapshot() {
-        return MongoReadBudget.supportsSnapshotReads(client) && inspectedCollections.containsAll(List.of(
+        return MongoReadBudget.supportsSnapshotReads(client) && inspectedCollections.get().containsAll(List.of(
                 SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS));
     }
 
     private boolean canBatchSrsControlReadiness() {
-        return inspectedCollections.containsAll(List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS));
+        return inspectedCollections.get().containsAll(List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS));
     }
 
     private boolean canBatchSrsReclaimReferences() {
-        return inspectedCollections.containsAll(List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
+        return inspectedCollections.get().containsAll(List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
                 SystemCollections.SRS_LOG_BOUNDS));
     }
 
@@ -931,7 +932,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
         public boolean updateExisting(io.tapstate.core.lifecycle.Observation observation, long epoch) {
             access.requireObservationActive();
-            if (!inspectedCollections.containsAll(MongoPipelineObservationRead.COLLECTIONS) || !structures.stands(MongoStructureProof.Kind.OBSERVATION, proof)) return false;
+            if (!inspectedCollections.get().containsAll(MongoPipelineObservationRead.COLLECTIONS) || !structures.stands(MongoStructureProof.Kind.OBSERVATION, proof)) return false;
             try {
                 return new MongoCachePipelineObservationStore(access).updateExisting(observation, epoch);
             } catch (RuntimeException failure) {
@@ -949,9 +950,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         access.requireObservationActive();
         if (!MongoReadBudget.supportsSnapshotReads(client)
                 || "transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY))) return java.util.Optional.empty();
-        if (!inspectedCollections.containsAll(MongoPipelineObservationRead.COLLECTIONS)) return java.util.Optional.empty();
+        if (!inspectedCollections.get().containsAll(MongoPipelineObservationRead.COLLECTIONS)) return java.util.Optional.empty();
         try {
-            var proof = structures.audit(MongoStructureProof.Kind.OBSERVATION, () -> inspectedCollections.containsAll(MongoPipelineObservationRead.COLLECTIONS));
+            var proof = structures.audit(MongoStructureProof.Kind.OBSERVATION, () -> inspectedCollections.get().containsAll(MongoPipelineObservationRead.COLLECTIONS));
             if (!structures.stands(MongoStructureProof.Kind.OBSERVATION, proof)) return java.util.Optional.empty();
             var facts = new MongoPipelineObservationRead(client, database, access).read(Map.copyOf(sources));
             access.requireObservationActive();

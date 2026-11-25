@@ -190,9 +190,12 @@ final class MongoSrsReadFacts {
         var remaining = new java.util.LinkedHashMap<Lookup, Object>();
         for (Object id : ids) {
             var key = lookup(table, new Document("_id", id), false);
+            if (!rows.containsKey(key)) {
+                remaining.put(key, id);
+                continue;
+            }
             var known = rows.get(key);
-            if (known == null) remaining.put(key, id);
-            else if (known.isEmpty() || !key.equals(lookup(table, new Document("_id", known.orElseThrow().get("_id")), false)))
+            if (known.isEmpty() || !key.equals(lookup(table, new Document("_id", known.orElseThrow().get("_id")), false)))
                 return false;
         }
         if (remaining.isEmpty()) return true;

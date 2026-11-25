@@ -1051,7 +1051,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return inTransaction(session -> {
             requireStructure.run();
             var captured = capturedStartup(session, context, Map.of(), false, StartupRead.SNAPSHOT_RESUME);
-            if (captured != null) return captured.map(value -> value.snapshot().progress());
+            if (!captured.fallback()) return captured.result().map(value -> value.snapshot().progress());
             validateStore(session, true);
             return progress(session, context, false);
         });
@@ -1291,7 +1291,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Function<ClientSession, Optional<StartupSnapshot>> read = session -> {
             requireStructure.run();
             var captured = capturedStartup(session, context, selected, verifyControlClosure, StartupRead.SNAPSHOT);
-            if (captured != null) return captured.map(CapturedStartup::snapshot);
+            if (!captured.fallback()) return captured.result().map(CapturedStartup::snapshot);
             validateStore(session, true);
             return startupSnapshotInSession(session, context, selected, verifyControlClosure);
         };
@@ -1303,7 +1303,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return inTransaction(session -> {
             requireStructure.run();
             var captured = capturedStartup(session, context, Map.of(), verifyControlClosure, StartupRead.PREPARATION);
-            if (captured != null) return captured.map(value -> new StartupPreparation(value.snapshot(), value.topology()));
+            if (!captured.fallback()) return captured.result().map(value -> new StartupPreparation(value.snapshot(), value.topology()));
             validateStore(session, true);
             return startupSnapshotInSession(session, context, Map.of(), verifyControlClosure).map(snapshot -> {
                 var view = view(session, context.key().miningChainId());
@@ -1316,7 +1316,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     private record CapturedStartup(StartupSnapshot snapshot, SrsConsumerTopology topology) {}
 
-    private Optional<CapturedStartup> capturedStartup(ClientSession session, SrsConsumerContext context,
+    private record StartupCapture(boolean fallback, Optional<CapturedStartup> result) {
+        static final StartupCapture FALLBACK = new StartupCapture(true, Optional.empty());
+        static final StartupCapture DETACHED = new StartupCapture(false, Optional.empty());
+    }
+
+    private StartupCapture capturedStartup(ClientSession session, SrsConsumerContext context,
             Map<String, String> selected, boolean verifyControlClosure, StartupRead read) {
         boolean withTopology = read == StartupRead.PREPARATION;
         String chain = context.key().miningChainId();
@@ -1330,7 +1335,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 || MongoCaptureStartupRows.get(captured, "cache") == null
                 || MongoCaptureStartupRows.get(captured, "schema") == null
                 || MongoCaptureStartupRows.ambiguous(captured, "cache", "cluster")
-                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")) return null;
+                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")) return StartupCapture.FALLBACK;
         MongoCacheBusinessIdentity.requireObservedReady(MongoCaptureStartupRows.get(captured, "cache"),
                 MongoCaptureStartupRows.get(captured, "schema"), scope);
         var members = captured.getList("members", Document.class);
@@ -1338,7 +1343,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (java.util.stream.Stream.concat(members.stream(), cursors.stream()).anyMatch(row ->
                 !(row.get("_id") instanceof Document id) || !chain.equals(id.get("chain"))
                         || !scope.cacheIncarnation().equals(id.get("cacheIncarnation"))
-                        || !withTopology && !verifyControlClosure && !context.key().consumerId().equals(id.get("consumer")))) return null;
+                        || !withTopology && !verifyControlClosure && !context.key().consumerId().equals(id.get("consumer")))) return StartupCapture.FALLBACK;
         var facts = new MongoSrsReadFacts(session, database, scope, root, true);
         var control = MongoSrsChainStore.decode(root, scope, new MongoSrsModelContexts(database, scope));
         facts.prefetchStartupCheckpoint(root, control.checkpoint());
@@ -1349,13 +1354,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 row.get("_id", Document.class).get("consumer"))).toList();
         if (memberRows.size() != 1 || ownCursors.size() > 1
                 || !exactStartupId(records.id(context.key()), memberRows.getFirst().get("_id"))
-                || !ownCursors.isEmpty() && !exactStartupId(records.id(context.key()), ownCursors.getFirst().get("_id"))) return null;
+                || !ownCursors.isEmpty() && !exactStartupId(records.id(context.key()), ownCursors.getFirst().get("_id"))) return StartupCapture.FALLBACK;
         var member = records.membership(memberRows.getFirst());
         if (!member.context().key().equals(context.key()) || state.consumerRevision() < member.revision()
                 || member.context().stateGeneration() != context.stateGeneration()) throw unavailable(chain);
         if (member.detached()) {
             if (!ownCursors.isEmpty()) throw unavailable(chain);
-            return Optional.empty();
+            return StartupCapture.DETACHED;
         }
         if (state.consumerCount() < 1) throw unavailable(chain);
         var cursor = records.cursor(member, ownCursors.isEmpty() ? null : ownCursors.getFirst());
@@ -1365,8 +1370,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         var view = withTopology ? validateRelations(chain, root, state, members, () -> cursors) : null;
         var progress = new SrsConsumerProgress(context, member.revision(), cursor.revision(), cursor.value(),
                 cursor.snapshot(), cursor.writerRun(), cursor.ringDoneThrough());
-        return Optional.of(new CapturedStartup(startupSnapshot(session, root, state, progress, selected, facts),
-                view == null ? null : topology(view)));
+        return new StartupCapture(false, Optional.of(new CapturedStartup(startupSnapshot(session, root, state, progress, selected, facts),
+                view == null ? null : topology(view))));
     }
 
     private static boolean exactStartupId(Document expected, Object actual) {

@@ -836,9 +836,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             // Completion receipts belong to this process. A peer may still own asynchronous reporting.
             StoppedTerminalRecheck stopped = cluster.getProfile() != ClusterProperties.Profile.SINGLE
                     || hz.getDiscovery().getMode() != HazelcastProperties.DiscoveryMode.NONE ? null :
-                    (intent, checkpoint, original, tenure) -> NativeStoppedTerminalRecheck.localEvidence(member, membership, original)
-                            && nativeRecheck.unchanged(intent, checkpoint, original, tenure)
-                            && NativeStoppedTerminalRecheck.localEvidence(member, membership, original);
+                    (intent, checkpoint, original, tenure) -> {
+                        if (!NativeStoppedTerminalRecheck.localEvidence(member, membership, original)
+                                || !nativeRecheck.unchanged(intent, checkpoint, original, tenure)) return false;
+                        return NativeStoppedTerminalRecheck.localEvidence(member, membership, original);
+                    };
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
             if (!(captures instanceof ScopedPipelineCaptureCoordinator scopedCaptures)) throw ThreeLayerStorePort.refused();

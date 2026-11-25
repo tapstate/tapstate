@@ -712,6 +712,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     static WorkloadClaimReading nodeSessionReading(Document document) {
+        if (document == null) throw unreadableClaim();
         var claim = decodeStrict(document);
         if (claim.key().type() != WorkloadClaimType.NODE_SESSION || nodeBacked(document)
                 || !(document.get(LEASE_REMAINING) instanceof Long remaining)) throw unreadableClaim();

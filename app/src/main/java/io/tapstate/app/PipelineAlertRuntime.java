@@ -58,7 +58,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         volatile PipelineState actual;
         final ArrayDeque<Work> pending = new ArrayDeque<>();
         boolean scheduled;
-        volatile TerminalAlerts terminal;
+        final AtomicReference<TerminalAlerts> terminal = new AtomicReference<>();
         final TerminalPublication.Admission admission;
         Slot(Producer producer, Instant now, Slot previous, TerminalPublication.Admission admission) {
             this.producer = producer;this.admission = admission;
@@ -193,8 +193,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                     && entry.getValue().idle());
             var slot = slot(pass);
             if (slot != null) {
-                if (slot.terminal != null) slot.terminal.invalid = true;
-                slot.terminal = null;slot.admission.reopen();
+                var terminal = slot.terminal.get();
+                if (terminal != null) terminal.invalid = true;
+                slot.terminal.set(null);
+                slot.admission.reopen();
             }
         }
     }
@@ -237,7 +239,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         final long interruptions, freshnessSequence;
         volatile boolean completed, invalid, admitted, capacityRejected;
         final boolean initiallyContinuous;
-        volatile RejectedFinal rejectedInput;
+        final AtomicReference<RejectedFinal> rejectedInput = new AtomicReference<>();
         boolean ownRejectedReplay;
         TerminalAlerts(Slot slot, TerminalPublication publication, PipelineState actual) {
             this.slot = slot; this.publication = publication; this.actual = actual;
@@ -249,9 +251,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             synchronized(slot.pending){return eligibleRejection();}
         }
         private boolean eligibleRejection() {
-            var input=rejectedInput;
+            var input=rejectedInput.get();
             return capacityRejected && !admitted && input!=null && initiallyContinuous && !closed.get()
-                    && actual==PipelineState.STOPPED && slots.get(publication.scope().pipelineId())==slot && slot.terminal==this
+                    && actual==PipelineState.STOPPED && slots.get(publication.scope().pipelineId())==slot && slot.terminal.get()==this
                     && !slot.admission.failed && slot.admission.idle() && !slot.scheduled && slot.pending.isEmpty()
                     && snapshot.equals(rules.get()) && !needsFrequentTerminalSamples(publication.scope(),actual)
                     && slot.interruptions.get()==interruptions+1 && slot.sequence.get()==input.sequence()+1
@@ -260,23 +262,23 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         public TerminalPublication.Receipt retryRejected() {
             synchronized(slot.pending){
                 if(!eligibleRejection())return null;
-                var input=rejectedInput;rejectedInput=null;
-                var next=new TerminalAlerts(slot,publication,actual);next.ownRejectedReplay=true;slot.terminal=next;
+                var input=rejectedInput.get();rejectedInput.set(null);
+                var next=new TerminalAlerts(slot,publication,actual);next.ownRejectedReplay=true;slot.terminal.set(next);
                 enqueuePublication(slot,input.observation(),input.trace(),input.rules(),
-                        ()->slots.get(publication.scope().pipelineId())==slot&&slot.terminal==next,
+                        ()->slots.get(publication.scope().pipelineId())==slot&&slot.terminal.get()==next,
                         input.sequence(),input.measured(),next,input.bytes());
                 return next;
             }
         }
         public void reopen() {
-            if(slots.get(publication.scope().pipelineId())==slot && slot.terminal==this)slot.admission.reopen();
+            if(slots.get(publication.scope().pipelineId())==slot && slot.terminal.get()==this)slot.admission.reopen();
         }
         public boolean seal() {
-            return status() == TerminalPublication.Status.COMPLETE && slot.admission.seal()
-                    && status() == TerminalPublication.Status.COMPLETE;
+            if (status() != TerminalPublication.Status.COMPLETE || !slot.admission.seal()) return false;
+            return status() == TerminalPublication.Status.COMPLETE;
         }
         public TerminalPublication.Status status() {
-            if (closed.get() || invalid || slot.admission.failed || slots.get(publication.scope().pipelineId()) != slot || slot.terminal != this
+            if (closed.get() || invalid || slot.admission.failed || slots.get(publication.scope().pipelineId()) != slot || slot.terminal.get() != this
                     || slot.interruptions.get() != interruptions || !snapshot.equals(rules.get())
                     || needsFrequentTerminalSamples(publication.scope(), actual)) return TerminalPublication.Status.FAILED;
             synchronized (slot.pending) {
@@ -295,14 +297,14 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if (slot == null) return TerminalPublication.failed();
         TerminalAlerts receipt;
         synchronized (slot.pending) {
-            var previous = slot.terminal;
+            var previous = slot.terminal.get();
             if (previous != null && previous.publication.equals(terminal)
                     && previous.status() != TerminalPublication.Status.FAILED) return previous;
             receipt = new TerminalAlerts(slot, terminal, observation.state());
-            slot.terminal = receipt;
+            slot.terminal.set(receipt);
         }
         publish(slot, slot.sequence.getAndIncrement(), observation, cause,
-                () -> expectedSlot(pass) == slot && slot.terminal == receipt, measured, receipt);
+                () -> expectedSlot(pass) == slot && slot.terminal.get() == receipt, measured, receipt);
         return receipt;
     }
 
@@ -348,7 +350,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             boolean measured, TerminalAlerts terminal) {
         if (terminal == null) {
             if (slot.admission.sealed()) return;
-            synchronized (slot.pending) { if (slot.terminal != null) slot.terminal.invalid = true; }
+            synchronized (slot.pending) {
+                var currentTerminal = slot.terminal.get();
+                if (currentTerminal != null) currentTerminal.invalid = true;
+            }
         }
         int bytes = inputBytes(observation);
         if (bytes < 0 || observation.observedAt() == null || observation.observedAt().isAfter(clock.instant())) {
@@ -366,7 +371,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             TerminalAlerts terminal,int bytes) {
         if(terminal!=null) {
             var lifecycle=new Observation(original.pipelineId(),original.state(),Map.of(),Map.of(),Map.of(),null,original.observedAt(),List.of());
-            terminal.rejectedInput=new RejectedFinal(lifecycle,trace,capturedRules,sequence,measured,bytes);
+            terminal.rejectedInput.set(new RejectedFinal(lifecycle,trace,capturedRules,sequence,measured,bytes));
         }
         submit(slot, bytes, () -> {
             if (!current.getAsBoolean()) return;
@@ -376,7 +381,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             } catch (TapstateException refused) {
                 if (current.getAsBoolean()) throw refused;
             }
-        },()->{if(terminal!=null){terminal.invalid=true;if(!terminal.capacityRejected)terminal.rejectedInput=null;}},terminal);
+        },()->{if(terminal!=null){terminal.invalid=true;if(!terminal.capacityRejected)terminal.rejectedInput.set(null);}},terminal);
     }
 
     private void publishCurrent(Slot slot, Observation original, AlarmDiagnostics.SafeTrace trace,
@@ -477,7 +482,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
 
     private boolean pipelineTimerOffer(Slot slot, List<AlertConfiguration.Rule> capturedRules, long round) {
-        var terminal = slot.terminal;
+        var terminal = slot.terminal.get();
         if (slot.admission.sealed() || terminal != null && !terminal.invalid
                 && (terminal.completed || terminal.admitted && terminal.status() == TerminalPublication.Status.PENDING)
                 && terminal.actual == PipelineState.STOPPED && terminal.snapshot.equals(rules.get())
@@ -926,7 +931,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             boolean start;
             synchronized (slot.pending) {
                 slot.pending.addLast(work);
-                if(terminal!=null){terminal.admitted=true;terminal.rejectedInput=null;}
+                if(terminal!=null){terminal.admitted=true;terminal.rejectedInput.set(null);}
                 start = !slot.scheduled; slot.scheduled = true;
             }
             if (start) dispatch(slot);
@@ -948,8 +953,13 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 if(!(unavailable instanceof TapstateException))throw unavailable;
             }
             catch (Error fatal) {
-                if(slot!=null){var current=slots.get(slot.producer.scope().pipelineId());
-                    if(current!=null && current.admission==slot.admission && current.terminal!=null)current.terminal.invalid=true;}
+                if (slot != null) {
+                    var current = slots.get(slot.producer.scope().pipelineId());
+                    if (current != null && current.admission == slot.admission) {
+                        var receipt = current.terminal.get();
+                        if (receipt != null) receipt.invalid = true;
+                    }
+                }
                 throw fatal;
             }
             finally { release(); }
@@ -994,7 +1004,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if (slot != null) {
             slot.interruptions.incrementAndGet();
             var current=slots.get(slot.producer.scope().pipelineId());
-            if(current!=null && current.admission==slot.admission && current.terminal!=null)current.terminal.invalid=true;
+            if (current != null && current.admission == slot.admission) {
+                var receipt = current.terminal.get();
+                if (receipt != null) receipt.invalid = true;
+            }
         }
         var parameters=new HashMap<String,Object>();
         refusal.args().forEach((key,value)->parameters.put(key,value instanceof String text&&text.matches("[a-zA-Z0-9._:-]{1,128}")?text:"redacted"));
