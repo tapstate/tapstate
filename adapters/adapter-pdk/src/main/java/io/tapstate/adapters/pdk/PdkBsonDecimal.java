@@ -22,9 +22,11 @@ final class PdkBsonDecimal {
 
     private PdkBsonDecimal() {}
 
+    static final String MONGODB = "io.tapdata.mongodb.MongodbConnector";
+    static final String ATLAS = "io.tapdata.mongodb.MongodbAtlasConnector";
+
     static boolean usesBsonModel(String connectorClass) {
-        return "io.tapdata.mongodb.MongodbConnector".equals(connectorClass)
-                || "io.tapdata.mongodb.MongodbAtlasConnector".equals(connectorClass);
+        return MONGODB.equals(connectorClass) || ATLAS.equals(connectorClass);
     }
 
     static boolean isNative(Object value) {

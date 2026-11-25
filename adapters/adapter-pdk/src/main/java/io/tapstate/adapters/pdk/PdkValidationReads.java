@@ -109,15 +109,22 @@ public final class PdkValidationReads {
     }
 
     public enum ModelScope {
-        LEGACY, STRUCTURAL;
+        LEGACY, STRUCTURAL, SAVED_FULL, SAVED_STRUCTURAL;
 
         public static ModelScope forSavedVersion(String version) {
-            return version.startsWith(PdkValidationModelVersion.STRUCTURAL_SCOPE_PROFILE + ":") ? STRUCTURAL : LEGACY;
+            if (version.startsWith(PdkValidationModelVersion.STRUCTURAL_SCOPE_PROFILE + ":")) return SAVED_STRUCTURAL;
+            if (version.startsWith(PdkValidationModelVersion.PROFILE + ":")) return SAVED_FULL;
+            return LEGACY;
         }
 
-        private String version(TapTable model, ConnectorRef artifact) {
-            return this == STRUCTURAL ? PdkValidationModelVersion.structuralScopeVersion(model, artifact)
-                    : PdkValidationModelVersion.scopeVersion(model, artifact);
+        String version(TapTable model, ConnectorRef artifact) {
+            // Recheck saved bindings under the profile recorded when their tasks were compiled.
+            return switch (this) {
+                case SAVED_FULL -> PdkValidationModelVersion.of(model);
+                case SAVED_STRUCTURAL -> PdkValidationModelVersion.declaredStructuralVersion(model);
+                case STRUCTURAL -> PdkValidationModelVersion.structuralScopeVersion(model, artifact);
+                case LEGACY -> PdkValidationModelVersion.scopeVersion(model, artifact);
+            };
         }
     }
 
@@ -266,7 +273,7 @@ public final class PdkValidationReads {
                 portableTextFields.add(field);
                 continue;
             }
-            boolean nativeId=artifact.className().equals("io.tapdata.mongodb.MongodbConnector")&&actual.getDataType()!=null
+            boolean nativeId=PdkBsonDecimal.usesBsonModel(artifact.className())&&actual.getDataType()!=null
                     &&actual.getDataType().replace("_","").equalsIgnoreCase("OBJECTID");
             boolean idDomain=component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("object-id"));
             if(nativeId!=idDomain)
@@ -274,7 +281,7 @@ public final class PdkValidationReads {
         }
         var decoder=new PdkValidationRows(model,codecs,path->path.size()==1&&portableTextFields.contains(path.getFirst())
                 ?PdkValidationRows.Rule.PORTABLE_TEXT:PdkValidationRows.Rule.AUTO,rowLimits,
-                artifact.className().equals("io.tapdata.mongodb.MongodbConnector"));
+                PdkBsonDecimal.usesBsonModel(artifact.className()));
         String currentModel=PdkValidationModelVersion.of(model,artifact);
         return raw->{
             requireCurrentModel(model,artifact,currentModel,"beforeRow");
