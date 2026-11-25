@@ -8,14 +8,14 @@ import io.tapstate.core.validation.ValidationRootHintBatch;
 import io.tapstate.core.validation.ValidationRootHintBatch.Change;
 import io.tapstate.core.validation.ValidationRootHintBatch.Sender;
 import io.tapstate.core.validation.ValidationRunIdentity;
-import java.util.ArrayDeque;
-import java.util.Iterator;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
@@ -65,17 +65,34 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
             this.batch = batch; this.charge = 512 + batch.retainedBytes(); this.createdAt = now; this.dueAt = now;
         }
     }
+    // Publish FIFO order and its byte charge together. Delivery owns the mutable fields on each entry.
+    private record Buffer(List<Entry> entries, long bytes) {
+        private static final Buffer EMPTY = new Buffer(List.of(), 0);
+
+        Entry first() { return entries.isEmpty() ? null : entries.getFirst(); }
+
+        Buffer append(Entry entry) {
+            var next = new ArrayList<Entry>(entries.size() + 1);
+            next.addAll(entries);
+            next.add(entry);
+            return new Buffer(List.copyOf(next), bytes + entry.charge);
+        }
+
+        Buffer removeFirst() {
+            return new Buffer(List.copyOf(entries.subList(1, entries.size())), bytes - entries.getFirst().charge);
+        }
+    }
     private final ValidationRunIdentity run;
     private final Sender sender;
     private final Limits limits;
     private final LongSupplier nanoTime;
-    private final ReentrantLock lock = new ReentrantLock();
-    private final ArrayDeque<Entry> entries = new ArrayDeque<>();
+    private final ReentrantLock offerLock = new ReentrantLock();
+    private final ReentrantLock deliveryLock = new ReentrantLock();
+    private final AtomicReference<Buffer> buffer = new AtomicReference<>(Buffer.EMPTY);
     private final ValidationFailureLatch failure = new ValidationFailureLatch();
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
     private volatile boolean closed;
     private long sequence;
-    private long bytes;
 
     /** nanoTime is local, monotonic and nonblocking; the caller reserves limits.reservationBytes() first. */
     public ValidationRootHintOutbox(ValidationRunIdentity run, Sender sender, Limits limits, LongSupplier nanoTime) {
@@ -104,35 +121,44 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
      */
     public Offer tryOffer(List<Change> changes) {
         if (closed) return terminalOffer();
-        if (!lock.tryLock()) { fail(invalid("hint.senderBusy")); return Offer.FAILED; }
+        if (!offerLock.tryLock()) {
+            if (closed) return terminalOffer();
+            fail(invalid("hint.senderBusy")); return Offer.FAILED;
+        }
         try {
             if (closed) return terminalOffer();
-            if (entries.size() >= limits.packets()) { fail(invalid("hint.senderFull")); return Offer.FAILED; }
+            if (buffer.get().entries().size() >= limits.packets()) { fail(invalid("hint.senderFull")); return Offer.FAILED; }
             if (changes == null || changes.isEmpty() || changes.size() > limits.changes() || sequence == Long.MAX_VALUE) {
                 fail(invalid("hint.senderBatch")); return Offer.FAILED;
             }
             var batch = new ValidationRootHintBatch(run, sender, sequence + 1, changes);
             long charge = 512 + batch.retainedBytes();
-            if (batch.retainedBytes() > limits.batchBytes() || charge > limits.bytes() - bytes) {
+            if (batch.retainedBytes() > limits.batchBytes() || charge > limits.bytes() - buffer.get().bytes()) {
                 fail(invalid("hint.senderBytes")); return Offer.FAILED;
             }
-            long now = nanoTime.getAsLong();
-            if (closed) return terminalOffer();
-            entries.addLast(new Entry(batch, now)); bytes += charge; sequence++;
-            return Offer.ACCEPTED;
+            var entry = new Entry(batch, nanoTime.getAsLong());
+            // With one offer active, delivery can only remove existing packets. Each retry frees capacity.
+            while (!closed) {
+                var current = buffer.get();
+                if (buffer.compareAndSet(current, current.append(entry))) {
+                    sequence++;
+                    return Offer.ACCEPTED;
+                }
+            }
+            return terminalOffer();
         } catch (RuntimeException problem) {
             fail(problem); return Offer.FAILED;
         } catch (Error fatal) {
             fail(fatal); throw fatal;
-        } finally { lock.unlock(); }
+        } finally { offerLock.unlock(); }
     }
 
     /** Background-only. No network call occurs under the lock; the returned lease retains the packet. */
     public Optional<Lease> poll() {
         boolean completeDrain;
-        lock.lock();
+        deliveryLock.lock();
         try {
-            Entry first = entries.peekFirst();
+            Entry first = buffer.get().first();
             if (!closed && first != null) {
                 long now = nanoTime.getAsLong();
                 if (closed) return Optional.empty();
@@ -150,9 +176,8 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
         } catch (RuntimeException | Error problem) {
             fail(problem); throw problem;
         } finally {
-            discardIdleIfClosed();
-            completeDrain = closed && entries.isEmpty();
-            lock.unlock();
+            completeDrain = discardIdleIfClosed();
+            deliveryLock.unlock();
             if (completeDrain) drained.complete(null);
         }
     }
@@ -161,58 +186,80 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
      * Background-only, after the physical request has exited. Null means an unknown delivery outcome;
      * BUSY also retries. Only a matching accepted/duplicate receipt releases the logical packet.
      */
+    // The controller observes this latch even if the delivery thread dies. A fatal Error is always rethrown.
+    @SuppressWarnings("java:S1181")
     public Settlement settle(Lease lease, ValidationRootHintInbox.Receipt receipt) {
         Objects.requireNonNull(lease, "lease");
         if (lease.owner != this) throw invalid("hint.foreignLease");
         boolean completeDrain;
-        lock.lock();
+        deliveryLock.lock();
         try {
             if (lease.settled) return Settlement.ALREADY_SETTLED;
-            Entry entry = lease.entry;
-            if (entries.peekFirst() != entry || entry.lease != lease) throw new IllegalStateException("hint lease ownership was lost");
+            Entry entry = activeEntry(lease);
             lease.settled = true; entry.lease = null;
             if (closed) return failure.get() == null ? Settlement.CLOSED : Settlement.FAILED;
             long now = nanoTime.getAsLong();
             if (closed) return failure.get() == null ? Settlement.CLOSED : Settlement.FAILED;
-            if (elapsed(now, entry.createdAt) >= limits.windowNanos()) {
-                fail(invalid("hint.deliveryWindow")); return Settlement.FAILED;
-            }
-            if (receipt != null) {
-                if (!run.equals(receipt.run()) || !sender.equals(receipt.sender()) || receipt.sequence() != entry.batch.sequence()
-                        || receipt.disposition() == null) {
-                    fail(invalid("hint.foreignReceipt")); return Settlement.FAILED;
-                }
-                switch (receipt.disposition()) {
-                    case ACCEPTED, DUPLICATE -> {
-                        entries.removeFirst(); bytes -= entry.charge;
-                        return Settlement.ACCEPTED;
-                    }
-                    case BUSY -> { }
-                    default -> { fail(invalid("hint.rejectedDelivery")); return Settlement.FAILED; }
-                }
-            }
-            if (entry.attempts == limits.attempts()) {
-                fail(invalid("hint.deliveryAttempts")); return Settlement.FAILED;
-            }
-            entry.dueAt = now + limits.retryNanos();
-            return Settlement.RETRY;
+            return settleEntry(entry, receipt, now);
         } catch (RuntimeException | Error problem) {
             fail(problem); throw problem;
         } finally {
-            discardIdleIfClosed();
-            completeDrain = closed && entries.isEmpty();
-            lock.unlock();
+            completeDrain = discardIdleIfClosed();
+            deliveryLock.unlock();
             if (completeDrain) drained.complete(null);
         }
+    }
+
+    private Entry activeEntry(Lease lease) {
+        var entry = buffer.get().first();
+        if (entry == null || entry != lease.entry || entry.lease != lease) {
+            throw new IllegalStateException("hint lease ownership was lost");
+        }
+        return entry;
+    }
+
+    private Settlement settleEntry(Entry entry, ValidationRootHintInbox.Receipt receipt, long now) {
+        if (elapsed(now, entry.createdAt) >= limits.windowNanos()) {
+            fail(invalid("hint.deliveryWindow")); return Settlement.FAILED;
+        }
+        Settlement receiptResult = settleReceipt(entry, receipt);
+        if (receiptResult != null) return receiptResult;
+        if (entry.attempts == limits.attempts()) {
+            fail(invalid("hint.deliveryAttempts")); return Settlement.FAILED;
+        }
+        entry.dueAt = now + limits.retryNanos();
+        return Settlement.RETRY;
+    }
+
+    private Settlement settleReceipt(Entry entry, ValidationRootHintInbox.Receipt receipt) {
+        if (receipt == null) return null;
+        if (!run.equals(receipt.run()) || !sender.equals(receipt.sender()) || receipt.sequence() != entry.batch.sequence()
+                || receipt.disposition() == null) {
+            fail(invalid("hint.foreignReceipt")); return Settlement.FAILED;
+        }
+        return switch (receipt.disposition()) {
+            case ACCEPTED, DUPLICATE -> {
+                buffer.updateAndGet(Buffer::removeFirst);
+                yield Settlement.ACCEPTED;
+            }
+            case BUSY -> null;
+            default -> {
+                fail(invalid("hint.rejectedDelivery"));
+                yield Settlement.FAILED;
+            }
+        };
     }
 
     /** Safe to sample without completing callbacks on the capture thread. */
     public Optional<Throwable> failure() { return Optional.ofNullable(failure.get()); }
 
     public Snapshot snapshot() {
-        lock.lock();
-        try { return new Snapshot(entries.size(), bytes, !entries.isEmpty() && entries.peekFirst().lease != null, closed, failure.get()); }
-        finally { lock.unlock(); }
+        deliveryLock.lock();
+        try {
+            var current = buffer.get();
+            var first = current.first();
+            return new Snapshot(current.entries().size(), current.bytes(), first != null && first.lease != null, closed, failure.get());
+        } finally { deliveryLock.unlock(); }
     }
 
     /** Packet ownership only; transport resources and controller/run reservations have their own drains. */
@@ -221,21 +268,27 @@ public final class ValidationRootHintOutbox implements AutoCloseable {
     /** Background-only cancellation. It cannot release a still-running physical transport request. */
     @Override public void close() {
         boolean completeDrain;
-        lock.lock();
-        try { closed = true; discardIdleIfClosed(); completeDrain = entries.isEmpty(); }
-        finally { lock.unlock(); }
+        deliveryLock.lock();
+        try { closed = true; completeDrain = discardIdleIfClosed(); }
+        finally { deliveryLock.unlock(); }
         if (completeDrain) drained.complete(null);
     }
 
     private Offer terminalOffer() { return failure.get() == null ? Offer.CLOSED : Offer.FAILED; }
     private void fail(Throwable problem) { failure.record(problem); closed = true; }
-    private void discardIdleIfClosed() {
-        if (!closed) return;
-        Iterator<Entry> iterator = entries.iterator();
-        while (iterator.hasNext()) {
-            Entry entry = iterator.next();
-            if (entry.lease == null) { bytes -= entry.charge; iterator.remove(); }
-        }
+    private boolean discardIdleIfClosed() {
+        if (!closed) return false;
+        // Only a closed delivery waits for an active offer to release its constructor reservation.
+        offerLock.lock();
+        try {
+            var first = buffer.get().first();
+            if (first != null && first.lease != null) {
+                buffer.set(new Buffer(List.of(first), first.charge));
+                return false;
+            }
+            buffer.set(Buffer.EMPTY);
+            return true;
+        } finally { offerLock.unlock(); }
     }
     private static long elapsed(long now, long before) {
         long elapsed = now - before;
