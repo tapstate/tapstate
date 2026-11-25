@@ -71,6 +71,7 @@ class RestApiSecurityConfiguration {
                     var installation = installations.getIfAvailable();
                     return installation != null && installation.isManagementRequest(request);
                 })
+                .addFilterAfter(new OperationErrorDiagnosticsFilter(), org.springframework.security.web.access.intercept.AuthorizationFilter.class)
                 .csrf(AbstractHttpConfigurer::disable).formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable).logout(AbstractHttpConfigurer::disable)
                 .requestCache(AbstractHttpConfigurer::disable)
@@ -103,6 +104,7 @@ class RestApiSecurityConfiguration {
 
         http
                 .securityMatcher(PathPatternRequestMatcher.pathPattern("/api/**"))
+                .addFilterAfter(new OperationErrorDiagnosticsFilter(), org.springframework.security.web.access.intercept.AuthorizationFilter.class)
                 .headers(RestApiSecurityConfiguration::writeApiHeadersEagerly)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
@@ -154,6 +156,7 @@ class RestApiSecurityConfiguration {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
+                .addFilterAfter(new OperationErrorDiagnosticsFilter(), org.springframework.security.web.access.intercept.AuthorizationFilter.class)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -180,8 +183,19 @@ class RestApiSecurityConfiguration {
 
     private static AuthenticationFilter bearerFilter(
             AuthenticationManager manager, CodedAuthenticationEntryPoint entryPoint, AuthenticationMode mode) {
-        AuthenticationFilter filter = new AuthenticationFilter(manager, mode == AuthenticationMode.CLOUD
-                ? new CloudCookieAuthenticationConverter() : new StrictBearerAuthenticationConverter());
+        var converter = mode == AuthenticationMode.CLOUD
+                ? new CloudCookieAuthenticationConverter() : new StrictBearerAuthenticationConverter();
+        AuthenticationFilter filter = new AuthenticationFilter(manager, request -> {
+            var converted = converter.convert(request);
+            if (converted instanceof TapstateCredentialAuthenticationToken token) {
+                String path = request.getRequestURI().substring(request.getContextPath().length());
+                if ("POST".equals(request.getMethod())) {
+                    if (path.matches("/api/pipelines/[^/]+:start")) token.setDetails(CredentialAuthenticator.Request.PIPELINE_START);
+                    else if (path.matches("/api/pipelines/[^/]+:stop")) token.setDetails(CredentialAuthenticator.Request.PIPELINE_STOP);
+                }
+            }
+            return converted;
+        });
         filter.setRequestMatcher(new DispatcherTypeRequestMatcher(DispatcherType.REQUEST));
         filter.setSuccessHandler(new ContinuingAuthenticationSuccessHandler());
         filter.setFailureHandler((request, response, failure) -> entryPoint.commence(request, response, failure));

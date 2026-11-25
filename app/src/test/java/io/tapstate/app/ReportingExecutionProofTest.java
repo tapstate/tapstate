@@ -14,6 +14,62 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 class ReportingExecutionProofTest {
+    @Test void aBlockedReportingReadDoesNotSerializeAnotherReportingRead() throws Exception {
+        var owner = owner();
+        var execution = owner.beginExecution(SCOPE, WorkloadClaimFence.from(owner.permit(SCOPE).claim()));
+        alive.set(false);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(call -> {
+            var reply = raw.read(KEY);
+            if (calls.incrementAndGet() == 1) { entered.countDown(); release.await(); }
+            return reply;
+        }).when(store).readPipeline(SCOPE);
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var blocked = workers.submit(() -> owner.reportingExecution(SCOPE));
+            try {
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var independent = workers.submit(() -> owner.reportingExecution(SCOPE));
+                assertThat(independent.get(1, java.util.concurrent.TimeUnit.SECONDS).orElseThrow().execution()).isEqualTo(execution.fence());
+                assertThat(release.getCount()).isEqualTo(1);
+            } finally { release.countDown(); }
+            assertThat(blocked.get(2, java.util.concurrent.TimeUnit.SECONDS).orElseThrow().current()).isTrue();
+        }
+    }
+
+    @Test void reportingShutdownWaitsForTheActualReadAndRejectsItsLateReply() throws Exception {
+        var owner = owner();
+        owner.beginExecution(SCOPE, WorkloadClaimFence.from(owner.permit(SCOPE).claim()));
+        alive.set(false);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> { var reply = raw.read(KEY); entered.countDown(); release.await(); return reply; })
+                .when(store).readPipeline(SCOPE);
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var blocked = workers.submit(() -> {
+                try { return owner.reportingExecution(SCOPE).isPresent(); }
+                catch (io.tapstate.core.common.TapstateException refused) {
+                    assertThat(refused.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED);
+                    return false;
+                }
+            });
+            java.util.concurrent.Future<?> drained = null;
+            try {
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                owner.stopForShutdown();
+                drained = workers.submit(() -> owner.awaitStopped(System.nanoTime() + Duration.ofSeconds(5).toNanos()));
+                var waiting = drained;
+                assertThatThrownBy(() -> waiting.get(100, java.util.concurrent.TimeUnit.MILLISECONDS))
+                        .isInstanceOf(java.util.concurrent.TimeoutException.class);
+                assertThat(owner.reportingExecution(SCOPE)).isEmpty();
+                verify(store, times(1)).readPipeline(SCOPE);
+            } finally { release.countDown(); }
+            assertThat(blocked.get(2, java.util.concurrent.TimeUnit.SECONDS)).isFalse();
+            drained.get(2, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
     @Test void alertEvaluationCanReportTheOriginalSingleProcessFailureWithoutReopeningBusinessWork() {
         var owner=owner();var permit=owner.permit(SCOPE);var execution=owner.beginExecution(SCOPE,WorkloadClaimFence.from(permit.claim()));
         alive.set(false);clearInvocations(store);

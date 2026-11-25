@@ -14,14 +14,22 @@ import java.util.Objects;
 final class ScopedOperatorStateProvider implements OperatorMapBindings.Provider {
     private final PipelineStoreViews stores;
     private final ExecutionAuthorization authorization;
+    private final boolean executionBoundNest;
     ScopedOperatorStateProvider(PipelineStoreViews stores, ExecutionAuthorization authorization) {
+        this(stores, authorization, false);
+    }
+    ScopedOperatorStateProvider(PipelineStoreViews stores, ExecutionAuthorization authorization, boolean executionBoundNest) {
+        this.executionBoundNest = executionBoundNest;
         this.stores = Objects.requireNonNull(stores, "stores"); this.authorization = Objects.requireNonNull(authorization, "authorization");
     }
     @Override public KeyedStateStore open(OperatorMapBinding original, Runnable requireBindingActive) {
         if (!(original.executionIdentity() instanceof ExecutionFence fence) || fence.scope() == null
                 || !original.placement().scope().equals(fence.scope()) || !original.executionKey().equals(fence.operatorExecutionKey())) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
         requireBindingActive.run(); var claim = authorization.require(fence);
-        var store = stores.operatorState(original.placement(), claim, () -> { requireBindingActive.run(); authorization.require(fence); });
+        Runnable active = () -> { requireBindingActive.run(); authorization.require(fence); };
+        var store = executionBoundNest && original.placement().resource() == io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE
+                ? stores.executionBoundNestState(original.placement(), claim, active)
+                : stores.operatorState(original.placement(), claim, active);
         // A store that validates once per lease loses that lease with this member's claim reading.
         if (store instanceof LeasedStateStore leased) authorization.holdLease(fence, leased);
         return store;

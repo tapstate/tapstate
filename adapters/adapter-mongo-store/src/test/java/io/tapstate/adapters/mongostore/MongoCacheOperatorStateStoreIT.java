@@ -36,11 +36,35 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void executionBoundNestReusesProofAcrossTheTimedWindowAndFencesStaleWrites() {
+        withFixture(f -> {
+            var placement = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var namespace = placement.mapName();
+            var writer = (MongoCacheOperatorStateStore) f.domain.executionBoundNestState(placement, WorkloadClaimFence.from(f.claim), ACTIVE);
+            writer.save(namespace, "order", new byte[]{1});
+            long opens = MongoCacheOperatorStateStore.LEASE_OPENS.get();
+            Thread.sleep(MongoCacheOperatorStateStore.DEFAULT_LEASE_MILLIS + 100);
+            writer.save(namespace, "order", new byte[]{2});
+            assertThat(writer.load(namespace, "order")).hasValue(new byte[]{2});
+            assertThat(MongoCacheOperatorStateStore.LEASE_OPENS.get()).isEqualTo(opens);
+            writer.dropLease();
+            writer.save(namespace, "order", new byte[]{3});
+            assertThat(MongoCacheOperatorStateStore.LEASE_OPENS.get()).isEqualTo(opens + 1);
+            assertThat(f.domain.workloadClaims(BUSINESS).release(f.claim)).isTrue();
+            code(() -> writer.delete(namespace, "order"), IoError.WORKLOAD_CLAIM_FENCED);
+        });
+    }
+
+    private static boolean readingPipelineState(CommandStartedEvent event) {
+        return event.getCommandName().equals("find")
+                && event.getCommand().getString("find").getValue().equals(SystemCollections.CACHE_PIPELINE_STATE.collectionName());
+    }
+
     @Test void leaseRenewalDoesNotWaitForALocalNestWriterBlockedBeforeItsFence() {
         withFixture(f -> {
             var paused = new CountDownLatch(1); var resume = new CountDownLatch(1); var once = new AtomicBoolean();
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
-                if (event.getCommandName().equals("listCollections") && once.compareAndSet(false, true)) {
+                if (readingPipelineState(event) && once.compareAndSet(false, true)) {
                     paused.countDown(); await(resume);
                 }
             }};
@@ -66,7 +90,7 @@ class MongoCacheOperatorStateStoreIT {
             var paused = new CountDownLatch(2); var resume = new CountDownLatch(1);
             Set<Thread> observedWorkers = ConcurrentHashMap.newKeySet();
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
-                if (event.getCommandName().equals("listCollections") && observedWorkers.add(Thread.currentThread())) {
+                if (readingPipelineState(event) && observedWorkers.add(Thread.currentThread())) {
                     paused.countDown(); await(resume);
                 }
             }};
@@ -218,18 +242,18 @@ class MongoCacheOperatorStateStoreIT {
         });
     }
 
-    @Test void missingOrWeakenedPendingIndexesAreRejectedWithoutOrdinaryDdl() {
+    @Test void missingPendingIndexFailsTheHintedReadButDoesNotBlockOpaqueWrites() {
         withFixture(f -> {
-            var at = f.at(OperatorPlacement.Resource.NEST_STATE); var writer = (NestReleaseStore) f.writer(at);
-            writer.saveWithRelease(at.mapName(),"key",new byte[]{1},new byte[]{9});
-            var table = SystemCollections.CACHE_NEST_STATE.on(f.database); table.dropIndex("nest_pending_releases"); var before = f.snapshot();
-            code(() -> writer.pendingReleases(at.mapName(),null),IoError.DOCUMENT_UNREADABLE);
-            code(() -> writer.saveWithRelease(at.mapName(),"key",new byte[]{2},null),IoError.DOCUMENT_UNREADABLE);
-            assertThat(f.snapshot()).isEqualTo(before);
-            assertThat(table.listIndexes().into(new ArrayList<>())).noneSatisfy(index -> assertThat(index.getString("name")).isEqualTo("nest_pending_releases"));
-            table.createIndex(new Document("_id.placement",1).append("_id.key",1),new com.mongodb.client.model.IndexOptions()
-                    .name("nest_pending_releases").partialFilterExpression(new Document("pendingRelease",false)));
-            code(() -> writer.pendingReleases(at.mapName(),null),IoError.DOCUMENT_UNREADABLE);
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var writer = (NestReleaseStore) f.writer(at);
+            writer.saveWithRelease(at.mapName(), "key", new byte[]{1}, new byte[]{9});
+            var table = SystemCollections.CACHE_NEST_STATE.on(f.database);
+            table.dropIndex("nest_pending_releases");
+            code(() -> writer.pendingReleases(at.mapName(), null), IoError.STORE_UNAVAILABLE);
+            writer.saveWithRelease(at.mapName(), "key", new byte[]{2}, null);
+            assertThat(f.writer(at).load(at.mapName(), "key")).hasValue(new byte[]{2});
+            assertThat(table.listIndexes().into(new ArrayList<>())).noneSatisfy(index ->
+                    assertThat(index.getString("name")).isEqualTo("nest_pending_releases"));
         });
     }
 
@@ -394,7 +418,7 @@ class MongoCacheOperatorStateStoreIT {
                 code(() -> f.writer(f.at(OperatorPlacement.Resource.NEST_STATE)).load(f.at(OperatorPlacement.Resource.NEST_STATE).mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
                 table.replaceOne(new Document(),saved);
             }
-            table.drop(); code(() -> shapes.recordIfAbsent("another",Set.of("root")),IoError.DOCUMENT_UNREADABLE);
+            table.drop(); code(() -> shapes.recordIfAbsent("step",Set.of("root")),IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("nest_shapes");
         });
     }
@@ -521,13 +545,17 @@ class MongoCacheOperatorStateStoreIT {
         });
     }
 
-    @Test void missingCollectionsAndIndexesAreUnknownAndNeverRepaired() {
+    @Test void ordinaryOpaqueReadsAndWritesUseMongoWhenCatalogEntriesAreMissing() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE); var table = SystemCollections.CACHE_NEST_STATE.on(f.database);
             table.dropIndex("operator_placement"); var before = f.snapshot();
-            code(() -> f.writer(at).load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE); assertThat(f.snapshot()).isEqualTo(before);
-            table.drop(); code(() -> f.writer(at).save(at.mapName(),"key",new byte[]{1}),IoError.DOCUMENT_UNREADABLE);
-            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("nest_state");
+            assertThat(f.writer(at).load(at.mapName(), "key")).isEmpty();
+            assertThat(f.snapshot()).isEqualTo(before);
+            table.drop();
+            var writer = f.writer(at);
+            writer.save(at.mapName(), "key", new byte[]{1});
+            assertThat(writer.load(at.mapName(), "key")).hasValue(new byte[]{1});
+            assertThat(table.listIndexes().into(new ArrayList<>())).extracting(index -> index.getString("name")).containsExactly("_id_");
         });
     }
 
@@ -691,6 +719,28 @@ class MongoCacheOperatorStateStoreIT {
             assertThat(f.claims().find().first()).isEqualTo(claim);
         }));
     }
+    @Test void hourlyInspectionIncludesTheOriginallyRegisteredOperatorDatabase() {
+        withFixture(f -> withExtra(f, (bound, target) -> {
+            var auth = new CacheAuthScope(BUSINESS.clusterId(), BUSINESS.bindingVersion(), StorageBinding.Mode.OP,
+                    BUSINESS.cacheIncarnation(), 1);
+            assertThat(bound.inspectStructure(auth, new MongoReadBudget(Duration.ofSeconds(5))))
+                    .noneMatch(issue -> issue.database().equals(target.getName()));
+            bound.prepareOperatorDatabase(SCOPE, target.getName(), WorkloadClaimFence.from(f.claim),
+                    UUID.randomUUID().toString(), ACTIVE);
+            var state = SystemCollections.CACHE_NEST_STATE;
+            var index = state.indexes().getFirst();
+            state.on(target).dropIndex(index.indexName());
+            assertThat(bound.inspectStructure(auth, new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.database()).isEqualTo(target.getName());
+                        assertThat(issue.collection()).isEqualTo(state.collectionName());
+                        assertThat(issue.index()).isEqualTo(index.indexName());
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                    });
+            assertThat(IndexEnsure.existing(state.on(target), index)).isNull();
+        }));
+    }
+
     @Test void trustedConfigurationAndMasterNamesAndSystemDatabasesAreRejectedWithoutRawCauses() {
         withFixture(f -> withExtra(f,(bound,target) -> {
             var before = SystemCollections.CACHE_PIPELINE_STATE.on(f.database).find().first();
@@ -792,12 +842,43 @@ class MongoCacheOperatorStateStoreIT {
         withFixture(f -> withExtra(f,(bound,target) -> {
             var fence = WorkloadClaimFence.from(f.claim); String operation = UUID.randomUUID().toString();
             bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE);
+            bound.nestShapes(SCOPE, target.getName(), fence, ACTIVE).recordIfAbsent("extra-step", Set.of("root"));
             target.getCollection(missing).drop(); var names = new HashSet<>(target.listCollectionNames().into(new ArrayList<>()));
             var before = f.snapshot();
-            code(() -> bound.nestShapes(SCOPE,target.getName()).read("extra-step"),IoError.DOCUMENT_UNREADABLE);
+            if (missing.equals("nest_state")) {
+                assertThat(bound.nestShapes(SCOPE, target.getName()).read("extra-step")).contains(Set.of("root"));
+            } else {
+                code(() -> bound.nestShapes(SCOPE, target.getName()).read("extra-step"), IoError.DOCUMENT_UNREADABLE);
+            }
             code(() -> bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE),IoError.DOCUMENT_UNREADABLE);
             assertThat(target.listCollectionNames()).containsExactlyInAnyOrderElementsOf(names);
             assertThat(f.snapshot()).isEqualTo(before);
+        }));
+    }
+
+    @Test void anOperatorViewFailureInspectsOnlyTheRegisteredChildNamespace() {
+        withFixture(f -> withExtra(f, (bound, target) -> {
+            var fence = WorkloadClaimFence.from(f.claim);
+            bound.prepareOperatorDatabase(SCOPE, target.getName(), fence, UUID.randomUUID().toString(), ACTIVE);
+            bound.nestShapes(SCOPE, target.getName(), fence, ACTIVE).recordIfAbsent("extra-step", Set.of("root"));
+            var at = new OperatorPlacement(SCOPE, target.getName(), OperatorPlacement.Resource.NEST_STATE,
+                    "extra-step", "root", "logical");
+            var writer = bound.operatorState(at, fence, ACTIVE);
+            var physicalName = SystemCollections.CACHE_NEST_STATE.collectionName();
+            SystemCollections.CACHE_NEST_STATE.on(target).drop();
+            target.createView(physicalName, "unrelated_fixture", List.of());
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThatThrownBy(() -> writer.save(at.mapName(), "late", new byte[]{1}))
+                        .isInstanceOfSatisfying(TapstateException.class, error -> {
+                            assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                            assertThat(error.args().get("detail").toString())
+                                    .contains(target.getName() + "." + physicalName, "COLLECTION_TYPE");
+                        });
+                var groups = (List<?>) diagnostics.snapshot().get("mongo_groups");
+                assertThat(groups).filteredOn(group -> "listCollections".equals(((Map<?, ?>) group).get("command")))
+                        .singleElement().satisfies(group ->
+                                assertThat(((Map<?, ?>) group).get("database")).isEqualTo(target.getName()));
+            }
         }));
     }
 

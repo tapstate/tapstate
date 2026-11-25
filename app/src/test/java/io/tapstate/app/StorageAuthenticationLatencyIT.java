@@ -43,7 +43,7 @@ class StorageAuthenticationLatencyIT {
 
     @ParameterizedTest
     @EnumSource(Damage.class)
-    void dailyAdmissionDoesNotAuditDdlButExplicitDomainValidationStillDoes(Damage damage) {
+    void authenticationContinuesWhileStorageInspectionReportsCatalogDamage(Damage damage) {
         withCloud(Change.NONE, fixture -> {
             if (damage == Damage.MISSING_REVOCATIONS) {
                 SystemCollections.CLOUD_REVOCATIONS.on(fixture.raw.getDatabase(fixture.cacheDatabase)).drop();
@@ -54,9 +54,17 @@ class StorageAuthenticationLatencyIT {
             }
             assertThat(fixture.authentication.credentials().authenticateContext(fixture.cookie)).isPresent();
             assertThat(fixture.authentication.credentials().authenticateContext("tcs_anRp.not-a-real-secret")).isEmpty();
-            assertThatThrownBy(() -> fixture.authentication.managed())
-                    .isInstanceOfSatisfying(TapstateException.class,
-                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            assertThat(fixture.authentication.managed().service().authenticate(fixture.cookie)).isPresent();
+            var reports = fixture.cache.inspectStructure(fixture.scope, new io.tapstate.adapters.mongostore.MongoReadBudget(Duration.ofSeconds(5)));
+            assertThat(reports).anySatisfy(issue -> {
+                if (damage == Damage.MISSING_REVOCATIONS) {
+                    assertThat(issue.collection()).isEqualTo(SystemCollections.CLOUD_REVOCATIONS.collectionName());
+                    assertThat(issue.problem()).isEqualTo(io.tapstate.adapters.mongostore.MongoStructureInspection.Problem.COLLECTION_MISSING);
+                } else {
+                    assertThat(issue.collection()).isEqualTo(SystemCollections.CLOUD_SESSIONS.collectionName());
+                    assertThat(issue.problem()).isEqualTo(io.tapstate.adapters.mongostore.MongoStructureInspection.Problem.UNEXPECTED_CONSTRAINT);
+                }
+            });
         });
     }
 
@@ -91,12 +99,12 @@ class StorageAuthenticationLatencyIT {
     }
 
     @Test
-    void healthyAuthenticationDoesNotRepeatTheIndexCensusAroundItsFencedSessionRead() {
+    void healthyAuthenticationDoesNotReadTheMongoCatalog() {
         withCloud(Change.NONE, fixture -> {
             var admin = fixture.raw.getDatabase("admin");
             admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("listIndexes"))
-                            .append("blockConnection", true).append("blockTimeMS", 2600)));
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("listCollections", "listIndexes"))
+                            .append("errorCode", 2)));
             try {
                 var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
                 assertThat(proof.storageScope()).contains(fixture.scope);
@@ -294,7 +302,7 @@ class StorageAuthenticationLatencyIT {
                      var authentication = new StorageAuthentication(configuration, cloud,
                              bridge, new RandomTokenSecrets(), clock, new byte[32])) {
                     var bound = runtime.loadBound().orElseThrow(); authentication.install(bound);
-                    var fixture = new Fixture(raw, cacheDatabase, authentication, initial.preparation().authScope(), change, now, cloud, bridge);
+                    var fixture = new Fixture(raw, cacheDatabase, bound.cache(), authentication, initial.preparation().authScope(), change, now, cloud, bridge);
                     fixtureReference.set(fixture);
                     fixture.cookie = authentication.managed().service().exchangeCode("fresh", "cluster.example").token();
                     scenario.accept(fixture);
@@ -306,6 +314,7 @@ class StorageAuthenticationLatencyIT {
     private static final class Fixture {
         final MongoClient raw;
         final String cacheDatabase;
+        final MongoCacheDomain cache;
         final StorageAuthentication authentication;
         final CacheAuthScope scope;
         final Change change;
@@ -316,9 +325,9 @@ class StorageAuthenticationLatencyIT {
         String cookie;
         boolean armed;
         long previousUse;
-        Fixture(MongoClient raw, String cacheDatabase, StorageAuthentication authentication,
+        Fixture(MongoClient raw, String cacheDatabase, MongoCacheDomain cache, StorageAuthentication authentication,
                 CacheAuthScope scope, Change change, AtomicReference<Instant> now, CloudRuntimeSettings cloud, CloudSdkBridge bridge) {
-            this.raw = raw; this.cacheDatabase = cacheDatabase; this.authentication = authentication;
+            this.raw = raw; this.cacheDatabase = cacheDatabase; this.cache = cache; this.authentication = authentication;
             this.scope = scope; this.change = change; this.now = now;
             this.cloud = cloud; this.bridge = bridge;
         }

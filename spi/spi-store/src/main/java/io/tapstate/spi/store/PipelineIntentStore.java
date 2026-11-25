@@ -42,6 +42,16 @@ public interface PipelineIntentStore {
         throw new UnsupportedOperationException("connector bindings are not supported");
     }
 
+    record ExecutionBindings(ConnectorRunBindings bindings, long intentRevision) {}
+
+    default Optional<ExecutionBindings> executionBindings(PipelineIntentScope scope) {
+        return connectorBindings().load(scope).map(bindings -> {
+            var intent = load(scope.pipelineId()).filter(value -> scope.equals(value.scope()))
+                    .orElseThrow(() -> new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null));
+            return new ExecutionBindings(bindings, intent.intentRevision());
+        });
+    }
+
     /** A durable request to prepare exactly the definition and intent that HTTP accepted. */
     record PendingStart(PipelineIntentSnapshot intent, PipelinePreparationInputs inputs) {}
 
@@ -81,4 +91,17 @@ public interface PipelineIntentStore {
 
     /** Projects live ids only, without decoding intent bodies. */
     List<String> pipelineIds();
+
+    /** Scheduling hint only. Zero means no new RUNNING intent to prioritize. */
+    record ScanCandidate(String pipelineId, long startRevision, PipelineIntentScope scope,
+            long intentRevision, io.tapstate.core.lifecycle.PipelineState targetState) {
+        public ScanCandidate(String pipelineId, long startRevision) {
+            this(pipelineId, startRevision, null, 0, null);
+        }
+    }
+
+    /** The scheduler must still load and prove the original intent before acting. */
+    default List<ScanCandidate> scanCandidates() {
+        return pipelineIds().stream().map(id -> new ScanCandidate(id, 0)).toList();
+    }
 }

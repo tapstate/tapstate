@@ -1,6 +1,10 @@
 package io.tapstate.app;
 
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimType;
+import java.util.Optional;
+import java.util.function.Supplier;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -22,6 +26,7 @@ import java.util.function.BooleanSupplier;
  */
 final class CaptureClaimLease implements AutoCloseable {
 
+    private final Runnable parentGuard;
     private final CaptureOwnership ownership;
     private final AtomicReference<WorkloadClaim> current;
     private final ScheduledExecutorService renewer;
@@ -40,6 +45,7 @@ final class CaptureClaimLease implements AutoCloseable {
     private final AtomicReference<BooleanSupplier> needed = new AtomicReference<>(() -> true);
 
     private CaptureClaimLease() {
+        this.parentGuard = null;
         this.ownership = null;
         this.current = new AtomicReference<>();
         this.lost = () -> { };
@@ -62,6 +68,11 @@ final class CaptureClaimLease implements AutoCloseable {
 
     /** Starts renewing {@code initial} now; what losing it stops is bound later with {@link #onLost}. */
     CaptureClaimLease(CaptureOwnership ownership, WorkloadClaim initial, Duration renewInterval) {
+        this(ownership, initial, null, renewInterval);
+    }
+
+    private CaptureClaimLease(CaptureOwnership ownership, WorkloadClaim initial, Runnable parentGuard, Duration renewInterval) {
+        this.parentGuard = parentGuard;
         this.ownership = Objects.requireNonNull(ownership, "ownership");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         Objects.requireNonNull(renewInterval, "renewInterval");
@@ -73,6 +84,32 @@ final class CaptureClaimLease implements AutoCloseable {
         });
         renewer.scheduleWithFixedDelay(
                 this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    static CaptureClaimLease followingParent(CaptureOwnership ownership, WorkloadClaim initial,
+            Duration interval, WorkloadClaimFence parent,
+            Supplier<Optional<WorkloadClaimFence>> currentParent,
+            Supplier<WorkloadClaimFence> currentCapture) {
+        Objects.requireNonNull(initial, "initial");
+        Objects.requireNonNull(parent, "parent");
+        Objects.requireNonNull(currentParent, "currentParent");
+        Objects.requireNonNull(currentCapture, "currentCapture");
+        var original = WorkloadClaimFence.from(initial);
+        if (parent.key().type() != WorkloadClaimType.NODE_SESSION
+                || original.key().type() != WorkloadClaimType.CAPTURE
+                || !parent.key().clusterId().equals(original.key().clusterId())
+                || !parent.owner().equals(original.owner())) throw refused();
+        Runnable guard = () -> {
+            if (currentParent.get().filter(parent::equals).isEmpty()
+                    || !original.equals(currentCapture.get())) throw refused();
+        };
+        guard.run();
+        return new CaptureClaimLease(ownership, initial, guard, interval);
+    }
+
+    private static RuntimeException refused() {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,
+                java.util.Map.of(), null);
     }
 
     /**
@@ -102,6 +139,7 @@ final class CaptureClaimLease implements AutoCloseable {
         if (renewer != null && closed.get()) {
             return false;
         }
+        if (parentGuard != null) parentGuard.run();
         reserve.run();
         return true;
     }
@@ -116,6 +154,10 @@ final class CaptureClaimLease implements AutoCloseable {
                 if (closed.get()) {
                     return;
                 }
+            }
+            if (parentGuard != null) {
+                parentGuard.run();
+                return;
             }
             ownership.renew(current.get()).ifPresentOrElse(
                     current::set,

@@ -50,6 +50,31 @@ class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
+    @Test void confirmedDiagnosticsOnlyDecorateAuthenticatedBusinessErrors() throws Exception {
+        var request = new MockHttpServletRequest();
+        var response = new MockHttpServletResponse();
+        var writer = new ApiSecurityErrorWriter(MessageCatalog.bundled(), new ObjectMapper());
+        var original = handler.handle(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "safe"), null));
+        var security = org.springframework.security.core.context.SecurityContextHolder.getContext();
+        var previous = security.getAuthentication();
+        try (var diagnostics = io.tapstate.core.common.OperationErrorDiagnostics.open()) {
+            io.tapstate.core.common.OperationErrorDiagnostics.confirmed("CONFIG test_config.tokens COLLECTION_MISSING");
+            security.setAuthentication(new org.springframework.security.authentication.TestingAuthenticationToken("operator", null, "ADMIN"));
+            var diagnosed = handler.handle(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "safe"), null));
+            assertThat(diagnosed.getStatusCode()).isEqualTo(original.getStatusCode());
+            assertThat(diagnosed.getBody().code()).isEqualTo(original.getBody().code());
+            assertThat(diagnosed.getBody().params()).isEqualTo(original.getBody().params());
+            assertThat(diagnosed.getBody().message()).isEqualTo(original.getBody().message()
+                    + " Storage structure: CONFIG test_config.tokens COLLECTION_MISSING");
+            writer.unauthenticated(request, response);
+            assertThat(response.getStatus()).isEqualTo(401);
+            assertThat(response.getContentAsString()).doesNotContain("COLLECTION_MISSING");
+            security.setAuthentication(null);
+            var denied = handler.handle(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "safe"), null));
+            assertThat(denied.getBody().message()).isEqualTo(original.getBody().message());
+        } finally { security.setAuthentication(previous); }
+    }
+
     @Test
     void migratedIoRefusalsKeepTheirExplicitStatuses() {
         assertThat(ApiExceptionHandler.statusFor(new StubCode(io.tapstate.core.common.IoErrorDefinitions.STORE_QUOTA_EXCEEDED.code())))

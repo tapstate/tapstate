@@ -51,19 +51,6 @@ final class MongoRequiredDeadLetterStore implements RequiredDeadLetterStore {
             for (var index : SystemCollections.CONFIG_NEST_DEAD_LETTERS.indexes()) IndexEnsure.createIfAbsent(SystemCollections.CONFIG_NEST_DEAD_LETTERS.on(database), index);
         });
     }
-    void verify() {
-        StoreIo.run(() -> {
-            var indexes = rows.listIndexes().into(new ArrayList<>());
-            if (indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw RequiredDeadLetterCodec.unreadable();
-            for (var declared : SystemCollections.CONFIG_NEST_DEAD_LETTERS.indexes()) {
-                var found = indexes.stream().filter(index -> declared.indexName().equals(index.get("name"))).findFirst().orElse(null);
-                Document keys = new Document(); declared.keys().forEach(key -> keys.append(key, 1));
-                if (found == null || !keys.equals(found.get("key")) || Boolean.TRUE.equals(found.get("unique"))
-                        || Boolean.TRUE.equals(found.get("sparse")) || Boolean.TRUE.equals(found.get("hidden"))
-                        || found.containsKey("partialFilterExpression")) throw RequiredDeadLetterCodec.unreadable();
-            }
-        });
-    }
     @Override public Optional<RequiredDeadLetterSnapshot> find(RequiredDeadLetterContext context, String element) {
         Objects.requireNonNull(element, "element");
         return transaction(session -> {
@@ -167,13 +154,14 @@ final class MongoRequiredDeadLetterStore implements RequiredDeadLetterStore {
         key.forEach((field, value) -> filter.append("_id." + field, value)); return filter;
     }
     private <T> T transaction(Function<ClientSession, T> operation) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
-                    requireActive.run(); verify(); T result = operation.apply(session); requireActive.run(); return result;
+                    MongoStructureFailureScope.beginCallback();
+                    requireActive.run(); T result = operation.apply(session); requireActive.run(); return result;
                 }, TRANSACTION);
             }
-        });
+        }));
     }
     private static TapstateException fenced() { return new TapstateException(IoError.REQUIRED_DEAD_LETTER_FENCED, Map.of(), null); }
 }

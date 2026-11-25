@@ -24,6 +24,9 @@ public interface RebuildAdmission {
     /** Whether this pipeline's failed run may be replaced now. Called only while it is failed. */
     boolean admits(String pipelineId);
 
+    /** Whether membership or a timer can admit a later retry without a new user intent. */
+    default boolean mayAdmitLater() { return true; }
+
     /** Records failure context after the checkpoint first enters FAILED. */
     default void recordFailure(String pipelineId) {}
 
@@ -35,6 +38,9 @@ public interface RebuildAdmission {
 
     /** The answer for a run nothing can rebuild: a single node, where no member left to change anything. */
     static RebuildAdmission never() {
-        return pipelineId -> false;
+        return new RebuildAdmission() {
+            @Override public boolean admits(String pipelineId) { return false; }
+            @Override public boolean mayAdmitLater() { return false; }
+        };
     }
 }

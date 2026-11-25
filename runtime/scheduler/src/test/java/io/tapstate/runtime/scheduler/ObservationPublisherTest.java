@@ -52,6 +52,129 @@ import static org.assertj.core.api.Assertions.entry;
  */
 class ObservationPublisherTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = PipelineState.class, names = {"FAILED", "STOPPED"})
+    void settledScopedTerminalPublicationDoesNotReadTheReleasedDataPlaneAgain(PipelineState terminal) {
+        state.seed("orders", terminal);
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var wired = withWatch(NestColdLayerAlert.NONE, id -> {
+            reads.incrementAndGet(); return Map.of("nest.orders.doc.$root", new NestStateReading(8, 100, 400, 2_000));
+        });
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var first = wired.publishScopedReading(scope, state, observations, null, true).orElseThrow();
+        var second = wired.publishScopedReading(scope, state, observations, null, true).orElseThrow();
+        assertThat(reads).as("terminal state refresh must not resample the released execution").hasValue(1);
+        assertThat(second.measured()).isFalse();
+        assertThat(first.measured()).isTrue();
+        assertThat(second.observation().state()).isEqualTo(terminal);
+        assertThat(second.observation().facts()).isEqualTo(first.observation().facts());
+        assertThat(second.observation().metrics()).isEqualTo(first.observation().metrics());
+        state.seed("orders", PipelineState.RUNNING);
+        wired.publishScopedReading(scope, state, observations, null, true);
+        assertThat(reads).hasValue(2);
+    }
+
+    @Test
+    void coherentTerminalRefreshDoesNotSeparatelyRereadTheCheckpointOrProjection() {
+        state.seed("orders", PipelineState.STOPPED);
+        var first = publisher.publishScopedReading(new PipelineIntentScope("cluster", 1, "cache", "orders", 1),
+                state, observations, null, true).orElseThrow().observation();
+        var scoped = new ObservationStore() {
+            public void save(Observation value) { throw new AssertionError("refresh already saved"); }
+            public Optional<Observation> read(String id) { throw new AssertionError("refresh already read"); }
+            public void delete(String id) { throw new AssertionError("no removal"); }
+            public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+                assertThat(expected).isEqualTo(first); assertThat(epoch).isZero();
+                return Optional.of(new Observation(expected.pipelineId(), expected.state(), expected.metrics(),
+                        expected.snapshot(), expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad()));
+            }
+        };
+        var checkpointReads = new StateStore() {
+            public Optional<CheckpointDoc> read(String id) { throw new AssertionError("refresh already read checkpoint"); }
+            public void create(String id, String json, Instant at) { throw new AssertionError("no lifecycle mutation"); }
+            public CasOutcome compareAndSwap(String id, long epoch, String json, Instant at) { throw new AssertionError("no lifecycle mutation"); }
+            public void delete(String id) { throw new AssertionError("no removal"); }
+        };
+        var refreshed = publisher.publishScopedReading(new PipelineIntentScope("cluster", 1, "cache", "orders", 1),
+                checkpointReads, scoped, null, true).orElseThrow();
+        assertThat(refreshed.measured()).isFalse();
+        assertThat(refreshed.observation().facts()).isEqualTo(first.facts());
+    }
+
+    @Test
+    void aRefusedCoherentRefreshCannotReuseAnotherExecutionsTerminalDetails() {
+        state.seed("orders", PipelineState.FAILED);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var first = publisher.publishScopedReading(scope, state, observations, null, true).orElseThrow().observation();
+        var nextExecution = new ObservationStore() {
+            public void save(Observation value) { observations.save(value); }
+            public Optional<Observation> read(String id) { return Optional.of(first); }
+            public void delete(String id) { throw new AssertionError("no removal"); }
+            public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+                return Optional.empty();
+            }
+        };
+        assertThat(publisher.publishScopedReading(scope, state, nextExecution, null, true)
+                .orElseThrow().measured()).isTrue();
+    }
+
+    @Test
+    void anOptionalTerminalReuseReadRefusalFallsBackToOrdinaryMeasurement() {
+        state.seed("orders", PipelineState.STOPPED);
+        var scoped = new RecordingObservationStore();
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        publisher.publishScopedReading(scope, state, scoped, null, true).orElseThrow();
+        scoped.nextReadFailure = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,
+                Map.of("chain", "orders"), null);
+        assertThat(publisher.publishScopedReading(scope, state, scoped, null, true).orElseThrow().measured()).isTrue();
+        assertThat(publisher.publishScopedReading(scope, state, scoped, null, true).orElseThrow().measured()).isFalse();
+    }
+
+    @Test
+    void aPartialFailedMeasurementIsRetriedBeforeAnyReuse() {
+        state.seed("orders", PipelineState.FAILED);
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> {
+            if (reads.incrementAndGet() == 1)
+                throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+            return Map.of("orders", "recovered");
+        });
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        assertThat(wired.publishScopedReading(scope, state, observations, null, true).orElseThrow()
+                .observation().positions()).isEmpty();
+        var recovered = wired.publishScopedReading(scope, state, observations, null, true).orElseThrow();
+        assertThat(recovered.observation().positions()).containsEntry("orders", "recovered");
+        assertThat(recovered.measured()).isTrue();
+        assertThat(wired.publishScopedReading(scope, state, observations, null, true).orElseThrow().measured()).isFalse();
+        assertThat(reads).hasValue(2);
+    }
+
+    @Test
+    void terminalReuseExpiresAndCannotCrossScopeEpochOrUnmeasuredProjection() {
+        state.seed("orders", PipelineState.FAILED);
+        var clock = new MutableClock(OBSERVED_AT);
+        var wired = withClock(clock);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var first = wired.publishScopedReading(scope, state, observations, null, true).orElseThrow();
+        clock.advanceSeconds(1);
+        var reused = wired.publishScopedReading(scope, state, observations, null, true).orElseThrow();
+        assertThat(reused.measured()).isFalse();
+        assertThat(reused.observation().observedAt()).isAfter(first.observation().observedAt());
+        assertThat(reused.observation().facts()).isEqualTo(first.observation().facts());
+        clock.advanceSeconds(29);
+        assertThat(wired.publishScopedReading(scope, state, observations, null, true).orElseThrow().measured()).isTrue();
+        assertThat(wired.publishScopedReading(scope, state, observations, null, false).orElseThrow().measured()).isTrue();
+        var nextScope = new PipelineIntentScope("cluster", 1, "cache", "orders", 2);
+        assertThat(wired.publishScopedReading(nextScope, state, observations, null, true).orElseThrow().measured()).isTrue();
+        wired.forgetPipelinesOutside(List.of());
+        assertThat(wired.publishScopedReading(nextScope, state, observations, null, true).orElseThrow().measured()).isTrue();
+        wired.publishReconcileFailure("orders", 2);
+        assertThat(wired.publishScopedReading(nextScope, state, observations, null, true).orElseThrow().measured()).isTrue();
+        var checkpoint = state.docs.get("orders");
+        state.docs.put("orders", new CheckpointDoc("orders", StateJson.of(PipelineState.FAILED), checkpoint.epoch() + 1, T0));
+        assertThat(wired.publishScopedReading(nextScope, state, observations, null, true).orElseThrow().measured()).isTrue();
+    }
+
     @Test
     void keyInstrumentsAreAdditionalAndKeepTheLegacyFactsAndFlatValues() {
         state.seed("orders", PipelineState.RUNNING);
@@ -1044,14 +1167,26 @@ class ObservationPublisherTest {
     }
 
     /** In-memory observation store double. */
-    private static final class RecordingObservationStore implements ObservationStore {
+    private final class RecordingObservationStore implements ObservationStore {
         @Override
         public void delete(String pipelineId) {
             throw new UnsupportedOperationException("removal is not exercised by this double");
         }
 
 
+        @Override
+        public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+            var checkpoint = state.read(expected.pipelineId()).orElseThrow();
+            if (checkpoint.epoch() != epoch || StateJson.parse(checkpoint.stateJson()) != expected.state()
+                    || !read(expected.pipelineId()).filter(expected::equals).isPresent()) return Optional.empty();
+            var updated = new Observation(expected.pipelineId(), expected.state(), expected.metrics(), expected.snapshot(),
+                    expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad());
+            save(updated);
+            return Optional.of(updated);
+        }
+
         private final Map<String, Observation> docs = new HashMap<>();
+        private TapstateException nextReadFailure;
 
         @Override
         public void save(Observation observation) {
@@ -1060,6 +1195,9 @@ class ObservationPublisherTest {
 
         @Override
         public Optional<Observation> read(String pipelineId) {
+            if (nextReadFailure != null) {
+                var failure = nextReadFailure; nextReadFailure = null; throw failure;
+            }
             return Optional.ofNullable(docs.get(pipelineId));
         }
     }

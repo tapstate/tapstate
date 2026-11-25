@@ -154,6 +154,8 @@ final class PeriodicObservations implements AutoCloseable {
         return enqueue(pipelineId, slot) ? Offer.ACCEPTED : Offer.REJECTED;
     }
 
+    synchronized boolean idle(String pipelineId) { return !slots.containsKey(pipelineId); }
+
     synchronized Set<String> pipelineIds() {
         return Set.copyOf(slots.keySet());
     }
