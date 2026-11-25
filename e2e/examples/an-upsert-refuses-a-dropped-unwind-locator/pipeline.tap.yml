@@ -1,0 +1,19 @@
+version: tapstate/v1
+kind: pipeline
+id: dropped_unwind_locator
+source: src_file
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: listed
+    from: [orders]
+    type: map
+    fields: { items: "=['a', 'b']" }
+  - { id: expanded, from: listed, type: unwind, path: items, include_array_index: item_no, element_type: string }
+  - id: projected
+    from: expanded
+    type: map
+    fields: { item_no: false }
+serve:
+  from: projected
+  sync:
+    - source: tgt_file
