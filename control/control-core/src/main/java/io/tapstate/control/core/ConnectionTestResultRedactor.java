@@ -1,0 +1,141 @@
+package io.tapstate.control.core;
+
+import io.tapstate.core.common.DiagnosticCodeSource;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.DiagnosticProjection;
+import io.tapstate.core.logging.MongoUriUserInfo;
+import io.tapstate.core.logging.SecretRedactor;
+import io.tapstate.spi.store.ConnectionTestItem;
+import io.tapstate.spi.store.ConnectionTestResult;
+
+import java.lang.reflect.Array;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.UnaryOperator;
+
+/** Removes submitted credentials from connector-controlled connection diagnostics. */
+final class ConnectionTestResultRedactor {
+
+    private static final String REFERENCES = "references";
+
+    private ConnectionTestResultRedactor() {
+    }
+
+    static ConnectionTestResult redact(
+            ConnectionTestResult result, List<String> secretValues, UnaryOperator<String> testText) {
+        return redact(result, secretValues, testText, null);
+    }
+
+    static ConnectionTestResult redact(
+            ConnectionTestResult result, List<String> secretValues, UnaryOperator<String> testText, String sourceId) {
+        List<ConnectionTestItem> items = result.items().stream()
+                .map(item -> new ConnectionTestItem(
+                        redact(item.name(), secretValues),
+                        item.status(),
+                        redact(testText.apply(item.message()), secretValues),
+                        redact(testText.apply(item.reason()), secretValues),
+                        redact(testText.apply(item.solution()), secretValues),
+                        redact(item.connectorErrorCode(), secretValues),
+                        DiagnosticProjection.read(withSource(
+                                redactDiagnostic(item.diagnostic(), secretValues, testText), sourceId, secretValues))))
+                .toList();
+        return new ConnectionTestResult(
+                result.connectionId(), result.connectorId(), result.outcome(), items,
+                result.testedAt(), true);
+    }
+
+    static Map<String, Object> withSource(Map<String, Object> diagnostic, String id, List<String> secrets) {
+        if (diagnostic.isEmpty() || id == null || !id.equals(redact(id, secrets))) return diagnostic;
+        Map<String, Object> enriched = new LinkedHashMap<>(diagnostic);
+        List<Object> references = new ArrayList<>();
+        if (diagnostic.get(REFERENCES) instanceof List<?> existing) references.addAll(existing);
+        var reference = Map.of("type", "connection", "id", id);
+        if (!references.contains(reference)) references.add(reference);
+        enriched.put(REFERENCES, List.copyOf(references));
+        return enriched;
+    }
+
+    /** Rechecks credential structures in stored reports and hides text without a safety marker. */
+    static ConnectionTestResult hideUntrustedDiagnostics(ConnectionTestResult result) {
+        if (result.diagnosticsRedacted()) {
+            return redact(result, List.of(), UnaryOperator.identity());
+        }
+        List<ConnectionTestItem> safeItems = new ArrayList<>(result.items().size());
+        for (int index = 0; index < result.items().size(); index++) {
+            ConnectionTestItem item = result.items().get(index);
+            safeItems.add(new ConnectionTestItem(
+                    "Check " + (index + 1), item.status(), null, null, null, null));
+        }
+        return new ConnectionTestResult(
+                result.connectionId(), result.connectorId(), result.outcome(), safeItems,
+                result.testedAt(), true);
+    }
+
+    static TapstateException redact(TapstateException failure, List<String> secretValues) {
+        Map<String, Object> safeArgs = new LinkedHashMap<>();
+        failure.args().forEach((name, value) ->
+                safeArgs.put(redact(name, secretValues), redactValue(value, secretValues)));
+        if (failure.getCause() == null && safeArgs.equals(failure.args())) {
+            return failure;
+        }
+        return failure.withoutCause(safeArgs);
+    }
+
+    private static Map<String, Object> redactDiagnostic(
+            Map<?, ?> diagnostic, List<String> secrets, UnaryOperator<String> testText) {
+        Map<String, Object> safe = new LinkedHashMap<>();
+        diagnostic.forEach((key, value) -> {
+            String field = (String) key;
+            switch (field) {
+                case "message", "solution" -> safe.put(field, redact(testText.apply((String) value), secrets));
+                case "definitionStatus", DiagnosticCodeSource.FIELD -> safe.put(field, value);
+                case "cause" -> safe.put(field, redactDiagnostic((Map<?, ?>) value, secrets, testText));
+                case "causes" -> safe.put(field, ((List<?>) value).stream()
+                        .map(child -> redactDiagnostic((Map<?, ?>) child, secrets, testText)).toList());
+                case REFERENCES -> {
+                    var authorized = ((List<?>) value).stream()
+                            .filter(reference -> reference.equals(redactValue(reference, secrets))).toList();
+                    if (!authorized.isEmpty()) safe.put(field, authorized);
+                }
+                default -> safe.put(field, redactValue(value, secrets));
+            }
+        });
+        return safe;
+    }
+
+    private static Object redactValue(Object value, List<String> secretValues) {
+        if (value == null || value instanceof Number || value instanceof Boolean || value instanceof Enum<?>) {
+            return value;
+        }
+        if (value instanceof CharSequence text) {
+            return redact(text.toString(), secretValues);
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<Object, Object> safe = new LinkedHashMap<>();
+            map.forEach((key, child) -> safe.put(redactValue(key, secretValues), redactValue(child, secretValues)));
+            return safe;
+        }
+        if (value instanceof Iterable<?> iterable) {
+            List<Object> safe = new ArrayList<>();
+            iterable.forEach(child -> safe.add(redactValue(child, secretValues)));
+            return safe;
+        }
+        if (value.getClass().isArray()) {
+            if (value.getClass().getComponentType().isPrimitive()) {
+                return MongoUriUserInfo.REDACTED;
+            }
+            List<Object> safe = new ArrayList<>(Array.getLength(value));
+            for (int index = 0; index < Array.getLength(value); index++) {
+                safe.add(redactValue(Array.get(value, index), secretValues));
+            }
+            return safe;
+        }
+        return MongoUriUserInfo.REDACTED;
+    }
+
+    private static String redact(String text, List<String> secretValues) {
+        return SecretRedactor.redactConnectionDiagnostic(text, secretValues);
+    }
+}

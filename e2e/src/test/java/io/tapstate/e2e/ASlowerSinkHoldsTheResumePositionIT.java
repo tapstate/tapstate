@@ -11,7 +11,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
@@ -66,11 +65,11 @@ class ASlowerSinkHoldsTheResumePositionIT {
         FileEndpoints files = new FileEndpoints();
         files.seed(sourceAddress, TABLE, SeedRows.generated(0));
 
-        String suffix = tier.name().toLowerCase(Locale.ROOT);
-        String store = SharedMongo.replicaSetUrl("two_sink_floor_" + suffix);
-        try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage);
+                ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(temporary)));
             control.apply(workspace(source, fastTarget, heldTarget, signals));
@@ -78,10 +77,9 @@ class ASlowerSinkHoldsTheResumePositionIT {
             control.lifecycle(PIPELINE, LifecycleVerb.START);
 
             String chain = Await.answered("the pipeline's one mining chain", TIMEOUT, () -> {
-                if (documents.miningChainIds().size() != 1) {
-                    return Optional.empty();
-                }
-                return Optional.of(documents.miningChainIds().iterator().next());
+                Document member = documents.pipelineMembership(PIPELINE, SOURCE);
+                return member == null ? Optional.empty()
+                        : Optional.of(member.get("_id", Document.class).getString("chain"));
             });
             Await.until("the pipeline's initial shared resume position", TIMEOUT,
                     () -> hasAggregateRingDone(documents, chain),
@@ -104,9 +102,11 @@ class ASlowerSinkHoldsTheResumePositionIT {
                         () -> "signals=" + directoryEntries(signals));
 
                 Await.until("one writer to advance without moving the shared resume floor", TIMEOUT,
-                        () -> oneWriterIsAhead(progress(documents, chain), initial.aggregateRingDone()),
+                        () -> oneWriterIsAhead(progress(documents, chain), initial),
                         () -> progress(documents, chain).toString());
                 Progress divided = progress(documents, chain);
+                assertThat(divided.runId()).isEqualTo(initial.runId());
+                assertThat(divided.epoch()).isEqualTo(initial.epoch());
                 assertThat(divided.aggregateRingDone())
                         .as("the shared resume floor while one target write is held")
                         .isEqualTo(initial.aggregateRingDone());
@@ -135,7 +135,8 @@ class ASlowerSinkHoldsTheResumePositionIT {
                 Await.until("the shared resume floor to stand where the slower writer stands", TIMEOUT,
                         () -> {
                             Progress caughtUp = progress(documents, chain);
-                            return caughtUp.aggregateRingDone() == Math.min(
+                            return initial.runId().equals(caughtUp.runId()) && initial.epoch() == caughtUp.epoch()
+                                    && caughtUp.aggregateRingDone() == Math.min(
                                     caughtUp.writerAt(FAST_WRITER, initial.aggregateRingDone()),
                                     caughtUp.writerAt(HELD_WRITER, initial.aggregateRingDone()));
                         },
@@ -147,48 +148,44 @@ class ASlowerSinkHoldsTheResumePositionIT {
         }
     }
 
-    private static boolean oneWriterIsAhead(Progress progress, long initial) {
-        return progress.writerAt(HELD_WRITER, initial) == initial
-                && progress.writerAt(FAST_WRITER, initial) > initial
-                && progress.aggregateRingDone() == initial;
+    private static boolean oneWriterIsAhead(Progress progress, Progress initial) {
+        return initial.runId().equals(progress.runId()) && initial.epoch() == progress.epoch()
+                && progress.writerAt(HELD_WRITER, initial.aggregateRingDone()) == initial.aggregateRingDone()
+                && progress.writerAt(FAST_WRITER, initial.aggregateRingDone()) > initial.aggregateRingDone()
+                && progress.aggregateRingDone() == initial.aggregateRingDone();
     }
 
-    private static boolean hasAggregateRingDone(StoreDocuments documents, String chain) {
+    private static boolean hasAggregateRingDone(NativeSrsDocuments documents, String chain) {
         Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
-        return consumer != null
-                && consumer.get("perTableRingDone") instanceof Document rings
-                && rings.get(TABLE) instanceof Number;
+        return consumer != null && documents.chain(chain).getLong("epoch") > 0
+                && consumer.get("writerRun") instanceof Document run
+                && run.get("runId") instanceof String
+                && consumer.getList("ringDoneThrough", Document.class).stream()
+                        .anyMatch(row -> TABLE.equals(row.getString("table")) && row.get("sequence") instanceof Number);
     }
 
-    /**
-     * The aggregate and how far each writer of the current run is durable on the table, read from one real
-     * consumer record. A writer that has reported nothing yet has no entry.
-     */
-    private static Progress progress(StoreDocuments documents, String chain) {
+    /** The aggregate and individual writer positions from one original native consumer cursor. */
+    private static Progress progress(NativeSrsDocuments documents, String chain) {
         Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
-        if (consumer == null) {
-            return new Progress(-1L, Map.of());
+        if (consumer == null || !(consumer.get("writerRun") instanceof Document run)) {
+            return new Progress(-1L, Map.of(), null, -1L);
         }
-        long aggregate = numberIn(consumer.get("perTableRingDone", Document.class), TABLE, -1L);
+        long aggregate = consumer.getList("ringDoneThrough", Document.class).stream()
+                .filter(row -> TABLE.equals(row.getString("table")))
+                .mapToLong(row -> row.get("sequence", Number.class).longValue()).findFirst().orElse(-1L);
         Map<String, Long> positions = new TreeMap<>();
-        if (consumer.get("writerRun") instanceof Document run
-                && run.get("progress") instanceof Document byTable
-                && byTable.get(TABLE) instanceof Document writers) {
-            for (Object raw : writers.values()) {
-                if (raw instanceof Document writer
-                        && writer.get("writer") instanceof String id
-                        && writer.get("durableSeq") instanceof Number position) {
-                    positions.put(id, position.longValue());
-                }
+        long epoch = documents.chain(chain).getLong("epoch");
+        for (Document table : run.getList("progress", Document.class)) {
+            if (!TABLE.equals(table.getString("table"))) continue;
+            for (Document writer : table.getList("writers", Document.class)) {
+                Document through = writer.get("durableThrough", Document.class);
+                long reportedEpoch = through.get("epoch", Number.class).longValue();
+                if (epoch != reportedEpoch)
+                    throw new AssertionError("writer positions belong to different source epochs");
+                positions.put(writer.getString("writer"), through.get("sequence", Number.class).longValue());
             }
         }
-        return new Progress(aggregate, positions);
-    }
-
-    private static long numberIn(Document document, String field, long absent) {
-        return document != null && document.get(field) instanceof Number number
-                ? number.longValue()
-                : absent;
+        return new Progress(aggregate, positions, run.getString("runId"), epoch);
     }
 
     private static List<String> directoryEntries(Path directory) {
@@ -240,7 +237,7 @@ class ASlowerSinkHoldsTheResumePositionIT {
         return resources;
     }
 
-    private record Progress(long aggregateRingDone, Map<String, Long> writerRingDone) {
+    private record Progress(long aggregateRingDone, Map<String, Long> writerRingDone, String runId, long epoch) {
 
         /** How far {@code writer} is durable on the table, or {@code initial} while it has reported nothing. */
         long writerAt(String writer, long initial) {

@@ -320,7 +320,7 @@
   ],
   "provenance": {
     "specPath": "connectors/mysql-connector/src/main/resources/mysql-spec.json",
-    "specContentHash": "e4b9e9f4b531aedc",
+    "specContentHash": "037cb5ff6e2b0b4e",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

@@ -63,22 +63,19 @@ class AtlasPdkRoutingIT {
                 + UUID.randomUUID().toString().substring(0, 8);
         String sourceDatabase = "ts_plan_afs_" + suffix;
         String targetDatabase = "ts_plan_aft_" + suffix;
-        String metadataDatabase = "ts_plan_afm_" + suffix;
         String sourceUri = SharedMongo.replicaSetUrl(sourceDatabase);
-        String metadataUri = SharedMongo.replicaSetUrl(metadataDatabase);
 
-        try (MongoClient source = MongoClients.create(sourceUri);
+        try (PreparedNativeStore prepared = mode == AtlasRuntime.Mode.ON_PREM
+                     ? PreparedNativeStore.create() : PreparedNativeStore.createCloud();
+             MongoClient source = MongoClients.create(sourceUri);
              DeleteFailureTarget target = DeleteFailureTarget.start(targetDatabase, "delete-ack-" + suffix);
-             MongoClient metadata = MongoClients.create(metadataUri);
+             MongoClient metadata = MongoClients.create(prepared.cacheUri());
              AutoCloseable sourceCleanup = () -> source.getDatabase(sourceDatabase).drop();
-             AutoCloseable metadataCleanup = () -> {
-                 for (String database : List.of(metadataDatabase, metadataDatabase + "_operator",
-                         metadataDatabase + "_views")) metadata.getDatabase(database).drop();
-             };
-             AtlasRuntime runtime = new AtlasRuntime(mode, metadataUri)) {
+             NativeSrsDocuments documents = new NativeSrsDocuments(prepared);
+             AtlasRuntime runtime = new AtlasRuntime(mode, prepared)) {
             MongoCollection<Document> sourceRows = source.getDatabase(sourceDatabase).getCollection(TABLE);
             MongoCollection<Document> targetRows = target.database().getCollection(TABLE);
-            MongoDatabase raw = metadata.getDatabase(metadataDatabase);
+            MongoDatabase raw = metadata.getDatabase(prepared.cacheDatabase());
             sourceRows.insertMany(List.of(row(DELETED_ID, 10), row("keep-1", 20), row("keep-2", 30),
                     row("keep-3", 40), row("keep-4", 50)));
 
@@ -112,26 +109,29 @@ class AtlasPdkRoutingIT {
                         .as("the exact target client's real delete reached the armed server fault")
                         .isPositive();
                 Document deleted = Await.answered("the refused DELETE retained in the durable SRS log", TIMEOUT,
-                        () -> deletedRecord(raw));
+                        () -> deletedRecord(raw, documents));
                 refused = new SourceOrder(number(deleted, "epoch"),
                         number(deleted.get("_id", Document.class), "seq"));
-                Document consumer = consumer(raw);
+                Document consumer = consumer(documents);
                 assertThat(confirmed(consumer)).as("the consumer cannot confirm the refused DELETE")
                         .isLessThan(refused);
+                assertThat(tableConfirmed(consumer)).isLessThan(refused);
                 assertThat(tableDone(consumer)).isLessThan(refused.seq());
                 assertThat(rows(targetRows)).as("a failed write leaves the target's old row in place")
                         .isEqualTo(beforeFailure).containsKey(DELETED_ID);
 
-                Document capture = SystemCollections.SRS_META.on(raw)
-                        .find(new Document("_id", consumer.getString("miningChainId"))).first();
-                assertThat(capture).containsEntry("sourceReadDurable", true);
-                assertThat(new SourceOrder(number(capture, "sourceReadEpoch"), number(capture, "sourceReadSeq")))
-                        .as("SRS capture can checkpoint the durable batch independently of the target")
-                        .isGreaterThanOrEqualTo(refused);
+                String chain = consumer.get("_id", Document.class).getString("chain");
+                Await.until("SRS capture to checkpoint the refused batch independently of its target", TIMEOUT, () -> {
+                    Document capture = documents.chain(chain);
+                    Document checkpoint = capture == null ? null : capture.get("checkpoint", Document.class);
+                    return checkpoint != null && number(capture, "checkpointRevision") > 0
+                            && new SourceOrder(number(checkpoint, "epoch"), tableSequence(checkpoint, "tables"))
+                                    .compareTo(refused) >= 0;
+                }, () -> "capture=" + documents.chain(chain));
 
                 control.stop(PIPELINE, false);
                 awaitState(control, PipelineState.STOPPED);
-                assertThat(confirmed(consumer(raw))).as("the keeping stop preserves the confirmation floor")
+                assertThat(confirmed(consumer(documents))).as("the keeping stop preserves the confirmation floor")
                         .isLessThan(refused);
             }
 
@@ -141,13 +141,14 @@ class AtlasPdkRoutingIT {
             try (ServerHandle server = runtime.launch(Tiers.IN_PROCESS)) {
                 ControlPlane control = runtime.control(server, false);
                 assertThat(control.state(PIPELINE)).contains(PipelineState.STOPPED);
-                assertThat(confirmed(consumer(raw))).isLessThan(refused);
+                assertThat(confirmed(consumer(documents))).isLessThan(refused);
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 awaitRows(sourceRows, targetRows, "the pending DELETE and downtime insert after restart");
                 Await.until("the replayed DELETE to become durably confirmed", TIMEOUT,
-                        () -> confirmed(consumer(raw)).compareTo(refused) >= 0
-                                && tableDone(consumer(raw)) >= refused.seq(),
-                        () -> "consumer=" + consumer(raw));
+                        () -> confirmed(consumer(documents)).compareTo(refused) >= 0
+                                && tableConfirmed(consumer(documents)).compareTo(refused) >= 0
+                                && tableDone(consumer(documents)) >= refused.seq(),
+                        () -> "consumer=" + consumer(documents));
                 assertThat(rows(targetRows)).doesNotContainKey(DELETED_ID);
                 String replayAck = Await.answered("the recovered target confirmation", TIMEOUT,
                         () -> control.durablePosition(PIPELINE, TABLE));
@@ -186,28 +187,53 @@ class AtlasPdkRoutingIT {
         return new Document("_id", id).append("value", value);
     }
 
-    private static Document consumer(MongoDatabase raw) {
-        Document consumer = SystemCollections.SRS_CONSUMER_OFFSETS.on(raw)
-                .find(new Document("pipelineId", SrsConsumerId.of(PIPELINE, SOURCE).value())).first();
-        assertThat(consumer).as("the pipeline has an actual persistent consumer checkpoint").isNotNull();
+    private static Document consumer(NativeSrsDocuments documents) {
+        Document member = documents.pipelineMembership(PIPELINE, SOURCE);
+        assertThat(member).as("the pipeline's original native source membership").isNotNull();
+        String chain = member.get("_id", Document.class).getString("chain");
+        Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
+        assertThat(consumer).as("the pipeline has an actual persistent native consumer checkpoint").isNotNull();
+        assertThat(consumer.get("stateGeneration")).isEqualTo(member.get("stateGeneration"));
+        assertThat(consumer.get("membershipRevision")).isEqualTo(member.get("revision"));
         return consumer;
     }
 
-    private static Optional<Document> deletedRecord(MongoDatabase raw) {
-        String chain = consumer(raw).getString("miningChainId");
-        for (Document record : SystemCollections.SRS_LOG.on(raw).find(new Document("op", Op.DELETE.symbol()))) {
-            Document key = record.get("_id", Document.class);
-            if (SrsRingbuffer.ringName(chain, TABLE).equals(key.getString("ring"))) return Optional.of(record);
-        }
-        return Optional.empty();
+    private static Optional<Document> deletedRecord(MongoDatabase raw, NativeSrsDocuments documents) {
+        Document consumer = consumer(documents);
+        String chain = consumer.get("_id", Document.class).getString("chain");
+        long epoch = number(documents.chain(chain), "epoch");
+        List<Document> records = SystemCollections.SRS_EVENTS.on(raw).find(
+                new Document("_id.ring", SrsRingbuffer.ringName(chain, TABLE))
+                        .append("op", Op.DELETE.symbol()).append("epoch", epoch))
+                .into(new java.util.ArrayList<>());
+        if (records.isEmpty()) return Optional.empty();
+        assertThat(records).as("the original chain and table retain exactly the refused DELETE").hasSize(1);
+        return Optional.of(records.getFirst());
     }
 
     private static SourceOrder confirmed(Document consumer) {
-        return new SourceOrder(number(consumer, "sinkAckedEpoch"), number(consumer, "sinkAckedSeq"));
+        Document position = consumer.get("progress", Document.class).get("sinkAcked", Document.class);
+        return new SourceOrder(number(position, "epoch"), number(position, "sequence"));
+    }
+
+    private static SourceOrder tableConfirmed(Document consumer) {
+        List<Document> positions = consumer.get("progress", Document.class)
+                .getList("sinkAckedByTable", Document.class).stream()
+                .filter(value -> TABLE.equals(value.getString("table"))).toList();
+        assertThat(positions).as("the refused table's durable target confirmation").hasSize(1);
+        Document position = positions.getFirst().get("position", Document.class);
+        return new SourceOrder(number(position, "epoch"), number(position, "sequence"));
     }
 
     private static long tableDone(Document consumer) {
-        return number(consumer.get("perTableRingDone", Document.class), TABLE);
+        return tableSequence(consumer, "ringDoneThrough");
+    }
+
+    private static long tableSequence(Document document, String field) {
+        List<Document> entries = document.getList(field, Document.class).stream()
+                .filter(value -> TABLE.equals(value.getString("table"))).toList();
+        assertThat(entries).as(TABLE + " has an exact " + field + " coordinate").hasSize(1);
+        return number(entries.getFirst(), "sequence");
     }
 
     private static long number(Document document, String field) {

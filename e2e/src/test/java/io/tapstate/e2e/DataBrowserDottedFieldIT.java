@@ -99,10 +99,10 @@ class DataBrowserDottedFieldIT {
 
     @Test
     void tellsTheColumnNamedWithADotFromThePathThroughOne() {
-        String storeUri = SharedMongo.replicaSetUrl("e2e_dotted_field_store");
         String dataUri = SharedMongo.replicaSetUrl(DATABASE);
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             mongo.insert(EndpointAddress.uri(dataUri), COLLECTION,
                     new Document("_id", LITERALLY_NAMED).append(LITERAL_COLUMN, HELD_UNDER_THE_LITERAL_NAME));
@@ -110,7 +110,7 @@ class DataBrowserDottedFieldIT {
                     new Document("_id", NESTED).append("price", new Document("usd", HELD_UNDER_THE_PATH)));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(Map.of("src_mongo.tap.yml", sourceYaml(dataUri)));
 

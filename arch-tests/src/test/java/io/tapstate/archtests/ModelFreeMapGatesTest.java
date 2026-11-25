@@ -4,8 +4,7 @@ import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaField;
 import com.tngtech.archunit.core.domain.JavaParameterizedType;
 import com.tngtech.archunit.core.domain.JavaType;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
+import io.tapstate.core.model.SourceRef;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -17,13 +16,14 @@ import java.util.stream.Collectors;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A free map on a model record says "any key, any value, nobody checks". Two of them are meant to say
- * that and the rest are drift, so this gate names the two and refuses every other.
+ * A free map on a model record leaves the keys and values to the owner of a separate contract.
+ * Only connector configuration and experimental data have that boundary in the DSL.
  *
  * <p>{@code config} carries a connector's connection settings. Its keys belong to whichever connector
  * the resource names, they differ per connector, and the product has no standing to enumerate them —
  * it stays free on purpose, validated against the connector's own declared spec rather than against a
- * type here.
+ * type here. The same contract owns {@code SourceRef.Spec.nodeConfig}, whose keys come from the
+ * connector's node form and are checked against the registered specification on apply.
  *
  * <p>{@code experimental} is the declared escape hatch from the compatibility freeze: whatever sits in
  * it is exempt precisely because it is marked as not yet a contract.
@@ -42,16 +42,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ModelFreeMapGatesTest {
 
-    /** The two component names allowed to hold a free map, and why, is in this class's javadoc. */
+    /** The existing free-map names used by connector configuration and experimental data. */
     private static final List<String> ALLOWED = List.of("config", "experimental");
 
     private static JavaClasses modelClasses;
 
     @BeforeAll
     static void importClasses() {
-        modelClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate.core.model");
+        modelClasses = ProductionClassImports.packages("io.tapstate.core.model");
     }
 
     /** A field of type {@code Map<?, Object>} — the shape that promises nothing about its values. */
@@ -83,20 +81,23 @@ class ModelFreeMapGatesTest {
                 .isNotEmpty();
     }
 
+    private static boolean connectorNodeConfig(JavaField field) {
+        return field.getOwner().isEquivalentTo(SourceRef.Spec.class) && field.getName().equals("nodeConfig");
+    }
+
     @Test
-    @DisplayName("only config and experimental may be a free map")
+    @DisplayName("only connector configuration and experimental data may be a free map")
     void noFreeMapOutsideTheTwoExemptions() {
         List<String> offenders = modelClasses.stream()
                 .flatMap(c -> c.getFields().stream())
                 .filter(ModelFreeMapGatesTest::isFreeMap)
-                .filter(f -> !ALLOWED.contains(f.getName()))
+                .filter(f -> !ALLOWED.contains(f.getName()) && !connectorNodeConfig(f))
                 .map(f -> f.getOwner().getSimpleName() + "." + f.getName())
                 .sorted()
                 .collect(Collectors.toList());
 
         assertThat(offenders)
-                .as("a free map outside 'config' (connector-owned) and 'experimental' (not yet a "
-                        + "contract): give it a type, or state why the product cannot own its keys")
+                .as("a free map outside connector-owned configuration or experimental data")
                 .isEmpty();
     }
 }

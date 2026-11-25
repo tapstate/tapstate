@@ -1,0 +1,716 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
+import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore.Published;
+import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.StorageSetupScope;
+import io.tapstate.testsupport.RequiresDocker;
+import org.bson.BsonDocument;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
+
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Real configuration-only encrypted editing, publication and metadata-only wire projection witnesses. */
+@RequiresDocker
+class MongoConfigurationDraftStoreIT {
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+    private static final Instant NOW = Instant.parse("2026-10-17T00:00:00Z");
+    private static final DslParser PARSER = new DslParser();
+
+    @Test
+    void privateSummaryAndBodyAreEncryptedAndBsonValuesSurviveRestartWithoutCache() {
+        withConfiguration((domain, database) -> {
+            var settings = Map.<String, Object>of("password", "body-secret", "long", 5L, "decimal", new BigDecimal("12.3400"),
+                    "binary", new byte[]{1, 2, 3}, "nested", Map.of("$numberLong", "7"));
+            var graph = new PipelineDraft.Graph(List.of(new PipelineDraft.Node("node", "transform", null, null, settings,
+                    Map.of("hint", "metadata-secret"))), List.of(), new PipelineDraft.Viewport(0, 0, 1));
+            var draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG, "summary-secret", "description-secret", graph,
+                    null, null, null, null, NOW, NOW, "author");
+            assertThat(domain.drafts().create(draft)).isEqualTo(PipelineDraftMutation.CREATED);
+            var raw = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first();
+            assertThat(raw.toJson()).doesNotContain("body-secret", "metadata-secret", "summary-secret", "description-secret", "$numberLong");
+            assertThat(raw.keySet()).containsExactlyInAnyOrder("_id", "formatVersion", "revision", "deleted", "updatedAt", "summary", "body");
+            assertThat(revision(database)).isOne();
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                var restored = reopened.drafts().get("orders").orElseThrow();
+                var values = restored.graph().nodes().getFirst().config();
+                assertThat(values).containsEntry("password", "body-secret").containsEntry("long", 5L)
+                        .containsEntry("decimal", new BigDecimal("12.3400")).containsEntry("nested", Map.of("$numberLong", "7"));
+                assertThat((byte[]) values.get("binary")).containsExactly((byte) 1, (byte) 2, (byte) 3);
+                assertThat(reopened.drafts().listSummaries()).singleElement().satisfies(summary -> assertThat(summary.name()).isEqualTo("summary-secret"));
+            }
+        });
+    }
+
+    @Test
+    void summariesReallyProjectOutTheEncryptedBodyOnTheMongoWire() {
+        withConfiguration((domain, database) -> {
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            List<BsonDocument> commands = new CopyOnWriteArrayList<>();
+            CommandListener witness = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("find")) commands.add(event.getCommand().clone());
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(witness).build())) {
+                var ciphers = SourceConfigCipherProvider.fixed(cipher(database));
+                var target = observed.getDatabase(database.getName());
+                var store = new MongoConfigurationDraftStore(observed, target, ciphers, new MongoConfigurationArtifactStore(observed, target, ciphers));
+                assertThat(store.listSummaries(0, 1)).hasSize(1);
+                assertThat(commands).hasSize(1);
+                var projection = commands.getFirst().getDocument("projection");
+                assertThat(projection.keySet()).containsExactlyInAnyOrder("_id", "formatVersion", "revision", "deleted", "updatedAt", "summary");
+                assertThat(projection.getInt32("summary").getValue()).isOne();
+                assertThat(projection.containsKey("body")).isFalse();
+            }
+        });
+    }
+
+    @Test
+    void autosaveRebaseDeleteAndRecreationKeepDraftCasWithoutAdvancingPublishedConfiguration() {
+        withConfiguration((domain, database) -> {
+            var store = domain.drafts();
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.WIZARD, "old", 1L, "published"))).isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null))).isEqualTo(PipelineDraftMutation.ALREADY_EXISTS);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG, "old", 1L, "published")))
+                    .isEqualTo(PipelineDraftMutation.MODE_CONFLICT);
+            var replacement = draft("orders", 2, PipelineDraft.Mode.WIZARD, "new", 1L, "published");
+            assertThat(store.replace("orders", 1, replacement)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.rebase("orders", 1, "old", replacement)).isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(store.delete("orders", 1)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.DELETED);
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first().keySet())
+                    .containsExactlyInAnyOrder("_id", "formatVersion", "revision", "deleted", "updatedAt");
+            assertThat(store.get("orders")).isEmpty();
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null))).isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(3);
+            assertThat(store.replace("orders", 2, draft("orders", 3, PipelineDraft.Mode.DAG, null, null, null)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.publish(publication("orders", 2, null, Map.of()))).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(revision(database)).isOne();
+        });
+    }
+
+    @Test
+    void publishingIncludesArtifactStableStateNotesAndPublicationMarkersInOneConfigurationTransaction() {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "secret"); domain.artifacts().create(source);
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            long before = revision(database);
+            var publication = publication("orders", 1, null, Map.of("src", CanonicalHash.of(source)));
+            assertThat(domain.drafts().publish(publication)).isEqualTo(PipelineDraftMutation.PUBLISHED);
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            var saved = domain.drafts().get("orders").orElseThrow();
+            assertThat(saved.baseArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+            assertThat(saved.publishedDraftRevision()).isOne();
+            assertThat(revision(database)).isEqualTo(before + 1);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first())
+                    .containsEntry("stateGeneration", 1L);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).find(new Document("_id.namespace", "pdk.state.orders.capture.src")).first()).isNotNull();
+            assertThat(domain.drafts().replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG, null, null, null)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(domain.drafts().replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    saved.baseArtifactHash(), saved.publishedDraftRevision(), saved.publishedArtifactHash())))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"2, true", "4, false"})
+    void publicationAttemptsCommitAtMostThreeTimes(int unknownReplies, boolean confirmed) {
+        withPublicationFault("commitTransaction", unknownReplies, new Document("writeConcernError",
+                new Document("code", 64).append("errmsg", "test commit acknowledgement lost"))
+                .append("errorLabels", List.of(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)),
+                (store, publication, commands) -> {
+                    if (confirmed) {
+                        assertThat(store.publishWithGeneration(publication)).isEqualTo(new Published(PipelineDraftMutation.PUBLISHED, 1));
+                    } else {
+                        assertThatThrownBy(() -> store.publishWithGeneration(publication))
+                                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                    assertThat(error.code()).isEqualTo(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN);
+                                    assertThat(error.args()).containsExactlyEntriesOf(Map.of("pipeline", "orders"));
+                                });
+                    }
+                    var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                    assertThat(starts).hasSize(1);
+                    var first = starts.getFirst();
+                    assertThat(first.getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+                    assertThat(commands.stream().filter(command -> command.containsKey("abortTransaction"))).isEmpty();
+                    assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                            .hasSize(3).allSatisfy(commit -> {
+                                assertThat(commit.get("lsid")).isEqualTo(first.get("lsid"));
+                                assertThat(commit.get("txnNumber")).isEqualTo(first.get("txnNumber"));
+                                var writeConcern = commit.getDocument("writeConcern");
+                                assertThat(writeConcern.getString("w").getValue()).isEqualTo("majority");
+                                assertThat(writeConcern.getBoolean("j").getValue()).isTrue();
+                            });
+                });
+    }
+
+    @Test
+    void publicationRetriesATransientTransactionBodyFailure() {
+        withPublicationFault("find", 1, new Document("errorCode", 112)
+                .append("errorLabels", List.of(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL)),
+                (store, publication, commands) -> {
+                    assertThat(store.publishWithGeneration(publication)).isEqualTo(new Published(PipelineDraftMutation.PUBLISHED, 1));
+                    var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                    assertThat(starts).hasSize(2);
+                    assertThat(starts.getFirst().get("txnNumber")).isNotEqualTo(starts.getLast().get("txnNumber"));
+                    assertThat(commands.stream().filter(command -> command.containsKey("abortTransaction")))
+                            .singleElement().satisfies(abort -> assertThat(abort.get("txnNumber")).isEqualTo(starts.getFirst().get("txnNumber")));
+                    assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                            .singleElement().satisfies(commit -> assertThat(commit.get("txnNumber")).isEqualTo(starts.getLast().get("txnNumber")));
+                });
+    }
+
+    private static void withPublicationFault(String command, int times, Document fault, PublicationScenario scenario) {
+        withConfiguration((domain, database) -> {
+            domain.artifacts().create(source("src", "secret"));
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            long before = revision(database);
+            var publication = publication("orders", 1, null, Map.of());
+            withObservedFault(database, command, times, fault, (store, commands) -> scenario.run(store, publication, commands));
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(domain.drafts().get("orders").orElseThrow().publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"2, true", "4, false"})
+    void definitionChangesBoundAmbiguousCommits(int unknownReplies, boolean confirmed) {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            var hash = CanonicalHash.of(changed);
+            var change = new PipelineDraft.DefinitionChange("orders", publication.publishedArtifactHash(),
+                    changed, hash, Map.of(), draft -> changedDraft(draft, hash));
+            long before = revision(database);
+            var fault = new Document("writeConcernError", new Document("code", 64).append("errmsg", "acknowledgement lost"))
+                    .append("errorLabels", List.of(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL));
+            withObservedFault(database, "commitTransaction", unknownReplies, fault, (store, commands) -> {
+                if (confirmed) {
+                    assertThat(store.changeDefinition(change)).isEqualTo(PipelineDraftMutation.REPLACED);
+                } else {
+                    assertThatThrownBy(() -> store.changeDefinition(change))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                assertThat(error.code()).isEqualTo(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN);
+                                assertThat(error.args()).containsExactlyEntriesOf(Map.of("pipeline", "orders"));
+                            });
+                }
+                var starts = commands.stream().filter(command -> command.containsKey("startTransaction")).toList();
+                assertThat(starts).hasSize(1);
+                assertThat(commands.stream().filter(command -> command.containsKey("commitTransaction")))
+                        .hasSize(3).allSatisfy(commit -> {
+                            assertThat(commit.get("lsid")).isEqualTo(starts.getFirst().get("lsid"));
+                            assertThat(commit.get("txnNumber")).isEqualTo(starts.getFirst().get("txnNumber"));
+                        });
+            });
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            assertThat(domain.drafts().get("orders").orElseThrow().revision()).isEqualTo(2);
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    private static void withObservedFault(MongoDatabase database, String command, int times, Document fault,
+            BiConsumer<MongoConfigurationDraftStore, List<BsonDocument>> scenario) {
+        var ciphers = SourceConfigCipherProvider.fixed(cipher(database));
+        List<BsonDocument> commands = new CopyOnWriteArrayList<>();
+        var witness = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommand().containsKey("autocommit")) commands.add(event.getCommand().clone());
+            }
+        };
+        String appName = database.getName();
+        try (var observed = MongoClients.create(MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).applicationName(appName)
+                .addCommandListener(witness).build())) {
+            var target = observed.getDatabase(database.getName());
+            var store = new MongoConfigurationDraftStore(observed, target, ciphers, new MongoConfigurationArtifactStore(observed, target, ciphers));
+            var admin = observed.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", times))
+                    .append("data", fault.append("failCommands", List.of(command)).append("appName", appName)));
+            try { scenario.accept(store, commands); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+        }
+    }
+
+    @FunctionalInterface
+    private interface PublicationScenario {
+        void run(MongoConfigurationDraftStore store, PipelineDraft.Publication publication, List<BsonDocument> commands);
+    }
+
+    @Test
+    void concurrentAlertActivityDoesNotReplayPublicationDependencyReads() {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "secret"); domain.artifacts().create(source);
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var publication = publication("orders", 1, null, Map.of("src", CanonicalHash.of(source)));
+            long before = revision(database);
+            var dependencyReads = new java.util.concurrent.atomic.AtomicInteger();
+            var triggered = new java.util.concurrent.atomic.AtomicBoolean();
+            var competing = new java.util.concurrent.atomic.AtomicReference<java.util.concurrent.Future<?>>();
+            try (var writer = Executors.newSingleThreadExecutor()) {
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                    if (!command.equals("aggregate") || !collection.equals("sources")) return;
+                    dependencyReads.incrementAndGet();
+                    if (!triggered.compareAndSet(false, true)) return;
+                    competing.set(writer.submit(() -> SystemCollections.CONFIGURATION_VERSION.on(database)
+                            .updateOne(new Document("_id", "configuration"),
+                                    new Document("$inc", new Document("alertWriteFence", 1L)))));
+                    try { competing.get().get(100, TimeUnit.MILLISECONDS); }
+                    catch (java.util.concurrent.TimeoutException orderingHeld) {
+                        // A publication that already owns the ordering document completes before this writer.
+                    } catch (Exception failed) { throw new AssertionError(failed); }
+                });
+                try { assertThat(domain.drafts().publish(publication)).isEqualTo(PipelineDraftMutation.PUBLISHED); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                competing.get().get(5, TimeUnit.SECONDS);
+            }
+            assertThat(triggered).isTrue();
+            assertThat(dependencyReads).as("an unrelated alert write must not replay the dependency snapshot").hasValue(1);
+            assertThat(revision(database)).isEqualTo(before + 1);
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(domain.drafts().get("orders").orElseThrow().publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "wrong-type", "array", "exhausted", "invalid-schema"})
+    void earlyPublicationOrderingCannotCommitAcrossInvalidConfiguration(String damage) {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "secret"); domain.artifacts().create(source);
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(database);
+            if (damage.equals("missing")) versions.deleteOne(new Document("_id", "configuration"));
+            else if (damage.equals("invalid-schema")) SystemCollections.SCHEMA_MIGRATIONS.on(database)
+                    .updateOne(new Document("_id", "config"), new Document("$set", new Document("validation", new Document("phase", "PREPARING"))));
+            else versions.updateOne(new Document("_id", "configuration"), new Document("$set",
+                    new Document("revision", damage.equals("wrong-type") ? "invalid" : damage.equals("array") ? List.of(1L) : Long.MAX_VALUE - 1)));
+            var before = versions.find().first();
+            var saved = domain.drafts().get("orders");
+            assertThatThrownBy(() -> domain.drafts().publish(publication("orders", 1, null, Map.of("src", CanonicalHash.of(source)))))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        if (!damage.equals("invalid-schema")) assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    });
+            assertThat(versions.find().first()).isEqualTo(before);
+            assertThat(domain.artifacts().get("orders")).isEmpty();
+            assertThat(domain.drafts().get("orders")).isEqualTo(saved);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first()).isNull();
+        });
+    }
+
+    @Test
+    void failedFinalDraftWriteRollsBackArtifactScopeMappingVersionAndKeyFence() {
+        withConfiguration((domain, database) -> {
+            domain.artifacts().create(source("src", "secret"));
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var second = draft("another", 1, PipelineDraft.Mode.DAG, null, null, null);
+            second = new PipelineDraft(second.pipelineId(), 1, 1, second.mode(), second.name(), second.description(), second.graph(), null,
+                    null, null, null, NOW, NOW.plusSeconds(1), "author");
+            domain.drafts().create(second);
+            SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).createIndex(new Document("updatedAt", 1),
+                    new IndexOptions().unique(true).name("forced_unique_updated_at"));
+            long version = revision(database);
+            var key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            assertThatThrownBy(() -> domain.drafts().publish(publication("orders", 1, null, Map.of())))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(domain.artifacts().get("orders")).isEmpty();
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first()).isNull();
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).find(new Document("_id.namespace", "pdk.state.orders.capture.src")).first()).isNull();
+            assertThat(domain.drafts().get("orders").orElseThrow().publishedDraftRevision()).isNull();
+            assertThat(revision(database)).isEqualTo(version);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+        });
+    }
+
+    @Test
+    void definitionChangesCarryTheMatchingEncryptedDraftAndAdvanceOnePublishedRevision() {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            String hash = CanonicalHash.of(changed);
+            long before = revision(database);
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first();
+            assertThat(domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                    publication.publishedArtifactHash(), changed, hash, Map.of(), current -> changedDraft(current, hash))))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            var saved = domain.drafts().get("orders").orElseThrow();
+            assertThat(saved.revision()).isEqualTo(2);
+            assertThat(saved.baseArtifactHash()).isEqualTo(hash);
+            assertThat(saved.name()).isEqualTo("definition-change-secret");
+            assertThat(saved.publishedDraftRevision()).isOne();
+            assertThat(saved.publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+            assertThat(revision(database)).isEqualTo(before + 1);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first())
+                    .isEqualTo(mapping);
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first().toJson())
+                    .doesNotContain("definition-change-secret");
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"absent", "deleted", "unrelated"})
+    void definitionChangesNeverCreateResurrectOrRebaseAnUnrelatedDraft(String state) {
+        withConfiguration((domain, database) -> {
+            var original = publication("orders", 1, null, Map.of()).artifact();
+            domain.artifacts().create(original);
+            if (!state.equals("absent")) {
+                domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, "another-definition", null, null));
+                if (state.equals("deleted")) domain.drafts().delete("orders", 1);
+            }
+            var rows = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            var beforeDraft = rows.find().first();
+            long before = revision(database);
+            var changed = changedDefinition();
+            assertThat(domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                    CanonicalHash.of(original), changed, CanonicalHash.of(changed), Map.of(), current -> {
+                        throw new AssertionError("an unrelated or absent draft must not be changed");
+                    }))).isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            assertThat(rows.find().first()).isEqualTo(beforeDraft);
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    @Test
+    void movedDefinitionOrWorkspaceDependencyRefusesWithoutChangingConfigurationOrDraft() {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "first-secret");
+            domain.artifacts().create(source);
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            domain.artifacts().replace("src", CanonicalHash.of(source), source("src", "changed-secret"));
+            long before = revision(database);
+            var beforeDraft = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first();
+            for (var expected : List.of(Map.of("hash", "moved", "dependency", "current"),
+                    Map.of("hash", publication.publishedArtifactHash(), "dependency", CanonicalHash.of(source)))) {
+                Map<String, String> dependencies = expected.get("dependency").equals("current") ? Map.of()
+                        : Map.of("src", expected.get("dependency"));
+                assertThat(domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                        expected.get("hash"), changed, CanonicalHash.of(changed), dependencies,
+                        current -> changedDraft(current, CanonicalHash.of(changed)))))
+                        .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            }
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first()).isEqualTo(beforeDraft);
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aFailedFinalDefinitionDraftWriteRollsBackArtifactVersionMappingAndKeyFence() {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var other = draft("another", 1, PipelineDraft.Mode.DAG, null, null, null);
+            domain.drafts().create(new PipelineDraft(other.pipelineId(), other.schemaVersion(), other.revision(), other.mode(),
+                    other.name(), other.description(), other.graph(), other.wizard(), other.baseArtifactHash(),
+                    other.publishedDraftRevision(), other.publishedArtifactHash(), NOW, NOW.plusSeconds(2), "author"));
+            var rows = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            rows.createIndex(new Document("updatedAt", 1), new IndexOptions().unique(true).name("forced_definition_updated_at"));
+            var beforeDraft = rows.find(new Document("_id", "orders")).first();
+            long before = revision(database);
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first();
+            var key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            var changed = changedDefinition();
+            assertThatThrownBy(() -> domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                    publication.publishedArtifactHash(), changed, CanonicalHash.of(changed), Map.of(),
+                    current -> changedDraft(current, CanonicalHash.of(changed)))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(rows.find(new Document("_id", "orders")).first()).isEqualTo(beforeDraft);
+            assertThat(revision(database)).isEqualTo(before);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first()).isEqualTo(mapping);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+        });
+    }
+
+    @Test
+    void staleDependenciesAndEveryOtherArtifactKindRefusePublicationWithoutSideEffects() {
+        withConfiguration((domain, database) -> {
+            var original = source("src", "old"); domain.artifacts().create(original);
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            domain.artifacts().replace("src", CanonicalHash.of(original), source("src", "new"));
+            long before = revision(database);
+            assertThat(domain.drafts().publish(publication("orders", 1, null, Map.of("src", CanonicalHash.of(original)))))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(revision(database)).isEqualTo(before);
+            for (String kind : List.of("source", "transform", "view", "serve")) {
+                String id = "taken_" + kind;
+                var existing = kind.equals("source") ? source(id, "secret") : PARSER.parse("version: tapstate/v1\nkind: " + kind + "\nid: " + id + "\n"
+                        + (kind.equals("transform") ? "type: filter\nexpr: 'true'\n" : kind.equals("view") ? "primary_key: id\n" : ""));
+                domain.artifacts().create(existing);
+                domain.drafts().create(draft(id, 1, PipelineDraft.Mode.DAG, null, null, null));
+                long version = revision(database);
+                assertThat(domain.drafts().publish(publication(id, 1, null, Map.of()))).isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+                assertThat(domain.artifacts().get(id)).contains(existing);
+                assertThat(revision(database)).isEqualTo(version);
+            }
+        });
+    }
+
+    @Test
+    void twoClientsKeepOneDraftCreateAndOneExpectedRevisionWinner() {
+        withConfiguration((domain, database) -> {
+            try (var other = MongoConfigurationDomain.open(settings(database), "cluster-a"); var executor = Executors.newFixedThreadPool(2)) {
+                var ready = new CountDownLatch(2); var start = new CountDownLatch(1);
+                var a = executor.submit(() -> { ready.countDown(); start.await(10, TimeUnit.SECONDS); return domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null)); });
+                var b = executor.submit(() -> { ready.countDown(); start.await(10, TimeUnit.SECONDS); return other.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null)); });
+                assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue(); start.countDown();
+                assertThat(List.of(a.get(20, TimeUnit.SECONDS), b.get(20, TimeUnit.SECONDS)))
+                        .containsExactlyInAnyOrder(PipelineDraftMutation.CREATED, PipelineDraftMutation.ALREADY_EXISTS);
+                var x = executor.submit(() -> domain.drafts().replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG, null, null, null)));
+                var y = executor.submit(() -> other.drafts().replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG, null, null, null)));
+                assertThat(List.of(x.get(20, TimeUnit.SECONDS), y.get(20, TimeUnit.SECONDS)))
+                        .containsExactlyInAnyOrder(PipelineDraftMutation.REPLACED, PipelineDraftMutation.REVISION_CONFLICT);
+                assertThat(revision(database)).isOne();
+            }
+        });
+    }
+
+    @Test
+    void bodySwapsAndPlaintextAreRefusedWithoutRepairWhileSummariesStayIndependent() {
+        withConfiguration((domain, database) -> {
+            domain.drafts().create(draft("a", 1, PipelineDraft.Mode.DAG, null, null, null));
+            domain.drafts().create(draft("b", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var rows = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            String body = rows.find(new Document("_id", "a")).first().getString("body");
+            rows.updateOne(new Document("_id", "b"), new Document("$set", new Document("body", body)));
+            assertThatThrownBy(() -> domain.drafts().get("b")).satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThat(domain.drafts().listSummaries()).hasSize(2);
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(database), "cluster-a"))
+                    .satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            rows.replaceOne(new Document("_id", "b"), MongoPipelineDraftStore.toDocument(draft("b", 1, PipelineDraft.Mode.DAG, null, null, null)));
+            assertThatThrownBy(() -> domain.drafts().get("b")).satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThat(rows.find(new Document("_id", "b")).first()).containsKey("graph");
+        });
+    }
+
+    @Test
+    void authenticatedMissingGraphFieldsNeverReceiveLegacyEmptyDefaults() {
+        withConfiguration((domain, database) -> {
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var raw = new org.bson.RawBsonDocument(new Document("graph", new Document("viewport", new Document("x", 0D).append("y", 0D).append("zoom", 1D))), new org.bson.codecs.DocumentCodec());
+            byte[] bytes = Arrays.copyOfRange(raw.getBackingArray(), raw.getByteOffset(), raw.getByteOffset() + raw.getByteLength());
+            String envelope = cipher(database).encryptBytes(JsonWriter.write(List.of("pipeline-draft", "orders", 1L, "body")), "pipeline-draft", bytes);
+            SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).updateOne(new Document("_id", "orders"), new Document("$set", new Document("body", envelope)));
+            assertThatThrownBy(() -> domain.drafts().get("orders")).satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThat(domain.drafts().list()).isEmpty();
+            assertThat(domain.drafts().listSummaries()).hasSize(1);
+        });
+    }
+
+    @Test
+    void wizardRelatedTransformsAndOutputKeepTheirTypedPrivateValues() {
+        withConfiguration((domain, database) -> {
+            var fields = Map.<String, Object>of("nested", Map.of("$date", "literal"), "amount", new BigDecimal("1.2300"));
+            var transform = new PipelineDraft.Transform("t", "fields", fields);
+            var wizard = new PipelineDraft.Wizard(new PipelineDraft.Root("root", "src", "orders", List.of("id"), List.of(transform)),
+                    List.of(new PipelineDraft.Related("child", "root", "src", "lines",
+                            new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")), PipelineDraft.Shape.ARRAY,
+                                    "lines", List.of("id"), List.of("id")), List.of(transform))),
+                    List.of(transform), new PipelineDraft.Output("target", fields));
+            var draft = new PipelineDraft("wizard", 1, 1, PipelineDraft.Mode.WIZARD, "private-name", "", null, wizard,
+                    null, null, null, NOW, NOW, "author");
+            domain.drafts().create(draft);
+            assertThat(domain.drafts().get("wizard").orElseThrow()).isEqualTo(draft);
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first().toJson())
+                    .doesNotContain("private-name", "literal", "order_id");
+        });
+    }
+
+    @Test
+    void requestCaptureOwnsNestedMapsAndBinaryBeforeCallingTheKeyProvider() {
+        withConfiguration((domain, database) -> {
+            byte[] callerBytes = new byte[]{1, 2};
+            var callerMap = new java.util.LinkedHashMap<String, Object>(); callerMap.put("value", "original-secret");
+            var graph = new PipelineDraft.Graph(List.of(new PipelineDraft.Node("n", "transform", null, null,
+                    Map.of("nested", callerMap, "bytes", callerBytes), Map.of())), List.of(), new PipelineDraft.Viewport(0, 0, 1));
+            var draft = new PipelineDraft("snapshot", 1, 1, PipelineDraft.Mode.DAG, "", "", graph, null, null, null, null, NOW, NOW, "author");
+            SourceConfigCipher original = cipher(database);
+            SourceConfigCipherProvider provider = new SourceConfigCipherProvider() {
+                @Override public SourceConfigCipher current() { return original; }
+                @Override public SourceConfigCipher refresh() { callerBytes[0] = 9; callerMap.put("value", "changed-secret"); return original; }
+            };
+            try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var ownDatabase = client.getDatabase(database.getName());
+                var store = new MongoConfigurationDraftStore(client, ownDatabase, provider,
+                        new MongoConfigurationArtifactStore(client, ownDatabase, provider));
+                store.create(draft);
+                assertThat(callerBytes[0]).isEqualTo((byte) 9);
+                var config = store.get("snapshot").orElseThrow().graph().nodes().getFirst().config();
+                assertThat(config).containsEntry("nested", Map.of("value", "original-secret"));
+                assertThat((byte[]) config.get("bytes")).containsExactly((byte) 1, (byte) 2);
+            }
+        });
+    }
+
+    @Test
+    void unsupportedValuesAndMissingKeyNeverCommitOrRecreateNecessaryConfiguration() {
+        withConfiguration((domain, database) -> {
+            var graph = new PipelineDraft.Graph(List.of(new PipelineDraft.Node("n", "transform", null, null,
+                    Map.of("secret", new BigDecimal("123456789012345678901234567890123456789")), Map.of())), List.of(), new PipelineDraft.Viewport(0, 0, 1));
+            var invalid = new PipelineDraft("bad", 1, 1, PipelineDraft.Mode.DAG, "", "", graph, null, null, null, null, NOW, NOW, "author");
+            assertThatThrownBy(() -> domain.drafts().create(invalid)).isInstanceOfSatisfying(TapstateException.class, error -> {
+                assertThat(error.code()).isEqualTo(IoError.DOCUMENT_INVALID); assertThat(error.getCause()).isNull();
+                assertThat(error.getMessage()).doesNotContain("123456789012345678901234567890123456789");
+            });
+            assertThat(domain.drafts().get("bad")).isEmpty();
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var before = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first();
+            SystemCollections.CLUSTER_KEYS.on(database).deleteMany(new Document());
+            assertThatThrownBy(() -> domain.drafts().replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG, null, null, null)))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            assertThatThrownBy(() -> domain.drafts().delete("orders", 1)).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first()).isEqualTo(before);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+            assertThat(revision(database)).isOne();
+        });
+    }
+
+    @Test
+    void ordinaryOpenNeverRecreatesADeletedDraftIndex() {
+        withConfiguration((domain, database) -> {
+            SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).dropIndex("pipeline_drafts_revision");
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(database), "cluster-a"))
+                    .satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThat(IndexEnsure.existing(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database),
+                    SystemCollections.CONFIG_PIPELINE_DRAFTS.indexes().getFirst())).isNull();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ttl", "extra-ttl", "partial", "sparse", "hidden"})
+    void unsafeDraftIndexesAreRefusedWithoutRepair(String option) {
+        withConfiguration((domain, database) -> {
+            var collection = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            String name = option.equals("extra-ttl") ? "extra_unsafe_ttl" : "pipeline_drafts_updated_at";
+            if (!option.equals("extra-ttl")) collection.dropIndex(name);
+            var options = new IndexOptions().name(name);
+            switch (option) {
+                case "ttl", "extra-ttl" -> options.expireAfter(1_000_000_000L, TimeUnit.SECONDS);
+                case "partial" -> options.partialFilterExpression(new Document("deleted", false));
+                case "sparse" -> options.sparse(true);
+                case "hidden" -> options.hidden(true);
+                default -> throw new AssertionError(option);
+            }
+            collection.createIndex(new Document("updatedAt", option.equals("extra-ttl") ? -1 : 1), options);
+            var before = collection.listIndexes().into(new java.util.ArrayList<>());
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(database), "cluster-a"))
+                    .satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThat(collection.listIndexes().into(new java.util.ArrayList<>())).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void anIncompleteFullRowCannotBeMistakenForASummaryProjection() {
+        withConfiguration((domain, database) -> {
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var rows = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            rows.updateOne(new Document("_id", "orders"), new Document("$unset", new Document("body", "")));
+            var before = rows.find().first();
+            assertThat(domain.drafts().listSummaries()).hasSize(1);
+            assertThatThrownBy(() -> domain.drafts().replace("orders", 1,
+                    draft("orders", 2, PipelineDraft.Mode.DAG, null, null, null)))
+                    .satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThatThrownBy(() -> domain.drafts().delete("orders", 1)).satisfies(MongoConfigurationDraftStoreIT::unreadable);
+            assertThat(rows.find().first()).isEqualTo(before);
+            assertThat(revision(database)).isOne();
+        });
+    }
+
+    private static PipelineDraft.Publication publishedDefinition(MongoConfigurationDomain domain) {
+        domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+        var publication = publication("orders", 1, null, Map.of());
+        assertThat(domain.drafts().publish(publication)).isEqualTo(PipelineDraftMutation.PUBLISHED);
+        return publication;
+    }
+    private static PipelineResource changedDefinition() {
+        return (PipelineResource) PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: orders\nsource: src\nmetadata: {description: changed}\n");
+    }
+    private static PipelineDraft changedDraft(PipelineDraft draft, String base) {
+        return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), draft.revision() + 1, draft.mode(),
+                "definition-change-secret", draft.description(), draft.graph(), draft.wizard(), base,
+                draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(), NOW.plusSeconds(2), "editor");
+    }
+    private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode, String base, Long publishedRevision, String publishedHash) {
+        return new PipelineDraft(id, 1, revision, mode, id, "", mode == PipelineDraft.Mode.DAG ? new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)) : null,
+                mode == PipelineDraft.Mode.WIZARD ? new PipelineDraft.Wizard(new PipelineDraft.Root(id, "src", "orders", List.of(), List.of()), List.of(), List.of(), null) : null,
+                base, publishedRevision, publishedHash, NOW, NOW, "author");
+    }
+    private static PipelineDraft.Publication publication(String id, long revision, String expected, Map<String, String> dependencies) {
+        var pipeline = (PipelineResource) PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: " + id + "\nsource: src\n");
+        return new PipelineDraft.Publication(id, revision, expected, pipeline, CanonicalHash.of(pipeline), NOW.plusSeconds(1), "publisher", dependencies);
+    }
+    private static SourceResource source(String id, String secret) {
+        return (SourceResource) PARSER.parse("version: tapstate/v1\nkind: source\nid: " + id + "\nconnector: mongodb\nconfig: {password: " + secret + "}\n");
+    }
+    private static SourceConfigCipher cipher(MongoDatabase database) {
+        return new SourceConfigCipher(Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material")));
+    }
+    private static void unreadable(Throwable failure) {
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> {
+            assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+            assertThat(error.getCause()).isNull();
+            assertThat(error.getMessage()).doesNotContain("body-secret", "summary-secret");
+        });
+    }
+    private static long revision(MongoDatabase database) { return SystemCollections.CONFIGURATION_VERSION.on(database).find().first().getLong("revision"); }
+    private static MongoConnectionSettings settings(MongoDatabase database) {
+        return new MongoConnectionSettings(MONGO.getReplicaSetUrl(database.getName()), null, Duration.ofSeconds(5));
+    }
+    private static void withConfiguration(Scenario scenario) {
+        try (var admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var database = admin.getDatabase("config_drafts_" + UUID.randomUUID().toString().replace("-", ""));
+            try (var domain = MongoConfigurationBootstrap.prepare(settings(database), "cluster-a", "installation-a", "setup-a", 1)) {
+                domain.bindings().commit(new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1), StorageBinding.Mode.OP,
+                        new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://cache.invalid/cache", "cache", null), source("views", "secret"));
+                scenario.run(domain, database);
+            } catch (Exception failure) { throw new AssertionError(failure); }
+            finally { database.drop(); }
+        }
+    }
+    @FunctionalInterface private interface Scenario { void run(MongoConfigurationDomain domain, MongoDatabase database) throws Exception; }
+}

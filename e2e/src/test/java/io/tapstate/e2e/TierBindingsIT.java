@@ -52,10 +52,10 @@ class TierBindingsIT {
         String endpointUri = SharedMongo.replicaSetUrl(database);
         writeWorkspace();
 
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(database + "_store"));
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                 MongoEndpoints endpoints = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding =
                     new HttpTierBinding(control, workspace, driversFor(endpoints), envFor(endpointUri));
 
@@ -77,10 +77,10 @@ class TierBindingsIT {
         String database = "e2e_unapplied_" + tier.name().toLowerCase();
         writeWorkspace();
 
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(database + "_store"));
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                 MongoEndpoints endpoints = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, driversFor(endpoints), envFor(SharedMongo.replicaSetUrl(database)));
 
@@ -106,10 +106,10 @@ class TierBindingsIT {
         String database = "e2e_unobserved_" + tier.name().toLowerCase();
         writeWorkspace();
 
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(database + "_store"));
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                 MongoEndpoints endpoints = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, driversFor(endpoints), envFor(SharedMongo.replicaSetUrl(database)));
 

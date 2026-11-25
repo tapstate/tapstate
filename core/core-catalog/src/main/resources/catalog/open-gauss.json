@@ -328,7 +328,7 @@
   ],
   "provenance": {
     "specPath": "connectors/opengauss-connector/src/main/resources/spec_opengauss.json",
-    "specContentHash": "3e11cc67808c6bd6",
+    "specContentHash": "14c0c1765d76bbc4",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

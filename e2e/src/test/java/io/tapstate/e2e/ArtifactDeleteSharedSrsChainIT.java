@@ -1,6 +1,5 @@
 package io.tapstate.e2e;
 
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.SrsConsumerId;
@@ -14,7 +13,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
-import java.util.Locale;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -78,10 +77,10 @@ class ArtifactDeleteSharedSrsChainIT {
     @EnumSource(Tiers.class)
     void removingOnePipelineDetachesOnlyItsCursorAndLeavesTheSharedChainCarryingTheOther(
             Tiers tier, @TempDir Path directory) throws Exception {
-        String storeUri = storeUri("delete_shared_chain", tier);
-        try (ServerHandle server = tier.launch(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
-            ControlPlane control = connected(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage);
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage)) {
+            ControlPlane control = connected(server, directory, storage);
             Path sourceDirectory = Files.createDirectories(directory.resolve(SOURCE_ID));
             FileEndpoints files = new FileEndpoints();
             files.seed(EndpointAddress.uri(sourceDirectory.toString()), TABLE, SeedRows.generated(SEEDED_ROWS));
@@ -111,13 +110,28 @@ class ArtifactDeleteSharedSrsChainIT {
             Await.until(
                     DEPARTING_ID + " to land the seeded rows, so what outlives its removal is data that "
                             + "was demonstrably there",
-                    () -> files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE) == SEEDED_ROWS,
-                    () -> "rows at " + DEPARTING_TARGET + " = "
-                            + files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE));
+                    () -> files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE) == SEEDED_ROWS
+                            && files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE) == SEEDED_ROWS,
+                    () -> "departed rows=" + files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE)
+                            + " survivor rows=" + files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE));
+
+            String departed = SrsConsumerId.of(DEPARTING_ID, SOURCE_ID).value();
+            String survivor = SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value();
+            files.cdc(EndpointAddress.uri(sourceDirectory.toString()), TABLE, CdcOp.INSERT, 2);
+            Await.until("both original consumers to carry changes before one is deleted",
+                    () -> files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE) == SEEDED_ROWS + 2
+                            && files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE) == SEEDED_ROWS + 2
+                            && documents.consumerReadSeq(chainId, survivor, TABLE) > 0,
+                    () -> "survivor cursor=" + documents.consumerOffset(chainId, survivor));
+            var originalChain = documents.chain(chainId);
+            var originalMembership = documents.membership(chainId, survivor);
+            var originalCursor = documents.consumerOffset(chainId, survivor);
+            long originalSequence = documents.consumerReadSeq(chainId, survivor, TABLE);
 
             // The departing pipeline comes to rest first; the surviving one is left running throughout,
             // because what this case measures is whether it keeps going.
-            control.stop(DEPARTING_ID, true);
+            // Preserve the original private scope and cursor so deletion itself must retire them.
+            control.stop(DEPARTING_ID, false);
             Await.until(
                     DEPARTING_ID + " to reach " + PipelineState.STOPPED,
                     () -> control.state(DEPARTING_ID).filter(PipelineState.STOPPED::equals).isPresent(),
@@ -125,25 +139,55 @@ class ArtifactDeleteSharedSrsChainIT {
 
             long departingTargetRows = files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE);
 
-            control.deleteArtifact(DEPARTING_ID, control.contentHash(DEPARTING_ID));
+            try {
+                control.deleteArtifact(DEPARTING_ID, control.contentHash(DEPARTING_ID));
+            } catch (RuntimeException | Error failure) {
+                FailureScene.writeThreads(storage.clusterId(), server);
+                throw failure;
+            }
 
             assertThat(control.artifact(DEPARTING_ID))
                     .as("the removal went through: sharing a chain is not a reason to refuse one")
                     .isEmpty();
-            assertThat(documents.holds(MongoStorePort.SRS_META, chainId))
+            assertThat(documents.chain(chainId))
                     .as("the chain record itself, which belongs to everyone reading through it and is "
                             + "never the departing pipeline's to take with it")
-                    .isTrue();
+                    .isNotNull();
             assertThat(documents.consumersOf(chainId))
                     .as("exactly who holds a cursor now - the departed one gone, the survivor's kept; a "
                             + "detach that cleared both would break the chain for everyone left on it")
                     .containsExactly(SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value());
+            assertThat(documents.chain(chainId).get("consumerCount", Number.class).longValue()).isEqualTo(1L);
+            assertThat(documents.membership(chainId, departed)).containsEntry("detached", true);
+            assertThat(documents.membership(chainId, survivor)).containsEntry("detached", false);
+            assertThat(documents.consumerOffset(chainId, departed)).isNull();
+            assertThat(documents.consumerOffset(chainId, survivor)).isNotNull();
+            var keptChain = documents.chain(chainId);
+            var keptMembership = documents.membership(chainId, survivor);
+            var keptCursor = documents.consumerOffset(chainId, survivor);
+            for (String field : List.of("_id", "cacheIncarnation", "captureId", "captureFence", "epoch"))
+                assertThat(keptChain.get(field)).as("original chain %s", field).isEqualTo(originalChain.get(field));
+            for (String field : List.of("_id", "pipelineId", "sourceId", "stateGeneration", "commandFence"))
+                assertThat(keptMembership.get(field)).as("original survivor membership %s", field).isEqualTo(originalMembership.get(field));
+            for (String field : List.of("_id", "stateGeneration"))
+                assertThat(keptCursor.get(field)).as("original survivor cursor %s", field).isEqualTo(originalCursor.get(field));
+            var originalWriters = originalCursor.get("writerRun", org.bson.Document.class);
+            var keptWriters = keptCursor.get("writerRun", org.bson.Document.class);
+            assertThat(originalWriters).isNotNull();
+            assertThat(keptWriters).isNotNull();
+            for (String field : List.of("membershipRevision", "commandFence", "runId", "expected"))
+                assertThat(keptWriters.get(field)).as("original survivor writer identity %s", field).isEqualTo(originalWriters.get(field));
+            assertThat(keptMembership.getLong("revision")).isGreaterThanOrEqualTo(originalMembership.getLong("revision"));
+            for (String field : List.of("membershipRevision", "progressRevision"))
+                assertThat(keptCursor.getLong(field)).as("retained survivor %s", field).isGreaterThanOrEqualTo(originalCursor.getLong(field));
+            assertThat(documents.consumerReadSeq(chainId, survivor, TABLE)).isGreaterThanOrEqualTo(originalSequence);
+            assertThat(keptChain.getLong("checkpointRevision")).isGreaterThanOrEqualTo(originalChain.getLong("checkpointRevision"));
             assertThat(files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE))
                     .as("the rows the departed pipeline had already landed, which are the user's data and "
                             + "not bookkeeping the removal is entitled to reclaim; a removal that tidied "
                             + "away 'its' target would destroy delivered data and report success")
                     .isEqualTo(departingTargetRows)
-                    .isEqualTo(SEEDED_ROWS);
+                    .isEqualTo(SEEDED_ROWS + 2);
 
             // Everything above is still satisfied by an implementation that detached nothing but removed the
             // chain document too, and by one that detached correctly. What follows is what separates a
@@ -155,7 +199,7 @@ class ArtifactDeleteSharedSrsChainIT {
 
             Await.until(
                     "the surviving pipeline to carry further changes after its neighbour was removed",
-                    () -> files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE) > rowsAfterRemoval,
+                    () -> files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE) == rowsAfterRemoval + 3,
                     () -> "rows at target = "
                             + files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE)
                             + ", was " + rowsAfterRemoval);
@@ -173,7 +217,7 @@ class ArtifactDeleteSharedSrsChainIT {
     }
 
     /** The single chain both pipelines read through; asserted to be single before this is ever called. */
-    private static String onlyChain(StoreDocuments documents) {
+    private static String onlyChain(NativeSrsDocuments documents) {
         return documents.miningChainIds().iterator().next();
     }
 
@@ -184,16 +228,12 @@ class ArtifactDeleteSharedSrsChainIT {
                 () -> String.valueOf(control.state(pipelineId)));
     }
 
-    private static ControlPlane connected(ServerHandle server, Path directory) throws Exception {
+    private static ControlPlane connected(ServerHandle server, Path directory, PreparedNativeStore storage) throws Exception {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector(
                 E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
         return control;
-    }
-
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
     }
 
     /** One source, two targets, two pipelines - the sharing arrangement, applied as one closure. */

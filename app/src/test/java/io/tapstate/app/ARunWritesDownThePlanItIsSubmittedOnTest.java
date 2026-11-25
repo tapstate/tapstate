@@ -128,7 +128,10 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
     @Test
     void aFencedRunNamesTheGenerationsItIsHeldToAndTheTopologyItsClaimWasHeldUnder() {
         PipelineActuationOwnership.Execution fenced =
-                new PipelineActuationOwnership.Execution(true, new ExecutionFence(PIPE, 3, 7), 11L);
+                new PipelineActuationOwnership.Execution(true, new ExecutionFence(PIPE, 3, 7), 11L,
+                        new io.tapstate.spi.store.WorkloadClaimFence(new io.tapstate.spi.store.WorkloadClaimKey("cluster-a",
+                                io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, PIPE),
+                                new io.tapstate.spi.store.WorkloadOwner("node-a", "boot-a"), 3, 7, 11));
 
         ExecutionPlan plan = EngineLifecycleActuator.planOf(PIPE, fenced, new PlannedIdle().planned(), T0);
 
@@ -253,6 +256,11 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
         @Override
         public void forget(String pipelineId) {
             forgotten.add(pipelineId);
+        }
+
+        @Override
+        public void forget(ExecutionPlan expected) {
+            forgotten.add(expected.pipelineId());
         }
     }
 }

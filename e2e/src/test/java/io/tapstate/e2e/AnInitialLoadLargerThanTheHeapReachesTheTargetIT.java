@@ -74,7 +74,6 @@ class AnInitialLoadLargerThanTheHeapReachesTheTargetIT {
         Map<String, Object> source = SharedPostgres.settings(DATABASE);
         seed(source);
 
-        String storeUri = SharedMongo.replicaSetUrl("large_load_store");
         String targetUri = SharedMongo.replicaSetUrl("large_load_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
@@ -82,38 +81,42 @@ class AnInitialLoadLargerThanTheHeapReachesTheTargetIT {
         // one under test. Uploading a connector holds its jar several times over on the way in, which a heap
         // this small cannot afford either: a limit of its own, found in the first run of this case, and not
         // the one this case is about.
-        try (ServerHandle preparing = RealProcessServer.start(storeUri)) {
-            ControlPlane control = new ControlPlane(preparing.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+            try (ServerHandle preparing = Tiers.REAL_PROCESS.launch(storage)) {
+                ControlPlane control = new ControlPlane(preparing.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put(SOURCE_ID + ".tap.yml", sourceYaml(source));
-            resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
-            resources.put(PIPELINE_ID + ".tap.yml", Workspaces.pipelineYaml(
-                    PIPELINE_ID, SOURCE_ID, TARGET_ID, TABLE));
-            control.apply(resources);
-            control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
-        }
+                Map<String, String> resources = new LinkedHashMap<>();
+                resources.put(SOURCE_ID + ".tap.yml", sourceYaml(source));
+                resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
+                resources.put(PIPELINE_ID + ".tap.yml", Workspaces.pipelineYaml(
+                        PIPELINE_ID, SOURCE_ID, TARGET_ID, TABLE));
+                control.apply(resources);
+                control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
+            }
 
-        try (RealProcessServer server = RealProcessServer.startInJvm(storeUri, SMALL_HEAP);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.login("e2e", "e2e-password");
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            try (RealProcessServer server = RealProcessServer.startPreparedInJvm(storage.configurationUri(), SMALL_HEAP,
+                        port -> List.of("--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0",
+                                "--tapstate.hz.jet.cooperative-thread-count=2"));
+                    MongoEndpoints mongo = new MongoEndpoints()) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-            long[] reading = {0};
-            Await.until("all " + ROWS + " rows of the load to reach the target", BOUND,
-                    () -> {
-                        if (!server.isAlive()) {
-                            throw new AssertionError("the server exited part way through the load, with "
-                                    + mongo.count(target, TABLE) + " of " + ROWS + " rows at the target; "
-                                    + "its output ended:\n" + server.tail());
-                        }
-                        return (reading[0] = mongo.count(target, TABLE)) == ROWS;
-                    },
-                    () -> reading[0] + " rows");
+                long[] reading = {0};
+                Await.until("all " + ROWS + " rows of the load to reach the target", BOUND,
+                        () -> {
+                            if (!server.isAlive()) {
+                                throw new AssertionError("the server exited part way through the load, with "
+                                        + mongo.count(target, TABLE) + " of " + ROWS + " rows at the target; "
+                                        + "its output ended:\n" + server.tail());
+                            }
+                            return (reading[0] = mongo.count(target, TABLE)) == ROWS;
+                        },
+                        () -> reading[0] + " rows");
+            }
         }
     }
 

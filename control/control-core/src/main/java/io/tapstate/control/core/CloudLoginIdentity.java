@@ -8,11 +8,16 @@ import java.util.Objects;
 /** Verified login proof returned only after the SDK's initial JWT verification. */
 public record CloudLoginIdentity(
         CloudSessionIdentity deployment, String userId, String organizationId, String clusterId,
-        String jwtId, Scope scope, Instant jwtExpiresAt) {
+        String jwtId, Scope scope, Instant jwtExpiresAt, String userEmail) {
 
     public CloudLoginIdentity(CloudSessionIdentity deployment, String userId, String jwtId,
             Scope scope, Instant jwtExpiresAt) {
-        this(deployment, userId, null, null, jwtId, scope, jwtExpiresAt);
+        this(deployment, userId, null, null, jwtId, scope, jwtExpiresAt, null);
+    }
+
+    public CloudLoginIdentity(CloudSessionIdentity deployment, String userId, String organizationId, String clusterId,
+            String jwtId, Scope scope, Instant jwtExpiresAt) {
+        this(deployment, userId, organizationId, clusterId, jwtId, scope, jwtExpiresAt, null);
     }
 
     public CloudLoginIdentity {

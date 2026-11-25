@@ -15,6 +15,8 @@ import java.util.TreeSet;
  */
 public enum Domain {
     DSL,
+    // Alert configuration and action refusals, separate from resource alarm severity.
+    ALERT,
     CLI,
     CORE,
     CATALOG,
@@ -61,6 +63,10 @@ public enum Domain {
     // engine, propagating a frontier; diagnosable failures such as acting on a pipeline that has no
     // running job, or a position the frontier's encoding cannot represent (runtime)
     ENGINE,
+    // the grouped step: what it may read, how its input rows are identified, and whether its group
+    // expressions and fields hold against the input's columns. Distinct from NEST, whose rollup
+    // fields share the function library but are checked with a document tree (core)
+    AGGREGATE,
     // stateful assembly of nested documents: checking a nest tree, sizing its state, and the runtime
     // limits and unresolvable references that stop or dead-letter part of it (runtime)
     NEST,
@@ -88,6 +94,11 @@ public enum Domain {
     PIPELINE,
     // Pipeline authoring operations: draft revisions, compilation, publication and discard
     PIPELINE_DRAFT,
+    // the questions a pipeline start answers before anything is written: each start check's findings
+    // and the actions a person can take on them. Its codes name the text of a start check report and
+    // are never thrown -- a start the checks refuse is refused under LIFECYCLE, which owns the verb.
+    // Distinct from LIFECYCLE so a check can be added without touching the verb's own vocabulary (control)
+    START_CHECK,
     // local MCP presentation: sidecar input, connector-spec and upstream-response failures
     MCP,
     // runtime data plane: reading a source's snapshot / cdc into the replay store — diagnosable
@@ -98,7 +109,9 @@ public enum Domain {
     // would move a chain still being read, one that changed a reading rather than the resume point, and
     // one that asks for no move at all. Distinct from CAPTURE, which owns what goes wrong when a run
     // consumes a start point, and from MONITOR, which reports a run without ever setting anything
-    POSITION;
+    POSITION,
+    // Independent data validation, including identity and execution-contract refusals.
+    VALIDATION;
 
 
     /**

@@ -63,7 +63,7 @@ class DataBrowserFollowEndingTest {
                 .as("the stream is over and the connection is not; a reader left on it is watching "
                         + "what a collection nobody is changing looks like")
                 .isNotNull();
-        assertThat(session.closedWith.getReason()).isEqualTo("data-browser.follow-stopped");
+        assertThat(session.closedWith.getReason()).isEqualTo("TS0390006");
         assertThat(session.closedWith.getCode())
                 .as("closed as a refusal the client cannot fix by reconnecting, so it stops rather "
                         + "than re-attaching into the same failure")
@@ -88,7 +88,7 @@ class DataBrowserFollowEndingTest {
         handler.sweepIdle();
 
         assertThat(session.closedWith).isNotNull();
-        assertThat(session.closedWith.getReason()).isEqualTo("data-browser.follow-idle");
+        assertThat(session.closedWith.getReason()).isEqualTo("TS0390007");
         assertThat(closes.get()).isEqualTo(1);
     }
 
@@ -120,6 +120,26 @@ class DataBrowserFollowEndingTest {
         assertThat(session.sent)
                 .as("and the change itself still reached the reader")
                 .hasSize(1);
+    }
+
+    @Test
+    @DisplayName("duplicate connection-close callbacks release the follow only once")
+    void ignoresACloseCallbackAfterTheFollowWasAlreadyReleased() throws Exception {
+        AtomicReference<DataBrowserChangeListener> opened = new AtomicReference<>();
+        AtomicInteger closes = new AtomicInteger();
+        MutableClock clock = new MutableClock(Instant.parse("2026-08-19T10:00:00Z"));
+        DataBrowserTailHandler handler =
+                new DataBrowserTailHandler(service(opened, closes), clock, IDLE_LIMIT);
+        FakeSession session = new FakeSession("closed-twice");
+        handler.afterConnectionEstablished(session);
+
+        handler.afterConnectionClosed(session, CloseStatus.NORMAL);
+        assertThat(closes.get()).isEqualTo(1);
+        handler.afterConnectionClosed(session, CloseStatus.NORMAL);
+
+        assertThat(closes.get())
+                .as("the late callback no longer owns a follow or a connector instance")
+                .isEqualTo(1);
     }
 
     // ---- fakes ----

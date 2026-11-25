@@ -49,6 +49,8 @@ final class ControlPlane {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
 
+    private static final Duration SNAPSHOT_METRICS_PUBLICATION_TIMEOUT = Duration.ofSeconds(5);
+
     /** How often a caller waiting on a pushed change looks again; a follow is told, never asked. */
     private static final Duration POLL = Duration.ofMillis(100);
 
@@ -91,12 +93,54 @@ final class ControlPlane {
         this.baseUrl = baseUrl;
     }
 
+    /** Actual View projection, read with this scenario's original authenticated session. */
+    String viewsJson(){
+        var response=send(authedGet("/api/views"));
+        if(response.statusCode()!=200)throw new AssertionError("View read failed: "+response.statusCode()+" "+response.body());
+        return response.body();
+    }
+    String metricsJson(String pipeline){
+        var response=send(authedGet("/api/pipelines/"+pipeline+"/metrics"));
+        if(response.statusCode()!=200)throw new AssertionError("Metrics read failed: "+response.statusCode()+" "+response.body());
+        return response.body();
+    }
+    Map<String,Object> alert(String operation,Map<String,?> input) {
+        var response=send(authed("/api/alerts/"+operation,JsonWriter.write(input)));
+        expect(response,200,"alert "+operation);
+        Object parsed=JsonReader.parse(response.body());
+        if(!(parsed instanceof Map<?,?> map))throw new AssertionError("alert response is not an object");
+        var value=new LinkedHashMap<String,Object>();map.forEach((key,item)->value.put(String.valueOf(key),item));return value;
+    }
+    boolean alertCenterAvailable() {
+        var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
+        String code = codeOf(response.body());
+        if ("TS0210030".equals(code)) return false;
+        if ("TS0480004".equals(code) || "io.document-unreadable".equals(code)) {
+            var params = paramsOf(response.body());
+            if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {
+                return false;
+            }
+        }
+        expect(response, 200, "read alert center");
+        return true;
+    }
+
+    void awaitInitialAlertMaintenance(){
+        Await.until("the initial bounded alert cleanup to finish",Duration.ofSeconds(30),()->{
+            var value=alert("health",Map.of()).get("maintenance");
+            return value instanceof Map<?,?> maintenance&&maintenance.get("lastSuccess")!=null;
+        },()->"initial alert cleanup has not finished");
+    }
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
+        HttpRequest request = get("/healthz");
+        long started = ClusterHealthProbe.started();
         try {
-            HttpResponse<String> response = send(get("/healthz"));
+            HttpResponse<String> response = send(request);
+            ClusterHealthProbe.response(request, response.statusCode(), response.body(), started);
             return response.statusCode() == 200 && "ok".equals(response.body());
         } catch (UncheckedIOException e) {
+            ClusterHealthProbe.failure(request, e, started);
             return false;
         }
     }
@@ -152,6 +196,26 @@ final class ControlPlane {
         }
         credential = token;
         cloudCookie = false;
+    }
+
+    /** Reads admission through the same native snapshot used by the application. */
+    Map<?, ?> storageStatus() {
+        var response = send(authed("/api/storage/status", "{}"));
+        return readStorageStatus(response);
+    }
+
+    Optional<Map<?, ?>> storageStatusDuringStartup() {
+        var response = send(authed("/api/storage/status", "{}"));
+        if (response.statusCode() == 503
+                && io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(readStorageStatus(response));
+    }
+
+    private static Map<?, ?> readStorageStatus(HttpResponse<String> response) {
+        expect(response, 200, "read native storage admission");
+        return (Map<?, ?>) JsonReader.parse(response.body());
     }
 
     /** Redeems one code once; the real SDK and server create the local session. */
@@ -210,7 +274,7 @@ final class ControlPlane {
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        HttpResponse<String> response = send(applyRequest(body));
         expect(response, 200, "apply " + contentBySource.keySet());
         return warningsOf(response.body());
     }
@@ -225,6 +289,12 @@ final class ControlPlane {
      */
     List<Map<String, Object>> preview(
             String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        return preview(pipelineId, outputId, rootLimit, sampleId, drafts, null);
+    }
+
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts,
+            String language) {
         List<Map<String, String>> encodedDrafts = drafts.stream()
                 .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
                 .toList();
@@ -234,7 +304,7 @@ final class ControlPlane {
         request.put("rootLimit", rootLimit);
         request.put("sampleId", sampleId);
         request.put("drafts", encodedDrafts);
-        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        HttpResponse<String> response = sourceResponse("POST", "/api/artifacts:preview", request, null, language);
         expect(response, 200, "preview Pipeline " + pipelineId);
         String contentType = response.headers().firstValue("content-type").orElse("");
         if (!contentType.startsWith("application/x-ndjson")) {
@@ -293,7 +363,7 @@ final class ControlPlane {
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        HttpResponse<String> response = send(applyRequest(body));
         return interpretRefusal(response.statusCode(), response.body(), "applying " + contentBySource.keySet());
     }
 
@@ -306,7 +376,7 @@ final class ControlPlane {
 
     /** Applies one document written against the version {@code expectedContentHash} names. */
     void applyExpecting(String source, String content, String expectedContentHash) {
-        expect(send(authed("/api/artifacts:apply", applyBody(List.of(
+        expect(send(applyRequest(applyBody(List.of(
                         new Draft(source, content, expectedContentHash))))),
                 200, "apply " + source + " against version " + expectedContentHash);
     }
@@ -317,8 +387,7 @@ final class ControlPlane {
      * is kept apart from its success: one return value cannot mean both.
      */
     Refusal applyExpectingRefusal(String source, String content, String expectedContentHash) {
-        HttpResponse<String> response = send(authed("/api/artifacts:apply",
-                applyBody(List.of(new Draft(source, content, expectedContentHash)))));
+        HttpResponse<String> response = send(applyRequest(applyBody(List.of(new Draft(source, content, expectedContentHash)))));
         return interpretRefusal(response.statusCode(), response.body(), "applying " + source);
     }
 
@@ -340,6 +409,21 @@ final class ControlPlane {
     /** The ids the server holds - read back from the server, which is the truth, not from the files sent. */
     List<String> artifactIds() {
         HttpResponse<String> response = send(authedGet("/api/artifacts"));
+        return artifactIds(response);
+    }
+
+    /** A fault witness can wait through the driver's transaction retry window, preserving coded refusals. */
+    Optional<List<String>> artifactIdsIfConfigurationAvailable(Duration timeout) {
+        HttpResponse<String> response = send(authedGet("/api/artifacts", timeout));
+        if (response.statusCode() == 503
+                && Set.of(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE.code(),
+                        io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code()).contains(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(artifactIds(response));
+    }
+
+    private static List<String> artifactIds(HttpResponse<String> response) {
         expect(response, 200, "list artifacts");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("artifacts") instanceof List<?> artifacts)) {
@@ -803,6 +887,50 @@ final class ControlPlane {
         return asObject(map);
     }
 
+    /** Reads a durable authoring draft, distinguishing an absent draft from a failed read. */
+    Optional<Map<String, Object>> pipelineDraft(String id) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/draft"));
+        if (response.statusCode() == 404) return Optional.empty();
+        expect(response, 200, "read pipeline draft " + id);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("the pipeline draft read was not an object: " + response.body());
+        }
+        return Optional.of(asObject(map));
+    }
+
+    /** The merged catalog that backs the Web list. */
+    List<String> pipelineCatalogIds() {
+        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=0"));
+        expect(response, 200, "read the Pipeline catalog");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("items") instanceof List<?> items)) {
+            throw new AssertionError("the pipeline catalog was not a list: " + response.body());
+        }
+        return items.stream().map(item -> {
+            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String id)) {
+                throw new AssertionError("the pipeline catalog contained an invalid entry: " + item);
+            }
+            return id;
+        }).toList();
+    }
+
+    /** Removes the applied Pipeline and the exact authoring revision the caller read. */
+    void deletePipeline(String id, String artifactHash, long draftRevision) {
+        expect(send(pipelineDelete(id, artifactHash, draftRevision)), 204, "delete the whole Pipeline " + id);
+    }
+
+    Refusal deletePipelineExpectingRefusal(String id, String artifactHash, long draftRevision) {
+        HttpResponse<String> response = send(pipelineDelete(id, artifactHash, draftRevision));
+        return interpretRefusal(response.statusCode(), response.body(), "deleting the whole Pipeline " + id);
+    }
+
+    private HttpRequest pipelineDelete(String id, String artifactHash, long draftRevision) {
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/pipelines/" + urlSegment(id)))
+                .timeout(TIMEOUT).DELETE())
+                .header("If-Match", "\"" + artifactHash + "\"")
+                .header("If-Draft-Match", "\"" + draftRevision + "\"").build();
+    }
+
     /** Reads the aggregate lifecycle projection for a known pipeline draft. */
     Map<String, Object> pipelineStatus(String id) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/status"));
@@ -848,6 +976,17 @@ final class ControlPlane {
     /** Removes the artifact {@code id}, offering {@code expectedContentHash} as the version the caller read. */
     void deleteArtifact(String id, String expectedContentHash) {
         expect(send(authedDelete(id, expectedContentHash)), 204, "delete " + id);
+    }
+
+    /** Returns false only when the current server refuses the deletion with its workload claim fence. */
+    boolean deleteArtifactWhenClaimAvailable(String id, String expectedContentHash) {
+        var response = send(authedDelete(id, expectedContentHash));
+        if (response.statusCode() == 500
+                && io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED.code().equals(codeOf(response.body()))) {
+            return false;
+        }
+        expect(response, 204, "delete " + id);
+        return true;
     }
 
     /**
@@ -1287,6 +1426,12 @@ final class ControlPlane {
                 200, verb.id() + " " + pipelineId);
     }
 
+    /** A refused admission must be a coded client response, never an accepted intent or server failure. */
+    Refusal startExpectingRefusal(String pipelineId) {
+        var response = send(authed("/api/pipelines/" + urlSegment(pipelineId) + ":start", ""));
+        return interpretRefusal(response.statusCode(), response.body(), "starting " + pipelineId);
+    }
+
     /**
      * Starts the pipeline unless it is running already, and answers whether this call is what started it.
      *
@@ -1307,7 +1452,7 @@ final class ControlPlane {
 
     private static boolean refusedAsAlreadyRunning(String body) {
         return JsonReader.parse(body) instanceof Map<?, ?> refusal
-                && "lifecycle.illegal-transition".equals(refusal.get("code"))
+                && "TS0280001".equals(refusal.get("code"))
                 && refusal.get("params") instanceof Map<?, ?> params
                 && PipelineState.RUNNING.name().equals(params.get("from"));
     }
@@ -1320,6 +1465,89 @@ final class ControlPlane {
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.STOP.id(),
                         "{\"purgeState\":" + purgeState + "}")),
                 200, LifecycleVerb.STOP.id() + " " + pipelineId);
+    }
+
+    /** What a start of the pipeline would be asked, read without starting it: its start checks report. */
+    Map<String, Object> startChecks(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/start-checks"));
+        expect(response, 200, "read the start checks of " + pipelineId);
+        return asObject((Map<?, ?>) JsonReader.parse(response.body()));
+    }
+
+    /**
+     * Starts the pipeline the way a person who was asked does: reads what its start checks ask, and answers
+     * every question {@code check} asks with {@code action}, against the definition the checks read. With
+     * nothing asked it is the plain start.
+     *
+     * <p>A question from another check fails the call rather than being answered: a case answers what it
+     * expects to be asked, and a question it did not expect is a finding of its own.
+     */
+    void startAnswering(String pipelineId, String check, String action) {
+        Map<String, Object> report = startChecks(pipelineId);
+        List<Map<String, Object>> decisions = new ArrayList<>();
+        for (Object item : (List<?>) report.get("findings")) {
+            Map<?, ?> finding = (Map<?, ?>) item;
+            if (!"CONFIRM".equals(finding.get("behavior"))) {
+                continue;
+            }
+            if (!check.equals(finding.get("check"))) {
+                throw new AssertionError("starting " + pipelineId + " asks " + finding.get("key")
+                        + ", which this case does not answer: " + finding.get("message"));
+            }
+            decisions.add(Map.of("finding", finding.get("key"), "action", action));
+        }
+        StartAnswer answer = start(pipelineId, decisions,
+                decisions.isEmpty() ? null : (String) report.get("contentHash"));
+        if (answer.status() != 200) {
+            throw new AssertionError("could not start " + pipelineId + " answering " + check + "=" + action
+                    + ": expected HTTP 200, got " + answer.status() + " - " + answer.body());
+        }
+    }
+
+    /**
+     * How a start was answered, refused or not: the HTTP status and the decoded body.
+     *
+     * @param body the body as the product sent it; empty when it sent none
+     */
+    record StartAnswer(int status, Map<String, Object> body) {
+
+        /** The start checks report the answer carried, or an empty map when it carried none. */
+        Map<String, Object> startChecks() {
+            return body.get("startChecks") instanceof Map<?, ?> report ? asObject(report) : Map.of();
+        }
+
+        /** The findings of {@link #startChecks()}, in the order the product listed them. */
+        List<Map<String, Object>> findings() {
+            List<Map<String, Object>> findings = new ArrayList<>();
+            if (startChecks().get("findings") instanceof List<?> listed) {
+                listed.forEach(item -> findings.add(asObject((Map<?, ?>) item)));
+            }
+            return findings;
+        }
+    }
+
+    /**
+     * Sends a start carrying {@code decisions} under {@code contentHash}, and answers whatever the product
+     * said: for a case about a start that is refused, and about the answers that get one through. No answers
+     * is a bare start; a null hash sends no precondition.
+     */
+    StartAnswer start(String pipelineId, List<Map<String, Object>> decisions, String contentHash) {
+        HttpRequest.Builder request = HttpRequest.newBuilder(
+                        baseUrl.resolve("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.START.id()))
+                .timeout(TIMEOUT)
+                .header("Authorization", "Bearer " + requireCredential());
+        if (decisions.isEmpty()) {
+            request.POST(HttpRequest.BodyPublishers.noBody());
+        } else {
+            request.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(
+                    JsonWriter.write(Map.of("decisions", decisions)), StandardCharsets.UTF_8));
+        }
+        if (contentHash != null) {
+            request.header("If-Match", "\"" + contentHash + "\"");
+        }
+        HttpResponse<String> response = send(request.build());
+        Object body = response.body() == null || response.body().isBlank() ? null : JsonReader.parse(response.body());
+        return new StartAnswer(response.statusCode(), body instanceof Map<?, ?> map ? asObject(map) : Map.of());
     }
 
     /**
@@ -1336,8 +1564,13 @@ final class ControlPlane {
      * its whole bound before saying so.
      */
     Optional<PipelineState> state(String pipelineId) {
-        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
-        return interpretState(response.statusCode(), response.body(), pipelineId);
+        HttpRequest request = authedGet("/api/pipelines/" + pipelineId + "/status");
+        HttpResponse<String> response = send(request);
+        Optional<PipelineState> state = interpretState(response.statusCode(), response.body(), pipelineId);
+        ClusterHealthProbe.pipelineStatus(request, response.statusCode(), response.body(), pipelineId,
+                state,
+                () -> interpretFailureCode(response.statusCode(), response.body(), pipelineId));
+        return state;
     }
 
     /**
@@ -1881,7 +2114,8 @@ final class ControlPlane {
      * <p>The per-run counter is read from the metrics face. The snapshot face reports completed load
      * progress across replacement runs, so it cannot say whether the live run read a table again. A
      * resumed run that skips a table reports zero here while the target still holds its earlier rows.
-     * Every selected table appears while its run is live; a missing key is a broken reading.
+     * Tables arrive individually after their bounded reads finish. This sampled observation can lag a
+     * sink's durable completion record, so callers needing several tables must wait for all of them.
      */
     Map<String, Long> snapshotRowsRead(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
@@ -1905,6 +2139,29 @@ final class ControlPlane {
             }
         }
         return read;
+    }
+
+    /** A fresh publication allowance after the caller has proved durable completion. */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> metricKeys) {
+        return awaitSnapshotRowsRead(pipelineId, metricKeys, SNAPSHOT_METRICS_PUBLICATION_TIMEOUT);
+    }
+
+    /**
+     * The accepted sample itself, containing every requested key from {@link #snapshotRowsRead}.
+     * Unique table names are bare; colliding names are {@code sourceId.table}. Keys and counts are
+     * preserved without aliasing or aggregation. The caller asserts the exact counts afterwards.
+     */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> metricKeys, Duration bound) {
+        if (bound.isZero() || bound.isNegative()) {
+            throw new IllegalArgumentException("snapshot metric publication bound must be positive");
+        }
+        AtomicReference<Map<String, Long>> observed = new AtomicReference<>(Map.of());
+        Await.until("snapshot read metrics for every requested key " + metricKeys, bound, () -> {
+            Map<String, Long> sample = snapshotRowsRead(pipelineId);
+            observed.set(sample);
+            return sample.keySet().containsAll(metricKeys);
+        }, () -> observed.get().toString());
+        return observed.get();
     }
 
     /**
@@ -1931,6 +2188,19 @@ final class ControlPlane {
             });
         }
         return tables;
+    }
+
+    /** Current-run load facts, absent until the runtime publishes them through the snapshot face. */
+    Optional<Map<?, ?>> initialLoad(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        expect(response, 200, "read the initial load of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> answer)) {
+            throw new AssertionError("snapshot answer was not an object: " + response.body());
+        }
+        return answer.get("initialLoad") instanceof Map<?, ?> load ? Optional.of(load) : Optional.empty();
     }
 
     Optional<TableSnapshot> snapshotTable(String pipelineId, String table) {
@@ -2154,7 +2424,7 @@ final class ControlPlane {
      */
     private HttpRequest authedDelete(String id, String expectedContentHash) {
         HttpRequest.Builder builder = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
-                .timeout(TIMEOUT)
+                .timeout(io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT)
                 .DELETE());
         if (expectedContentHash != null) {
             builder.header("If-Match", "\"" + expectedContentHash + "\"");
@@ -2163,8 +2433,12 @@ final class ControlPlane {
     }
 
     private HttpRequest authedGet(String path) {
+        return authedGet(path, TIMEOUT);
+    }
+
+    private HttpRequest authedGet(String path, Duration timeout) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
-                .timeout(TIMEOUT)
+                .timeout(timeout)
                 .GET()).build();
     }
 
@@ -2177,6 +2451,22 @@ final class ControlPlane {
     }
 
     /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
+    HttpResponse<String> retrySettings() {
+        var response = send(authedGet("/api/retry-settings"));
+        expect(response, 200, "read the cluster retry settings");
+        return response;
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults) {
+        return replaceRetrySettings(revision, defaults, Map.of());
+    }
+
+    HttpResponse<String> replaceRetrySettings(long revision, Map<String, Object> defaults,
+            Map<String, Map<String, Object>> operations) {
+        return send(authedPut("/api/retry-settings", JsonWriter.write(
+                Map.of("revision", revision, "defaults", defaults, "operations", operations))));
+    }
+
     private HttpRequest authedPut(String path, String body) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)
@@ -2186,6 +2476,11 @@ final class ControlPlane {
 
     private HttpRequest authed(String path, String body) {
         return authed(path, body, TIMEOUT);
+    }
+
+    /** Artifact configuration writes use the existing shared heavy-operation budget. */
+    private HttpRequest applyRequest(String body) {
+        return authed("/api/artifacts:apply", body, io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT);
     }
 
     /** The same request with a bound of the caller's own, for a body large enough to need one. */
@@ -2204,14 +2499,33 @@ final class ControlPlane {
 
     /** The typed Source wire, including its caller-visible ETag precondition. */
     HttpResponse<String> sourceRequest(String method, String path, Map<String, ?> body, String etag, int status) {
-        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
+        HttpResponse<String> response = sourceResponse(method,path,body,etag);
+        expect(response, status, method + " " + path);
+        return response;
+    }
+
+    /** Leaves an explicitly tested alternative outcome to the calling witness's own assertions. */
+    HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag) {
+        return sourceResponse(method, path, body, etag, TIMEOUT, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag,Duration timeout) {
+        return sourceResponse(method, path, body, etag, timeout, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag, String language) {
+        return sourceResponse(method, path, body, etag, TIMEOUT, language);
+    }
+
+    private HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag,
+                                              Duration timeout, String language) {
+        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(timeout))
                 .header("Content-Type", "application/json");
+        if (language != null) request.header("Accept-Language", language);
         if (etag != null) request.header("If-Match", etag);
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));
-        HttpResponse<String> response = send(request.build());
-        expect(response, status, method + " " + path);
-        return response;
+        return send(request.build());
     }
 
     /**

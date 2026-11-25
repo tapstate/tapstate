@@ -36,9 +36,8 @@ class TwoMembersFormOneClusterIT {
 
     @Test
     void twoProcessesFindEachOtherAndBothAnswerTheSameMembership() {
-        String store = SharedMongo.replicaSetUrl("e2e_two_members");
-
-        try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-two-members")) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
             List<String> asAsees = cluster.awaitBothMembers();
 
             assertThat(asAsees)

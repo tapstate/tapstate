@@ -87,41 +87,22 @@ class AFailedHandoffLeavesWhatItWasCarryingTest {
         assertThat(stores.forParking(POLICIES).count()).isPositive();
     }
 
-    /**
-     * The same shape where the durable half is the dead-letter channel rather than the parking area. A
-     * deleted parent releases the children waiting under it, and they are released by being written
-     * somewhere - so the entry may not be emptied until that write is done.
-     */
     @Test
-    void aFailedDeadLetterWriteLeavesTheChildrenInTheEntryToo() throws Exception {
-        NestBinding.NestStores stores = HeapNestStores.onHeap();
-        ResolverProcessor deleting = resolver(stores.forParking(POLICIES), (from, released) -> {
-            throw new IllegalStateException("dead-letter write refused");
-        });
-        feed(deleting, CLAIMS, claim(1, "K1", "P1"));
-
-        assertThatThrownBy(() -> feed(deleting, OWN_ROWS, policyDeleted(RENAMED_AT, "P1", "C1")))
-                .isInstanceOf(IllegalStateException.class);
-
-        assertThat(mappings.load(List.of("P1")).waiting())
-                .describedAs("a child released by a deletion is released by being written somewhere; until "
-                        + "that write is done this entry is still the only place it is")
-                .hasSize(1);
+    void aParentDeletionDoesNotConsultAnUnrelatedFailingDeadLetterChannel() throws Exception {
+        NestBinding.NestStores stores=HeapNestStores.onHeap();
+        ResolverProcessor deleting=resolver(stores.forParking(POLICIES),(from,released) -> {throw new AssertionError("a missing parent does not abandon its children");});
+        feed(deleting,CLAIMS,claim(1,"K1","P1"));feed(deleting,OWN_ROWS,policyDeleted(RENAMED_AT,"P1","C1"));
+        assertThat(mappings.load(List.of("P1")).waiting()).hasSize(1);assertThat(mappings.load(List.of("P1")).deleted()).isTrue();
     }
 
-    /** The discrimination: with a channel that accepts the write, the deletion does release them. */
     @Test
-    void aDeadLetterWriteThatLandsDoesEmptyTheEntry() throws Exception {
-        NestBinding.NestStores stores = HeapNestStores.onHeap();
-        List<ReleasedChild> written = new ArrayList<>();
-        ResolverProcessor deleting = resolver(stores.forParking(POLICIES),
-                (from, released) -> written.add(released));
-        feed(deleting, CLAIMS, claim(1, "K1", "P1"));
-
-        feed(deleting, OWN_ROWS, policyDeleted(RENAMED_AT, "P1", "C1"));
-
-        assertThat(written).hasSize(1);
-        assertThat(mappings.load(List.of("P1")).waiting()).isEmpty();
+    void aParentRecreationReleasesTheRetainedWaitingWithoutWritingDeadLetter() throws Exception {
+        NestBinding.NestStores stores=HeapNestStores.onHeap();List<ReleasedChild> written=new ArrayList<>();
+        ResolverProcessor deleting=resolver(stores.forParking(POLICIES),(from,released) -> written.add(released));
+        feed(deleting,CLAIMS,claim(1,"K1","P1"));feed(deleting,OWN_ROWS,policyDeleted(RENAMED_AT,"P1","C1"));
+        assertThat(written).isEmpty();assertThat(mappings.load(List.of("P1")).waiting()).hasSize(1);
+        feed(deleting,OWN_ROWS,Envelope.insert(RENAMED_AT+1,"policy",row("policy_id","P1","customer_id","C1","policy_no","PN-P1"),null).withOrder(at(RENAMED_AT+1)));
+        assertThat(mappings.load(List.of("P1")).waiting()).isEmpty();assertThat(written).isEmpty();
     }
 
     // ---- harness ------------------------------------------------------------------------

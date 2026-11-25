@@ -80,10 +80,9 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
         FileEndpoints.replaceTable(refusedSource.resolve("orders.csv"), "id,name\n1,one\n");
         FileEndpoints.replaceTable(tailSource.resolve("orders.csv"), "id,name\n2,two\n");
 
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("connector_words_state"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             // The jar goes in a directory of its own, not in the one both pipelines write their rows into:
             // a file target enumerates what is in its directory, and a case about connector log attribution
             // must not be the thing that reddens when it starts counting a file it did not put there.
@@ -112,8 +111,8 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                             && control.logs(REFUSED_PIPELINE).contains(ON_THE_SHARED_CHANNEL),
                     () -> control.logs(REFUSED_PIPELINE));
 
-            CliOnce.Run refused = CliOnce.runSession(PASSWORD, "logs " + REFUSED_PIPELINE + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            CliOnce.Run refused = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "logs", REFUSED_PIPELINE);
             assertThat(refused.exitCode())
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s",
                             refused.stdout(), refused.stderr())
@@ -135,8 +134,8 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                             && control.logs(TAIL_PIPELINE).contains(FROM_THE_TAIL_ALOUD),
                     () -> control.logs(TAIL_PIPELINE));
 
-            CliOnce.Run tail = CliOnce.runSession(PASSWORD, "logs " + TAIL_PIPELINE + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            CliOnce.Run tail = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "logs", TAIL_PIPELINE);
             assertThat(tail.stdout())
                     .as("what a connector says from the thread its tail runs on")
                     .contains(FROM_THE_TAIL)

@@ -7,6 +7,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import textwrap
 import subprocess
 import sys
 import tarfile
@@ -89,7 +91,7 @@ class StageConnectorsTest(unittest.TestCase):
 
     def make_jar(self, connector_id: str, *, spec_id: str | None = None,
                  pdk_version: str = "2.0.5-SNAPSHOT", spec_path: str | None = None,
-                 implementation_title: str | None = None) -> None:
+                 implementation_title: str | None = None, authentication: str | None = None) -> None:
         jar_path = self.jars / f"{connector_id}-connector.jar"
         spec_path = spec_path or f"{connector_id}-spec.json"
         title = implementation_title or (
@@ -98,9 +100,13 @@ class StageConnectorsTest(unittest.TestCase):
         manifest = (
             "Manifest-Version: 1.0\r\n"
             f"Implementation-Title: {title}\r\n"
+            "Implementation-Version: 2.5.0\r\n"
             f"Git-Commit-Id: {'a' * 40}\r\n"
-            f"PDK-API-Version: {pdk_version}\r\n\r\n"
+            f"PDK-API-Version: {pdk_version}\r\n"
         )
+        if authentication is not None:
+            manifest += f"Authentication: {authentication}\r\n"
+        manifest += "\r\n"
         with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_STORED) as jar:
             jar.writestr("META-INF/MANIFEST.MF", manifest)
             jar.writestr(spec_path, json.dumps({"properties": {"id": spec_id or connector_id}}))
@@ -134,7 +140,7 @@ class StageConnectorsTest(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         with patch.object(PREPARE.subprocess, "run", side_effect=response) as downloaded:
             PREPARE.prepare(self.lock, self.staged)
-        self.assertEqual(downloaded.call_count, 10)
+        self.assertEqual(downloaded.call_count, 11)
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
 
     def test_tampered_public_test_input_fails_without_producing_output(self) -> None:
@@ -174,8 +180,8 @@ class StageConnectorsTest(unittest.TestCase):
                  label_overrides: dict[str, str | None] | None = None,
                  runtime_users: dict[str, str | None] | None = None,
                  runtime_env: dict[str, list[str]] | None = None,
-                 duplicate_profile_label: bool = False) -> Path:
-        MODULE.stage(self.lock, self.jars, self.staged)
+                 duplicate_profile_label: bool = False, required_ids=None) -> Path:
+        MODULE.stage(self.lock, self.jars, self.staged, required_ids or MODULE.REQUIRED_IDS)
         layout = self.root / "oci"
         (layout / "blobs/sha256").mkdir(parents=True)
 
@@ -253,6 +259,34 @@ class StageConnectorsTest(unittest.TestCase):
         (layout / "index.json").write_text(json.dumps({"manifests": [{"digest": top_digest}]}), encoding="utf-8")
         return layout
 
+    def published_lock(self, required_ids):
+        self.entries = [entry for entry in self.entries if entry["id"] in required_ids]
+        for path in self.jars.glob("*.jar"):
+            if path.stem.removesuffix("-connector") not in required_ids:
+                path.unlink()
+        for entry in self.entries:
+            artifact_id = "mssql-connector" if entry["id"] == "sqlserver" else entry["id"] + "-connector"
+            entry.update(groupId="io.tapdata", artifactId=artifact_id, version="2.5.0")
+        if set(required_ids) == set(MODULE.CLOUD_IDS):
+            self.license_files = []
+        self.lock.write_text(json.dumps({"schemaVersion": 3, "connectors": self.entries,
+                                        "licenseFiles": self.license_files}))
+
+    def test_published_cloud_oci_carries_four_bootstrap_artifacts(self) -> None:
+        self.published_lock(MODULE.CLOUD_IDS)
+        layout = self.make_oci(required_ids=MODULE.CLOUD_IDS)
+        self.verify_image(layout)
+
+    def test_published_onprem_oci_carries_eight_artifacts_including_dummy(self) -> None:
+        self.published_lock(MODULE.PUBLISHED_ONPREM_IDS)
+        self.boot_jar = self.make_boot_jar(profile="onprem", console_url=None)
+        layout = self.make_oci(required_ids=MODULE.PUBLISHED_ONPREM_IDS,
+                label_overrides={"io.tapstate.distribution": "onprem", "io.tapstate.web.profile": "onprem",
+                                 "io.tapstate.web.cloud-console-url": None},
+                runtime_users={"amd64": "tapstate", "arm64": "tapstate"},
+                runtime_env={arch: ["TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"] for arch in ("amd64", "arm64")})
+        IMAGE.verify(layout, self.lock, web_profile="onprem", cloud_console_url=None)
+
     def test_stages_exact_verified_bytes_and_lock(self) -> None:
         MODULE.stage(self.lock, self.jars, self.staged)
         self.assertEqual(
@@ -261,28 +295,80 @@ class StageConnectorsTest(unittest.TestCase):
         )
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
         lines = (self.staged / "release/connectors.sha256").read_text(encoding="ascii").splitlines()
-        self.assertEqual(len(lines), 8)
+        self.assertEqual(len(lines), 9)
         for entry in self.entries:
             self.assertIn(f"{entry['sha256']}  {entry['id']}-connector.jar", lines)
         for entry in self.license_files:
             staged_license = self.staged / "release/licenses" / entry["name"]
             self.assertEqual(staged_license.read_bytes(), (self.jars / entry["name"]).read_bytes())
 
-    def test_bundled_db2_runtime_has_a_bound_without_expanding_other_connector_budgets(self) -> None:
-        db2 = next(entry for entry in self.entries if entry["id"] == "db2")
-        db2["bytes"] = 203_082_147
-        self.write_lock()
-        entries, _ = MODULE.read_lock(self.lock)
-        self.assertEqual(next(entry for entry in entries if entry["id"] == "db2")["bytes"], 203_082_147)
-        db2["bytes"] = 256 * 1024 * 1024 + 1
-        self.write_lock()
-        with self.assertRaisesRegex(MODULE.StageError, "db2: invalid shaded JAR length"):
-            MODULE.read_lock(self.lock)
-        db2["bytes"] = 203_082_147
-        next(entry for entry in self.entries if entry["id"] == "mysql")["bytes"] = 203_082_147
-        self.write_lock()
-        with self.assertRaisesRegex(MODULE.StageError, "mysql: invalid shaded JAR length"):
-            MODULE.read_lock(self.lock)
+    def test_cli_reports_invalid_lock_with_staging_refusal(self) -> None:
+        cases = (
+            (None, "cannot read connector lock"),
+            ("{", "cannot read connector lock"),
+            ("[]", "connector lock must have schemaVersion"),
+            ('{"schemaVersion":2,"schemaVersion":3}', "duplicate JSON field: schemaVersion"),
+        )
+        for index, (payload, expected) in enumerate(cases):
+            with self.subTest(payload=payload):
+                lock = self.root / f"invalid-{index}.json"
+                if payload is not None:
+                    lock.write_text(payload, encoding="utf-8")
+                result = subprocess.run([sys.executable, str(SCRIPT), "--lock", str(lock),
+                                         "--jar-dir", str(self.jars), "--stage-dir", str(self.staged)],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith(f"connector staging refused: {expected}"), result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(self.staged.exists())
+
+    def test_jar_size_limit_is_512_mb_for_every_connector(self) -> None:
+        for connector_id in ("db2", "mysql"):
+            with self.subTest(connector_id=connector_id):
+                connector = next(entry for entry in self.entries if entry["id"] == connector_id)
+                original_size = connector["bytes"]
+                connector["bytes"] = 512_000_000
+                self.write_lock()
+                entries, _ = MODULE.read_lock(self.lock)
+                self.assertEqual(next(entry for entry in entries if entry["id"] == connector_id)["bytes"], 512_000_000)
+                connector["bytes"] += 1
+                self.write_lock()
+                with self.assertRaisesRegex(MODULE.StageError, f"{connector_id}: invalid shaded JAR length"):
+                    MODULE.read_lock(self.lock)
+                connector["bytes"] = original_size
+
+    def test_cloud_workflows_download_only_locked_assets_from_a_larger_release(self) -> None:
+        repository = SCRIPT.parents[2]
+        # The release may contain optional connectors that are not Cloud startup seeds.
+        (self.jars / "db2i-connector.jar").write_bytes(b"optional preview")
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import fnmatch, os, pathlib, shutil, sys
+            args = sys.argv[1:]
+            assert args[:3] == ["release", "download", "connectors-preview"]
+            patterns = [args[i + 1] for i, arg in enumerate(args) if arg == "--pattern"]
+            destination = pathlib.Path(args[args.index("--dir") + 1])
+            for asset in pathlib.Path(os.environ["TEST_RELEASE_ASSETS"]).iterdir():
+                if not patterns or any(fnmatch.fnmatchcase(asset.name, pattern) for pattern in patterns):
+                    shutil.copyfile(asset, destination / asset.name)
+            """), encoding="utf-8")
+        gh.chmod(0o755)
+        for name in ("release-images.yml", "cloud-cluster-dev.yml"):
+            with self.subTest(workflow=name):
+                runtime = self.root / name
+                runtime.mkdir()
+                text = (repository / ".github/workflows" / name).read_text(encoding="utf-8")
+                start = text.index('          mkdir -p "$RUNNER_TEMP/cloud-jars"')
+                end = text.index("          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py", start)
+                download = textwrap.dedent(text[start:end])
+                env = dict(os.environ, RUNNER_TEMP=str(runtime), TEST_RELEASE_ASSETS=str(self.jars),
+                           PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+                subprocess.run(["bash", "-euo", "pipefail", "-c", download], cwd=repository, env=env, check=True)
+                MODULE.stage(self.lock, runtime / "cloud-jars", runtime / "staged")
+                self.assertEqual({path.name for path in (runtime / "staged/connectors").iterdir()},
+                                 {f"{entry['id']}-connector.jar" for entry in self.entries})
 
     def test_missing_or_extra_jar_refuses_without_staging(self) -> None:
         (self.jars / "mysql-connector.jar").unlink()
@@ -341,6 +427,25 @@ class StageConnectorsTest(unittest.TestCase):
         self.write_lock()
         MODULE.stage(self.lock, self.jars, self.staged)
         self.assertTrue((self.staged / "connectors/sqlserver-connector.jar").is_file())
+
+    def test_versioned_lock_uses_maven_title_and_checks_the_pdk_id_separately(self) -> None:
+        connector_id = "aliyun-db-mongodb"
+        artifact_id = "aliyun-mongodb-connector"
+        self.make_jar(connector_id, implementation_title=artifact_id)
+        wanted = ("mongodb", connector_id)
+        self.published_lock(wanted)
+        lock = json.loads(self.lock.read_text())
+        entry = next(item for item in lock["connectors"] if item["id"] == connector_id)
+        entry["artifactId"] = artifact_id
+        self.lock.write_text(json.dumps(lock))
+
+        MODULE.stage(self.lock, self.jars, self.staged, wanted, profile="op")
+        jar = self.staged / "connectors" / f"{connector_id}-connector.jar"
+        self.assertTrue(jar.is_file())
+        with self.assertRaisesRegex(MODULE.StageError, "Implementation-Title disagrees"):
+            MODULE.verify_jar(jar, dict(entry, artifactId="unrelated-connector"))
+        with self.assertRaisesRegex(MODULE.StageError, "spec id disagrees"):
+            MODULE.verify_jar(jar, dict(entry, id="different-pdk-id"))
 
     def test_unrelated_manifest_title_still_refuses(self) -> None:
         self.make_jar("sqlserver", implementation_title="unrelated-connector")

@@ -1,7 +1,7 @@
 package io.tapstate.app;
 
-import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
+import io.tapstate.core.catalog.SecretConfigPaths;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.logging.SecretRedactor;
@@ -110,9 +110,16 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public Optional<Resource> get(String id) {
-        return delegate.get(id);
+    public synchronized Optional<Resource> get(String id) {
+        var current = delegate.get(id); current.ifPresent(this::track); return current;
     }
+    @Override public synchronized Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
+        var current=delegate.sourceBinding(id);current.ifPresent(value->track(value.source()));return current;
+    }
+    @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
+
+    /** Native publication supplies only identities; refresh current committed values under the same mutation lock. */
+    synchronized void refreshLoaded(java.util.Set<String> ids) { ids.forEach(this::get); }
 
     /** Registers a store-proven startup winner, never a candidate from a refused write. */
     synchronized void trackLoaded(Resource resource) {
@@ -120,13 +127,43 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public List<Resource> list() {
-        return delegate.list();
+    public synchronized List<Resource> list() {
+        var current = delegate.list(); current.forEach(this::track); return current;
     }
 
     @Override
     public List<StoredArtifactRecord> listStored() {
         return delegate.listStored();
+    }
+
+    @Override public synchronized List<Resource> listReadable() {
+        return readableInventory().resources();
+    }
+
+    @Override public synchronized ReadableInventory readableInventory() {
+        return trackInventory(delegate.readableInventory());
+    }
+
+    @Override public synchronized Optional<ReadableInventory> draftPublicationInventory(
+            io.tapstate.core.model.PipelineResource candidate) {
+        return delegate.draftPublicationInventory(candidate).map(this::trackInventory);
+    }
+
+    @Override public synchronized ReadableInventory readableInventory(String kind) {
+        return trackInventory(delegate.readableInventory(kind));
+    }
+
+    @Override public synchronized ReadableInventory readableInventory(String kind, String id) {
+        return trackInventory(delegate.readableInventory(kind, id));
+    }
+
+    private ReadableInventory trackInventory(ReadableInventory inventory) {
+        boolean hasSources = inventory.resources().stream().anyMatch(SourceResource.class::isInstance);
+        if (!hasSources) { inventory.resources().forEach(this::track); return inventory; }
+        TapstateCatalog captured = inventory.connectorCatalog().orElseGet(catalog);
+        inventory.resources().forEach(resource -> track(resource, () -> captured));
+        return new ReadableInventory(inventory.resources(), Optional.of(captured), inventory.managedDefaultSourceId(),
+                inventory.exactLookupIds());
     }
 
     @Override
@@ -137,26 +174,46 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return delegate.listStored(kind);
     }
 
+    @Override public java.util.function.Function<SourceResource, Runnable> resolvedSourceTracking() {
+        TapstateCatalog captured = catalog.get();
+        return source -> {
+            String probe = "start-probe:" + java.util.UUID.randomUUID();
+            redactor.replace(probe, secretValues(source, () -> captured));
+            return () -> redactor.remove(probe);
+        };
+    }
+
     private void track(Resource resource) {
+        track(resource, catalog);
+    }
+
+    private void track(Resource resource, Supplier<TapstateCatalog> selectedCatalog) {
         if (!(resource instanceof SourceResource source)) {
             redactor.remove(resource.id());
             return;
         }
-        redactor.replace(source.id(), secretValues(source));
+        redactor.replace(source.id(), secretValues(source, selectedCatalog));
     }
 
-    private Collection<String> secretValues(SourceResource source) {
+    private Collection<String> secretValues(SourceResource source, Supplier<TapstateCatalog> selectedCatalog) {
+        List<String> secrets = new ArrayList<>();
+        if (("mongodb".equals(source.connector()) || "mongodb-atlas".equals(source.connector()))
+                && source.config().get(io.tapstate.control.core.StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca) {
+            secrets.add(ca);
+            // Structured and multiline logs can escape or indent the original bundle differently.
+            ca.lines().filter(line -> !line.isBlank()).forEach(secrets::add);
+        }
         ConnectorCatalogEntry connector;
         try {
-            connector = catalog.get().byId(source.connector());
+            connector = selectedCatalog.get().byId(source.connector());
         } catch (IllegalArgumentException unavailable) {
-            return namedSecretValues(source.config());
+            secrets.addAll(namedSecretValues(source.config()));
+            SecretConfigPaths.shared().forEach(path -> collectScalars(path.value(source.config()), secrets));
+            return secrets;
         }
 
-        List<String> secrets = new ArrayList<>();
-        connector.config().stream()
-                .filter(ConfigField::secret)
-                .map(field -> configValue(source.config(), field.name()))
+        SecretConfigPaths.forConnector(connector).stream()
+                .map(path -> path.value(source.config()))
                 .filter(Objects::nonNull)
                 .forEach(value -> collectScalars(value, secrets));
         boolean trackedMongoUri = "mongodb-atlas".equals(source.connector())
@@ -166,20 +223,6 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
             secrets.addAll(MongoUriUserInfo.secretValues(uri));
         }
         return secrets;
-    }
-
-    private static Object configValue(Map<String, Object> config, String name) {
-        if (config.containsKey(name)) {
-            return config.get(name);
-        }
-        Object current = config;
-        for (String part : name.split("\\.")) {
-            if (!(current instanceof Map<?, ?> map) || !map.containsKey(part)) {
-                return null;
-            }
-            current = map.get(part);
-        }
-        return current;
     }
 
     private static Collection<String> namedSecretValues(Object value) {

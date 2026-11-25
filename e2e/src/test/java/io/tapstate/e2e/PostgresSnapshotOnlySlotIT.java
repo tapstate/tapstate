@@ -13,7 +13,6 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.SoftAssertions.assertSoftly;
 
 /** A PostgreSQL load with no change tail must not retain a logical replication slot. */
 class PostgresSnapshotOnlySlotIT {
@@ -27,7 +26,7 @@ class PostgresSnapshotOnlySlotIT {
     }
 
     @Test
-    void aSnapshotOnlyLoadAndItsClearingStopLeaveNoReplicationSlot() throws Exception {
+    void aSnapshotOnlyLoadCompletesWithoutLeavingAReplicationSlot() throws Exception {
         Map<String, Object> postgres = SharedPostgres.settings("snapshot_only_slot_source_632");
         try (Connection connection = SharedPostgres.connect(postgres);
                 Statement statement = connection.createStatement()) {
@@ -36,11 +35,11 @@ class PostgresSnapshotOnlySlotIT {
         }
 
         String targetUri = SharedMongo.replicaSetUrl("snapshot_only_slot_target_632");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("snapshot_only_slot_store_632"), "snapshot_only_slot_state_632");
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
@@ -89,26 +88,14 @@ class PostgresSnapshotOnlySlotIT {
             Await.until("the snapshot row to reach MongoDB",
                     () -> mongo.count(target, "items") == 1,
                     () -> control.logs(PIPELINE));
-            Await.until("the snapshot-only pipeline to report RUNNING",
-                    () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+            Await.until("the snapshot-only pipeline to report COMPLETED",
+                    () -> control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent(),
                     () -> control.state(PIPELINE) + "; pipeline logs: " + control.logs(PIPELINE));
             List<PostgresSlots.Slot> afterLoad = PostgresSlots.of(postgres);
 
-            control.stop(PIPELINE, true);
-            Await.until("the clearing stop to report STOPPED",
-                    () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
-                    () -> control.state(PIPELINE) + "; pipeline logs: " + control.logs(PIPELINE));
-            List<PostgresSlots.Slot> afterClear = PostgresSlots.of(postgres);
-
-            assertSoftly(softly -> {
-                softly.assertThat(afterLoad)
-                        .as("snapshot_only has no change tail to consume or confirm a slot after its load")
-                        .isEmpty();
-                softly.assertThat(afterClear)
-                        .as("purgeState=true must leave no slot retaining WAL after snapshot_only is STOPPED; "
-                                + "slots after the load: %s", afterLoad)
-                        .isEmpty();
-            });
+            assertThat(afterLoad)
+                    .as("the completed snapshot-only run must leave no replication slot retaining WAL")
+                    .isEmpty();
         }
     }
 }

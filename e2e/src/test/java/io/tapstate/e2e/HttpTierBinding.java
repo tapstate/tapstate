@@ -25,9 +25,9 @@ import java.util.function.UnaryOperator;
  * class sees a URL. A second binding per tier would be two chances to drift, and drift is precisely
  * what "the same specification runs on both tiers" is a promise against.
  *
- * <p>Endpoints are learned by applying them. That mirrors the product's own rule - a source must be
- * applied before a pipeline can reference it by id - so the harness cannot address an endpoint the
- * product does not have either.
+ * <p>Endpoint addresses come from the declared resource files. Authored sources are applied before a
+ * pipeline can reference them; an installation-owned target is prepared before this binding is created
+ * and contributes its address without being sent through artifact apply.
  */
 final class HttpTierBinding implements TierBinding {
 
@@ -152,6 +152,14 @@ final class HttpTierBinding implements TierBinding {
             return;
         }
         control.lifecycle(pipelineId, verb);
+    }
+
+    @Override
+    public void startRefused(String pipelineId, String expectedCode) {
+        var refused = control.startExpectingRefusal(pipelineId);
+        if (refused.status() != 409 || !expectedCode.equals(refused.code()))
+            throw new AssertionError("expected start admission conflict " + expectedCode + ", got HTTP "
+                    + refused.status() + " " + refused.code());
     }
 
     @Override

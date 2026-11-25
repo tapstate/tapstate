@@ -127,7 +127,7 @@ class ConnectorArtifactRegistrarTest {
         assertThatThrownBy(() -> registrar.register(artifact, RegistrationSource.REGISTER))
                 .as("an unreadable upload must reach the connector-domain HTTP 400 mapping")
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).startsWith("connector.");
+                    assertThat(error.code()).isInstanceOf(ConnectorError.class);
                     assertThat(error.args()).containsKey("artifact");
                     assertThat(error.args().get("artifact")).asString()
                             .contains("tapstate-connector-").endsWith(".jar");
@@ -206,7 +206,7 @@ class ConnectorArtifactRegistrarTest {
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres",
                 "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
-                "db2");
+                "db2", "db2i", "dummy");
     }
 
     @Test

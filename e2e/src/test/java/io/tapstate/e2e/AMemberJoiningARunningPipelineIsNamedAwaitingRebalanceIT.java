@@ -70,8 +70,8 @@ class AMemberJoiningARunningPipelineIsNamedAwaitingRebalanceIT {
         EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_joining_member_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-joining-member")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -147,6 +147,25 @@ class AMemberJoiningARunningPipelineIsNamedAwaitingRebalanceIT {
                             () -> "rows at the target = " + files.count(targetAddress, TABLE) + ", was "
                                     + beforeTheChange + "; the pipeline is " + control.state(PIPELINE));
                     assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+
+                    control.stop(PIPELINE, false);
+                    Await.until("the original run to stop before an explicit restart", Duration.ofMinutes(1),
+                            () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                            () -> "state=" + control.state(PIPELINE));
+                    control.lifecycle(PIPELINE, LifecycleVerb.START);
+                    Await.until("the explicit restart to use the committed three-member topology", Duration.ofMinutes(1),
+                            () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent()
+                                    && control.executionGenerationOf(PIPELINE).filter(value -> value == generation + 1).isPresent(),
+                            () -> "state=" + control.state(PIPELINE) + ", generation=" + control.executionGenerationOf(PIPELINE));
+                    var restarted = control.executionPlan(PIPELINE).orElseThrow();
+                    assertThat(restarted.members()).containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B, JOINING);
+                    assertThat(restarted.nodeRequested(WRITERS).effective()).isEqualTo(9);
+                    assertThat(control.awaitingRebalance(PIPELINE)).isEmpty();
+                    long beforeRestartedChange = files.count(targetAddress, TABLE);
+                    files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
+                    Await.until("a change after the explicit restart to arrive", Duration.ofMinutes(1),
+                            () -> files.count(targetAddress, TABLE) > beforeRestartedChange,
+                            () -> "rows=" + files.count(targetAddress, TABLE) + ", state=" + control.state(PIPELINE));
                 } finally {
                     third.close();
                 }

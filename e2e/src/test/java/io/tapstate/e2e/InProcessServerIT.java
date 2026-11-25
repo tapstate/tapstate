@@ -38,9 +38,9 @@ class InProcessServerIT {
 
     @Test
     void appliedResourcesComeBackFromTheServerNotFromTheFileThatWasSent() {
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_apply"))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             control.apply(Map.of("e2e_probe.tap.yml", SOURCE));
 

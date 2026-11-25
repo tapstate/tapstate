@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.RowMapKeys;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -145,10 +146,14 @@ public final class SnapshotBuffer {
         BufferKey key = new BufferKey(pipelineId, ringName);
         Handoff handoff = handoffs.get(key);
         if (handoff == null) {
+            validate(row);
             queueOf(key).add(row);
             return;
         }
-        handoff.append(() -> queueOf(key).add(row), capacity);
+        handoff.append(() -> {
+            validate(row);
+            queueOf(key).add(row);
+        }, capacity);
     }
 
     /**
@@ -163,7 +168,10 @@ public final class SnapshotBuffer {
             @Override
             public void accept(Envelope row) {
                 Objects.requireNonNull(row, "row");
-                handoff.append(() -> queueOf(key).add(row), capacity, true);
+                handoff.append(() -> {
+                    validate(row);
+                    queueOf(key).add(row);
+                }, capacity, true);
             }
 
             @Override
@@ -243,6 +251,11 @@ public final class SnapshotBuffer {
      * ended, been started on or been released. The rows wait in the coordinate's queue, ahead of appends after the
      * load ended, so the load's rows are always the first ones a drain takes.
      */
+    private static void validate(Envelope row) {
+        RowMapKeys.validate(row.before(), "$/before");
+        RowMapKeys.validate(row.after(), "$/after");
+    }
+
     private static final class Handoff {
 
         private final ReentrantLock lock = new ReentrantLock();

@@ -8,13 +8,11 @@ This product includes software developed by Tapstate, Inc.
 Connector plugin jars distributed as release assets
 
 Tapstate loads connector plugins as separate, independently licensed artifacts;
-none of them are part of this source tree or of the standard Tapstate server
-image. For convenience, prebuilt connector jars are published as assets on the
-"connectors-preview" release for the online-runtime quickstart and explicit CLI
-registration without building the connector repositories first. The Cloud image
-target stages a byte-locked release set and includes the
-Oracle and Microsoft companion license texts under
-/opt/tapstate/release/licenses/. Those jars are shaded and carry their own
+none of them are part of this source tree. Prebuilt connector jars are
+published as assets on the "connectors-preview" release for the online-runtime
+quickstart and explicit CLI registration. The on-prem and Cloud release images
+ship their own byte-locked connector sets and include the Oracle and Microsoft
+companion license texts under /opt/tapstate/release/licenses/. Those jars are shaded and carry their own
 drivers on an isolated class loader:
 
   * mysql-connector.jar bundles Oracle MySQL Connector/J 8.0, licensed under
@@ -41,9 +39,15 @@ drivers on an isolated class loader:
   * db2-connector.jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13,
     governed by IBM's International Program License Agreement.
 
+  * db2i-connector.jar bundles IBM Toolbox for Java (JTOpen) 21.0.5, licensed
+    under the IBM Public License 1.0, whose complete text is license.html at the
+    jar root; its source is available from the JTOpen
+    project at https://github.com/IBM/JTOpen.
+
 The release carries companion copies of the Oracle Free Use Terms and the
 Microsoft MIT License beside the enterprise jars; the other jars carry their
-dependency notices under META-INF/. Those terms govern only the bundled drivers
+dependency notices under META-INF/ or, for JTOpen, in the jar-root license.html.
+Those terms govern only the bundled drivers
 and dependencies identified above; they do not alter the Apache-2.0 license of
-Tapstate itself. The Oracle, SQL Server and Db2 implementations are paid connector
-implementations; their use remains subject to the applicable Tapdata agreement.
+Tapstate itself. The Oracle, SQL Server, Db2 and Db2 for i implementations are
+paid connector implementations; their use remains subject to the applicable Tapdata agreement.

@@ -33,9 +33,10 @@ class APipelineOnlyCapturesReferencedTablesIT {
         FileEndpoints.replaceTable(sourceDirectory.resolve("pricebook2.csv"), "id,name\n1,first\n2,second\n");
         Path connectorJar = E2eConnectorJar.buildInto(Files.createDirectory(temporary.resolve("connectors")));
 
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("selected_tables_state"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(connectorJar));
 
             Map<String, String> resources = new LinkedHashMap<>();

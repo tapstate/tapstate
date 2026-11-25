@@ -64,17 +64,17 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
     void theSlotWaitsForTheTargetAndAKillWhileItIsUnreachableLosesNothing() throws Exception {
         Map<String, Object> source = SharedPostgres.settings("direct_waits_src");
         createTable(source);
-        String storeUri = SharedMongo.replicaSetUrl("direct_waits_store");
 
-        try (NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
             String targetUri = frozenTarget.uriForThisHost("direct_waits_target");
             String lastInside;
             String firstBefore;
 
-            RealProcessServer server = RealProcessServer.start(storeUri);
+            RealProcessServer server = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage);
             try {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 Map<String, String> resources = new LinkedHashMap<>();
@@ -112,15 +112,17 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
                                 PostgresSlots.of(source))
                         .isTrue();
 
+                String boot = originalBoot(storage);
                 server.kill();
+                awaitOriginalBootExpired(storage, boot);
             } finally {
                 server.close();
             }
             frozenTarget.thaw();
 
-            try (RealProcessServer restarted = RealProcessServer.start(storeUri)) {
+            try (RealProcessServer restarted = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(restarted.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.startUnlessRunning(PIPELINE);
                 List<Integer> expected = Stream.concat(Stream.of(1, 2),
                         IntStream.range(1000, 1000 + WHILE_FROZEN).boxed()).toList();
@@ -131,6 +133,35 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
                         () -> String.valueOf(PostgresSlots.of(source)));
                 assertThat(PostgresSlots.names(source)).as("one slot throughout").hasSize(1);
             }
+        }
+    }
+
+    private static String originalBoot(PreparedNativeStore storage) {
+        try (var client = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+            var claims = io.tapstate.adapters.mongostore.SystemCollections.CACHE_WORKLOAD_CLAIMS
+                    .on(client.getDatabase(storage.cacheDatabase()));
+            var sessions = claims.find(new org.bson.Document("_id.clusterId", storage.clusterId())
+                    .append("_id.resourceType", io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION.name()))
+                    .into(new java.util.ArrayList<org.bson.Document>());
+            assertThat(sessions).as("the original process's exact native node session").hasSize(1);
+            return sessions.getFirst().getString("ownerBootId");
+        }
+    }
+
+    private static void awaitOriginalBootExpired(PreparedNativeStore storage, String boot) {
+        assertThat(boot).isNotBlank();
+        try (var client = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+            var claims = io.tapstate.adapters.mongostore.SystemCollections.CACHE_WORKLOAD_CLAIMS
+                    .on(client.getDatabase(storage.cacheDatabase()));
+            Await.until("the killed process's original claims to expire before reusing its stable node id", BOUND,
+                    () -> claims.aggregate(List.of(
+                            new org.bson.Document("$match", new org.bson.Document("_id.clusterId", storage.clusterId())
+                                    .append("ownerBootId", boot)),
+                            new org.bson.Document("$project", new org.bson.Document("leased",
+                                    new org.bson.Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                            .into(new java.util.ArrayList<org.bson.Document>()).stream()
+                            .noneMatch(claim -> Boolean.TRUE.equals(claim.getBoolean("leased"))),
+                    () -> "original boot=" + boot);
         }
     }
 

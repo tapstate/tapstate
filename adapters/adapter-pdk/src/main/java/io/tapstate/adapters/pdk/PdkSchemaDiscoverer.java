@@ -78,11 +78,18 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
 
     @Override
     public SourceModel discover(ConnectionConfig config) {
+        return discover(config,true);
+    }
+
+    /** Explicit recovery preflight reads structure without starting potentially expensive row counts. */
+    public SourceModel discoverStructure(ConnectionConfig config) { return discover(config,false); }
+
+    private SourceModel discover(ConnectionConfig config,boolean countRows) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
         try {
             List<TapTable> tables = drive(connector);
-            return toSourceModel(tables, counts(connector, tables));
+            return toSourceModel(tables, countRows?counts(connector,tables):Map.of());
         } finally {
             connector.stopQuietly();
             connector.close();
@@ -128,16 +135,21 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
                         counted.put(table, count.count(connector.context(), table));
                     } catch (Throwable t) {
                         // Per table, so one source refusing to be counted does not cost the rest theirs.
-                        LOG.warn("connector {} could not count table {}: {}",
-                                connector.connectorId(), table.getId(), detail(t));
+                        LOG.warn("connector {} could not count table {} ({})",
+                                connector.connectorId(), table.getId(), failureType(t));
                     }
                 }
                 return null;
             });
         } catch (Throwable t) {
-            LOG.warn("connector {} could not be asked to count: {}", connector.connectorId(), detail(t));
+            LOG.warn("connector {} could not be asked to count ({})",
+                    connector.connectorId(), failureType(t));
         }
         return counted;
+    }
+
+    private static String failureType(Throwable failure) {
+        return failure.getClass().getSimpleName();
     }
 
     /**
@@ -159,10 +171,37 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
+            if (PdkConnectionTester.authenticationRejected(t)) {
+                throw new TapstateException(ConnectorError.DISCOVERY_AUTHENTICATION_REJECTED,
+                        Map.of("connector", connector.connectorId()), t);
+            }
+            if (connectionSelectionTimedOut(t)) {
+                throw new TapstateException(ConnectorError.DISCOVERY_CONNECTION_TIMEOUT,
+                        Map.of("connector", connector.connectorId()), t);
+            }
             throw new TapstateException(ConnectorError.DISCOVER_FAILED,
                     Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
         }
     }
+
+    private static boolean connectionSelectionTimedOut(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = failure; cause != null && seen.size() < 32 && seen.add(cause); cause = cause.getCause()) {
+            Class<?> actual = cause.getClass();
+            ClassLoader loader = actual.getClassLoader();
+            if (loader == null) continue;
+            try {
+                // A connector can carry its own driver. Resolve its exact timeout type without initialization.
+                if (actual == Class.forName("com.mongodb.MongoTimeoutException", false, loader)) return true;
+            } catch (ClassNotFoundException | LinkageError | SecurityException unavailable) {
+                // A different driver or a partially available connector cannot identify this cause.
+            }
+        }
+        return false;
+    }
+
+    /** Normalizes the actual open session's metadata without launching a separate discovery or count. */
+    static SourceModel structuralModel(List<TapTable> tables) { return toSourceModel(tables, Map.of()); }
 
     private static SourceModel toSourceModel(List<TapTable> tables, Map<TapTable, Long> counts) {
         List<SourceTable> mapped = new ArrayList<>(tables.size());

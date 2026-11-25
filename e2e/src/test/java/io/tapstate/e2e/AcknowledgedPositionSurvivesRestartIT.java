@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeAll;
@@ -59,16 +60,16 @@ class AcknowledgedPositionSurvivesRestartIT {
     void aKillWhileTheTargetIsUnreachableLosesNothingTheSourceAlreadyReleased() throws Exception {
         Map<String, Object> source = SharedPostgres.settings("ack_restart_src");
         createTable(source);
-        String storeUri = SharedMongo.replicaSetUrl("ack_restart_store");
 
-        try (NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
             String targetUri = frozenTarget.uriForThisHost("ack_restart_target");
             String lastInside;
 
-            RealProcessServer server = RealProcessServer.start(storeUri);
+            RealProcessServer server = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage);
             try {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 Map<String, String> resources = new LinkedHashMap<>();
@@ -108,9 +109,17 @@ class AcknowledgedPositionSurvivesRestartIT {
             }
             frozenTarget.thaw();
 
-            try (RealProcessServer restarted = RealProcessServer.start(storeUri)) {
+            try (RealProcessServer restarted = Await.answered("the same node to restart after its lease lapses",
+                    BOUND, () -> {
+                        try {
+                            return Optional.of((RealProcessServer) Tiers.REAL_PROCESS.launch(storage));
+                        } catch (AssertionError startup) {
+                            if (!startup.getMessage().contains("[TS0310028]")) throw startup;
+                            return Optional.empty();
+                        }
+                    })) {
                 ControlPlane control = new ControlPlane(restarted.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.startUnlessRunning(PIPELINE);
                 List<Integer> expected = Stream.concat(Stream.of(1, 2),
                         IntStream.range(1000, 1000 + WHILE_FROZEN).boxed()).toList();

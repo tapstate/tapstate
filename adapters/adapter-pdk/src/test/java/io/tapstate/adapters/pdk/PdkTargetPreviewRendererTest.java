@@ -1,6 +1,8 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.RowValueError;
 import io.tapstate.core.model.SourceResource;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -11,6 +13,8 @@ import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.AbstractMap;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -126,11 +130,58 @@ class PdkTargetPreviewRendererTest {
         }
 
         assertThatThrownBy(() -> renderer.render(null, List.of(Map.of("nested", invalid)), () -> { }))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("field names must be strings");
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$/nested", "keyType", "java.lang.Integer"));
+                });
         assertThatThrownBy(() -> renderer.render(null, List.of(tooDeep), () -> { }))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("nesting limit");
+    }
+
+    @Test
+    void mongoPreviewRejectsTheSameKeyBeforeResolvingTheTarget() {
+        AtomicInteger resolutions = new AtomicInteger();
+        PdkTargetPreviewRenderer renderer = new PdkTargetPreviewRenderer(id -> {
+            resolutions.incrementAndGet();
+            throw new AssertionError("invalid rows must not open a target connector");
+        });
+        SourceResource target = new SourceResource(
+                "mongo_target", null, "mongodb", Map.of(), null, null, null, null);
+        assertThatThrownBy(() -> renderer.render(target,
+                List.of(Map.of("dict", Map.of(7, "number-key", "7", "text-key"))), () -> { }))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$/dict", "keyType", "java.lang.Integer"));
+                });
+        assertThat(resolutions).hasValue(0);
+    }
+
+    @Test
+    void rejectsExcessiveDepthBeforeVisitingItsContainer() {
+        Map<String, Object> guarded = new AbstractMap<>() {
+            @Override
+            public Set<Entry<String, Object>> entrySet() {
+                throw new AssertionError("preview traversed beyond its nesting limit");
+            }
+        };
+        Map<String, Object> document = guarded;
+        for (int index = 0; index < 129; index++) {
+            document = Map.of("nested", document);
+        }
+        Map<String, Object> tooDeep = document;
+        PdkTargetPreviewRenderer renderer = new PdkTargetPreviewRenderer(id -> {
+            throw new AssertionError("over-depth rows must not open a connector");
+        });
+        SourceResource mongo = new SourceResource(
+                "mongo_target", null, "mongodb", Map.of(), null, null, null, null);
+        for (SourceResource target : new SourceResource[] {null, mongo}) {
+            assertThatThrownBy(() -> renderer.render(target, List.of(tooDeep), () -> { }))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("nesting limit");
+        }
     }
 
     private static Path bsonJar() throws URISyntaxException {

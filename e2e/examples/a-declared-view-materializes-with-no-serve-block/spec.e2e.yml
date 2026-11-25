@@ -13,8 +13,11 @@
 # and is a failure even with the right number of rows in it.
 name: a-declared-view-materializes-with-no-serve-block
 setup:
-  connectors: [e2e_file]
-  apply: [src_file.tap.yml, views.tap.yml, pipeline.tap.yml]
+  databases:
+    store: { kind: mongo }
+  connectors: [e2e_file, mongodb]
+  managed_target: views.tap.yml
+  apply: [src_file.tap.yml, pipeline.tap.yml]
   discover: [src_file]
 pipeline: pipeline.tap.yml
 seed:

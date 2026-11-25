@@ -8,6 +8,7 @@ import com.mongodb.client.MongoClients;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonWriter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -93,14 +94,13 @@ class McpOnlineControlIT {
     void sourceDraftOverStdioCannotReadAnExistingSourceSecretOrWriteAnArtifact() throws Exception {
         String storedSecret = "stored-only-mcp-secret";
         String callerSecret = "caller-only-mcp-secret";
-        String database = "e2e_mcp_source_draft";
-        String storeUri = SharedMongo.replicaSetUrl(database);
         Path stderr = temporaryDirectory.resolve("source-draft.stderr");
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                MongoClient mongo = MongoClients.create(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                MongoClient mongo = MongoClients.create(storage.configurationUri())) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.apply(Map.of("source/orders.tap.yml", """
                     version: tapstate/v1
                     kind: source
@@ -111,7 +111,7 @@ class McpOnlineControlIT {
                     """.formatted(storedSecret)));
             String beforeHash = control.contentHash("orders");
             String readToken = control.mintToken("read");
-            long beforeAudit = mongo.getDatabase(database).getCollection("audit").countDocuments();
+            long beforeAudit = SystemCollections.CONFIG_AUDIT.on(mongo.getDatabase(storage.configurationDatabase())).countDocuments();
 
             Process process = startMcp(server.baseUrl(), readToken, stderr);
             try (Writer input = new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8);
@@ -165,7 +165,7 @@ class McpOnlineControlIT {
 
             assertThat(Files.readString(stderr)).doesNotContain(storedSecret, callerSecret);
             assertThat(control.contentHash("orders")).isEqualTo(beforeHash);
-            assertThat(mongo.getDatabase(database).getCollection("audit").countDocuments())
+            assertThat(SystemCollections.CONFIG_AUDIT.on(mongo.getDatabase(storage.configurationDatabase())).countDocuments())
                     .isEqualTo(beforeAudit);
         }
     }
@@ -214,9 +214,10 @@ class McpOnlineControlIT {
         String previousConnectorsDir =
                 System.setProperty("tapstate.e2e.connectors-dir", connectorJars.toString());
         Path stderr = temporaryDirectory.resolve("mcp-online.stderr");
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_mcp_browse"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.BROWSABLE_CONNECTOR_ID,
                     ConnectorJars.bytesFor(E2eConnectorJar.BROWSABLE_CONNECTOR_ID));
             control.apply(Map.of(
@@ -264,7 +265,10 @@ class McpOnlineControlIT {
                         .as("the Source list returned by the existing server list API")
                         .containsExactly("src_browse");
                 assertThat(((Map<?, ?>) sources.getFirst()).keySet().stream().map(String::valueOf).toList())
-                        .containsExactlyInAnyOrder("id", "connector");
+                        .containsExactlyInAnyOrder("id", "metadata", "connector");
+                assertThat(((Map<?, ?>) sources.getFirst()).get("metadata"))
+                        .as("the native managed-target projection adds only an empty public label set here")
+                        .isEqualTo(Map.of("labels", Map.of()));
 
                 send(input, """
                         {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{

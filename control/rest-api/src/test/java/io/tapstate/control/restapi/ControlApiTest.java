@@ -203,7 +203,7 @@ class ControlApiTest {
 
         assertThat(invalid.valid()).isFalse();
         assertThat(invalid.diagnostics()).singleElement()
-                .extracting("code").isEqualTo("dsl.unknown-field");
+                .extracting("code").isEqualTo("TS0010002");
         assertThat(context.getBean(ArtifactStore.class).list()).isEmpty();
         assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
     }
@@ -257,9 +257,9 @@ class ControlApiTest {
                 assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
         assertThat(context.getBean(ArtifactStore.class).get("refresh_failed")).isPresent();
         assertThat(applied.warnings()).singleElement().satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "refresh_failed")
-                    .containsEntry("causeCode", "io.store-unavailable")
+                    .containsEntry("causeCode", "TS0480001")
                     .containsEntry("causeParams", Map.of("detail", "test outage"));
         });
     }
@@ -349,7 +349,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0240003");
         // Not merely "an error came back": the refusal has to precede the write, so the stored bytes are
         // the ones from before the call. An implementation that upserts then checks would pass a test
         // that only looked at the status.
@@ -372,7 +372,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.not-found");
+        assertThat(body.code()).isEqualTo("TS0240001");
     }
 
     @Test
@@ -539,7 +539,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.precondition-required");
+        assertThat(body.code()).isEqualTo("TS0240002");
         assertThat(body.params()).containsEntry("id", "tgt_mg");
         assertThat(context.getBean(ArtifactStore.class).get("tgt_mg")).isPresent();
     }
@@ -561,7 +561,7 @@ class ControlApiTest {
                                 .isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
                         return response.bodyTo(ApiError.class);
                     });
-            assertThat(body.code()).as(malformed).isEqualTo("artifact.precondition-required");
+            assertThat(body.code()).as(malformed).isEqualTo("TS0240002");
         }
         assertThat(context.getBean(ArtifactStore.class).get("tgt_mg")).isPresent();
     }
@@ -579,7 +579,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0240003");
         assertThat(canonicalOf("tgt_mg")).isEqualTo(before);
     }
 
@@ -599,7 +599,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.in-use");
+        assertThat(body.code()).isEqualTo("TS0240004");
         // The caller is told who to deal with, so it needs no second query to act on the refusal.
         assertThat(body.params().get("referrers").toString()).contains("ora2my_ods");
         // Nothing cascaded and nothing was removed first: all three are still stored.
@@ -626,7 +626,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("dsl.unknown-field");
+        assertThat(body.code()).isEqualTo("TS0010002");
         assertThat(body.message()).isEqualTo("Unknown field 'snapshot_mode' at options.snapshot_mode.");
         assertThat(body.params()).containsEntry("field", "snapshot_mode");
     }
@@ -635,7 +635,7 @@ class ControlApiTest {
     void applyingWithNullDraftsIsABadRequestWithACodedBody() {
         // A structurally malformed request — an apply body with no drafts array ({} deserializes to a null
         // drafts field) — is a client-attributable, diagnosable error. It is refused at the HTTP boundary
-        // with a coded control.malformed-request (400) carrying a human reason, not a bare invariant crash
+        // with a coded TS0210001 (400) carrying a human reason, not a bare invariant crash
         // (a 500) deeper in the service.
         ApiError body = client().post().uri("/api/artifacts:apply")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -646,10 +646,10 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         // the message is rendered from the catalog with the reason substituted, not the bare code
-        assertThat(body.message()).isNotBlank().isNotEqualTo("control.malformed-request").contains("drafts");
+        assertThat(body.message()).isNotBlank().isNotEqualTo("TS0210001").contains("drafts");
     }
 
     @Test
@@ -664,7 +664,7 @@ class ControlApiTest {
                         return response.bodyTo(ApiError.class);
                     });
 
-            assertThat(body.code()).isEqualTo("control.malformed-request");
+            assertThat(body.code()).isEqualTo("TS0210001");
             assertThat(body.params()).containsKey("reason");
         }
     }
@@ -1012,7 +1012,8 @@ class ControlApiTest {
             };
             AuditGate auditGate = new AuditGate(record -> {
             }, Clock.systemUTC());
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         // The read-back controller is imported too, so its query service must be present for the context to
@@ -1049,7 +1050,8 @@ class ControlApiTest {
                     return Optional.empty();
                 }
             }, new AuditGate(record -> {
-            }, Clock.systemUTC()), Clock.systemUTC());
+            }, Clock.systemUTC()), Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
@@ -1084,7 +1086,7 @@ class ControlApiTest {
 
     // ---- fixtures ----
 
-    /** A source draft carrying a field outside the tapstate/v1 schema — rejected as dsl.unknown-field. */
+    /** A source draft carrying a field outside the tapstate/v1 schema — rejected as TS0010002. */
     private static final String UNKNOWN_FIELD_DRAFT = """
             version: tapstate/v1
             kind: source

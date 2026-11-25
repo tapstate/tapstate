@@ -31,6 +31,8 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.InitialLoad;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.TableSnapshot;
 
 import java.time.Duration;
@@ -180,6 +182,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+        startOriginal(pipelineId,artifactSnapshot,source -> SourceDiscovery.model(storePort,source));
+    }
+    @Override public synchronized void startCapture(String pipelineId,ArtifactStore artifactSnapshot,SourceModelSnapshot sourceModels) {
+        Objects.requireNonNull(sourceModels,"sourceModels").requirePipeline(pipelineId);
+        startOriginal(pipelineId,artifactSnapshot,sourceModels::model);
+    }
+    private void startOriginal(String pipelineId,ArtifactStore artifactSnapshot,java.util.function.Function<SourceResource,SourceModel> modelInputs) {
         // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
         // open a second capture behind the one already filling the ring.
         if (runsByPipeline.containsKey(pipelineId)) {
@@ -198,7 +207,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // back is given back having opened nothing: a source opened first would otherwise read its whole
         // load again on every pass until the last one was ready.
         Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
-        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits);
+        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits, modelInputs);
         List<PipelineRun> runs = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
         // Taken before the first source is opened, because the load is what these totals accumulate from
@@ -375,7 +384,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             PipelineResource pipeline,
             ArtifactStore captured,
             long snapshotEpoch,
-            Map<CaptureId, CaptureOwnership.Permit> permits) {
+            Map<CaptureId, CaptureOwnership.Permit> permits,
+            java.util.function.Function<SourceResource,SourceModel> modelInputs) {
         List<SourcePlan> plans = new ArrayList<>();
         try {
             for (SourceRef ref : pipeline.sources()) {
@@ -384,9 +394,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // Read once and used twice: it decides which streams this run reads, and it carries the
                 // row count the last discovery took of each of them. Asking the store again for the second
                 // use would pay for a second read per source on every start.
-                SourceModel discovered = SourceDiscovery.model(storePort, source);
+                SourceModel discovered = modelInputs.apply(source);
                 Optional<SourceCaptureResolution> selected =
-                        SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+                        SourceCaptureResolution.forPipeline(pipeline, ref, source, discovered);
                 if (selected.isEmpty()) {
                     continue;
                 }
@@ -398,7 +408,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
                     permits.put(captureId, permitOrNotYet(pipelineId, captureId, spec));
                 }
-                plans.add(new SourcePlan(sourceId, discovered, resolution, spec, captureId));
+                plans.add(new SourcePlan(ref.binding(), discovered, resolution, spec, captureId));
             }
             requestSharedSelections(plans);
             requireRemoteSelections(pipelineId, plans, permits);
@@ -857,6 +867,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         private final Instant began;
         private final Map<CoveredTable, String> keys;
         private final Map<CoveredTable, Long> estimates;
+        private String executionKey;
+        private String readMode;
         private final Map<String, TableSnapshot> through = new ConcurrentHashMap<>();
 
         private PipelineLoad(Instant began, Map<CoveredTable, String> keys, Map<CoveredTable, Long> estimates) {
@@ -888,7 +900,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 keys.put(entry, occurrences.get(entry.table()) > 1
                         ? entry.sourceId() + "." + entry.table() : entry.table());
             }
-            return new PipelineLoad(began, Map.copyOf(keys), Map.copyOf(estimates));
+            PipelineLoad result = new PipelineLoad(began, Map.copyOf(keys), Map.copyOf(estimates));
+            var modes = plans.stream().map(plan -> plan.spec().readMode().yaml()).distinct().toList();
+            result.readMode = modes.size() == 1 ? modes.getFirst() : null;
+            return result;
         }
 
         /** {@code table} of {@code sourceId} is through, having read {@code rows} out of about {@code total}. */
@@ -964,6 +979,46 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
+    public synchronized InitialLoad initialLoad(String pipelineId, ExecutionPlan plan, Instant at) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
+        if (load == null || runs == null || load.readMode == null) return null;
+        String key;
+        if (plan != null) {
+            if (!pipelineId.equals(plan.pipelineId())) return null;
+            key = InitialLoad.executionKey(plan);
+            if (load.executionKey == null) load.executionKey = key;
+            if (!key.equals(load.executionKey)) return null;
+        } else {
+            if (load.executionKey != null) return null;
+            key = "capture:" + pipelineId + ":" + load.began;
+        }
+        Map<String, Map<String, Long>> countsBySource = new LinkedHashMap<>();
+        for (PipelineRun run : runs) {
+            countsBySource.putIfAbsent(run.spec().sourceId(), run.run().snapshotCounts());
+        }
+        Set<String> landed = new java.util.HashSet<>();
+        for (SnapshotOnChain source : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
+            source.chainId().flatMap(storePort.meta()::read).ifPresent(record -> {
+                for (String table : record.snapshotCompletedTables(source.consumerId())) {
+                    String name = load.keyOf(source.sourceId(), table);
+                    if (name != null) landed.add(name);
+                }
+            });
+        }
+        Map<String, InitialLoad.Table> tables = new LinkedHashMap<>();
+        load.keys.forEach((covered, name) -> {
+            Long count = countsBySource.getOrDefault(covered.sourceId(), Map.of()).get(covered.table());
+            TableSnapshot progress = load.through.get(name);
+            InitialLoad.Stage stage = landed.contains(name) || progress != null && progress.landed() ? InitialLoad.Stage.LANDED
+                    : load.through.containsKey(name) ? InitialLoad.Stage.LANDING
+                    : count != null ? InitialLoad.Stage.READING : InitialLoad.Stage.PENDING;
+            tables.put(name, new InitialLoad.Table(stage, count, load.estimates.get(covered)));
+        });
+        return new InitialLoad(key, at, load.readMode, tables);
+    }
+
+    @Override
     public SnapshotReading snapshotProgress(String pipelineId) {
         PipelineLoad load = loadsByPipeline.get(pipelineId);
         if (load == null) {
@@ -1023,6 +1078,19 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     public SnapshotReading runSnapshotProgress(String pipelineId) {
         PipelineLoad load = loadsByPipeline.get(pipelineId);
         return load == null ? SnapshotReading.NONE : load.reading();
+    }
+
+    @Override
+    public synchronized boolean confirmBoundedLoad(String pipelineId) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
+        if (load == null || runs == null || runs.stream().anyMatch(run -> run.run().loading()
+                || run.run().failure().isPresent()) || load.through.size() != load.keys.size()) {
+            return false;
+        }
+        load.through.replaceAll((table, reading) ->
+                new TableSnapshot(reading.rowsDone(), reading.rowsDone(), 100, true));
+        return true;
     }
 
     /**
@@ -1449,7 +1517,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 for (SourceRef ref : pipeline.sources()) {
                     SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
                     Optional<SourceCaptureResolution> selected = SourceCaptureResolution.forPipeline(
-                            pipeline, source, SourceDiscovery.model(storePort, source));
+                            pipeline, ref, source, SourceDiscovery.model(storePort, source));
                     if (selected.isEmpty()) {
                         continue;
                     }
@@ -1517,7 +1585,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 StartFrom.parse(startFromRaw),
                 retention,
                 MOCK_SCHEMA_VER,
-                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, source.id()).value());
+                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, resolution.sourceId()).value());
     }
 
     private static ReadMode readModeOf(Settings settings) {
@@ -1541,6 +1609,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized Optional<Throwable> captureFailure(String pipelineId) {
+        return captureFailureFact(pipelineId).map(io.tapstate.core.common.FailureFact::cause);
+    }
+
+    @Override
+    public synchronized Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipelineId) {
         List<PipelineRun> runs = runsByPipeline.get(pipelineId);
         if (runs == null) {
             return Optional.empty();
@@ -1549,12 +1622,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // snapshot-only capture has no shared tail; its owner's load failure belongs to that owner alone.
         return runs.stream()
                 .map(run -> {
-                    Optional<Throwable> ownFailure = run.run.failure();
+                    var ownFailure = run.run.health().failureFact();
                     if (ownFailure.isPresent()) {
                         return ownFailure;
                     }
                     OwnedCapture shared = run.sharedTail ? ownedCaptures.get(run.captureId) : null;
-                    return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
+                    return shared == null ? Optional.<io.tapstate.core.common.FailureFact>empty() : shared.run.health().failureFact();
                 })
                 .filter(Optional::isPresent)
                 .map(Optional::get)

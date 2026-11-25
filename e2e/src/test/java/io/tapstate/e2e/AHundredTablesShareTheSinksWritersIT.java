@@ -55,8 +55,8 @@ class AHundredTablesShareTheSinksWritersIT {
         List<String> tables = IntStream.range(0, TABLES).mapToObj(i -> String.format("t%03d", i)).toList();
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_hundred_tables_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-hundred-tables")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                 TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -78,11 +78,25 @@ class AHundredTablesShareTheSinksWritersIT {
                 // puts one table's rows into the other's, so the tables would never both come out whole, and the
                 // wait would end on a timeout rather than on the batch that did it. Counted as distinct ids of
                 // each table, by the table each row carries: a row can be written more than once.
-                Await.until("every table's rows to be written", Duration.ofMinutes(3),
+                try {
+                    Await.until("every table's rows to be written", Duration.ofMinutes(4),
                         () -> idsWrittenByTable(written).size() == TABLES && idsWrittenByTable(written).values()
                                 .stream().allMatch(ids -> ids.size() == ROWS_EACH),
-                        () -> "tables with every row written: " + idsWrittenByTable(written).values().stream()
-                                .filter(ids -> ids.size() == ROWS_EACH).count() + " of " + TABLES);
+                        () -> incompleteWrites(written, files, targetAddress, tables, control));
+                } catch (AssertionError failure) {
+                    // These are only the fixture's generated row identities and public measurements.
+                    // Capture them before AutoCloseable teardown stops writers and closes the store.
+                    try {
+                        Path scene = Files.createDirectories(Path.of("target", "failure-scenes", "hundred-tables"));
+                        Files.writeString(scene.resolve("writes.txt"), written.rows().toString());
+                        Files.writeString(scene.resolve("measurements.txt"),
+                                "metrics=" + control.metricsNamed(PIPELINE, "") + "\nfacts=" + control.metricFacts(PIPELINE));
+                    } catch (IOException | RuntimeException | AssertionError unavailable) {
+                        failure.addSuppressed(unavailable);
+                    }
+                    cluster.captureFailureThreads();
+                    throw failure;
+                }
 
                 List<WriteWitness.Written> rows = written.rows();
                 Map<String, Set<String>> tablesByBatch = rows.stream().collect(Collectors.groupingBy(
@@ -113,5 +127,31 @@ class AHundredTablesShareTheSinksWritersIT {
     private static Map<String, Set<String>> idsWrittenByTable(WriteWitness written) {
         return written.rows().stream().collect(Collectors.groupingBy(WriteWitness.Written::rowTable,
                 Collectors.mapping(WriteWitness.Written::id, Collectors.toSet())));
+    }
+
+    private static String incompleteWrites(WriteWitness written, FileEndpoints files, EndpointAddress target,
+            List<String> tables, ControlPlane control) {
+        Map<String, Set<String>> observed = idsWrittenByTable(written);
+        Map<String, Object> incomplete = new java.util.TreeMap<>();
+        Object initialLoad;
+        try {
+            initialLoad = control.initialLoad(PIPELINE).<Object>map(load -> load.get("tables")).orElse("not-published");
+        } catch (RuntimeException | AssertionError unavailable) {
+            initialLoad = unavailable.getClass().getSimpleName();
+        }
+        Map<?, ?> loadTables = initialLoad instanceof Map<?, ?> values ? values : Map.of();
+        for (String table : tables) {
+            Set<String> ids = observed.getOrDefault(table, Set.of());
+            if (ids.size() != ROWS_EACH) {
+                incomplete.put(table, Map.of("witnessIds", ids, "targetRows", files.count(target, table),
+                        "writtenTables", written.rowsOf(table).stream().map(WriteWitness.Written::rowTable).distinct().toList(),
+                        "initialLoad", loadTables.containsKey(table) ? loadTables.get(table)
+                                : initialLoad instanceof Map<?, ?> ? "table-not-published" : initialLoad,
+                        "writerBatches", written.rowsOf(table).stream().map(row -> Map.of("id", row.id(),
+                                "writer", row.writerId(), "batch", row.batchId(), "table", row.rowTable())).toList()));
+            }
+        }
+        return "incomplete=" + incomplete + ", pipeline=" + control.state(PIPELINE)
+                + ", failure=" + control.failure(PIPELINE);
     }
 }

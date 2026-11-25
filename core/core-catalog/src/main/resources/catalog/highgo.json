@@ -329,7 +329,7 @@
   ],
   "provenance": {
     "specPath": "connectors/highgo-connector/src/main/resources/spec_highgo.json",
-    "specContentHash": "f050d487c81f0c62",
+    "specContentHash": "2c7192145bb838b8",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

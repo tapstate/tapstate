@@ -25,4 +25,7 @@ public interface ConnectionProbe {
 
     /** Probes the target connection synchronously and reports the normalized result. */
     ConnectionTestResult probe(ConnectionConfig config);
+
+    /** Same local test action with the original default-Source deadline; never a new routing or retry action. */
+    default ConnectionTestResult probeDefault(ConnectionConfig config, long deadlineNanos) { return probe(config); }
 }

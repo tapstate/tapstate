@@ -59,14 +59,14 @@ class AMemberJoiningLeavesTheRunningCaptureAloneIT {
     void aChangeMadeAfterAThirdMemberJoinsStillReachesThePipeline() {
         String sourceUri = SharedMongo.replicaSetUrl("e2e_join_src");
         String targetUri = SharedMongo.replicaSetUrl("e2e_join_tgt");
-        String store = SharedMongo.replicaSetUrl("e2e_join_cluster");
 
-        try (MongoEndpoints mongo = new MongoEndpoints(); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             EndpointAddress target = EndpointAddress.uri(targetUri);
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-join")) {
+            try (TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));

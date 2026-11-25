@@ -3,7 +3,7 @@ package io.tapstate.spi.store;
 import java.time.Instant;
 import java.util.Objects;
 
-/** Minimal local login facts; neither a raw Cloud JWT nor user profile/password/role records are stored. */
+/** Local login facts and optional verified display email; raw Cloud JWT, passwords and role records are not stored. */
 public record CloudSessionRecord(
         CloudSessionIdentity identity,
         String jwtId,

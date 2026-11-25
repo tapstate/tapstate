@@ -18,6 +18,7 @@ class ViewController {
     @Verb("view.list")
     @GetMapping("/views")
     ViewList list() {
-        return new ViewList(views.list());
+        var catalog = views.catalog();
+        return new ViewList(catalog.items(), catalog.unresolved());
     }
 }

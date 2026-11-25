@@ -23,12 +23,18 @@ final class SeedSweepRunner implements ApplicationRunner {
     private final SeedConnectorSweep sweep;
     private final Path seedDir;
     private final CloudConnectorSeedReadiness cloudReadiness;
+    private final LocalConnectorRuntime local;
 
     SeedSweepRunner(SeedConnectorSweep sweep, Path seedDir) {
         this(sweep, seedDir, null);
     }
 
     SeedSweepRunner(SeedConnectorSweep sweep, Path seedDir, CloudConnectorSeedReadiness cloudReadiness) {
+        this(sweep, seedDir, cloudReadiness, null);
+    }
+
+    SeedSweepRunner(SeedConnectorSweep sweep, Path seedDir, CloudConnectorSeedReadiness cloudReadiness, LocalConnectorRuntime local) {
+        this.local = local;
         this.sweep = Objects.requireNonNull(sweep, "sweep");
         this.seedDir = Objects.requireNonNull(seedDir, "seedDir");
         this.cloudReadiness = cloudReadiness;
@@ -38,7 +44,9 @@ final class SeedSweepRunner implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         List<SeedOutcome> outcomes;
         try {
-            outcomes = sweep.sweep(seedDir);
+            outcomes = local != null ? local.initialize(cloudReadiness)
+                    : cloudReadiness == null || !cloudReadiness.reducedSelection() ? sweep.sweep(seedDir)
+                    : sweep.sweep(seedDir, cloudReadiness.selectedFileNames());
         } catch (UncheckedIOException failure) {
             if (cloudReadiness != null) {
                 throw CloudConnectorSeedReadiness.sweepUnavailable();

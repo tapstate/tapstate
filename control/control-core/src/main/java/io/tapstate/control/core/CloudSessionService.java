@@ -73,6 +73,13 @@ public final class CloudSessionService {
                 || !identity.clusterId().equals(clusterContext.clusterId()))) {
             return Optional.empty();
         }
+        if (clusterContext != null) {
+            String email = login.userEmail();
+            clusterContext = new CloudSessionContext(clusterContext.organizationId(), clusterContext.clusterId(),
+                    clusterContext.organizationName(), clusterContext.clusterName(), clusterContext.region(),
+                    clusterContext.ec2PublicIp(), clusterContext.egressAddressStatus(),
+                    email == null || email.isBlank() ? null : email);
+        }
         GeneratedSecret secret = secrets.generate();
         var expires = now.plus(IDLE_TTL);
         CloudSessionRecord record = new CloudSessionRecord(identity, login.jwtId(), secret.secretHash(),
@@ -93,6 +100,13 @@ public final class CloudSessionService {
 
     public Optional<CloudSessionContext> clusterContext(String cookie) {
         return authenticatedRecord(cookie).map(CloudSessionRecord::clusterContext).filter(Objects::nonNull);
+    }
+
+    /** One store transaction validates both projections; the result is never cached across requests. */
+    public Optional<AuthenticatedCloudSession> authenticateWithContext(String cookie) {
+        return authenticatedRecord(cookie).filter(record -> record.clusterContext() != null)
+                .map(record -> new AuthenticatedCloudSession(
+                        new VerifiedToken(record.userId(), scopeOf(record.scope())), record.clusterContext()));
     }
 
     private Optional<CloudSessionRecord> authenticatedRecord(String cookie) {

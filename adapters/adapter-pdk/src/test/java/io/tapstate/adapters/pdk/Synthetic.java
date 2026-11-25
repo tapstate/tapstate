@@ -95,6 +95,29 @@ final class Synthetic {
                 source("BlockingDiscoverySource", "", register, members, discovery, "stopped = true;"));
     }
 
+    /** The real plugin stop waits on a host-owned gate, independently of its completed metadata worker. */
+    static Path gatedStopSource(Path dir, String channel) {
+        String register = "functions.supportBatchRead((context,table,offset,size,consumer) -> {});"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new AssertionError(\"stream read must not start after a host refusal\"); });";
+        String discovery = "TapTable table = new TapTable(\"t1\");table.add(new TapField(\"id\", \"int\"));s.accept(List.of(table));";
+        String stop = "((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".entered\")).countDown();"
+                + "boolean interrupted=false;for(;;)try{((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".release\")).await();break;}"
+                + "catch(InterruptedException ignored){interrupted=true;}"
+                + "((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".ended\")).countDown();"
+                + "if(interrupted)Thread.currentThread().interrupt();";
+        return SyntheticJar.compileToJar(dir, "synthetic.GatedStopSource", source("GatedStopSource", "", register, "", discovery, stop));
+    }
+
+    /** A transient failure belongs to the original plugin instance; a second stop on it succeeds. */
+    static Path retryingStopSource(Path dir, String channel) {
+        String register = "functions.supportStreamRead((context,tables,offset,size,consumer) -> {throw new AssertionError();});";
+        String discovery = "TapTable table=new TapTable(\"t1\");table.add(new TapField(\"id\",\"int\"));s.accept(List.of(table));";
+        String stop = "if(((java.util.concurrent.atomic.AtomicInteger)System.getProperties().get(\""+channel+"\")).incrementAndGet()==1)"
+                + "throw new IllegalStateException(\"synthetic transient stop failure\");";
+        return SyntheticJar.compileToJar(dir,"synthetic.RetryingStopSource",source("RetryingStopSource","",register,"",discovery,stop));
+    }
+
     /** A stream source whose discovered table and column names are supplied by the caller. */
     static Path namedStreamSource(Path dir, String table, String column) {
         String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
@@ -347,6 +370,74 @@ final class Synthetic {
     }
 
     /** Batch-reads two snapshot rows and streams an insert / update / delete; a full source connector. */
+    static Path retryingSnapshotSource(Path dir, String counter, boolean withOffset) {
+        String offset = withOffset ? "1L" : "null";
+        String firstRow = "evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r1));";
+        String register = "functions.supportErrorHandleFunction((context, method, failure) -> {"
+                + "  if (method != io.tapdata.pdk.apis.functions.PDKMethod.SOURCE_BATCH_READ) throw new AssertionError(method);"
+                + "  return io.tapdata.pdk.apis.functions.connection.RetryOptions.create().needRetry(false).beforeRetryMethod(() -> "
+                + "{ ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + ".prepare\")).incrementAndGet();"
+                + "  if (System.getProperties().containsKey(\"" + counter + ".prepareFailure\")) throw new java.io.UncheckedIOException(new java.io.IOException(\"re-open temporarily failed\"));"
+                + "});"
+                + "});"
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  int call = ((java.util.concurrent.atomic.AtomicInteger) System.getProperties().get(\"" + counter + "\")).incrementAndGet();"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + row("r1", 1)
+                + row("r2", 2)
+                + "  if (call % 2 == 1) {" + firstRow
+                + "    consumer.accept(evs, " + offset + "); throw new java.io.IOException(\"transient snapshot fault\");"
+                + "  }"
+                + "  if (!java.util.Objects.equals(" + offset + ", offset)) throw new IllegalStateException(\"wrong retry offset\");"
+                + (withOffset ? "" : firstRow)
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r2));"
+                + "  consumer.accept(evs, " + (withOffset ? "2L" : "null") + ");"
+                + "});"
+                + "functions.supportTimestampToStreamOffset((context, time) -> 0L);";
+        return SyntheticJar.compileToJar(dir, "synthetic.RetryingSnapshotSource", source("RetryingSnapshotSource", "", register));
+    }
+
+    static Path asyncFailingStreamSource(Path dir, String channel, boolean interruptDuringDelivery) {
+        String register = "functions.supportTimestampToStreamOffset((context, time) -> 0L);"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + row("a", 1)
+                + "  var events = List.<TapEvent>of(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "  Thread.ofVirtual().start(() -> { try { consumer.accept(events, 1L); } finally {"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".delivered\")).countDown(); } });"
+                + "  if (!((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".entered\")).await(5, java.util.concurrent.TimeUnit.SECONDS))"
+                + "    throw new AssertionError(\"delivery was not admitted\");"
+                + (interruptDuringDelivery ? "" : "  if (!((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel
+                        + ".delivered\")).await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError(\"delivery did not finish\");")
+                + "  throw new java.io.IOException(\"new source interruption\");"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.AsyncFailingStreamSource",
+                source("AsyncFailingStreamSource", "", register));
+    }
+
+    static Path recoverySignalStreamSource(Path dir, String channel) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  String mode = (String) System.getProperties().get(\"" + channel + ".mode\");"
+                + "  ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".entered\")).countDown();"
+                + "  if (mode.equals(\"started\") || mode.equals(\"started-heartbeat\")) {"
+                + "    consumer.streamReadStarted();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".started\")).countDown();"
+                + "  }"
+                + "  if (mode.equals(\"started-heartbeat\")) {"
+                + "    consumer.accept(List.of(new io.tapdata.entity.event.control.HeartbeatEvent().init()), null);"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".heartbeat\")).countDown();"
+                + "  }"
+                + "  if (mode.equals(\"return\")) {"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); return; }"
+                + "  String command = ((java.util.concurrent.BlockingQueue<String>) System.getProperties().get(\"" + channel + ".commands\")).take();"
+                + "  if (command.equals(\"fail\")) throw new java.io.IOException(\"controlled source interruption\");"
+                + "  if (command.equals(\"return\")) { consumer.streamReadEnded();"
+                + "    ((java.util.concurrent.CountDownLatch) System.getProperties().get(\"" + channel + ".ended\")).countDown(); }"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.RecoverySignalStreamSource",
+                source("RecoverySignalStreamSource", "", register));
+    }
+
     static Path emittingSource(Path dir) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -585,6 +676,22 @@ final class Synthetic {
         return pollingSource(dir, "UnacknowledgingSource", channel, "");
     }
 
+    /** Opt-in finite acknowledgement fixture; existing factories retain their close-time delivery. */
+    static Path naturallyCompletingAcknowledgingSource(Path dir, String channel) {
+        return naturallyCompletingPollingSource(dir, "AcknowledgingSource", channel, flushFunction(""));
+    }
+
+    /** The finite fixture whose acknowledgement function still throws after recording the call. */
+    static Path naturallyCompletingRefusingAcknowledgementSource(Path dir, String channel) {
+        return naturallyCompletingPollingSource(dir, "RefusingAcknowledgementSource", channel,
+                flushFunction("throw new IllegalStateException(\"flush boom\");"));
+    }
+
+    /** The finite fixture with the original absence of an acknowledgement function. */
+    static Path naturallyCompletingUnacknowledgingSource(Path dir, String channel) {
+        return naturallyCompletingPollingSource(dir, "UnacknowledgingSource", channel, "");
+    }
+
     /**
      * A source that, as the postgres connector does, creates a slot the first time a drive reads it and keeps
      * the slot's name in its notes under {@code tapdata_pg_slot}; each read answers one row naming the slot it
@@ -594,6 +701,11 @@ final class Synthetic {
      * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
      * whether the write was taken.
      */
+    static Path originMutatingConnector(Path dir, String channel) {
+        return SyntheticJar.compileToJar(dir, "synthetic.OriginMutating",
+                source("OriginMutating", "((Runnable) System.getProperties().get(\"" + channel + "\")).run();", ""));
+    }
+
     static Path slotKeepingSource(Path dir, String channel) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -609,8 +721,10 @@ final class Synthetic {
                 + "  consumer.accept(evs, null);"
                 + "});"
                 + "functions.supportReleaseExternalFunction(context -> {"
+                + "  channel().put(\"releaseSettings\", new LinkedHashMap<>(context.getConnectionConfig()));"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
                 + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"changeSlotOnRelease\")) channel().put(\"currentSlot\", \"changed-slot\");"
                 + "  if (channel().containsKey(\"hang\")) {"
                 + "    try {"
                 + "      Thread.sleep(Long.MAX_VALUE);"
@@ -630,6 +744,13 @@ final class Synthetic {
                 + "  if (channel().containsKey(\"unreachable\")) {"
                 + "    throw new IllegalStateException(\"connection refused\");"
                 + "  }"
+                + "});";
+        register += "functions.supportRunRawCommandFunction((context, sql, table, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<String> queries=(List<String>)channel().computeIfAbsent(\"queries\", key -> new java.util.concurrent.CopyOnWriteArrayList<String>());"
+                + "  queries.add(sql);"
+                + "  Map<String,Object> row=new LinkedHashMap<>();row.put(\"slot_count\",channel().getOrDefault(\"slotCount\",Long.valueOf(0)));"
+                + "  List<TapEvent> result=new ArrayList<>();result.add(TapInsertRecordEvent.create().table(table.getId()).after(row));"
+                + "  consumer.accept(result);"
                 + "});";
         String members = ""
                 + "@SuppressWarnings(\"unchecked\")"
@@ -716,6 +837,112 @@ final class Synthetic {
                 + "  while (poll.isAlive()) {"
                 + "    try { poll.join(); } catch (InterruptedException stopping) { }"
                 + "  }"
+                + "  consumer.streamReadEnded();"
+                + "});"
+                + flushFunction;
+        String discovery = "TapTable table = new TapTable(\"t1\");"
+                + "table.add(new TapField(\"id\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName,
+                source(simpleName, "", register, members, discovery, "stopped = true;"));
+    }
+
+    /** A test-owned EOF is consumed only after all ordered deliveries and explicit case permission. */
+    private static Path naturallyCompletingPollingSource(Path dir, String simpleName, String channel, String flushFunction) {
+        String members = ""
+                + "public static class Offset implements java.io.Serializable {"
+                + "  public String mark;"
+                + "  public Offset() {}"
+                + "  public Offset(String mark) { this.mark = mark; }"
+                + "  public boolean equals(Object o) {"
+                + "    return o instanceof Offset && java.util.Objects.equals(mark, ((Offset) o).mark);"
+                + "  }"
+                + "  public int hashCode() { return java.util.Objects.hashCode(mark); }"
+                + "  public String toString() { return \"Offset(\" + mark + \")\"; }"
+                + "}"
+                + "private volatile boolean stopped;"
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        String register = ""
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.BlockingQueue<String> orders ="
+                + "      (java.util.concurrent.BlockingQueue<String>) channel().get(\"orders\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> named = (List<Object>) channel().get(\"named\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> deliveredOn ="
+                + "      (List<Object>) channel().get(\"deliveredOn\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> handedOver ="
+                + "      (List<Object>) channel().get(\"handedOver\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<Thread> worker ="
+                + "      (java.util.concurrent.atomic.AtomicReference<Thread>) channel().get(\"worker\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<Thread> polling ="
+                + "      (java.util.concurrent.atomic.AtomicReference<Thread>) channel().get(\"polling\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<ClassLoader> loader ="
+                + "      (java.util.concurrent.atomic.AtomicReference<ClassLoader>) channel().get(\"loader\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<Throwable> failure ="
+                + "      (java.util.concurrent.atomic.AtomicReference<Throwable>) channel().get(\"failure\");"
+                + "  java.util.concurrent.atomic.AtomicBoolean allowed ="
+                + "      (java.util.concurrent.atomic.AtomicBoolean) channel().get(\"completionAllowed\");"
+                + "  worker.set(Thread.currentThread());"
+                + "  loader.set(Thread.currentThread().getContextClassLoader());"
+                + "  consumer.streamReadStarted();"
+                + "  Thread poll = new Thread(() -> {"
+                + "    try {"
+                + "    boolean completed = false;"
+                + "    int rows = 0;"
+                + "    while (!stopped) {"
+                + "      String order;"
+                + "      try {"
+                + "        order = orders.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS);"
+                + "      } catch (InterruptedException e) {"
+                + "        Thread.currentThread().interrupt();"
+                + "        failure.set(e);"
+                + "        return;"
+                + "      }"
+                + "      if (order == null) continue;"
+                + "      if (order.equals(\"complete\")) {"
+                + "        if (!allowed.get()) throw new IllegalStateException(\"completion preceded the case assertions\");"
+                + "        completed = true;"
+                + "        break;"
+                + "      }"
+                + "      if (order.equals(\"fail\")) throw new IllegalStateException(\"poll boom\");"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Offset at = null;"
+                + "      if (order.equals(\"rows\")) {"
+                + "        rows++;"
+                + "        Map<String,Object> row = new LinkedHashMap<>(); row.put(\"id\", rows);"
+                + "        batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime((long) rows).after(row));"
+                + "        at = new Offset(\"batch-\" + rows);"
+                + "        named.add(at);"
+                + "      } else {"
+                + "        batch.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "      }"
+                + "      deliveredOn.add(Thread.currentThread());"
+                + "      consumer.accept(batch, at);"
+                + "      handedOver.add(Thread.currentThread());"
+                + "    }"
+                + "    if (!completed) {"
+                + "      List<TapEvent> last = new ArrayList<>();"
+                + "      last.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "      deliveredOn.add(Thread.currentThread());"
+                + "      consumer.accept(last, null);"
+                + "    }"
+                + "    } catch (Throwable failed) { failure.set(failed); }"
+                + "  }, \"synthetic-poll\");"
+                + "  polling.set(poll);"
+                + "  poll.start();"
+                + "  boolean interrupted = false;"
+                + "  while (poll.isAlive()) {"
+                + "    try { poll.join(); } catch (InterruptedException stopping) { interrupted = true; }"
+                + "  }"
+                + "  if (interrupted) Thread.currentThread().interrupt();"
+                + "  Throwable failed = failure.get();"
+                + "  if (failed instanceof RuntimeException) throw (RuntimeException) failed;"
+                + "  if (failed instanceof Error) throw (Error) failed;"
+                + "  if (failed != null) throw new IllegalStateException(\"synthetic polling failed\", failed);"
                 + "  consumer.streamReadEnded();"
                 + "});"
                 + flushFunction;
@@ -915,11 +1142,20 @@ final class Synthetic {
     private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
             + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
 
+    static Path lifecycleSinkThatLosesAuthorityOnActivation(Path dir, Path trace, String channel) {
+        return lifecycleSink(dir, trace, "ActivationLosingSink", LIFECYCLE_WRITES, "mark(\"init\");",
+                "((java.util.concurrent.atomic.AtomicBoolean) System.getProperties().get(\"" + channel + "\")).set(false);");
+    }
+
     private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
+        return lifecycleSink(dir, trace, simpleName, register, init, "");
+    }
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init, String ctor) {
         String members = "private void mark(String value) throws Exception {"
                 + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
                 + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
-        String code = source(simpleName, "", register, members)
+        String code = source(simpleName, ctor, register, members)
                 .replace("public void init(TapConnectionContext c) {}",
                         "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
                 .replace("public void stop(TapConnectionContext c) {}",
@@ -1080,6 +1316,23 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.StaticThrows", src);
     }
 
+    static Path refusedInitSource(Path dir, String channel) {
+        String code = source("RefusedInitSource", "",
+                "functions.supportBatchRead((a,b,c,d,e) -> {});functions.supportStreamRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (RuntimeException) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.RefusedInitSource", code);
+    }
+
+    static Path fatalInitSource(Path dir, String channel) {
+        String code = source("FatalInitSource", "", "functions.supportBatchRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (Error) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.FatalInitSource", code);
+    }
+
     /**
      * A source that registers batch read but throws from every lifecycle method (init / stop /
      * discover / connectionTest / tableCount). A capability derive reads only the registered ids, so a
@@ -1188,6 +1441,41 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.CodeOnlyTest", connectionTestSource("CodeOnlyTest", body));
     }
 
+    static Path testSettingsEcho(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.TestSettingsEcho", connectionTestSource("TestSettingsEcho",
+                "s.accept(new TestItem(\"URI\", TestItem.RESULT_SUCCESSFULLY, (String)c.getConnectionConfig().get(\"uri\"))); return ConnectionOptions.create();"));
+    }
+
+    static Path excessiveDiagnosticTest(Path dir, String kind) {
+        String body = switch (kind) {
+            case "items" -> "for(int i=0;i<1025;i++) s.accept(new TestItem(\"Check\", TestItem.RESULT_SUCCESSFULLY));";
+            case "sum" -> "for(int i=0;i<3;i++) s.accept(new TestItem(\"Check\", TestItem.RESULT_SUCCESSFULLY, \"x\".repeat(50000)));";
+            case "parameters" -> "TapTestItemException e=new TapTestItemException(); String[] values=new String[1025]; java.util.Arrays.fill(values, \"x\"); e.setDynamicDescriptionParameters(values); s.accept(new TestItem(\"Check\",e,TestItem.RESULT_FAILED));";
+            default -> throw new IllegalArgumentException("unsupported diagnostic fixture");
+        };
+        return SyntheticJar.compileToJar(dir, "synthetic.ExcessiveDiagnostic", connectionTestSource("ExcessiveDiagnostic", body + "return ConnectionOptions.create();"));
+    }
+
+    static Path oversizedTestReport(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.OversizedReport", connectionTestSource("OversizedReport",
+                "s.accept(new TestItem(\"Connection\", TestItem.RESULT_SUCCESSFULLY, \"x\".repeat(200000))); return ConnectionOptions.create();"));
+    }
+
+    static Path thrownTypedTestDiagnostic(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.TypedTestDiagnostic", connectionTestSource("TypedTestDiagnostic",
+                "TapTestItemException failure = new TapTestItemException(); failure.setMessage(\"Login denied\");"
+                + "failure.setReason(\"bad credentials\"); failure.setSolution(\"check credentials\"); failure.setErrorCode(\"28000\"); throw failure;"));
+    }
+
+    static Path emptyTestReport(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.EmptyTestReport", connectionTestSource("EmptyTestReport", "return ConnectionOptions.create();"));
+    }
+
+    static Path defectTest(Path dir, String simpleName, String exception) {
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName,
+                connectionTestSource(simpleName, "throw new " + exception + "(\"defect\");"));
+    }
+
     /** A connector whose connectionTest throws — the test could not be completed, a coded drive failure. */
     static Path throwingTest(Path dir) {
         String body = "throw new RuntimeException(\"test boom\");";
@@ -1281,6 +1569,13 @@ final class Synthetic {
                         "functions.supportBatchCount((context, table) -> 4200000L);"));
     }
 
+    /** Structural recovery probes must never invoke this count callback. */
+    static Path countTracingDiscoverableSource(Path dir) {
+        return SyntheticJar.compileToJar(dir,"synthetic.TracingCount",
+                discoverSource("TracingCount",ORDERS_TABLE,"functions.supportBatchCount((context, table) -> {"
+                        + "java.nio.file.Files.writeString(java.nio.file.Path.of((String)context.getConnectionConfig().get(\"countTrace\")),\"counted\");return 7L;});"));
+    }
+
     /** The two-table discoverSchema body the multi-table counting fixtures share. */
     private static final String ORDERS_AND_ITEMS = ""
             + "TapTable orders = new TapTable(\"orders\");"
@@ -1330,6 +1625,16 @@ final class Synthetic {
     }
 
     /** A connector whose discoverSchema throws — discovery could not complete, a coded drive failure. */
+    static Path declaredAuthenticationRejectedDiscoverSource(Path dir) {
+        String body = "throw new RuntimeException(new io.tapdata.exception.TapPdkUserPwdInvalidEx(\"demo\", \"fixture\", new java.sql.SQLException(\"password rejected marker\", \"72000\")));";
+        return SyntheticJar.compileToJar(dir, "synthetic.DeclaredAuthenticationDiscover", discoverSource("DeclaredAuthenticationDiscover", body));
+    }
+
+    static Path authenticationRejectedDiscoverSource(Path dir, String sqlState) {
+        String body = "throw new RuntimeException(new java.sql.SQLException(\"password rejected marker\", \"" + sqlState + "\"));";
+        return SyntheticJar.compileToJar(dir, "synthetic.AuthenticationDiscover", discoverSource("AuthenticationDiscover", body));
+    }
+
     static Path throwingDiscoverSource(Path dir) {
         String body = "throw new RuntimeException(\"discover boom\");";
         return SyntheticJar.compileToJar(dir, "synthetic.ThrowingDiscover", discoverSource("ThrowingDiscover", body));
@@ -1373,6 +1678,21 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.OrdersConnector", src,
                 Map.of("orders-spec.json", "{\"id\":\"orders\"}"),
                 Map.of("PDK-API-Version", "1.3.5"));
+    }
+
+    static Path connectorMissingItsSuperclass(Path dir) {
+        String source = SELF_SCAN_IMPORTS + "class MissingBase {} "
+                + "@TapConnectorClass(\"orders-spec.json\") public class BrokenConnector extends MissingBase implements TapConnector {"
+                + INERT_CONNECTOR_BODY + "}";
+        var complete = SyntheticJar.compileToJar(dir.resolve("complete"), "synthetic.BrokenConnector", source,
+                Map.of("orders-spec.json", "{\"id\":\"orders\"}"), Map.of("PDK-API-Version", "1.3.5"));
+        var entries = new java.util.LinkedHashMap<String,byte[]>();
+        try (var jar = new java.util.jar.JarFile(complete.toFile())) {
+            for (var entry : jar.stream().filter(e -> !e.isDirectory() && !e.getName().equals("synthetic/MissingBase.class")
+                    && !e.getName().equals("META-INF/MANIFEST.MF")).toList())
+                try (var input = jar.getInputStream(entry)) { entries.put(entry.getName(), input.readAllBytes()); }
+        } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+        return SyntheticJar.jarWithEntries(dir.resolve("broken"), entries, Map.of("PDK-API-Version", "1.3.5"));
     }
 
     /** A jar with a plain class and no {@code @TapConnectorClass} anywhere — not a connector artifact. */

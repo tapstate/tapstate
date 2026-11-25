@@ -47,14 +47,26 @@ final class RealProcessServer implements ServerHandle {
     // Keep closed reservations too: a delayed launch or cleanup must never refer to a port handed
     // to a later launch in this JVM. Open reservations protect members not yet launched from reuse.
     private static final Map<Integer, Socket> PORT_RESERVATIONS = new LinkedHashMap<>();
+    private static final int FIRST_FIXTURE_PORT = 10_000;
+    private static final int FIXTURE_PORT_LIMIT = 20_000;
+    private static final int PORTS_PER_BLOCK = 100;
+    private static final Map<Integer, java.nio.channels.FileLock> PORT_BLOCKS = new LinkedHashMap<>();
+    private static java.nio.channels.FileChannel portBlockFile;
+    private static int nextFixturePort = java.util.concurrent.ThreadLocalRandom.current()
+            .nextInt(FIRST_FIXTURE_PORT, FIXTURE_PORT_LIMIT);
 
     private final Process process;
+    private Runnable beforeClose = () -> { };
     private final URI baseUrl;
     private final Path output;
     private final Path stagingDirectory;
     // Whether the launch made the directory itself, and so deletes it as it ends; one a witness named is the
     // witness's to keep or clear.
     private final boolean ownsStagingDirectory;
+    private boolean closeRequested;
+    private boolean exitedBeforeCloseRequest;
+    private long closeRequestedAt;
+    private ClusterLifecycleProbe.Facts lifecycle;
 
     private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
             boolean ownsStagingDirectory) {
@@ -117,6 +129,50 @@ final class RealProcessServer implements ServerHandle {
     static RealProcessServer start(String storeUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
         return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
+    }
+
+    /** Starts an already prepared split-store installation with only its configuration URI. */
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return startPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launchingPrepared(configurationUri, listenAddress, stagingDirectory, extraArguments);
+        try {
+            server.awaitReady();
+            return server;
+        } catch (RuntimeException | Error failure) {
+            server.close();
+            throw failure;
+        }
+    }
+
+    /** Lets a fixture launch every seed before waiting for any member to finish joining. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return launchingPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    /** Keeps an explicitly supplied connector staging directory owned by the caller. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), listenAddress,
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments);
+    }
+
+    /** Real Cloud Bootstrap in a separate JVM; only its external SDK boundary is a fixture. */
+    static RealProcessServer startCloudFixture(String configurationUri,String cluster,Path seeds) {
+        var server=launching(configurationUri,null,bootJar(),LOOPBACK,
+                List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),null,port -> List.of(
+                        "--tapstate.cloud.cluster-id="+cluster,"--tapstate.cluster.node-id=restart-node",
+                        "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
+                        "--tapstate.connectors.seed-dir="+seeds,"--logging.level.root=ERROR",
+                        "--logging.level.io.tapstate.app.ConvergenceDriver=WARN"),
+                io.tapstate.app.CloudConfiguredOutageProcess.class.getName());
+        try { server.awaitReady(STARTUP_BUDGET,"CLOUD_FIXTURE_APPLICATION_READY");return server; }
+        catch(RuntimeException|Error failure) { try { server.close(); } catch(RuntimeException|Error cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
 
     /**
@@ -205,6 +261,28 @@ final class RealProcessServer implements ServerHandle {
                 List.of(), stagingDirectory, extraArguments);
     }
 
+    /** Prepares one initial member's owned paths, ports and command without creating a process. */
+    static PreparedLaunch prepare(String storeUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(storeUri, listenAddress, null, extraArguments);
+    }
+
+    /** The same preparation, retaining a staging directory explicitly owned by the witness. */
+    static PreparedLaunch prepare(String storeUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                List.of(), stagingDirectory, extraArguments);
+    }
+
+    /** Prepares native storage with its original JVM limits and no legacy operator database setting. */
+    static PreparedLaunch prepareNative(String configurationUri,String listenAddress,Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(configurationUri,null,bootJar(),listenAddress,List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),stagingDirectory,extraArguments);
+    }
+    static PreparedLaunch prepareNative(String configurationUri,String listenAddress,IntFunction<List<String>> extraArguments) {
+        return prepareNative(configurationUri,listenAddress,null,extraArguments);
+    }
+
     /** The same, listening on {@code listenAddress}. See {@link #start(String, String, IntFunction)}. */
     static RealProcessServer launching(String storeUri, Path jar, String listenAddress,
             IntFunction<List<String>> extraArguments) {
@@ -228,6 +306,17 @@ final class RealProcessServer implements ServerHandle {
                 jvmOptions, null, port -> List.of()));
     }
 
+    /** Retains native storage admission while the scenario selects the child JVM's original runtime shape. */
+    static RealProcessServer startPreparedInJvm(String configurationUri, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launchingPreparedInJvm(configurationUri, jvmOptions, extraArguments));
+    }
+
+    static RealProcessServer launchingPreparedInJvm(String configurationUri, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), LOOPBACK, jvmOptions, null, extraArguments);
+    }
+
     /**
      * Returns the launch once its health probe answers, and ends it otherwise.
      *
@@ -236,6 +325,8 @@ final class RealProcessServer implements ServerHandle {
      * why the server did not come up is the thing a reader needs.
      */
     private static RealProcessServer healthy(RealProcessServer server) {
+        ClusterFixtureTiming.phase(server.process, ClusterFixtureTiming.Phase.HEALTH_BEGIN);
+        server.observe(ClusterLifecycleProbe.Phase.HEALTH_STARTED);
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -246,23 +337,220 @@ final class RealProcessServer implements ServerHandle {
             }
             throw e;
         }
+        server.observe(ClusterLifecycleProbe.Phase.HEALTH_PASSED);
+        ClusterFixtureTiming.phase(server.process, ClusterFixtureTiming.Phase.HEALTH_RETURNED);
         return server;
+    }
+
+    /** Waits on the same health predicate and budget used by a single-process start. */
+    void awaitHealthy() {
+        healthy(this);
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, stagingDirectory,
+                extraArguments, null);
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments, String fixtureMain) {
+        try (PreparedLaunch prepared = prepare(storeUri, operatorStateDatabase, jar, listenAddress,
+                jvmOptions, stagingDirectory, extraArguments, fixtureMain)) {
+            return prepared.launch();
+        }
+    }
+
+    static PreparedLaunch preparePrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(configurationUri, null, bootJar(), listenAddress,
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments, null);
+    }
+
+    private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, stagingDirectory,
+                extraArguments, null);
+    }
+
+    private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments, String fixtureMain) {
+        long fixturePreparation = ClusterFixtureTiming.beginPreparation();
         int port = freePort();
+        ClusterFixtureTiming.bind(fixturePreparation, port);
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
-        Path workingDirectory = workingDirectory();
-        Path output = workingDirectory.resolve("server.out");
         boolean owned = stagingDirectory == null;
-        Path staging = owned ? ServerHandle.privateStagingDirectory() : stagingDirectory;
-        Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, staging, extraArguments.apply(port));
-        return new RealProcessServer(process, baseUrl, output, staging, owned);
+        Path staging = stagingDirectory;
+        try {
+            Path workingDirectory = workingDirectory();
+            Path output = workingDirectory.resolve("server.out");
+            try { Files.createFile(output); }
+            catch (IOException failure) {
+                throw new UncheckedIOException("could not prepare the server output at " + output, failure);
+            }
+            if (owned) staging = ServerHandle.privateStagingDirectory();
+            return new PreparedLaunch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
+                    workingDirectory, baseUrl, output, staging, owned, extraArguments.apply(port), fixtureMain);
+        } catch (RuntimeException | Error failure) {
+            try { releasePort(port); }
+            catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            if (owned && staging != null) {
+                try { ServerHandle.discardStagingDirectory(staging); }
+                catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            }
+            // The working directory is diagnostic evidence, not a connector cache to discard.
+            throw failure;
+        }
+    }
+
+    /** One owned launch plan; handed-off processes and caller-owned staging are never cancelled here. */
+    static final class PreparedLaunch implements AutoCloseable {
+        private final Path jar;
+        private final List<String> jvmOptions;
+        private final int httpPort;
+        private final String listenAddress;
+        private final String storeUri;
+        private final String operatorStateDatabase;
+        private final Path workingDirectory;
+        private final URI baseUrl;
+        private final Path output;
+        private final Path stagingDirectory;
+        private final boolean ownsStagingDirectory;
+        private final List<String> extraArguments;
+        private final String fixtureMain;
+        private final ClusterLifecycleProbe.Facts lifecycle;
+        private final StoreProcessScope processes;
+        private boolean launchAttempted;
+        private boolean handedOff;
+        private boolean released;
+        private Process unhandedProcess;
+        private final String launchToken = java.util.UUID.randomUUID().toString();
+        private long forcedAt;
+
+        private PreparedLaunch(Path jar, List<String> jvmOptions, int httpPort, String listenAddress,
+                String storeUri, String operatorStateDatabase, Path workingDirectory, URI baseUrl,
+                Path output, Path stagingDirectory, boolean ownsStagingDirectory, List<String> extraArguments, String fixtureMain) {
+            this.jar = jar;
+            this.jvmOptions = List.copyOf(jvmOptions);
+            this.httpPort = httpPort;
+            this.listenAddress = listenAddress;
+            this.storeUri = storeUri;
+            this.processes = StoreProcessScope.matching(storeUri);
+            this.operatorStateDatabase = operatorStateDatabase;
+            this.workingDirectory = workingDirectory;
+            this.baseUrl = baseUrl;
+            this.output = output;
+            this.stagingDirectory = stagingDirectory;
+            this.ownsStagingDirectory = ownsStagingDirectory;
+            this.extraArguments = List.copyOf(extraArguments);
+            this.fixtureMain = fixtureMain;
+            this.lifecycle = ClusterLifecycleProbe.facts(httpPort, workingDirectory, output, stagingDirectory,
+                    storeUri, operatorStateDatabase, listenAddress, this.jvmOptions, this.extraArguments);
+            ClusterLifecycleProbe.record(ClusterLifecycleProbe.Phase.PREPARED, lifecycle, -1);
+            ClusterFixtureTiming.prepared(httpPort, storeUri, operatorStateDatabase, listenAddress, this.jvmOptions, this.extraArguments);
+        }
+
+        synchronized RealProcessServer launch() {
+            if (released || launchAttempted) {
+                throw new IllegalStateException("the prepared server launch is no longer available");
+            }
+            launchAttempted = true;
+            try {
+                if (processes != null) processes.beforeLaunch();
+                unhandedProcess = RealProcessServer.launch(jar, jvmOptions, httpPort, listenAddress,
+                        storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments, fixtureMain,launchToken);
+                if (processes != null) processes.launched(unhandedProcess,output,launchToken);
+                ClusterFixtureTiming.spawned(httpPort, unhandedProcess);
+                ClusterHealthProbe.bind(unhandedProcess.pid(), baseUrl);
+                RealProcessServer server = new RealProcessServer(
+                        unhandedProcess, baseUrl, output, stagingDirectory, ownsStagingDirectory);
+                server.lifecycle = lifecycle;
+                server.observe(ClusterLifecycleProbe.Phase.LAUNCHED);
+                handedOff = true;
+                unhandedProcess = null;
+                return server;
+            } catch (RuntimeException | Error failure) {
+                try { close(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
+        }
+
+        int httpPort() {
+            return httpPort;
+        }
+
+        Path workingDirectory() {
+            return workingDirectory;
+        }
+
+        Path output() {
+            return output;
+        }
+
+        Path stagingDirectory() {
+            return stagingDirectory;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (handedOff || released) return;
+            List<Throwable> failures = new ArrayList<>();
+            InterruptedException interrupted = null;
+            boolean exited = unhandedProcess == null || !unhandedProcess.isAlive();
+            try {
+                if (!exited) {
+                    try {
+                        unhandedProcess.destroyForcibly();
+                        if (forcedAt == 0) forcedAt = System.nanoTime();
+                        while (!exited) {
+                            long remaining = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - forcedAt);
+                            if (remaining <= 0) break;
+                            try {
+                                exited = unhandedProcess.waitFor(remaining, TimeUnit.NANOSECONDS);
+                            } catch (InterruptedException failure) {
+                                if (interrupted == null) interrupted = failure;
+                                else interrupted.addSuppressed(failure);
+                            }
+                        }
+                    } catch (RuntimeException | Error failure) {
+                        failures.add(failure);
+                    }
+                }
+                boolean exitConfirmed = exited && (unhandedProcess == null || !unhandedProcess.isAlive());
+                if (!exitConfirmed) {
+                    failures.add(new AssertionError("the unhanded server did not exit within "
+                            + SHUTDOWN_BUDGET + "; its output was:\n" + tail(output), interrupted));
+                }
+                try { releasePort(httpPort); }
+                catch (RuntimeException | Error failure) { failures.add(failure); }
+                if (exitConfirmed && ownsStagingDirectory) {
+                    try { ServerHandle.discardStagingDirectory(stagingDirectory); }
+                    catch (RuntimeException | Error failure) { failures.add(failure); }
+                }
+                if (interrupted != null) {
+                    failures.add(new AssertionError("interrupted while cancelling the prepared server", interrupted));
+                }
+                if (!failures.isEmpty()) {
+                    Throwable primary = failures.getFirst();
+                    failures.stream().skip(1).filter(failure -> failure != primary).forEach(primary::addSuppressed);
+                    if (primary instanceof RuntimeException failure) throw failure;
+                    throw (Error) primary;
+                }
+                released = true;
+                // Logs and the private working directory are retained even when no JVM could start.
+            } finally {
+                if (interrupted != null) Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**
@@ -277,7 +565,10 @@ final class RealProcessServer implements ServerHandle {
     void kill() {
         process.destroyForcibly();
         try {
-            process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            if (!process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS)) {
+                throw new AssertionError("the killed server did not exit within " + SHUTDOWN_BUDGET
+                        + "; its output was:\n" + tail());
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for the killed server to go away", e);
@@ -308,6 +599,10 @@ final class RealProcessServer implements ServerHandle {
         return process.pid();
     }
 
+    private void observe(ClusterLifecycleProbe.Phase phase) {
+        if (lifecycle != null) ClusterLifecycleProbe.record(phase, lifecycle, pid());
+    }
+
     /** Where this launch staged its connectors, for a witness that the directory goes when the launch does. */
     Path stagingDirectory() {
         return stagingDirectory;
@@ -318,20 +613,35 @@ final class RealProcessServer implements ServerHandle {
         return process.isAlive();
     }
 
+    boolean exitsWithin(Duration window) throws InterruptedException {
+        return process.waitFor(window.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
+        awaitReady(STARTUP_BUDGET);
+    }
+
+    void awaitReady(Duration budget) {
+        awaitReady(budget,"Tapstate application is ready");
+    }
+    private void awaitReady(Duration budget,String marker) {
+        ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.READY_BEGIN);
+        observe(ClusterLifecycleProbe.Phase.READY_STARTED);
         ControlPlane control = new ControlPlane(baseUrl);
-        Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
+        Await.until("the process to complete application startup", budget, () -> {
             if (!process.isAlive()) {
                 throw new AssertionError("the server exited with status " + process.exitValue()
                         + " before application readiness; its output was:\n" + tail());
             }
             try {
-                return Files.readString(output).contains("Tapstate application is ready") && control.healthy();
+                return Files.readString(output).contains(marker) && control.healthy();
             } catch (IOException failure) {
                 throw new UncheckedIOException("could not read application readiness", failure);
             }
         }, this::tail);
+        ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.READY_RETURNED);
+        observe(ClusterLifecycleProbe.Phase.READY_PASSED);
     }
 
     /**
@@ -351,17 +661,90 @@ final class RealProcessServer implements ServerHandle {
 
     @Override
     public void close() {
-        process.destroy();
-        try {
-            if (!process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS)) {
-                process.destroyForcibly();
-                process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            process.destroyForcibly();
+        Throwable failure = null;
+        try { if(process.isAlive())beforeClose.run(); }catch(RuntimeException|Error stopped){failure=stopped;}
+        try {requestClose();awaitClosed();}catch(RuntimeException|Error stopped){
+            if(failure==null)failure=stopped;else failure.addSuppressed(stopped);
         }
-        discardOwnStagingDirectory();
+        if(failure instanceof Error error)throw error;
+        if(failure instanceof RuntimeException runtime)throw runtime;
+    }
+
+    void beforeClose(Runnable action) { beforeClose = java.util.Objects.requireNonNull(action); }
+
+    /** Requests this owned process's polite exit without waiting for another member. */
+    synchronized void requestClose() {
+        if (closeRequested) return;
+        exitedBeforeCloseRequest = !process.isAlive();
+        closeRequestedAt = System.nanoTime();
+        closeRequested = true;
+        process.destroy();
+        observe(ClusterLifecycleProbe.Phase.QUIT_REQUESTED);
+        ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.QUIT_RETURNED);
+    }
+
+    synchronized boolean exitedBeforeCloseRequest() {
+        return exitedBeforeCloseRequest;
+    }
+
+    /** Confirms exit under the original grace and forced-exit budgets before discarding staging. */
+    void awaitClosed() {
+        long requestedAt;
+        synchronized (this) {
+            if (!closeRequested) {
+                throw new IllegalStateException("the owned server has not been asked to close");
+            }
+            requestedAt = closeRequestedAt;
+        }
+        InterruptedException interrupted = null;
+        try {
+            ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.GRACE_BEGIN);
+            boolean exited = !process.isAlive();
+            long remainingGrace = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - requestedAt);
+            if (!exited && remainingGrace > 0) {
+                try {
+                    exited = process.waitFor(remainingGrace, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException failure) {
+                    interrupted = failure;
+                }
+            }
+            ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.GRACE_RETURNED);
+            if (!exited) {
+                process.destroyForcibly();
+                observe(ClusterLifecycleProbe.Phase.FORCE_REQUESTED);
+                ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.FORCE_RETURNED);
+                long forcedAt = System.nanoTime();
+                while (!exited) {
+                    long remaining = SHUTDOWN_BUDGET.toNanos() - (System.nanoTime() - forcedAt);
+                    if (remaining <= 0) break;
+                    try {
+                        exited = process.waitFor(remaining, TimeUnit.NANOSECONDS);
+                    } catch (InterruptedException failure) {
+                        if (interrupted == null) interrupted = failure;
+                        else interrupted.addSuppressed(failure);
+                    }
+                }
+            }
+            if (!exited || process.isAlive()) {
+                throw new AssertionError("the server did not exit after its " + SHUTDOWN_BUDGET
+                        + " grace and " + SHUTDOWN_BUDGET + " forced-exit budgets; its output was:\n"
+                        + tail(), interrupted);
+            }
+            observe(ClusterLifecycleProbe.Phase.EXIT_CONFIRMED);
+            ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.EXIT_CONFIRMED);
+            AssertionError interruptedFailure = interrupted == null ? null : new AssertionError(
+                    "interrupted while waiting for the server to close; its exit was confirmed", interrupted);
+            try {
+                discardOwnStagingDirectory();
+            } catch (RuntimeException | Error cleanup) {
+                if (interruptedFailure == null) throw cleanup;
+                interruptedFailure.addSuppressed(cleanup);
+            }
+            if (interruptedFailure != null) throw interruptedFailure;
+        } finally {
+            if (interrupted != null) ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.INTERRUPTED);
+            if (interrupted != null) Thread.currentThread().interrupt();
+        }
     }
 
     private void discardOwnStagingDirectory() {
@@ -372,13 +755,15 @@ final class RealProcessServer implements ServerHandle {
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
-            Path stagingDirectory, List<String> extraArguments) {
+            Path stagingDirectory, List<String> extraArguments,String fixtureMain,String launchToken) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
+        command.add("-Dlogging.pattern.level=%5p [launch="+launchToken+"]");
+        command.addAll(fixtureMain==null?List.of("-jar",jar.toString()):List.of(
+                "--add-opens=java.base/java.lang=ALL-UNNAMED","-cp",
+                System.getProperty("surefire.test.class.path",System.getProperty("java.class.path")),fixtureMain));
         command.addAll(List.of(
-                "-jar",
-                jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
                 "--role=all",
                 // Bound to the loopback, which is where the probe and
@@ -389,18 +774,21 @@ final class RealProcessServer implements ServerHandle {
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
-                "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own unless a witness names one, for the same reason
                 // the other tier gets one: the cache is content-addressed and reused, so a shared one serves
                 // a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        if (operatorStateDatabase != null) {
+            command.add("--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
+        }
         // After the standing ones, and additional to them rather than replacing any: a repeated option
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs
         // to set differently is a parameter above instead of an argument here.
         command.addAll(extraArguments);
         try {
+            ClusterFixtureTiming.spawnBegin(port);
             releaseLaunchPorts(port, extraArguments);
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
@@ -473,28 +861,47 @@ final class RealProcessServer implements ServerHandle {
 
     private static synchronized int freePort() {
         try {
-            while (true) {
+            for (int tried = 0; tried < FIXTURE_PORT_LIMIT - FIRST_FIXTURE_PORT; tried++) {
+                int port = nextFixturePort++;
+                if (nextFixturePort == FIXTURE_PORT_LIMIT) nextFixturePort = FIRST_FIXTURE_PORT;
+                if (PORT_RESERVATIONS.containsKey(port) || !claimPortBlock(port)) continue;
                 Socket socket = new Socket();
                 try {
-                    // Members bind a routable address, links bind loopback, and HTTP can bind both.
-                    // Disallow address reuse so the reservation owns the port on every local address.
-                    // A bound client socket reserves without listening to a member's discovery dials.
+                    // Keep listener handoff ports outside OS client-ephemeral ranges and the
+                    // fixture's 20000-29999 member-outbound range. Startup may take several seconds
+                    // after release, during which bind(0) client connections could steal the port.
                     socket.setReuseAddress(false);
-                    socket.bind(new InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0));
-                    int port = socket.getLocalPort();
-                    if (!PORT_RESERVATIONS.containsKey(port)) {
-                        PORT_RESERVATIONS.put(port, socket);
-                        return port;
-                    }
+                    socket.bind(new InetSocketAddress(InetAddress.getByName("0.0.0.0"), port));
+                    PORT_RESERVATIONS.put(port, socket);
+                    return port;
+                } catch (java.net.BindException occupied) {
+                    socket.close();
                 } catch (IOException failure) {
                     socket.close();
                     throw failure;
                 }
-                socket.close();
             }
+            throw new IOException("all fixture listener ports are reserved or occupied");
         } catch (IOException e) {
             throw new UncheckedIOException("could not reserve a port for the server", e);
         }
+    }
+
+    /** One file channel retains disjoint port blocks for this fixture JVM's entire lifetime. */
+    private static boolean claimPortBlock(int port) throws IOException {
+        int block = (port - FIRST_FIXTURE_PORT) / PORTS_PER_BLOCK;
+        if (PORT_BLOCKS.containsKey(block)) return true;
+        if (portBlockFile == null) {
+            Path file = Path.of(System.getProperty("java.io.tmpdir"),
+                    "tapstate-e2e-listener-port-blocks-" + System.getProperty("user.name"));
+            portBlockFile = java.nio.channels.FileChannel.open(file,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.READ,
+                    java.nio.file.StandardOpenOption.WRITE);
+        }
+        var lock = portBlockFile.tryLock(block, 1, false);
+        if (lock == null) return false;
+        PORT_BLOCKS.put(block, lock);
+        return true;
     }
 
     /** Releases only a reservation made here, immediately before its listener takes the port. */

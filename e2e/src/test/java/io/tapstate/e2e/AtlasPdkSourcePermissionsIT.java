@@ -12,6 +12,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.GenericContainer;
@@ -84,13 +85,41 @@ class AtlasPdkSourcePermissionsIT {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(AtlasRuntime.Mode.class)
+    void rejectedCredentialsAreHiddenInImmediateAndLatestReports(AtlasRuntime.Mode mode) throws Exception {
+        String username = "p2-atlas-witness-user";
+        String id = "atlas_wrong_user";
+        try (var prepared = mode == AtlasRuntime.Mode.CLOUD ? PreparedNativeStore.createCloud() : PreparedNativeStore.create();
+             var runtime = new AtlasRuntime(mode, prepared);
+             var server = runtime.launch(Tiers.IN_PROCESS)) {
+            var control = runtime.control(server, true);
+            runtime.register(control, CONNECTOR);
+            assertThat(control.testConnection("atlas_valid_user", CONNECTOR, settings(uri("root", "admin")))
+                    .outcome()).isEqualTo("PASSED");
+            var immediate = control.sourceRequest("POST", "/api/connections:test",
+                    Map.of("id", id, "connectorId", CONNECTOR, "settings", settings(uri(username, "admin"))),
+                    null, 200);
+            var latest = control.sourceRequest("GET", "/api/connections/" + id + "/test-result",
+                    null, null, 200);
+
+            assertThat(immediate.body()).doesNotContain(username, PASSWORD);
+            assertThat(latest.body()).doesNotContain(username, PASSWORD);
+            var report = (Map<?, ?>) JsonReader.parse(immediate.body());
+            assertThat(report.get("outcome")).isEqualTo("FAILED");
+            assertThat(report.get("checks").toString()).contains("Exception authenticating", "MongoCredential<redacted>");
+            assertThat((List<?>) report.get("checks")).anySatisfy(value ->
+                    assertThat(((Map<?, ?>) value).get("diagnostic")).isInstanceOf(Map.class));
+            assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
+            runtime.assertAuthenticationBoundary();
+        }
+    }
+
     @ParameterizedTest(name = "{0}/MISSING_FIND")
     @EnumSource(AtlasRuntime.Mode.class)
     void aSourceWithoutReadPermissionFailsThroughThePdkAndRecovers(AtlasRuntime.Mode mode) throws Exception {
         String suffix = suffix(mode);
-        String metadata = "ts_plan_prm_" + suffix;
         String targetDatabase = "ts_plan_prt_" + suffix;
-        String metadataUri = SharedMongo.replicaSetUrl(metadata);
         String targetUri = SharedMongo.replicaSetUrl(targetDatabase);
         String source = "permission_read_source";
         String target = "permission_read_target";
@@ -99,7 +128,9 @@ class AtlasPdkSourcePermissionsIT {
         try (SourceUser fixture = new SourceUser("ts_plan_prs_" + suffix);
              MongoClient targetClient = MongoClients.create(targetUri);
              AutoCloseable targetCleanup = () -> targetClient.getDatabase(targetDatabase).drop();
-             AtlasRuntime runtime = new AtlasRuntime(mode, metadataUri);
+             PreparedNativeStore prepared = mode == AtlasRuntime.Mode.ON_PREM
+                     ? PreparedNativeStore.create() : PreparedNativeStore.createCloud();
+             AtlasRuntime runtime = new AtlasRuntime(mode, prepared);
              ServerHandle server = runtime.launch(Tiers.IN_PROCESS)) {
             ControlPlane control = runtime.control(server, true);
             runtime.register(control, CONNECTOR);
@@ -126,8 +157,7 @@ class AtlasPdkSourcePermissionsIT {
                     () -> Long.valueOf(2).equals(control.snapshotRowsRead(pipeline).get(TABLE)),
                     () -> String.valueOf(control.snapshotRowsRead(pipeline)));
             awaitSnapshotProgress(control, pipeline);
-            control.stop(pipeline, false);
-            awaitState(control, pipeline, PipelineState.STOPPED);
+            awaitState(control, pipeline, PipelineState.COMPLETED);
             runtime.assertAuthenticationBoundary();
         }
     }
@@ -137,10 +167,8 @@ class AtlasPdkSourcePermissionsIT {
     void aSourceThatCanSnapshotButCannotWatchFailsThroughThePdkAndRecovers(AtlasRuntime.Mode mode)
             throws Exception {
         String suffix = suffix(mode);
-        String metadata = "ts_plan_pcm_" + suffix;
         String snapshotTargetDatabase = "ts_plan_pst_" + suffix;
         String cdcTargetDatabase = "ts_plan_pct_" + suffix;
-        String metadataUri = SharedMongo.replicaSetUrl(metadata);
         String snapshotTargetUri = SharedMongo.replicaSetUrl(snapshotTargetDatabase);
         String cdcTargetUri = SharedMongo.replicaSetUrl(cdcTargetDatabase);
         String snapshot = "permission_snapshot_pipeline";
@@ -153,7 +181,9 @@ class AtlasPdkSourcePermissionsIT {
                  targetClient.getDatabase(snapshotTargetDatabase).drop();
                  targetClient.getDatabase(cdcTargetDatabase).drop();
              };
-             AtlasRuntime runtime = new AtlasRuntime(mode, metadataUri);
+             PreparedNativeStore prepared = mode == AtlasRuntime.Mode.ON_PREM
+                     ? PreparedNativeStore.create() : PreparedNativeStore.createCloud();
+             AtlasRuntime runtime = new AtlasRuntime(mode, prepared);
              ServerHandle server = runtime.launch(Tiers.IN_PROCESS)) {
             fixture.permissions(true, false);
             try (MongoClient reader = MongoClients.create(fixture.sourceUri())) {
@@ -177,8 +207,7 @@ class AtlasPdkSourcePermissionsIT {
                     () -> Long.valueOf(2).equals(control.snapshotRowsRead(snapshot).get(TABLE)),
                     () -> String.valueOf(control.snapshotRowsRead(snapshot)));
             awaitSnapshotProgress(control, snapshot);
-            control.stop(snapshot, false);
-            awaitState(control, snapshot, PipelineState.STOPPED);
+            awaitState(control, snapshot, PipelineState.COMPLETED);
 
             control.apply(workspace(source, "permission_cdc_target", cdc, fixture.sourceUri(), cdcTargetUri,
                     "snapshot_and_cdc"));
@@ -213,6 +242,8 @@ class AtlasPdkSourcePermissionsIT {
     private static void assertSafeCaptureFailure(ControlPlane control, String pipeline, String sourceUri,
             String expectedDetail) {
         awaitState(control, pipeline, PipelineState.FAILED);
+        Await.until(pipeline + " to publish its connector failure", TIMEOUT,
+                () -> control.failureCode(pipeline).isPresent(), () -> control.logs(pipeline));
         assertThat(control.failureCode(pipeline)).contains(ConnectorError.CAPTURE_FAILED.code());
         String body = control.sourceRequest("GET", "/api/pipelines/" + pipeline + "/status", null, null, 200).body();
         assertThat(body).doesNotContain(PASSWORD, sourceUri);
@@ -237,11 +268,13 @@ class AtlasPdkSourcePermissionsIT {
     }
 
     private static void awaitSnapshotProgress(ControlPlane control, String pipeline) {
-        Await.until("the explicit confirmed two-row snapshot progress", TIMEOUT,
-                () -> control.snapshotTable(pipeline, TABLE)
-                        .filter(progress -> progress.rowsDone() == 2 && Integer.valueOf(100).equals(progress.donePct()))
-                        .isPresent(),
-                () -> "snapshot=" + control.snapshotTable(pipeline, TABLE));
+        var load = Await.answered("the completed snapshot progress", TIMEOUT,
+                () -> control.initialLoad(pipeline).filter(progress -> "COMPLETED".equals(progress.get("phase"))));
+        assertThat(load.get("runKey")).asString().startsWith("execution:" + pipeline + ":");
+        var tables = (Map<?, ?>) load.get("tables");
+        var progress = (Map<?, ?>) tables.get(TABLE);
+        assertThat(progress.get("stage")).isEqualTo("LANDED");
+        assertThat(((Number) progress.get("rowsRead")).longValue()).isEqualTo(2L);
         assertThat(control.state(pipeline)).as("the successful snapshot has a healthy current observation")
                 .hasValueSatisfying(state -> assertThat(state).isNotEqualTo(PipelineState.FAILED));
     }

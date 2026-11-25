@@ -2,12 +2,15 @@ package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.e2e.connector.CsvConnector;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
-import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -15,6 +18,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -80,9 +84,6 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
     /** Where a shared physical capture files the connector's own notes. */
     private static final String NAMESPACE_PREFIX = "pdk.chain.";
 
-    private static final String STATE_DATABASE = "tapstate_nest";
-    private static final String STATE_COLLECTION = "operator_state";
-
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
@@ -97,7 +98,6 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String pipelineId = PIPELINE_BASE + "_" + suffix;
         String namespace;
-        String storeUri = SharedMongo.replicaSetUrl("connector_notes_store_" + suffix);
 
         Path sourceDirectory = Files.createDirectories(directory.resolve(SOURCE_ID));
         Path targetDirectory = Files.createDirectories(directory.resolve(TARGET_ID));
@@ -107,76 +107,88 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
         FileEndpoints files = new FileEndpoints();
         files.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-        byte[] minted;
-        try (ServerHandle first = tier.launch(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
-            ControlPlane control = new ControlPlane(first.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector(
-                    E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage)) {
+            byte[] minted;
+            try (ServerHandle first = tier.launch(storage)) {
+                ControlPlane control = new ControlPlane(first.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.registerConnector(
+                        E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 
-            control.discoverSchema(
-                    SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", sourceDirectory.toString()));
-            control.apply(workspace(sourceDirectory, targetDirectory, pipelineId));
-            control.lifecycle(pipelineId, LifecycleVerb.START);
-            awaitRunning(control, pipelineId);
+                control.discoverSchema(
+                        SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", sourceDirectory.toString()));
+                control.apply(workspace(sourceDirectory, targetDirectory, pipelineId));
+                control.lifecycle(pipelineId, LifecycleVerb.START);
+                awaitRunning(control, pipelineId);
 
-            // The connector only mints on its stream read, so the rows landing is what says the run is
-            // past its snapshot and into the drive that writes the note.
-            Await.until(
-                    "the first run to carry the seeded rows to the target",
-                    () -> files.count(target, TABLE) >= SEEDED_ROWS,
-                    () -> "rows at target = " + files.count(target, TABLE));
-            namespace = NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
-            Await.until(
-                    "the connector to have filed the name it minted",
-                    () -> note(storeUri, namespace).isPresent(),
-                    () -> "nothing under " + namespace);
-            minted = note(storeUri, namespace).orElseThrow();
+                // The connector only mints on its stream read, so the rows landing is what says the run is
+                // past its snapshot and into the drive that writes the note.
+                Await.until(
+                        "the first run to carry the seeded rows to the target",
+                        () -> files.count(target, TABLE) >= SEEDED_ROWS,
+                        () -> "rows at target = " + files.count(target, TABLE));
+                assertThat(documents.miningChainIds()).hasSize(1);
+                namespace = NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
+                Await.until(
+                        "the connector to have filed the name it minted",
+                        () -> note(storage, namespace).isPresent(),
+                        () -> "nothing under " + namespace);
+                minted = note(storage, namespace).orElseThrow();
 
-            control.stop(pipelineId, false);
-            awaitStopped(control, pipelineId);
+                control.stop(pipelineId, false);
+                awaitStopped(control, pipelineId);
+            }
+
+            // The stopped server is gone. On the real-process tier so is the JVM that ran it; the store is not.
+            try (ServerHandle second = tier.launch(storage)) {
+                ControlPlane control = new ControlPlane(second.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.lifecycle(pipelineId, LifecycleVerb.START);
+                awaitRunning(control, pipelineId);
+
+                long rowsBefore = files.count(target, TABLE);
+                files.cdc(source, TABLE, CdcOp.INSERT, 1);
+                Await.until(
+                        "a change made after the server was replaced to reach the target, so the run that "
+                                + "came back is reading rather than merely present",
+                        () -> files.count(target, TABLE) > rowsBefore,
+                        () -> "rows at target = " + files.count(target, TABLE) + ", was " + rowsBefore);
+
+                assertThat(note(storage, namespace))
+                        .as("the connector's note after a run that came back and is carrying changes")
+                        .isPresent();
+                assertThat(note(storage, namespace).orElseThrow())
+                        .as("the run that came back opened the notepad the run before it wrote in, byte for "
+                                + "byte: a notepad that did not outlive the server is not empty on the second "
+                                + "run either - the connector finds nothing, mints again, and leaves a value "
+                                + "that is present, well-formed and not this one")
+                        .isEqualTo(minted);
+            }
         }
-
-        // The stopped server is gone. On the real-process tier so is the JVM that ran it; the store is not.
-        try (ServerHandle second = tier.launch(storeUri)) {
-            ControlPlane control = new ControlPlane(second.baseUrl());
-            control.login("e2e", "e2e-password");
-            control.lifecycle(pipelineId, LifecycleVerb.START);
-            awaitRunning(control, pipelineId);
-
-            long rowsBefore = files.count(target, TABLE);
-            files.cdc(source, TABLE, CdcOp.INSERT, 1);
-            Await.until(
-                    "a change made after the server was replaced to reach the target, so the run that "
-                            + "came back is reading rather than merely present",
-                    () -> files.count(target, TABLE) > rowsBefore,
-                    () -> "rows at target = " + files.count(target, TABLE) + ", was " + rowsBefore);
-
-            assertThat(note(storeUri, namespace))
-                    .as("the connector's note after a run that came back and is carrying changes")
-                    .isPresent();
-            assertThat(note(storeUri, namespace).orElseThrow())
-                    .as("the run that came back opened the notepad the run before it wrote in, byte for "
-                            + "byte: a notepad that did not outlive the server is not empty on the second "
-                            + "run either - the connector finds nothing, mints again, and leaves a value "
-                            + "that is present, well-formed and not this one")
-                    .isEqualTo(minted);
-        }
-        files.close();
     }
 
-    /** One of the connector's own notes, read straight out of the store as the bytes it was written as. */
-    private static Optional<byte[]> note(String storeUri, String namespace) {
-        try (MongoClient client = MongoClients.create(storeUri)) {
-            Document id = new Document("ns", namespace).append("k", CsvConnector.IDENTITY);
-            Document found = client.getDatabase(STATE_DATABASE)
-                    .getCollection(STATE_COLLECTION)
-                    .find(new Document("_id", id))
-                    .first();
-            return Optional.ofNullable(found)
-                    .map(document -> document.get("state", Binary.class))
-                    .map(Binary::getData);
+    /** Checks the exact native row, then decodes the encrypted value as the plugin receives it. */
+    private static Optional<byte[]> note(PreparedNativeStore storage, String namespace) {
+        try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
+                        storage.configurationUri(), null, Duration.ofSeconds(5)));
+                MongoClient client = MongoClients.create(storage.configurationUri())) {
+            long binding = configuration.bindings().load().orElseThrow().bindingVersion();
+            var database = client.getDatabase(storage.configurationDatabase());
+            Document scopeId = new Document("bindingVersion", binding).append("namespace", namespace);
+            if (SystemCollections.PDK_NOTE_SCOPES.on(database).find(new Document("_id", scopeId)).first() == null)
+                return Optional.empty();
+            var owner = new RequiredNoteOwner(binding, namespace, RequiredNoteOwner.Kind.CHAIN,
+                    namespace.substring(NAMESPACE_PREFIX.length()), 0);
+            var scope = configuration.requiredNotes().open(owner);
+            Document id = new Document("bindingVersion", binding).append("namespace", namespace)
+                    .append("generation", scope.generation()).append("key", CsvConnector.IDENTITY);
+            Document found = SystemCollections.PDK_NOTES.on(database)
+                    .find(new Document("_id", id)).first();
+            if (found == null || Boolean.TRUE.equals(found.getBoolean("deleted"))) return Optional.empty();
+            assertThat(found.get("value")).as("the necessary note is encrypted in configuration storage")
+                    .isInstanceOf(String.class);
+            return Optional.ofNullable(configuration.requiredNotes().read(scope, CsvConnector.IDENTITY).bytes());
         }
     }
 

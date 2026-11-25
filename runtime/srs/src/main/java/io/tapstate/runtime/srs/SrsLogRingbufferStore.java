@@ -68,7 +68,7 @@ final class SrsLogRingbufferStore implements RingbufferStore<Object> {
 
     @Override
     public long getLargestSequence() {
-        return log.largestSequence(ring);
+        return log.ringInitializationBounds(ring).largestSequence();
     }
 
     private static SrsLogRecord toRecord(SrsItem item) {

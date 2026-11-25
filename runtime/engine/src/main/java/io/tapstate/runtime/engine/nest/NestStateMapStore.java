@@ -36,6 +36,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     private final String namespace;
     private final String database;
+    private final boolean scoped;
 
     /**
      * The layer this files under, and where a trip made here is counted. Neither can be handed in: the
@@ -45,24 +46,49 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * and the difference is silent - counters that are simply never written.
      */
     private KeyedStateStore store;
+    private NestStateIo stateIo;
 
     private NestStateStats stats;
+    private NestStateIo.Committed committed = NestStateIo.Committed.NONE;
 
     NestStateMapStore(String namespace) {
         this(namespace, null);
     }
 
     NestStateMapStore(String namespace, String database) {
+        this(namespace, database, false);
+    }
+
+    NestStateMapStore(String namespace, String database, boolean scoped) {
+        this.scoped = scoped;
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         this.database = database;
     }
 
     @Override
     public void init(HazelcastInstance member, Properties properties, String mapName) {
-        var stores = NestStateMapStoreFactory.boundTo(member);
-        String resolved = database == null ? stores.defaultDatabase() : database;
-        this.store = stores.inDatabase(resolved).state();
+        boolean required = scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties);
+        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, required);
+        if (bindings != null) this.store = required ? bindings.initializingNest(namespace, database) : bindings.nest(namespace, database);
+        else {
+            var stores = NestStateMapStoreFactory.boundTo(member);
+            String resolved = database == null ? stores.defaultDatabase() : database;
+            this.store = stores.inDatabase(resolved).state();
+        }
         this.stats = NestStateStats.of(member);
+        NestStateStats counted = this.stats;
+        this.committed = new NestStateIo.Committed() {
+            @Override
+            public void group(long keys, long roundTrips, long nanos) {
+                counted.committed(namespace, keys, roundTrips, nanos);
+            }
+
+            @Override
+            public void sizes(java.util.Collection<byte[]> written) {
+                counted.wrote(namespace, written);
+            }
+        };
+        this.stateIo = new NestStateIo(store, namespace, bindings == null ? null : () -> bindings.isRootNestState(namespace), committed);
     }
 
     @Override
@@ -77,10 +103,12 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     @Override
     public Object load(Object key) {
         long began = System.nanoTime();
-        Object state = store.load(namespace, NestStateKeys.nameOf(key))
-                .map(NestStateMapStore::fromBytes).orElse(null);
+        String name = NestStateKeys.nameOf(key);
+        byte[] bytes = stateIo.load(name);
+        Object state = bytes == null ? null : fromBytes(bytes);
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
+            stats.coldKeys(namespace, 1);
         }
         return state;
     }
@@ -108,9 +136,10 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             byName.put(NestStateKeys.nameOf(key), key);
         }
         long began = System.nanoTime();
-        Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
+        Map<String, byte[]> found = stateIo.loadAll(byName.keySet());
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
+            stats.coldKeys(namespace, byName.size());
         }
         Map<Object, Object> loaded = new LinkedHashMap<>();
         found.forEach((name, state) -> loaded.put(byName.get(name), fromBytes(state)));
@@ -125,17 +154,31 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+        if (store instanceof io.tapstate.spi.store.NestReleaseStore releases
+                && value instanceof ResolverState resolver) {
+            byte[] originalKey = resolver.releases().isEmpty() ? null : toBytes(key);
+            String storedKey = NestStateKeys.nameOf(key);
+            byte[] bytes = toBytes(value);
+            NestStateIo.commit(committed, List.of(bytes), () -> releases.saveWithRelease(namespace, storedKey, bytes, originalKey));
+        } else stateIo.saveAll(Map.of(NestStateKeys.nameOf(key), toBytes(value)));
     }
 
     @Override
     public void storeAll(Map<Object, Object> map) {
-        map.forEach(this::store);
+        if (store instanceof io.tapstate.spi.store.NestReleaseStore
+                && map.values().stream().anyMatch(ResolverState.class::isInstance)) {
+            map.forEach(this::store);
+            return;
+        }
+        Map<String, byte[]> states = new LinkedHashMap<>();
+        map.forEach((key, value) -> states.put(NestStateKeys.nameOf(key), toBytes(value)));
+        stateIo.saveAll(states);
     }
 
     @Override
     public void delete(Object key) {
-        store.delete(namespace, NestStateKeys.nameOf(key));
+        String storedKey = NestStateKeys.nameOf(key);
+        NestStateIo.commit(committed, 1, () -> store.delete(namespace, storedKey));
     }
 
     @Override
@@ -163,11 +206,28 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         return bytes.toByteArray();
     }
 
-    private static Object fromBytes(byte[] bytes) {
+    static Object releaseKey(io.tapstate.spi.store.NestReleaseStore.PendingKey pending) {
+        try {
+            Object key = readObject(pending.routingKey());
+            if (NestStateKeys.nameOf(key).equals(pending.stateKey())) return key;
+        } catch (IOException | ClassNotFoundException | IllegalArgumentException malformed) {
+            // Stored recovery coordinates must be readable without exposing their payload as a cause.
+        }
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", pending.stateKey(), "field", "operator-release-key"), null);
+    }
+
+    private Object fromBytes(byte[] bytes) {
+        try { return readObject(bytes); }
+        catch (IOException | ClassNotFoundException malformed) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id",namespace,"field","operator-state"),null);
+        }
+    }
+
+    private static Object readObject(byte[] bytes) throws IOException, ClassNotFoundException {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
             return in.readObject();
-        } catch (IOException | ClassNotFoundException cause) {
-            throw new IllegalStateException("could not read back nest state", cause);
         }
     }
 

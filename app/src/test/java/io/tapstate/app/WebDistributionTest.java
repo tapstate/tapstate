@@ -44,8 +44,8 @@ class WebDistributionTest {
         WebDistribution distribution = WebDistribution.read(exploded("server-only", null, Map.of()));
 
         assertThat(distribution.profile()).isEqualTo(WebDistribution.Profile.SERVER_ONLY);
-        distribution.validate(CloudRuntimeSettings.resolve(new CloudProperties()));
-        distribution.validate(cloud());
+        distribution.validate(CloudRuntimeSettings.resolve(new CloudProperties()), false);
+        distribution.validate(cloud(), false);
     }
 
     @Test
@@ -54,8 +54,8 @@ class WebDistributionTest {
 
         assertThat(distribution.profile()).isEqualTo(WebDistribution.Profile.CLOUD);
         assertThat(distribution.consoleUrl()).isEqualTo(CONSOLE);
-        distribution.validate(cloud());
-        assertThatThrownBy(() -> distribution.validate(CloudRuntimeSettings.resolve(new CloudProperties())))
+        distribution.validate(cloud(), false);
+        assertThatThrownBy(() -> distribution.validate(CloudRuntimeSettings.resolve(new CloudProperties()), false))
                 .isInstanceOfSatisfying(TapstateException.class, failure -> {
                     assertThat(failure.code()).isEqualTo(BootError.WEB_PROFILE_MODE_MISMATCH);
                     assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
@@ -70,8 +70,8 @@ class WebDistributionTest {
 
         assertThat(distribution.profile()).isEqualTo(WebDistribution.Profile.ON_PREM);
         assertThat(distribution.consoleUrl()).isNull();
-        distribution.validate(CloudRuntimeSettings.resolve(new CloudProperties()));
-        assertThatThrownBy(() -> distribution.validate(cloud()))
+        distribution.validate(CloudRuntimeSettings.resolve(new CloudProperties()), false);
+        assertThatThrownBy(() -> distribution.validate(cloud(), false))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(BootError.WEB_PROFILE_MODE_MISMATCH));
     }

@@ -24,13 +24,52 @@ public final class ControlOperations {
     // Every operation is staged at the one stage this build ships at, on every face it is open on. The
     // stage is not part of these names on purpose: a name that spelled it would go stale the moment the
     // build moved on, and a per-face stage is what lets one face open a surface the rest do not.
+    private static final Map<Frontend, Maturity> REST_ONLY = Map.of(Frontend.REST, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_ONLY = Map.of(Frontend.CLI, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_MCP =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_REST =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT);
 
+    public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_SELECT = new Operation("ai-provider.select", Scope.WRITE, true, null,
+            "Select the existing workspace provider or Tapstate-managed AI.", REST_ONLY);
+    public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_MODELS = new Operation("ai-provider.models", Scope.WRITE, false, null, "Discover provider model identifiers without persisting credentials.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
+
+    public static final Operation VALIDATION_EVALUATE = new Operation("validation.evaluate", Scope.WRITE, false, null,
+            "Evaluate direct full validation choices through independent connector metadata without saving or starting.", REST_ONLY);
+    public static final Operation VALIDATION_SAVE = new Operation("validation.save", Scope.WRITE, true, null,
+            "Reevaluate and save a direct full validation definition using the expected fingerprint and task revision.", REST_ONLY);
+    public static final Operation VALIDATION_START = new Operation("validation.start", Scope.WRITE, true, null,
+            "Start only the fixed full validation command and query uncertain original admission without redispatch.", REST_ONLY);
+    public static final Operation VALIDATION_PROGRESS = new Operation("validation.progress", Scope.READ, false, null,
+            "Read the original validation run without recreating missing execution handles.", REST_ONLY);
+    public static final Operation VALIDATION_STOP = new Operation("validation.stop", Scope.WRITE, true, null,
+            "Stop only the original full validation command without changing its schedule or the Pipeline.", REST_ONLY);
+    public static final Operation VALIDATION_SCHEDULE_DISABLE = new Operation("validation.schedule-disable", Scope.WRITE, true, null,
+            "Disable future scheduled validation through the original configuration CAS without querying connectors or stopping an admitted run.", REST_ONLY);
+    public static final Operation VALIDATION_HISTORY = new Operation("validation.history", Scope.READ, false, null,
+            "Read bounded full validation history without creating a run or a missing report.", REST_ONLY);
+    public static final Operation VALIDATION_REPORT = new Operation("validation.report", Scope.READ, false, null,
+            "Read one original full validation report with PDK count results and its observation premise.", REST_ONLY);
+    public static final Operation VALIDATION_ROOTS = new Operation("validation.roots", Scope.READ, false, null,
+            "Read a bounded page of the original report root observations with explicit value types.", REST_ONLY);
+    public static final Operation VALIDATION_ROOT = new Operation("validation.root", Scope.READ, false, null,
+            "Read one retained root observation without truncating its exact values or claiming physical drain.", REST_ONLY);
+    public static final Operation VALIDATION_GET = new Operation("validation.get", Scope.READ, false, null,
+            "Read one saved full validation definition without allocating execution state.", REST_ONLY);
+    public static final Operation VALIDATION_SCHEDULE_PREVIEW = new Operation("validation.schedule-preview", Scope.READ, false, null,
+            "Preview five future full validation occurrences in the selected time zone.", REST_ONLY);
+
     // system domain
+    public static final Operation SYSTEM_PDK_VERSION = new Operation(
+            "system.pdk-version", Scope.READ, false, null, "Read the packaged host PDK versions and checksums.", REST_ONLY);
+
     public static final Operation SYSTEM_VERSION = new Operation(
             "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
             "Report which version of Tapstate this server is, plus the authoring grammar versions it "
@@ -61,8 +100,8 @@ public final class ControlOperations {
     // infer it: a remote model reads this text and nothing else before deciding to call it.
     public static final Operation ARTIFACT_DELETE = mcp(
             "artifact.delete", Scope.WRITE, true,
-            "Permanently remove one applied resource of any kind by id. This is not reversible and leaves "
-                    + "no tombstone; restoring means applying the resource again. The expectedContentHash "
+            "Permanently remove one applied resource of any kind by id. This is not reversible; restoring "
+                    + "means applying the resource again after its private resources are retired. The expectedContentHash "
                     + "must be the hash of the version just read, and the removal is refused if the stored "
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");
@@ -107,6 +146,23 @@ public final class ControlOperations {
             "state-store.connect", Scope.WRITE, true, null,
             "Configure the one Cloud MongoDB Atlas destination for materialized views.", CLI_AND_REST);
 
+    public static final Operation STATE_STORE_CONNECTION_URI = new Operation(
+            "state-store.connection-uri", Scope.WRITE, true, null,
+            "Retrieve the bound application data store URI for an authorized human session.", REST_ONLY);
+
+    public static final Operation STORAGE_STATUS = storage("storage.status", Scope.READ, false);
+    public static final Operation STORAGE_TEST = storage("storage.test", Scope.WRITE, false);
+    public static final Operation STORAGE_SETUP_COMMIT = storage("storage.setup.commit", Scope.WRITE, true);
+    public static final Operation STORAGE_SETUP_ACTIVATE = storage("storage.setup.activate", Scope.WRITE, true);
+    public static final Operation STORAGE_SETUP_STATUS = storage("storage.setup.status", Scope.READ, false);
+    public static final Operation STORAGE_RECOVERY_PLAN = storage("storage.recovery.plan", Scope.WRITE, true);
+    public static final Operation STORAGE_RECOVERY_CONFIRM = storage("storage.recovery.confirm", Scope.WRITE, true);
+    public static final Operation STORAGE_RECOVERY_STATUS = storage("storage.recovery.status", Scope.READ, false);
+    public static final Operation CONFIGURATION_EXPORT = storage("configuration.export", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_PREFLIGHT = storage("configuration.import.preflight", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_COMMIT = storage("configuration.import.commit", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_STATUS = storage("configuration.import.status", Scope.READ, false);
+
     // connection domain: each probing verb runs an external probe and persists its result for later query
     // and display, so it mutates persisted state (a write) and is audited; its read-back peer returns the
     // latest persisted result (or a 404 when the connection was never probed), mutates nothing, and is
@@ -148,6 +204,32 @@ public final class ControlOperations {
             "connector.icon", Scope.READ, false, null,
             "Read the registered connector icon asset.", CLI_ONLY);
 
+    public static final Operation CONNECTOR_CENTER_LIST = new Operation(
+            "connector-center.list", Scope.READ, false, null,
+            "Read supported connectors and their download and local installation availability.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_REFRESH = new Operation(
+            "connector-center.refresh", Scope.ADMIN, true, null,
+            "Refresh the official connector support and Maven download catalog.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_DOWNLOAD = new Operation(
+            "connector-center.download", Scope.ADMIN, true, null,
+            "Install the selected compatible connector release and report its progress.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_OPERATION = new Operation(
+            "connector-center.operation", Scope.READ, false, null,
+            "Read the transfer and installation progress of one connector operation.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_UPLOAD = new Operation(
+            "connector-center.upload", Scope.ADMIN, true, null,
+            "Upload an on-prem connector JAR for verified local installation.", REST_ONLY);
+
+    /** Cloud sessions use the workload write capability to fetch and install official releases. */
+    public static Scope requiredScope(Operation operation, CredentialType credential) {
+        if (credential == CredentialType.CLOUD_SESSION
+                && (operation.id().equals(CONNECTOR_CENTER_REFRESH.id())
+                    || operation.id().equals(CONNECTOR_CENTER_DOWNLOAD.id()))) {
+            return Scope.WRITE;
+        }
+        return operation.scope();
+    }
+
     // data-browser domain: the read face over a declared source's own database — list its collections,
     // read one collection's rows, report one collection's size. All three read through to the connector
     // and persist nothing, not even the result, so they are read-scoped and unaudited. That is what
@@ -185,7 +267,7 @@ public final class ControlOperations {
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
     public static final Operation CLUSTER_CONTEXT = new Operation(
             "cluster.context", Scope.READ, false, null,
-            "Read the organization and Cluster display context bound to the authenticated Cloud session.",
+            "Read the organization and Cluster display context and verified user email bound to the authenticated Cloud session.",
             Map.of(Frontend.REST, Maturity.CURRENT));
 
     // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle
@@ -200,6 +282,10 @@ public final class ControlOperations {
             "pipeline.catalog", Scope.READ, false, null,
             "List a bounded page of Pipelines from the unified artifact-and-draft catalog, including lifecycle status.",
             CLI_AND_REST);
+    public static final Operation PIPELINE_DELETE = new Operation(
+            "pipeline.delete", Scope.WRITE, true, null,
+            "Remove one applied Pipeline and the authoring draft revision the caller read, preserving the existing lifecycle, reference, and version guards.",
+            Map.of(Frontend.REST, Maturity.CURRENT));
     public static final Operation VIEW_LIST = new Operation(
             "view.list", Scope.READ, false, null,
             "List materialized views and replicas with their location, maintaining pipeline, and freshness.",
@@ -253,9 +339,25 @@ public final class ControlOperations {
             "pipeline-draft.rebase", Scope.WRITE, true, null,
             "Explicitly rebase one Pipeline draft onto the artifact hash the caller has just read, preserving its content.",
             CLI_AND_REST);
+    // The start runs its start checks first. The answer convention is in the description because the
+    // caller on that face is a model: it relays the questions and carries back a person's answers, and the
+    // precondition proves that somebody answered the report as it stood, never that a person did.
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
-            "Set a Pipeline's desired state to running after its workspace has been applied.");
+            "Set a Pipeline's desired state to running after its workspace has been applied. Its start "
+                    + "checks run first: a start they stop is refused with their report under startChecks, "
+                    + "each question listing the answers it offers. Relay the findings to the person starting "
+                    + "the Pipeline and send back the answers they choose as decisions, with the report's "
+                    + "contentHash as expectedContentHash. Never choose an answer that changes the Pipeline "
+                    + "or clears data unless the person said to.");
+    // The start checks a start would be asked, read without starting anything: what a client shows
+    // before it starts, and what a rerun asks about while the pipeline still runs untouched. Read-scoped,
+    // so a caller with no write capability can still see why a start would stop.
+    public static final Operation PIPELINE_START_CHECKS = mcp(
+            "pipeline.start-checks", Scope.READ, false,
+            "Read the start checks a Pipeline start would be asked, without starting it: each finding, "
+                    + "whether it lets the start go ahead, asks a question first, or refuses it, and the "
+                    + "answers a question offers. Relay the findings to the person starting the Pipeline.");
     // The description is rendered from the same declarations a stop works through, both outcomes of
             // them. Written out by hand it would describe whatever was true when somebody last edited it,
             // and a description that has fallen behind reads exactly like one that is complete.
@@ -294,6 +396,9 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+    public static final Operation PIPELINE_LOG_LEVEL = new Operation(
+            "pipeline.log-level", Scope.WRITE, true, null,
+            "Set the minimum severity retained for one Pipeline's future node-local log lines.", CLI_ONLY);
     public static final Operation PIPELINE_METRICS_HISTORY = mcp(
             "pipeline.metrics.history", Scope.READ, false,
             "Read a bounded, reset-aware page of target-acknowledged output rates and selected table lag "
@@ -331,6 +436,16 @@ public final class ControlOperations {
     public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
             "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
+    // A running aggregate step compared with its own rows, and written again from them. The check reads
+    // only; the repair rewrites stored totals and sends rows to the target, so it is write-scoped and
+    // audited. Both stay off the model-facing surface: what a check proves is narrow -- the totals match
+    // the rows the step holds, not the source -- and a repair is a decision about a finding, taken by the
+    // person looking at it.
+    public static final Operation PIPELINE_AGGREGATE_CHECK = new Operation(
+            "pipeline.aggregate-check", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_AGGREGATE_REPAIR = new Operation(
+            "pipeline.aggregate-repair", Scope.WRITE, true, null, CLI_ONLY);
+
     // The HTTP face projects the CLI-staged inventory; the current user read stays off MCP.
     public static final Operation AUTH_CURRENT_USER = new Operation(
             "auth.current-user", Scope.READ, false, null,
@@ -344,8 +459,40 @@ public final class ControlOperations {
     public static final Operation TOKEN_REVOKE = new Operation("token.revoke", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
+    public static final Operation ALERT_RESOURCES = new Operation("alert.resources", Scope.WRITE, false, null, "Read a bounded page of current configuration resource identities.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_RULE_PREVIEW = new Operation("alert.rule-preview", Scope.WRITE, false, null, "Evaluate synthetic rule lifecycle examples without publishing or persisting alert state.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_ROUTE_PREVIEW = new Operation("alert.route-preview", Scope.ADMIN, false, null, "Preview matching current alerts without planning or sending notifications.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CATALOG = new Operation("alert.catalog", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CENTER = new Operation("alert.center", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_DETAIL = new Operation("alert.detail", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_DELIVERIES = new Operation("alert.deliveries", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_HEALTH = new Operation("alert.health", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CONFIGURATION_LIST = new Operation("alert.configuration.list", Scope.WRITE, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CONFIGURATION_SAVE = new Operation("alert.configuration.save", Scope.WRITE, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CONFIGURATION_RETIRE = new Operation("alert.configuration.retire", Scope.WRITE, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_PREVIEW = new Operation("alert.preview", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_TEST = new Operation("alert.test", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_TEST_RESULT = new Operation("alert.test-result", Scope.ADMIN, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_RETRY = new Operation("alert.retry", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+
+    public static final Operation RETRY_SETTINGS_GET = new Operation("retry-settings.get", Scope.ADMIN, false, null,
+            "Read the cluster retry settings and revision.", REST_ONLY);
+    public static final Operation RETRY_SETTINGS_REPLACE = new Operation("retry-settings.replace", Scope.ADMIN, true, null,
+            "Replace the cluster retry settings at the supplied revision.", REST_ONLY);
+
     private static final List<Operation> ALL = List.of(
-            SYSTEM_VERSION,
+            RETRY_SETTINGS_GET, RETRY_SETTINGS_REPLACE,
+            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT, VALIDATION_SCHEDULE_DISABLE,
+            ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
+            AI_PROVIDER_GET,
+            AI_PROVIDER_REPLACE,
+            AI_PROVIDER_SELECT,
+            AI_PROVIDER_DELETE,
+            AI_PROVIDER_CHECK,
+            AI_PROVIDER_MODELS,
+            PIPELINE_DRAFT_ASSISTANT,
+            PIPELINE_DRAFT_ASSISTANT_VALIDATE,
+            SYSTEM_VERSION, SYSTEM_PDK_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,
             ARTIFACT_GET,
@@ -361,7 +508,10 @@ public final class ControlOperations {
             SOURCE_DELETE,
             SAMPLE_SOURCE_LIST,
             SAMPLE_SOURCE_INSTALL,
-            STATE_STORE_CONNECT,
+            STATE_STORE_CONNECT, STATE_STORE_CONNECTION_URI,
+            STORAGE_STATUS, STORAGE_TEST, STORAGE_SETUP_COMMIT, STORAGE_SETUP_STATUS, STORAGE_SETUP_ACTIVATE,
+            STORAGE_RECOVERY_PLAN, STORAGE_RECOVERY_CONFIRM, STORAGE_RECOVERY_STATUS,
+            CONFIGURATION_EXPORT, CONFIGURATION_IMPORT_PREFLIGHT, CONFIGURATION_IMPORT_COMMIT, CONFIGURATION_IMPORT_STATUS,
             CONNECTION_TEST,
             CONNECTION_TEST_RESULT,
             CONNECTION_DISCOVER_SCHEMA,
@@ -370,6 +520,8 @@ public final class ControlOperations {
             CONNECTOR_LIST,
             CONNECTOR_GET,
             CONNECTOR_ICON,
+            CONNECTOR_CENTER_LIST, CONNECTOR_CENTER_REFRESH, CONNECTOR_CENTER_DOWNLOAD,
+            CONNECTOR_CENTER_OPERATION, CONNECTOR_CENTER_UPLOAD,
             DATA_BROWSER_COLLECTIONS,
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,
@@ -377,6 +529,7 @@ public final class ControlOperations {
             CLUSTER_CONTEXT,
             PIPELINE_LIST,
             PIPELINE_CATALOG,
+            PIPELINE_DELETE,
             VIEW_LIST,
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,
@@ -393,6 +546,7 @@ public final class ControlOperations {
             PIPELINE_DRAFT_PUBLISH,
             PIPELINE_DRAFT_REBASE,
             PIPELINE_START,
+            PIPELINE_START_CHECKS,
             PIPELINE_STOP,
             PIPELINE_PAUSE,
             PIPELINE_RESUME,
@@ -400,12 +554,15 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_LOG_LEVEL,
             PIPELINE_METRICS_HISTORY,
             PIPELINE_EXPLAIN,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
+            PIPELINE_AGGREGATE_CHECK,
+            PIPELINE_AGGREGATE_REPAIR,
             AUTH_CURRENT_USER,
             USER_CREATE,
             USER_PASSWD,
@@ -415,6 +572,12 @@ public final class ControlOperations {
             TOKEN_LIST);
 
     private ControlOperations() {
+    }
+
+    private static Operation storage(String id, Scope scope, boolean audited) {
+        return new Operation(id, scope, audited, ControlApiSchema.ref(id),
+                "Manage storage using the original authorized operation and current installation phase; query an uncertain result before retrying.",
+                Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT));
     }
 
     private static Operation mcp(String id, Scope scope, boolean audited, String description) {

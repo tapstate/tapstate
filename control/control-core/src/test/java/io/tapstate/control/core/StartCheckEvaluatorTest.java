@@ -1,0 +1,350 @@
+package io.tapstate.control.core;
+
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.LifecycleError;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RunnableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
+
+/**
+ * One start check's failure stays its own. A check that cannot tell -- a coded refusal, or no answer in
+ * time -- becomes a finding that says so and never passes, while every other check's findings stand; a
+ * check that throws anything else is a defect and fails the start with it.
+ */
+class StartCheckEvaluatorTest {
+
+    private final StartChecksBench bench = new StartChecksBench();
+
+    @AfterEach
+    void close() {
+        bench.executor.close();
+    }
+
+    @Test
+    void cdcOnlyPlanningDoesNotConsultProgressForFullLoadClassification() {
+        var pipeline = (io.tapstate.core.model.PipelineResource) new io.tapstate.core.dsl.DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: cdc
+                source: [src]
+                settings: {read_mode: cdc_only}
+                """);
+        var planner = new StartPlanner(id -> { throw new AssertionError("progress should not be needed"); },
+                noRecords(), definition -> List.of());
+
+        assertThat(planner.plan(pipeline, Optional.empty(), StartIntent.START).load())
+                .isEqualTo(io.tapstate.spi.store.StartLoad.CDC_ONLY);
+    }
+
+    @Test
+    void aCheckThatCannotTellIsAFindingOfItsOwnAndTheOthersStillStand() {
+        bench.artifacts.put(StartChecksBench.pipeline(null));
+        bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 4L, false));
+        bench.checks.add(new Throwing("refused", new TapstateException(
+                LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", "elsewhere"), null)));
+        bench.checks.add(new Slow("slow"));
+        bench.budget = Duration.ofMillis(300);
+
+        StartEvaluation evaluation = evaluate();
+
+        assertThat(evaluation.findings()).extracting(StartFinding::key)
+                .containsExactly("target-not-empty/warehouse/orders", "refused/pl", "slow/pl");
+        StartFinding refused = evaluation.finding("refused/pl").orElseThrow();
+        assertThat(refused.behavior()).isEqualTo(StartFinding.Behavior.WARN);
+        assertThat(refused.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
+        assertThat(refused.params()).containsEntry("check", "refused")
+                .containsEntry("reasonCode", "TS0280005");
+        StartFinding slow = evaluation.finding("slow/pl").orElseThrow();
+        assertThat(slow.behavior()).isEqualTo(StartFinding.Behavior.WARN);
+        assertThat(slow.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
+        assertThat((String) slow.params().get("reason")).contains("did not answer");
+        assertThat(evaluation.finding("target-not-empty/warehouse/orders").orElseThrow().behavior())
+                .isEqualTo(StartFinding.Behavior.CONFIRM);
+        assertThat(evaluation.outcome(Set.of())).isEqualTo(StartCheckReport.Outcome.NEEDS_CONFIRMATION);
+    }
+
+    @Test
+    void aCheckThatThrowsAnUncodedErrorFailsTheStartWithIt() {
+        bench.artifacts.put(StartChecksBench.pipeline(null));
+        IllegalStateException defect = new IllegalStateException("check defect");
+        bench.checks.add(new Throwing("broken", defect));
+
+        assertThatThrownBy(this::evaluate).isSameAs(defect);
+    }
+
+    @Test
+    void aCheckCannotDeclareThatNotKnowingPasses() {
+        bench.checks.add(new StartCheck() {
+            @Override
+            public String id() {
+                return "optimist";
+            }
+
+            @Override
+            public List<StartFinding> evaluate(StartCheckContext context) {
+                return List.of();
+            }
+
+            @Override
+            public StartFinding.Behavior whenUnavailable() {
+                return StartFinding.Behavior.PASS;
+            }
+        });
+        assertThatThrownBy(bench::evaluator).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("optimist");
+    }
+
+    @Test
+    void aCheckIsNamedInLowerKebabOrRefused() {
+        for (String id : List.of("target-not-empty", "a", "a1", "x-1-2")) {
+            bench.checks.clear();
+            bench.checks.add(named(id));
+            assertThatCode(bench::evaluator).as("check id %s", id).doesNotThrowAnyException();
+        }
+        for (String id : List.of("Target", "target--x", "-target", "target-", "1target", "a_b", "")) {
+            bench.checks.clear();
+            bench.checks.add(named(id));
+            assertThatThrownBy(bench::evaluator).as("check id '%s'", id)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("lower-kebab");
+        }
+    }
+
+    /** Matching an id walks its segments without recursing once per segment, however many there are. */
+    @Test
+    void aLongIdIsCheckedWithoutRunningOutOfStack() {
+        bench.checks.clear();
+        bench.checks.add(named("a" + "-a".repeat(100_000)));
+
+        assertThatCode(bench::evaluator).doesNotThrowAnyException();
+    }
+
+    private static StartCheck named(String id) {
+        return new StartCheck() {
+            @Override
+            public String id() {
+                return id;
+            }
+
+            @Override
+            public List<StartFinding> evaluate(StartCheckContext context) {
+                return List.of();
+            }
+
+            @Override
+            public StartFinding.Behavior whenUnavailable() {
+                return StartFinding.Behavior.WARN;
+            }
+        };
+    }
+
+    @Test
+    void aStartWhosePlanCannotBeWorkedOutIsAFindingThatSaysSo() {
+        bench.artifacts.put(StartChecksBench.pipeline(null));
+        StartCheckEvaluator evaluator = new StartCheckEvaluator(bench.checks,
+                new StartPlanner(pipelineId -> List.of(), noRecords(), definition -> {
+                    throw new TapstateException(LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", "pl"), null);
+                }),
+                (connection, table) -> TargetProbe.TargetRows.EMPTY, (code, params) -> code.code(),
+                bench.executor, StartChecksBench.CLOCK);
+
+        StartEvaluation evaluation = evaluator.evaluate("pl", bench.stored("pl"), bench.hash("pl"),
+                Optional.empty(), StartIntent.START);
+
+        assertThat(evaluation.plan()).isNull();
+        assertThat(evaluation.findings()).singleElement().satisfies(finding -> {
+            assertThat(finding.key()).isEqualTo("target-not-empty/pl");
+            assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.WARN);
+            assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
+            assertThat(finding.params()).containsEntry("reasonCode", "TS0280004");
+        });
+        assertThat(evaluator.report(evaluation, Set.of()).plan()).isEmpty();
+    }
+
+    @Test
+    void aCopyPipelineWithoutTransformsStartsAfterSlowPlanning() {
+        bench.artifacts.put(StartChecksBench.pipeline("clear"));
+        assertThat(bench.stored("pl").transforms()).isNull();
+        bench.checks.add(new UnwindTargetIdentityCheck(new PipelineTargetIdentities() {
+            @Override
+            public boolean relevant(io.tapstate.core.model.PipelineResource definition) {
+                return definition.transforms() != null && !definition.transforms().isEmpty();
+            }
+
+            @Override
+            public List<Assessment> assess(io.tapstate.core.model.PipelineResource definition, boolean fullLoad) {
+                throw new AssertionError("a pipeline without transforms needs no target identity metadata");
+            }
+        }));
+        AtomicReference<Instant> now = new AtomicReference<>(StartChecksBench.CLOCK.instant());
+        Clock clock = new Clock() {
+            @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+            @Override public Clock withZone(ZoneId zone) { return this; }
+            @Override public Instant instant() { return now.get(); }
+        };
+        StartPlanner planner = new StartPlanner(pipelineId -> List.of(), noRecords(), definition -> {
+            // Successful remote planning can consume the entire check budget before checks are submitted.
+            now.set(now.get().plus(StartCheckEvaluator.BUDGET).plusMillis(200));
+            return bench.writeTargets(definition);
+        });
+        try (var checks = new ChecksRunWhenAwaited()) {
+            StartCheckEvaluator evaluator = new StartCheckEvaluator(bench.checks, planner,
+                    (connection, table) -> TargetProbe.TargetRows.EMPTY, (code, params) -> code.code(), checks, clock);
+            PipelineStartService service = new PipelineStartService(bench.lifecycle, evaluator, bench.apply);
+
+            StartRefusal refusal = catchThrowableOfType(StartRefusal.class,
+                    () -> service.start("alice", "pl", List.of(), null));
+
+            if (refusal != null) {
+                assertThat(refusal.report().plan()).singleElement().satisfies(entry -> {
+                    assertThat(entry.load()).isEqualTo(io.tapstate.spi.store.StartLoad.FULL_LOAD);
+                    assertThat(entry.onFullLoad()).isEqualTo("clear");
+                });
+            }
+            assertThat(refusal).as("A copy pipeline must start after successful planning; report: %s",
+                    refusal == null ? null : refusal.report()).isNull();
+            assertThat(bench.desiredById).containsKey("pl");
+        }
+    }
+
+    @Test
+    void theReportRendersEveryTextAndKeepsTheParamsTyped() {
+        bench.artifacts.put(StartChecksBench.pipeline(null));
+        bench.holding("warehouse/orders", new TargetProbe.TargetRows(false, 1465L, false));
+        StartCheckEvaluator evaluator = bench.evaluator();
+
+        StartCheckReport report = evaluator.report(evaluate(), Set.of());
+
+        assertThat(report.pipelineId()).isEqualTo("pl");
+        assertThat(report.contentHash()).isEqualTo(bench.hash("pl"));
+        assertThat(report.outcome()).isEqualTo(StartCheckReport.Outcome.NEEDS_CONFIRMATION);
+        assertThat(report.plan()).singleElement().satisfies(entry -> {
+            assertThat(entry.element()).isEqualTo("out");
+            assertThat(entry.target()).isEqualTo(new StartCheckReport.Target("warehouse", "orders"));
+            assertThat(entry.load()).isEqualTo(io.tapstate.spi.store.StartLoad.FULL_LOAD);
+            assertThat(entry.onFullLoad()).isEqualTo("append");
+        });
+        StartCheckReport.Finding finding = report.findings().getFirst();
+        assertThat(finding.code()).isEqualTo("TS0290006");
+        assertThat(finding.params()).containsEntry("rows", 1465L);
+        assertThat(finding.message()).startsWith("TS0290006 ");
+        assertThat(finding.actions()).extracting(StartCheckReport.Action::message)
+                .allSatisfy(message -> assertThat(message).startsWith("TS029"));
+    }
+
+    @Test
+    void slowPlanningLeavesOneSharedBudgetForApplicableChecks() {
+        bench.artifacts.put(StartChecksBench.pipeline("clear"));
+        AtomicReference<Instant> now = new AtomicReference<>(StartChecksBench.CLOCK.instant());
+        Clock clock = new Clock() {
+            @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+            @Override public Clock withZone(ZoneId zone) { return this; }
+            @Override public Instant instant() { return now.get(); }
+        };
+        List<Duration> remaining = new java.util.ArrayList<>();
+        bench.checks.clear();
+        for (String id : List.of("first", "second")) {
+            bench.checks.add(new StartCheck() {
+                @Override public String id() { return id; }
+                @Override public List<StartFinding> evaluate(StartCheckContext context) {
+                    remaining.add(Duration.between(clock.instant(), context.deadline()));
+                    now.set(now.get().plusMillis(400));
+                    return List.of();
+                }
+            });
+        }
+        StartPlanner planner = new StartPlanner(pipelineId -> List.of(), noRecords(), definition -> {
+            now.set(now.get().plusSeconds(2));
+            return bench.writeTargets(definition);
+        });
+        try (var checks = new ChecksRunWhenAwaited()) {
+            var evaluator = new StartCheckEvaluator(bench.checks, planner,
+                    (connection, table) -> TargetProbe.TargetRows.EMPTY, (code, params) -> code.code(), checks, clock);
+
+            StartEvaluation evaluated = evaluator.evaluate("pl", bench.stored("pl"), bench.hash("pl"),
+                    Optional.empty(), StartIntent.START);
+
+            assertThat(remaining).containsExactly(StartCheckEvaluator.BUDGET,
+                    StartCheckEvaluator.BUDGET.minusMillis(400));
+            assertThat(evaluated.evaluatedAt()).isEqualTo(StartChecksBench.CLOCK.instant());
+            assertThat(evaluated.findings()).isEmpty();
+        }
+    }
+
+    private StartEvaluation evaluate() {
+        return bench.evaluator().evaluate("pl", bench.stored("pl"), bench.hash("pl"), Optional.empty(),
+                StartIntent.START);
+    }
+
+    private static io.tapstate.spi.store.SrsMetaStore noRecords() {
+        return (io.tapstate.spi.store.SrsMetaStore) java.lang.reflect.Proxy.newProxyInstance(
+                StartCheckEvaluatorTest.class.getClassLoader(),
+                new Class<?>[] {io.tapstate.spi.store.SrsMetaStore.class}, (proxy, method, args) -> {
+                    throw new AssertionError("no chain is read here");
+                });
+    }
+
+    /** Models queued checks that run when given a positive wait, without sleeping or scheduler races. */
+    private static final class ChecksRunWhenAwaited extends AbstractExecutorService {
+        private boolean shutdown;
+        @Override public void shutdown() { shutdown = true; }
+        @Override public List<Runnable> shutdownNow() { shutdown = true; return List.of(); }
+        @Override public boolean isShutdown() { return shutdown; }
+        @Override public boolean isTerminated() { return shutdown; }
+        @Override public boolean awaitTermination(long timeout, TimeUnit unit) { return shutdown; }
+        @Override public void execute(Runnable task) { }
+        @Override protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+            return new FutureTask<>(callable) {
+                @Override
+                public T get(long timeout, TimeUnit unit)
+                        throws InterruptedException, ExecutionException, TimeoutException {
+                    if (timeout > 0) run();
+                    return super.get(timeout, unit);
+                }
+            };
+        }
+    }
+
+    /** A check that only exists here, and throws whatever it is given. */
+    private record Throwing(String id, RuntimeException thrown) implements StartCheck {
+        @Override
+        public List<StartFinding> evaluate(StartCheckContext context) {
+            throw thrown;
+        }
+    }
+
+    /** A check that only exists here, and never answers in time. */
+    private record Slow(String id) implements StartCheck {
+        @Override
+        public List<StartFinding> evaluate(StartCheckContext context) {
+            try {
+                Thread.sleep(Duration.ofSeconds(10));
+            } catch (InterruptedException stopped) {
+                Thread.currentThread().interrupt();
+            }
+            return List.of();
+        }
+    }
+}

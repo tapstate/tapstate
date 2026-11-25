@@ -18,6 +18,7 @@ import java.util.Optional;
 public final class CredentialAuthenticator {
 
     private final CredentialVerifier verifier;
+    private final java.util.function.Function<String, Optional<CredentialAuthentication>> contexts;
 
     public CredentialAuthenticator(TokenService tokenService, TokenSigner tokenSigner) {
         Objects.requireNonNull(tokenService, "tokenService");
@@ -25,11 +26,33 @@ public final class CredentialAuthenticator {
         this.verifier = presented -> TokenService.isMachineToken(presented)
                 ? tokenService.authenticate(presented)
                 : tokenSigner.verify(presented);
+        this.contexts = null;
     }
 
     /** Uses the selected deployment's verifier, such as the Cluster-local managed-session verifier. */
     public CredentialAuthenticator(CredentialVerifier verifier) {
         this.verifier = Objects.requireNonNull(verifier, "verifier");
+        this.contexts = null;
+    }
+
+    private CredentialAuthenticator(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts, boolean scoped) {
+        this.contexts = Objects.requireNonNull(contexts, "contexts");
+        this.verifier = credential -> contexts.apply(credential).map(CredentialAuthentication::token);
+    }
+
+    /** The selected provider supplies a fixed scope and an original-credential guard, never a latest-scope lookup. */
+    public static CredentialAuthenticator scoped(java.util.function.Function<String, Optional<CredentialAuthentication>> contexts) {
+        return new CredentialAuthenticator(contexts, true);
+    }
+
+    public Optional<CredentialAuthentication> authenticateContext(String presented) {
+        if (presented == null || presented.isBlank()) return Optional.empty();
+        if (contexts != null) return contexts.apply(presented);
+        return verifier.verify(presented).map(original -> new CredentialAuthentication(original,
+                Optional.empty(), Optional.empty(), () -> {
+                    if (!verifier.verify(presented).filter(original::equals).isPresent())
+                        throw new io.tapstate.core.common.TapstateException(ControlError.UNAUTHENTICATED, java.util.Map.of(), null);
+                }));
     }
 
     /** Refuses every credential until a required external verifier has been integrated. */

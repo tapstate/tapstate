@@ -159,6 +159,13 @@ public final class LevelBounds {
         return already != null && already >= FrontierOrders.pack(chain, order);
     }
 
+    /** The last bound offered on this chain, including one still waiting on the outbox. */
+    public java.util.Optional<SourceOrder> lastOfferedOn(String chain) {
+        Long already = sent.get(chain);
+        return already == null ? java.util.Optional.empty()
+                : java.util.Optional.of(FrontierOrders.unpack(already));
+    }
+
     /**
      * What this level may promise on {@code chain} as things stand, or nothing when it may promise no more
      * than it already has. Every edge expected to carry the chain must have spoken; whatever is still held

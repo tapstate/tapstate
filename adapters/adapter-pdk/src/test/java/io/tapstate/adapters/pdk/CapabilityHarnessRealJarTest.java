@@ -68,8 +68,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * written by hand, derivation cannot reproduce it and is not supposed to; the sink capability is
  * derived for every connector, so it is compared for every connector.
  *
- * <p>Supplying {@code tapstate.pdk.it.manifest} activates the {@code pdk-it} profile, which puts the
- * PDK runtime on the host test classpath — a connector's base class bootstraps the runtime through
+ * <p>Supplying {@code tapstate.pdk.it.manifest} selects the audit inputs; the PDK runtime is always
+ * on the host test classpath — a connector's base class bootstraps the runtime through
  * the host class loader, so it must be host-reachable, not inside the isolated connector loader.
  * A connector dist jar is a thin plugin and does not always bundle its own driver libraries either;
  * {@code tapstate.pdk.it.runtimeCp} is an optional {@link File#pathSeparator}-joined list of those,

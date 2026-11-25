@@ -26,7 +26,9 @@ class TargetModelResolverTest {
 
     @Test
     void legacy_qualified_rename_follows_the_source_model_name_for_an_assembled_stream() {
-        TargetTable root = TargetModelResolver.toTargetTable(oneColumnTable("AA_0716"));
+        TargetTable discovered = TargetModelResolver.toTargetTable(oneColumnTable("AA_0716"));
+        var identity = new io.tapstate.spi.sink.UnwindIdentity(List.of("id"), "original_id");
+        TargetTable root = new TargetTable(discovered.name(), discovered.fields(), discovered.indexes(), identity);
 
         Map<String, TargetTable> targets = TargetModelResolver.renameAll(
                 Map.of("k2__nest", root), List.of("k2__nest"),
@@ -35,6 +37,7 @@ class TargetModelResolverTest {
 
         assertThat(targets).containsOnlyKeys("k2__nest");
         assertThat(targets.get("k2__nest").name()).isEqualTo("k2");
+        assertThat(targets.get("k2__nest").unwindIdentity()).isEqualTo(identity);
     }
 
     @Test

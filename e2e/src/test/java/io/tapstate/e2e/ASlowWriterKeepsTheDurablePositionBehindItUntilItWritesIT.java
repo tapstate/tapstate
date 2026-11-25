@@ -61,8 +61,8 @@ class ASlowWriterKeepsTheDurablePositionBehindItUntilItWritesIT {
 
         try (MongoEndpoints mongo = new MongoEndpoints(); FileEndpoints file = new FileEndpoints()) {
             mongo.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
-            String store = SharedMongo.replicaSetUrl("e2e_slow_writer_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-slow-writer")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));

@@ -27,7 +27,7 @@ class ViewTargetResolverTest {
         assertThatThrownBy(() -> ViewTargetResolver.resolve(view))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-key-missing"));
+                        .isEqualTo("TS0360020"));
     }
 
     @Test
@@ -39,7 +39,7 @@ class ViewTargetResolverTest {
         assertThatThrownBy(() -> ViewTargetResolver.resolve(view))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-storage-tier-unsupported"));
+                        .isEqualTo("TS0360021"));
     }
 
     @Test
@@ -51,7 +51,7 @@ class ViewTargetResolverTest {
         assertThatThrownBy(() -> ViewTargetResolver.resolve(view))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-storage-tier-unsupported"));
+                        .isEqualTo("TS0360021"));
     }
 
     @Test

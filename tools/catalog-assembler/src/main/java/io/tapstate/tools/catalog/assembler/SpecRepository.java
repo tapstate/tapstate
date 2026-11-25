@@ -9,8 +9,8 @@ enum SpecRepository {
     OSS,
     ENTERPRISE;
 
-    // These bundled ids originate in the enterprise checkout, including the source-only preview.
-    private static final Set<String> ENTERPRISE_IDS = Set.of("oracle", "sqlserver", "db2");
+    // These bundled ids originate in the enterprise checkout, including the source-only previews.
+    private static final Set<String> ENTERPRISE_IDS = Set.of("oracle", "sqlserver", "db2", "db2i");
 
     static SpecRepository of(ConnectorCatalogEntry row) {
         return ENTERPRISE_IDS.contains(row.id()) ? ENTERPRISE : OSS;

@@ -1,9 +1,14 @@
 package io.tapstate.app;
 
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CapabilityDeriver;
+import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.RegistrationSource;
+import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -14,14 +19,15 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.io.IOException;
-import java.nio.file.StandardOpenOption;
-import java.util.jar.JarFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarFile;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -30,7 +36,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class CloudConnectorSeedReadinessIT {
     private static final Set<String> IDS = Set.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
 
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -38,134 +44,184 @@ class CloudConnectorSeedReadinessIT {
     @TempDir Path work;
 
     @Test
-    void allLockedRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() {
+    void allLockedRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() throws IOException {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
-        String uri = database("complete");
+        var storage = database("complete",true);
         var ready = new AtomicInteger();
         List<String> hashes;
-        try (var context = builder(ready).run(arguments(uri, true, seeds))) {
+        try (var context = builder(ready).run(arguments(storage, true, seeds))) {
             assertThat(ready.get()).isEqualTo(1);
-            var registry = context.getBean(ConnectorRegistry.class);
+            var business=NativeAppStorage.business(context);
+            var registry = business.getBean(ConnectorRegistry.class);
             assertThat(registry.list()).extracting(registration -> registration.connectorId())
                     .containsExactlyInAnyOrderElementsOf(IDS);
-            assertThat(context.getBean(ConnectorCatalogView.class).summaries())
+            assertThat(business.getBean(ConnectorCatalogView.class).summaries())
                     .extracting(summary -> summary.id()).containsExactlyInAnyOrderElementsOf(IDS);
+            assertDummyResolves(business, seeds);
             hashes = registry.list().stream().map(registration -> registration.contentHash()).sorted().toList();
         }
-        try (var restarted = builder(ready).run(arguments(uri, true, seeds))) {
+        assertNoArtifactCopies(storage);
+        try (var restarted = builder(ready).run(arguments(storage, true, seeds))) {
             assertThat(ready.get()).isEqualTo(2);
-            assertThat(restarted.getBean(ConnectorRegistry.class).list().stream()
+            assertDummyResolves(NativeAppStorage.business(restarted), seeds);
+            assertThat(NativeAppStorage.business(restarted).getBean(ConnectorRegistry.class).list().stream()
                     .map(registration -> registration.contentHash()).sorted()).containsExactlyElementsOf(hashes);
         }
+        assertNoArtifactCopies(storage);
+    }
+
+    private void assertNoArtifactCopies(NativeAppStorage storage) {
+        assertThat(work.resolve("plugins")).doesNotExist();
+        try (var client = MongoClients.create(storage.cacheUri())) {
+            var cache = client.getDatabase(storage.cacheDatabase());
+            assertThat(cache.getCollection("connector_artifacts.files").countDocuments()).isZero();
+            assertThat(cache.getCollection("connector_artifacts.chunks").countDocuments()).isZero();
+        }
     }
 
     @Test
-    void aMissingCloudJarRefusesReadyEvenThoughEveryOtherJarIsValid() throws Exception {
+    void onPremSeedsAndResolvesDummyAcrossRestart() throws IOException {
+        Path seeds = Files.createDirectory(work.resolve("op-seed"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("dummy-connector.jar"),
+                seeds.resolve("dummy-connector.jar"));
+        var storage = database("onprem_dummy", false);
+        var ready = new AtomicInteger();
+        try (var first = builder(ready).run(arguments(storage, false, seeds))) {
+            assertThat(ready.get()).isEqualTo(1);
+            assertDummyResolves(NativeAppStorage.business(first), seeds);
+        }
+        try (var restarted = builder(ready).run(arguments(storage, false, seeds))) {
+            assertThat(ready.get()).isEqualTo(2);
+            assertDummyResolves(NativeAppStorage.business(restarted), seeds);
+        }
+    }
+
+    private static void assertDummyResolves(org.springframework.context.ApplicationContext business, Path seeds)
+            throws IOException {
+        var registrations = business.getBean(ConnectorRegistry.class).findAll("dummy");
+        assertThat(registrations).hasSize(1);
+        assertThat(registrations.getFirst().source()).isEqualTo(RegistrationSource.SEED);
+        var ref = business.getBean(ConnectorProvisioner.class).resolve("dummy");
+        assertThat(ref.contentHash()).isEqualTo(registrations.getFirst().contentHash());
+        assertThat(Files.mismatch(ref.classpath().getFirst(), seeds.resolve("dummy-connector.jar"))).isEqualTo(-1);
+        assertThat(business.getBean(CapabilityDeriver.class).derive("dummy").capabilityIds())
+                .contains("batch_read_function", "stream_read_function", "write_record_function");
+    }
+
+    @Test
+    void aMissingCloudJarRefusesBusinessEvenThoughEveryOtherJarIsValid() throws Exception {
         Path seeds = copyRelease();
         Files.delete(seeds.resolve("mongodb-atlas-connector.jar"));
-        refusesReady(database("missing"), seeds);
+        refusesBusiness(database("missing",true), seeds);
     }
 
     @Test
-    void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherLockedInputs() throws Exception {
+    void aCorruptCloudJarRefusesBusinessWithoutWeakeningTheOtherLockedInputs() throws Exception {
         Path seeds = copyRelease();
         Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
-        // Break only the owned hard link, then create the damaged file. Never modify the shared input.
+        // Replace only the owned copy with the damaged file. Never modify the shared input.
         Files.delete(atlas);
         Files.write(atlas, new byte[] {0x13, 0x37});
-        refusesReady(database("corrupt"), seeds);
+        refusesBusiness(database("corrupt",true), seeds);
     }
 
     @Test
-    void aValidButByteChangedPluginCacheCannotBecomeReadyOnRestart() throws Exception {
-        String uri = database("changed_cache");
+    void aValidButByteChangedImageJarCannotBecomeReadyOnRestart() throws Exception {
+        var storage = database("changed_seed",true);
         var ready = new AtomicInteger();
-        Path seeds = CloudConnectorTestInputs.seedDirectory();
-        String atlasHash;
-        try (var context = builder(ready).run(arguments(uri, true, seeds))) {
-            atlasHash = context.getBean(ConnectorRegistry.class).findAll("mongodb-atlas").getFirst().contentHash();
+        Path seeds = copyRelease();
+        try (var context = builder(ready).run(arguments(storage, true, seeds))) {
+            assertThat(NativeAppStorage.business(context).getBean(ConnectorRegistry.class).findAll("mongodb-atlas")).hasSize(1);
         }
-        Path cache = work.resolve("plugins").resolve(atlasHash + ".jar");
-        Files.write(cache, new byte[] {0x42}, StandardOpenOption.APPEND);
-        try (var stillValid = new JarFile(cache.toFile())) {
+        Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
+        Files.write(atlas, new byte[] {0x42}, StandardOpenOption.APPEND);
+        try (var stillValid = new JarFile(atlas.toFile())) {
             assertThat(stillValid.getJarEntry("atlas-spec.json")).isNotNull();
         }
         ready.set(0);
-        refusesReady(uri, seeds, ready);
+        refusesBusiness(storage, seeds, ready);
     }
 
     @Test
-    void aRegistrationConflictIsFatalForCloudButDoesNotEmitApplicationReady() {
-        String uri = database("conflict");
+    void aRegistrationConflictRefusesCloudBusinessWithoutChangingItsInstallationMode() {
+        var storage = database("conflict",true);
         var ready = new AtomicInteger();
-        try (var onPrem = builder(ready).run(arguments(uri, false, work.resolve("optional-seeds")))) {
-            onPrem.getBean(ConnectorRegistry.class).register(
-                    "mysql", "2.0.5-SNAPSHOT", RegistrationSource.SEED, new byte[] {1, 2, 3});
+        Path seeds = CloudConnectorTestInputs.seedDirectory();
+        try (var context = builder(ready).run(arguments(storage, true, seeds))) {
+            var business = NativeAppStorage.business(context);
+            var registry = business.getBean(ConnectorRegistry.class);
+            var registration = registry.findAll("mysql").getFirst();
+            var catalog = business.getBean(io.tapstate.spi.store.ConnectorCatalogStore.class);
+            catalog.upsertBundled(catalog.get("mysql").orElseThrow(),
+                    new ConnectorRegistration("mysql", "0".repeat(64), registration.pdkApiVersion(), RegistrationSource.SEED),
+                    Optional.empty());
         }
         ready.set(0);
-        refusesReady(uri, CloudConnectorTestInputs.seedDirectory(), ready);
+        refusesBusiness(storage, seeds, ready);
     }
 
     @Test
     void onPremStillStartsWithMissingOrDefectiveOptionalSeeds() throws Exception {
         var ready = new AtomicInteger();
-        try (var missing = builder(ready).run(arguments(database("onprem_missing"), false, work.resolve("absent")))) {
-            assertThat(missing.getBean(ConnectorRegistry.class).list()).isEmpty();
+        try (var missing = builder(ready).run(arguments(database("onprem_missing",false), false, work.resolve("absent")))) {
+            assertThat(NativeAppStorage.business(missing).getBean(ConnectorRegistry.class).list()).isEmpty();
             assertThat(ready.get()).isEqualTo(1);
         }
         Path defective = Files.createDirectories(work.resolve("defective"));
         Files.write(defective.resolve("garbage.jar"), new byte[] {0x13, 0x37});
-        try (var damaged = builder(ready).run(arguments(database("onprem_defective"), false, defective))) {
-            assertThat(damaged.getBean(ConnectorRegistry.class).list()).isEmpty();
+        try (var damaged = builder(ready).run(arguments(database("onprem_defective",false), false, defective))) {
+            assertThat(NativeAppStorage.business(damaged).getBean(ConnectorRegistry.class).list()).isEmpty();
             assertThat(ready.get()).isEqualTo(2);
         }
     }
 
-    private void refusesReady(String uri, Path seeds) {
-        refusesReady(uri, seeds, new AtomicInteger());
+    private void refusesBusiness(NativeAppStorage storage, Path seeds) {
+        refusesBusiness(storage, seeds, new AtomicInteger());
     }
 
-    private void refusesReady(String uri, Path seeds, AtomicInteger ready) {
-        assertThatThrownBy(() -> {
-            try (var unexpected = builder(ready).run(arguments(uri, true, seeds))) {
-                throw new AssertionError("Cloud started without its required connector release");
-            }
-        }).satisfies(failure -> {
-            Throwable cause = failure;
-            while (!(cause instanceof TapstateException) && cause.getCause() != null) {
-                cause = cause.getCause();
-            }
-            assertThat(cause).isInstanceOfSatisfying(TapstateException.class,
-                    coded -> assertThat(coded.code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID));
-        });
-        assertThat(ready.get()).as("failed seed startup never emits ApplicationReadyEvent").isZero();
+    private void refusesBusiness(NativeAppStorage storage, Path seeds, AtomicInteger ready) {
+        try(var context=builder(ready).run(arguments(storage,true,seeds))) {
+            var root=context.getBean(StorageRoot.class);
+            assertThat(ready.get()).as("the diagnostic/auth root remains available").isEqualTo(1);
+            assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            assertThat(root.runtime().business()).isEmpty();
+            // Retry the actual child assembly to retain the exact release-validation diagnosis.
+            assertThatThrownBy(() -> root.runtime().startBusiness(root.runtime().current().orElseThrow(),
+                    bound -> new NativeBusinessContext(root,bound,context)))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID));
+            assertThat(root.runtime().business()).isEmpty();
+            assertThat(com.hazelcast.core.Hazelcast.getAllHazelcastInstances()).isEmpty();
+        }
     }
 
     private static SpringApplicationBuilder builder(AtomicInteger ready) {
-        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+        return new SpringApplicationBuilder(Bootstrap.class)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures).environment(CloudFixtureEnvironment.isolated())
                 .listeners(event -> {
                     if (event instanceof ApplicationReadyEvent) { ready.incrementAndGet(); }
                 });
     }
 
-    private String[] arguments(String uri, boolean cloud, Path seeds) {
+    private String[] arguments(NativeAppStorage storage, boolean cloud, Path seeds) {
+        String uri=storage.configurationUri();
         List<String> args = new ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + uri,
-                "--tapstate.store.mongo.operator-state-database=seed_ops_" + Long.toUnsignedString(System.nanoTime(), 16),
                 "--tapstate.connectors.seed-dir=" + seeds,
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins")));
         if (cloud) {
             args.addAll(List.of("--tapstate.cloud.base-url=https://cloud.example.invalid",
                     "--tapstate.cloud.token=cloud-seed-fixture-token", "--tapstate.cloud.atlas-uri=" + uri,
-                    "--tapstate.cloud.cluster-id=cloud-seed-cluster"));
+                    "--tapstate.cloud.cluster-id="+storage.clusterId()));
         }
         return args.toArray(String[]::new);
     }
 
-    private static String database(String prefix) {
-        return MONGO.getReplicaSetUrl("seed_" + prefix + "_" + Long.toUnsignedString(System.nanoTime(), 16));
+    private static NativeAppStorage database(String prefix,boolean cloud) {
+        return NativeAppStorage.create(MONGO,"seed_"+prefix,cloud?StorageBinding.Mode.CLOUD:StorageBinding.Mode.OP,
+                "cloud-seed-"+java.util.UUID.randomUUID());
     }
 
     private Path copyRelease() throws IOException {
@@ -177,7 +233,8 @@ class CloudConnectorSeedReadinessIT {
                 if (Files.isDirectory(input)) {
                     Files.createDirectories(destination);
                 } else {
-                    Files.createLink(destination, input);
+                    // The release and JUnit's temporary directory can be on different filesystems.
+                    Files.copy(input, destination);
                 }
             }
         }

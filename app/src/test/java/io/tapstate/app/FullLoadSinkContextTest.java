@@ -113,11 +113,11 @@ class FullLoadSinkContextTest {
 
     private static final class CapturingBinder implements StoreBackedDagSource.SinkWriterBinder {
         PdkSinkWriterFactory factory;
-        public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
+        public SupplierEx<SinkWriter> bind(String connector, Map<String, Object> settings,
                 WriteMode mode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
             throw new AssertionError("the complete sink policy must reach the binder");
         }
-        public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
+        public SupplierEx<SinkWriter> bind(String connector, Map<String, Object> settings,
                 WriteMode mode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node,
                 OnFullLoad policy, boolean fullLoad) {
             factory = new PdkSinkWriterFactory(connector, settings, mode, ddl, targets, node, policy, fullLoad);

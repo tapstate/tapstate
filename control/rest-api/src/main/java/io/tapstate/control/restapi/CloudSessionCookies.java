@@ -4,7 +4,6 @@ import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseCookie;
 
-import java.net.URI;
 import java.util.Collections;
 import java.util.Optional;
 
@@ -53,18 +52,8 @@ final class CloudSessionCookies {
             return false;
         }
         if (origins.size() == 1) {
-            try {
-                URI origin = URI.create(origins.getFirst());
-                int originPort = origin.getPort() < 0
-                        ? ("https".equalsIgnoreCase(origin.getScheme()) ? 443 : 80) : origin.getPort();
-                return origin.getUserInfo() == null && origin.getHost() != null && origin.getQuery() == null
-                        && origin.getFragment() == null && (origin.getPath().isEmpty() || "/".equals(origin.getPath()))
-                        && request.getScheme().equalsIgnoreCase(origin.getScheme())
-                        && request.getServerName().equalsIgnoreCase(origin.getHost())
-                        && request.getServerPort() == originPort;
-            } catch (IllegalArgumentException malformed) {
-                return false;
-            }
+            return SameOrigin.matches(origins.getFirst(), request.getScheme(), request.getServerName(),
+                    request.getServerPort(), true);
         }
         String site = request.getHeader("Sec-Fetch-Site");
         return site == null || "same-origin".equalsIgnoreCase(site) || "none".equalsIgnoreCase(site);

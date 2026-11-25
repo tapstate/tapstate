@@ -139,6 +139,55 @@ class MongoTargetPreparationTest {
                 .prepare(TARGET, TargetTapTable.build(TARGET))).hasMessageContaining("no clear-table function");
     }
 
+    @Test
+    void aViewReceiptDoesNotPrepareTheSameNamedSyncAndEachClearRunsOnce() throws Throwable {
+        List<String> calls = new ArrayList<>();
+        HeapKeyedState state = new HeapKeyedState();
+        ConnectorFunctions functions = functions(calls);
+        functions.supportExecuteCommandFunction((context, command, consumer) -> {
+            calls.add("clear");
+            consumer.accept(new ExecuteResult<Long>().result(0L));
+        });
+        var view = new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.VIEW);
+        view.prepare(TARGET, TargetTapTable.build(TARGET));
+        assertThatThrownBy(() -> PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET),
+                PipelineNode.Purpose.SYNC)).hasMessageContaining("not prepared");
+        var sync = new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.SYNC);
+        sync.prepare(TARGET, TargetTapTable.build(TARGET));
+        new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.VIEW).prepare(TARGET, TargetTapTable.build(TARGET));
+        new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.CLEAR, true, NODE, state,
+                false, PipelineNode.Purpose.SYNC).prepare(TARGET, TargetTapTable.build(TARGET));
+        assertThat(calls).containsExactly("clear", "create", "clear", "create", "create", "create");
+        PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET), PipelineNode.Purpose.VIEW);
+        PdkTargetPreparation.requirePrepared(NODE, state, List.of(TARGET), PipelineNode.Purpose.SYNC);
+    }
+
+    @Test
+    void losingAuthorityDuringTheCountCannotCreateOrPublishAPreparationReceipt() {
+        List<String> calls = new ArrayList<>();
+        HeapKeyedState state = new HeapKeyedState();
+        java.util.concurrent.atomic.AtomicBoolean active = new java.util.concurrent.atomic.AtomicBoolean(true);
+        ConnectorFunctions functions = functions(calls);
+        functions.supportCountByPartitionFilterFunction((context, table, filter) -> {
+            calls.add("count");
+            active.set(false);
+            return 0L;
+        });
+        var preparation = new PdkTargetPreparation("mongodb", null, functions, OnFullLoad.FAIL, true, NODE, state,
+                false, PipelineNode.Purpose.SYNC, () -> {
+                    if (!active.get()) throw new io.tapstate.core.common.TapstateException(
+                            io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+                });
+        assertThatThrownBy(() -> preparation.prepare(TARGET, TargetTapTable.build(TARGET)))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE));
+        assertThat(calls).containsExactly("count");
+        assertThat(state.count(SinkPreparationNamespace.of(NODE))).isZero();
+    }
+
     private static PdkTargetPreparation preparation(String id, ConnectorFunctions functions, OnFullLoad policy,
             boolean fullLoad, HeapKeyedState state) {
         return new PdkTargetPreparation(id, null, functions, policy, fullLoad, NODE, state);

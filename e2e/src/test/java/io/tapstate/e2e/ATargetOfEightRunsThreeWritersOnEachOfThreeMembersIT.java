@@ -62,8 +62,8 @@ class ATargetOfEightRunsThreeWritersOnEachOfThreeMembersIT {
         EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_wide_sink_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-wide-sink")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 RealProcessServer third = cluster.launching(THIRD);

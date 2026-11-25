@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelineLogs;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.logging.LogCursor;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.messages.MessageCatalog;
 
@@ -11,7 +12,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.Locale;
 
 /**
  * Renders a streamed status or logs frame to the same compact JSON the one-shot {@code GET} read faces
@@ -48,15 +49,10 @@ final class StreamFrames {
         if (failure == null) {
             return null;
         }
-        Map<String, Object> params = new TreeMap<>(failure.params());
-        Map<String, Object> encoded = new LinkedHashMap<>();
-        encoded.put("code", failure.code());
-        encoded.put("params", params);
-        encoded.put("message", catalog.render(failure.code(), params).message());
-        return encoded;
+        return ApiError.from(failure, catalog, Locale.ENGLISH).fields();
     }
 
-    /** A logs frame: {@code {"pipelineId":..,"lines":[{timestampMillis,level,message},..]}}. */
+    /** A logs frame with a resumable cursor and any retention-truncation indication. */
     static String logs(PipelineLogs logs) {
         List<Object> lines = new ArrayList<>();
         for (LogLine line : logs.lines()) {
@@ -64,11 +60,20 @@ final class StreamFrames {
             encoded.put("timestampMillis", line.timestampMillis());
             encoded.put("level", line.level());
             encoded.put("message", line.message());
+            if (!line.diagnostic().isEmpty()) encoded.put("diagnostic", line.diagnostic());
             lines.add(encoded);
         }
         Map<String, Object> frame = new LinkedHashMap<>();
         frame.put("pipelineId", logs.pipelineId());
         frame.put("lines", lines);
+        LogCursor nextCursor = logs.nextCursor();
+        if (nextCursor != null) {
+            Map<String, Object> cursor = new LinkedHashMap<>();
+            cursor.put("generation", nextCursor.generation());
+            cursor.put("sequence", nextCursor.sequence());
+            frame.put("nextCursor", cursor);
+        }
+        frame.put("truncated", logs.truncated());
         return JsonWriter.write(frame);
     }
 }

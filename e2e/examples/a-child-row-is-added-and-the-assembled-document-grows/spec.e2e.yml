@@ -37,7 +37,8 @@ setup:
     src: { kind: mysql }
     store: { kind: mongo }
   connectors: [mysql, mongodb]
-  apply: [src_grow_orders.tap.yml, src_grow_items.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_grow_orders.tap.yml, src_grow_items.tap.yml, pipeline.tap.yml]
   discover: [src_grow_orders, src_grow_items]
 pipeline: pipeline.tap.yml
 seed:

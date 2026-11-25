@@ -3,7 +3,7 @@ package io.tapstate.e2e;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
-import io.tapstate.adapters.mongostore.StoreError;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.spi.store.IoError;
@@ -25,11 +25,10 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** A real packaged server must reject corrupt encryption state before reporting application readiness. */
+/** A real packaged server keeps safe diagnostics but refuses admission when encryption state is corrupt. */
 @RequiresDocker
 class SourceConfigStartupRefusalIT {
 
@@ -40,8 +39,10 @@ class SourceConfigStartupRefusalIT {
     private static MongoClient client;
     private static MongoDatabase database;
     private static String uri;
+    private static PreparedNativeStore storage;
     private static Document originalKeyring;
     private static Document originalSource;
+    private static String originalCredential;
 
     enum Damage {
         MISSING_KEYRING,
@@ -50,19 +51,19 @@ class SourceConfigStartupRefusalIT {
         TAMPERED_CIPHERTEXT,
         WRONG_CONNECTOR_CONTEXT,
         INDEXED_KIND_MISMATCH,
-        PLAINTEXT_AFTER_MIGRATION
+        PLAINTEXT_SOURCE_CONFIG
     }
 
     @BeforeAll
     static void createRealEncryptedStoreOnce() {
-        String name = "source_startup_" + UUID.randomUUID().toString().replace("-", "");
-        uri = SharedMongo.replicaSetUrl(name);
+        storage = PreparedNativeStore.create("startup-admin", "startup-local-password");
+        uri = storage.configurationUri();
         client = MongoClients.create(uri);
-        database = client.getDatabase(name);
-        try (RealProcessServer seed = RealProcessServer.start(uri)) {
-            seed.awaitReady();
+        database = client.getDatabase(storage.configurationDatabase());
+        try (ServerHandle seed = Tiers.REAL_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(seed.baseUrl());
-            control.bootstrapAndLogin("startup-admin", "startup-local-password");
+            storage.loginAndAwaitBusiness(control);
+            originalCredential = control.credential();
             control.apply(Map.of("encrypted.tap.yml", """
                     version: tapstate/v1
                     kind: source
@@ -72,9 +73,9 @@ class SourceConfigStartupRefusalIT {
                       uri: mongodb://fake-user:fake-password@localhost/data
                       publicValue: %s
                     """.formatted(SOURCE, MARKER)));
-            originalKeyring = SystemCollections.SYSTEM_META.on(database)
-                    .find(new Document("_id", "source-config-keyring")).first();
-            originalSource = SystemCollections.ARTIFACTS.on(database)
+            originalKeyring = SystemCollections.CLUSTER_KEYS.on(database)
+                    .find(new Document("_id", "cluster")).first();
+            originalSource = SystemCollections.SOURCES.on(database)
                     .find(new Document("_id", SOURCE)).first();
             assertThat(originalKeyring).isNotNull();
             assertThat(originalSource).isNotNull();
@@ -85,38 +86,64 @@ class SourceConfigStartupRefusalIT {
 
     @AfterAll
     static void closeClient() {
-        if (client != null) client.close();
+        try { if (client != null) client.close(); }
+        finally { if (storage != null) storage.close(); }
     }
 
     @ParameterizedTest
     @EnumSource(Damage.class)
-    void damagedKeyringOrEncryptedSourceNeverReachesReadyAndDiagnosticsStaySafe(Damage damage) {
+    void damagedKeyringOrEncryptedSourceRefusesAdmissionAndPreservesStoredBytes(Damage damage) throws Exception {
         try {
             corrupt(damage);
-            try (RealProcessServer restarting = RealProcessServer.launching(uri)) {
-                Await.until("the packaged server to reject " + damage, STARTUP,
-                        () -> !restarting.isAlive() || output(restarting).contains(READY), restarting::tail);
-                assertThat(restarting.isAlive()).as("corrupt encryption state cannot report ready").isFalse();
-                assertThat(restarting.exitValue()).isEqualTo(1);
-                String expected = damage == Damage.MISSING_KEYRING || damage == Damage.MALFORMED_KEYRING
-                        ? StoreError.SOURCE_CONFIG_KEYRING_INVALID.code() : IoError.DOCUMENT_UNREADABLE.code();
-                String logs = output(restarting);
-                assertThat(logs).contains(expected).doesNotContain(READY, MARKER, "fake-password",
-                        originalKeyring.getList("keys", Document.class).getFirst().getString("material"));
+            Document damagedKey = SystemCollections.CLUSTER_KEYS.on(database)
+                    .find(new Document("_id", "cluster")).first();
+            Document damagedSource = SystemCollections.SOURCES.on(database)
+                    .find(new Document("_id", SOURCE)).first();
+            try (RealProcessServer restarting = RealProcessServer.launchingPrepared(uri, "127.0.0.1",
+                    port -> List.of("--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0",
+                            "--tapstate.hz.jet.cooperative-thread-count=2"));
+                 HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build()) {
+                Await.until("the diagnostic process to finish startup with " + damage, STARTUP,
+                        () -> output(restarting).contains(READY) && new ControlPlane(restarting.baseUrl()).healthy(),
+                        restarting::tail);
+                assertThat(restarting.isAlive()).as("the minimum root remains available for diagnostics").isTrue();
+                var entry = http.send(HttpRequest.newBuilder(restarting.baseUrl().resolve("/auth/storage-entry"))
+                        .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+                assertThat(entry.statusCode()).isEqualTo(200);
+                assertThat(Document.parse(entry.body())).containsEntry("entry", "UNAVAILABLE");
+                for (String path : List.of("/auth/login", "/auth/bootstrap", "/api/artifacts")) {
+                    var request = HttpRequest.newBuilder(restarting.baseUrl().resolve(path))
+                            .timeout(Duration.ofSeconds(5));
+                    if (path.equals("/api/artifacts")) request.header("Authorization", "Bearer " + originalCredential).GET();
+                    else request.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString("""
+                            {"username":"startup-admin","password":"startup-local-password"}
+                            """));
+                    var response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
+                    boolean bootstrap = path.equals("/auth/bootstrap");
+                    assertThat(response.statusCode()).as(path).isEqualTo(bootstrap ? 403 : 503);
+                    assertThat(ControlPlane.interpretClusterRefusal(response.statusCode(), response.body()))
+                            .contains((bootstrap ? ControlError.BOOTSTRAP_FORBIDDEN : ControlError.STORAGE_UNAVAILABLE).code());
+                    assertThat(response.body()).doesNotContain(MARKER, "fake-password", originalKeyring.getString("material"));
+                }
+                assertThat(output(restarting)).doesNotContain(MARKER, "fake-password", originalKeyring.getString("material"));
             }
+            // Compare before fixture restoration, including an absent key: refusal must never repair the data.
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).find(new Document("_id", "cluster")).first())
+                    .as("the original damaged or absent key is preserved").isEqualTo(damagedKey);
+            assertThat(SystemCollections.SOURCES.on(database).find(new Document("_id", SOURCE)).first())
+                    .as("the original damaged encrypted source is preserved").isEqualTo(damagedSource);
         } finally {
             // No server remains alive while restoring the two fixture-owned records.
-            SystemCollections.SYSTEM_META.on(database).replaceOne(new Document("_id", "source-config-keyring"),
+            SystemCollections.CLUSTER_KEYS.on(database).replaceOne(new Document("_id", "cluster"),
                     originalKeyring, new com.mongodb.client.model.ReplaceOptions().upsert(true));
-            SystemCollections.ARTIFACTS.on(database).replaceOne(new Document("_id", SOURCE), originalSource);
+            SystemCollections.SOURCES.on(database).replaceOne(new Document("_id", SOURCE), originalSource);
         }
     }
 
     @Test
     void anIndexedKindChangedAfterStartupCannotExposeSourcePlaintextThroughTheHttpList() throws Exception {
-        try (RealProcessServer running = RealProcessServer.start(uri);
+        try (ServerHandle running = Tiers.REAL_PROCESS.launch(storage);
                 HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build()) {
-            running.awaitReady();
             HttpRequest login = HttpRequest.newBuilder(running.baseUrl().resolve("/auth/login"))
                     .timeout(Duration.ofSeconds(5)).header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString("""
@@ -127,44 +154,39 @@ class SourceConfigStartupRefusalIT {
             Map<?, ?> credentials = (Map<?, ?>) JsonReader.parse(signedIn.body());
             assertThat(credentials.get("token")).isInstanceOf(String.class).asString().isNotBlank();
             corrupt(Damage.INDEXED_KIND_MISMATCH);
+            Document damaged = SystemCollections.SOURCES.on(database).find(new Document("_id", SOURCE)).first();
             HttpRequest list = HttpRequest.newBuilder(running.baseUrl().resolve("/api/artifacts"))
                     .timeout(Duration.ofSeconds(5)).header("Authorization", "Bearer " + credentials.get("token"))
                     .GET().build();
             HttpResponse<String> response = http.send(list, HttpResponse.BodyHandlers.ofString());
-            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.statusCode()).isEqualTo(500);
             assertThat(response.body().contains(MARKER)).as("public list contains no stored config plaintext").isFalse();
             assertThat(response.body().contains("fake-password")).isFalse();
-            Map<?, ?> body = (Map<?, ?>) JsonReader.parse(response.body());
-            List<?> rows = (List<?>) body.get("artifacts");
-            assertThat(rows).isNotEmpty();
-            List<?> matches = rows.stream().filter(row -> row instanceof Map<?, ?> value
-                    && SOURCE.equals(value.get("id"))).toList();
-            assertThat(matches).hasSize(1);
-            Map<?, ?> unreadable = (Map<?, ?>) matches.getFirst();
-            assertThat(unreadable.get("kind")).isEqualTo("pipeline");
-            assertThat(unreadable.get("readable")).isEqualTo(false);
-            assertThat(unreadable.get("canonicalForm")).isNull();
-            assertThat(unreadable.get("contentHash")).isEqualTo(originalSource.getString("contentHash"));
+            assertThat(ControlPlane.interpretClusterRefusal(response.statusCode(), response.body()))
+                    .contains(IoError.DOCUMENT_UNREADABLE.code());
+            assertThat(SystemCollections.SOURCES.on(database).find(new Document("_id", SOURCE)).first())
+                    .as("the read refuses a kind that disagrees with its native table without rewriting it")
+                    .isEqualTo(damaged);
         } finally {
-            SystemCollections.ARTIFACTS.on(database).replaceOne(new Document("_id", SOURCE), originalSource);
+            SystemCollections.SOURCES.on(database).replaceOne(new Document("_id", SOURCE), originalSource);
         }
     }
 
     private static void corrupt(Damage damage) {
         if (damage == Damage.MISSING_KEYRING) {
-            SystemCollections.SYSTEM_META.on(database).deleteOne(new Document("_id", "source-config-keyring"));
+            SystemCollections.CLUSTER_KEYS.on(database).deleteOne(new Document("_id", "cluster"));
             return;
         }
         if (damage == Damage.MALFORMED_KEYRING) {
-            SystemCollections.SYSTEM_META.on(database).updateOne(new Document("_id", "source-config-keyring"),
-                    new Document("$set", new Document("keys.0.material", new Document("input", MARKER))));
+            SystemCollections.CLUSTER_KEYS.on(database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("material", new Document("input", MARKER))));
             return;
         }
         String encrypted = originalSource.get("body", Document.class).getString("config");
         Object replacement = switch (damage) {
             case UNKNOWN_ENVELOPE_VERSION -> encrypted.replace("tscfg:1:", "tscfg:2:");
             case TAMPERED_CIPHERTEXT -> tamper(encrypted);
-            case PLAINTEXT_AFTER_MIGRATION -> new Document("uri", "mongodb://fake-user:fake-password@localhost/data")
+            case PLAINTEXT_SOURCE_CONFIG -> new Document("uri", "mongodb://fake-user:fake-password@localhost/data")
                     .append("publicValue", MARKER);
             case WRONG_CONNECTOR_CONTEXT -> encrypted;
             case INDEXED_KIND_MISMATCH -> encrypted;
@@ -173,7 +195,7 @@ class SourceConfigStartupRefusalIT {
         Document fields = new Document("body.config", replacement);
         if (damage == Damage.WRONG_CONNECTOR_CONTEXT) fields.append("body.connector", "mysql");
         if (damage == Damage.INDEXED_KIND_MISMATCH) fields.append("kind", "pipeline");
-        SystemCollections.ARTIFACTS.on(database).updateOne(new Document("_id", SOURCE), new Document("$set", fields));
+        SystemCollections.SOURCES.on(database).updateOne(new Document("_id", SOURCE), new Document("$set", fields));
     }
 
     private static String tamper(String envelope) {

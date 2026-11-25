@@ -53,10 +53,13 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
 
     private final ListAppender<ILoggingEvent> written = new ListAppender<>();
     private Logger logger;
+    private Level previousLevel;
 
     @BeforeEach
     void listen() {
         logger = (Logger) LoggerFactory.getLogger(StoreBackedPipelineCaptureCoordinator.class);
+        previousLevel = logger.getLevel();
+        logger.setLevel(Level.WARN);
         written.start();
         logger.addAppender(written);
     }
@@ -64,6 +67,8 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
     @AfterEach
     void stopListening() {
         logger.detachAppender(written);
+        written.stop();
+        logger.setLevel(previousLevel);
     }
 
     /**

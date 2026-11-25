@@ -57,6 +57,44 @@ class CloudSdkLiveContractTest {
     private static final String TOKEN = "shared-static-token-sentinel";
     private static final String KID = "test-key-one";
 
+    @Test
+    void currentAddressProviderTreatsCloudFailuresAsUnavailableAndLogsOnlyBoundedMetadata() throws Exception {
+        String providerPayload = "provider-secret-sentinel atlas-password-sentinel";
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/api/clusters/" + CLUSTER + "/egress-address", exchange -> {
+            byte[] bytes = providerPayload.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(503, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
+        ListAppender<ILoggingEvent> captured = new ListAppender<>();
+        captured.start();
+        logger.addAppender(captured);
+        try {
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+
+            assertThat(bridge.currentAddress("org-one", CLUSTER)).isEmpty();
+            assertThat(captured.list).extracting(ILoggingEvent::getFormattedMessage)
+                    .anySatisfy(message -> assertThat(message)
+                            .contains("http=503", "reason=sdk.context-unavailable")
+                            .doesNotContain(providerPayload, TOKEN, "atlas.example"));
+            assertThat(captured.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
+        } finally {
+            logger.detachAppender(captured);
+            captured.stop();
+            logger.setLevel(previousLevel);
+            server.stop(0);
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(ints = {0, 1})
     void overlappingJwksKeysVerifyCallbacksWithoutAcceptingUnknownKeysOrAlteredSignedFields(int signingKey)
@@ -118,6 +156,8 @@ class CloudSdkLiveContractTest {
         server.createContext("/v1/api/jwks.json", exchange -> respond(exchange, jwks(keyPair)));
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -147,6 +187,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
@@ -179,6 +220,8 @@ class CloudSdkLiveContractTest {
         });
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -227,6 +270,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
@@ -240,6 +284,8 @@ class CloudSdkLiveContractTest {
                 "data", Map.of("jwt", "provider-jwt-secret-sentinel"))));
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -268,6 +314,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
@@ -330,6 +377,7 @@ class CloudSdkLiveContractTest {
                 String exchanged = result.jwt();
                 assertThat(bridge.validate(exchanged, deployment, audience)).hasValueSatisfying(login -> {
                     assertThat(login.userId()).isEqualTo("stable-user-one");
+                    assertThat(login.userEmail()).isEqualTo("user@example.test");
                     assertThat(login.jwtId()).isEqualTo("jwt-one");
                 });
                 assertThat(exchangeSecret.get()).isEqualTo(TOKEN);

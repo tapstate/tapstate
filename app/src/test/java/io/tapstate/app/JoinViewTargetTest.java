@@ -27,7 +27,7 @@ import org.junit.jupiter.api.Test;
  *
  * <p>What feeds a view is resolved by walking its from-reference to leaves, and a join used to be
  * walked through to the tables under it - so a view fed by one join counted as a view fed by two
- * tables and was refused as such. Measured before the fix: {@code actuation.view-fed-by-many-tables}
+ * tables and was refused as such. Measured before the fix: {@code TS0360025}
  * with {@code tables=orders, customers}. The validator accepted the pipeline and the builder would
  * not build it, which is the one disagreement between the two halves that nothing else looks for.
  *
@@ -71,7 +71,7 @@ class JoinViewTargetTest {
         assertThatThrownBy(() -> build(VIEW_PIPELINE, List.of("region", "id")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.view-key-not-feed-identity"));
+                        .isEqualTo("TS0360024"));
     }
 
     private static boolean build(String pipeline, List<String> factKey) {
@@ -137,7 +137,7 @@ class JoinViewTargetTest {
     private static StoreBackedDagSource.SinkWriterBinder discarding() {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;

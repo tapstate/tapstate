@@ -50,6 +50,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -146,6 +147,9 @@ public class CsvConnector implements TapConnector {
 
     /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
     private static final String REQUIRE_PASSWORD = "require_password";
+
+    /** A test affordance for a saved source whose shared TLS and SSH secrets must be restored on connection test. */
+    private static final String REQUIRE_TRANSPORT_CREDENTIALS = "require_transport_credentials";
 
     /**
      * A test affordance naming a directory this connector notes every batch of rows it hands over into.
@@ -263,6 +267,7 @@ public class CsvConnector implements TapConnector {
 
     /** Set by {@code stop}; the tail also honours its thread's interrupt. Both signals arrive on cancel. */
     private volatile boolean stopped;
+    private final ReentrantReadWriteLock sinkWrites = new ReentrantReadWriteLock();
 
     /** How many batches this writer has written, which numbers them in the write witness. */
     private final AtomicLong batches = new AtomicLong();
@@ -362,6 +367,10 @@ public class CsvConnector implements TapConnector {
     @Override
     public void stop(TapConnectionContext context) {
         stopped = true;
+        // A stop releases held callbacks, then waits until none can still mutate the fixture's files.
+        var drain = sinkWrites.writeLock();
+        drain.lock();
+        drain.unlock();
     }
 
     /**
@@ -402,6 +411,13 @@ public class CsvConnector implements TapConnector {
                 "directory",
                 reachable ? TestItem.RESULT_SUCCESSFULLY : TestItem.RESULT_FAILED,
                 reachable ? null : directory(context) + " is not a directory"));
+        if (transportCredentialsRequired(context)) {
+            boolean present = transportCredentialsPresent(context);
+            consumer.accept(new TestItem(
+                    "transport credentials",
+                    present ? TestItem.RESULT_SUCCESSFULLY : TestItem.RESULT_FAILED,
+                    present ? null : "configured transport credentials were not restored"));
+        }
         return ConnectionOptions.create();
     }
 
@@ -416,6 +432,14 @@ public class CsvConnector implements TapConnector {
     private List<TapEvent> snapshot(TapConnectionContext context, String table) {
         List<TapEvent> events = new ArrayList<>();
         for (Map<String, Object> row : rows(file(context, table))) {
+            // JSON and CSV cannot seed distinct Integer and String keys with the same text.
+            if (context.getConnectionConfig() != null
+                    && Boolean.TRUE.equals(context.getConnectionConfig().getObject("mixed_map_keys"))) {
+                Map<Object, Object> nested = new LinkedHashMap<>();
+                nested.put(7, "number-key");
+                nested.put("7", "text-key");
+                row.put("dict", nested);
+            }
             events.add(insert(table, row));
         }
         return events;
@@ -516,6 +540,20 @@ public class CsvConnector implements TapConnector {
      * behind it is the one that grows a duplicate per replayed row.
      */
     private WriteListResult<TapRecordEvent> write(
+            TapConnectionContext context, List<TapRecordEvent> events, TapTable target) {
+        var active = sinkWrites.readLock();
+        active.lock();
+        try {
+            if (stopped) {
+                throw new IllegalStateException("the file connector has stopped");
+            }
+            return writeWhileRunning(context, events, target);
+        } finally {
+            active.unlock();
+        }
+    }
+
+    private WriteListResult<TapRecordEvent> writeWhileRunning(
             TapConnectionContext context, List<TapRecordEvent> events, TapTable target) {
         awaitWriteRelease(context);
         if (writesRejected(context)) {
@@ -662,7 +700,7 @@ public class CsvConnector implements TapConnector {
     }
 
     /** Holds this target's write at the connector boundary until the harness releases it. */
-    private static void awaitWriteRelease(TapConnectionContext context) {
+    private void awaitWriteRelease(TapConnectionContext context) {
         Object configured = context.getConnectionConfig() == null
                 ? null
                 : context.getConnectionConfig().getObject(HOLD_WRITES);
@@ -677,6 +715,9 @@ public class CsvConnector implements TapConnector {
             throw new UncheckedIOException("publishing the held-write signal at " + signals, failure);
         }
         while (!Files.exists(signals.resolve("release"))) {
+            if (stopped) {
+                throw new IllegalStateException("a held target write was stopped before release");
+            }
             if (!pausedBetweenPolls(20)) {
                 throw new IllegalStateException("a held target write was interrupted before release");
             }
@@ -1156,6 +1197,26 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getConnectionConfig().getObject("password");
         return password != null && !String.valueOf(password).isBlank();
+    }
+
+    private static boolean transportCredentialsRequired(TapConnectionContext context) {
+        Object required = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(REQUIRE_TRANSPORT_CREDENTIALS);
+        return required != null && Boolean.parseBoolean(String.valueOf(required));
+    }
+
+    private static boolean transportCredentialsPresent(TapConnectionContext context) {
+        if (context.getConnectionConfig() == null) return false;
+        Object sslKey = context.getConnectionConfig().getObject("sslKey");
+        Object sslKeyPassword = context.getConnectionConfig().getObject("sslKeyPassword");
+        Object tapdata = context.getConnectionConfig().getObject("__TAPDATA");
+        Object sshPassword = tapdata instanceof Map<?, ?> nested ? nested.get("sshPassword") : null;
+        return present(sslKey) && present(sslKeyPassword) && present(sshPassword);
+    }
+
+    private static boolean present(Object value) {
+        return value != null && !String.valueOf(value).isBlank();
     }
 
     /**

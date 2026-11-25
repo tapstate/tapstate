@@ -84,9 +84,10 @@ class DataBrowserConnectorReuseIT {
         seed(firstDirectory, FIRST);
         seed(secondDirectory, SECOND);
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_browser_reuse"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             String connector = E2eConnectorJar.BROWSABLE_CONNECTOR_ID;
             control.registerConnector(connector, ConnectorJars.bytesFor(connector));
 

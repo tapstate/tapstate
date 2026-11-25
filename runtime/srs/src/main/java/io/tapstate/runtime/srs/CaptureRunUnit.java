@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.UUID;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -88,6 +89,7 @@ public final class CaptureRunUnit {
     private final SrsCoordinator coordinator;
     private final SrsMetaStore meta;
     private final HazelcastInstance hz;
+    private final CaptureObservation.Factory observations;
     /** The fallback for direct callers that do not supply the product's durable per-pipeline generation. */
     private final AtomicLong chainlessSnapshotEpoch = new AtomicLong();
     private final ConcurrentMap<String, SharedTail> sharedTails = new ConcurrentHashMap<>();
@@ -95,10 +97,23 @@ public final class CaptureRunUnit {
     private final SourceAcknowledgements sourceAcknowledgements = new SourceAcknowledgements();
 
     public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz) {
+        this(port, coordinator, meta, hz, CaptureObservation.NONE);
+    }
+
+    public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz,
+                          CaptureObservation.Factory observations) {
         this.port = Objects.requireNonNull(port, "port");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.meta = Objects.requireNonNull(meta, "meta");
         this.hz = Objects.requireNonNull(hz, "hz");
+        this.observations = Objects.requireNonNull(observations, "observations");
+    }
+
+    private CaptureObservation observation(CaptureRunSpec spec, String chain, long epoch, List<String> tables) {
+        if (observations == CaptureObservation.NONE) return CaptureObservation.none();
+        return CaptureObservation.create(observations, new CaptureObservation.Context(CaptureId.of(spec).value(),
+                UUID.randomUUID().toString(), chain, spec.sourceId(), spec.pipelineId(), spec.consumerId(),
+                epoch, spec.schemaVer(), spec.captureFence(), tables));
     }
 
     /**
@@ -574,7 +589,7 @@ public final class CaptureRunUnit {
                         () -> meta.consumerOffsets(chain), ignored -> { }));
             }
             CaptureConfig config = new CaptureConfig(spec.config().connectorId(), spec.config().settings(),
-                    tables, spec.config().node()).sharing(sharedNotes(spec, chain));
+                    tables, spec.config().node(), null, spec.config().nodeConfig()).sharing(sharedNotes(spec, chain));
             Optional<SrsMeta> state = meta.read(chain);
             CaptureStart start = state.filter(record -> record.sourceReadDurable()
                             && record.sourceReadOffset() != null)
@@ -582,7 +597,8 @@ public final class CaptureRunUnit {
                     .orElseGet(() -> tailStart(meta, chain, spec.consumerId(), firstSeam, CaptureStart.present()));
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
             serving = tables;
-            subscription.set(CdcPhase.runDurable(port, config, start, routes, health, batchOrder));
+            subscription.set(CdcPhase.runDurable(port, config, start, routes, health, batchOrder,
+                    observation(spec, chain, epoch, tables)));
         }
 
         private void trim(String table, String ring, Collection<ConsumerOffset> consumers,
@@ -603,7 +619,8 @@ public final class CaptureRunUnit {
             if (subscribed && through >= 0 && through != Long.MAX_VALUE) {
                 long already = log.bounds(ring).trimmedThrough();
                 if (through > already) {
-                    log.trim(ring, through);
+                    if (spec.captureFence() == null) log.trim(ring, through);
+                    else log.trim(ring, through, spec.captureFence());
                 }
             }
         }
@@ -730,13 +747,17 @@ public final class CaptureRunUnit {
                 // one ring is comparable with a sequence of another exactly when both were opened by the
                 // same provisioning.
                 CdcChain chain = new CdcChain(gate, meta, cid, epoch, spec.schemaVer(), spec.captureFence());
-                LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
+                LongConsumer trim = cuttable ? seq -> {
+                    if (spec.captureFence() == null) log.trim(ringName, seq);
+                    else log.trim(ringName, seq, spec.captureFence());
+                } : seq -> { };
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
             }
             CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
             return Optional.of(sourceAcknowledgements.follow(
-                    meta, cid, CdcPhase.run(port, spec.config(), minerStart, routes, health), health, false));
+                    meta, cid, CdcPhase.run(port, spec.config(), minerStart, routes, health,
+                            observation(spec, cid, epoch, tables)), health, false));
         }
         if (plan.directTail()) {
             // Direct capture has no shared replay log. It resumes from this channel's safely processed
@@ -750,8 +771,8 @@ public final class CaptureRunUnit {
             String anchor = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
             meta.beginDirectCapture(directChain, spec.consumerId(), epoch, anchor);
             Map<String, Long> targets = new LinkedHashMap<>();
-            Subscription direct = port.cdc(
-                    spec.config(), start, health.recording(new CaptureStartedListener() {
+            CaptureObservation observed = observation(spec, directChain, epoch, tables);
+            Subscription direct = observed.start(health.recording(new CaptureStartedListener() {
                         @Override
                         public void onStart(SourcePosition position) {
                             meta.beginDirectCapture(directChain, spec.consumerId(), epoch, position.token());
@@ -778,7 +799,7 @@ public final class CaptureRunUnit {
                                     Map.copyOf(targets)));
                             ordered.forEach(passthrough);
                         }
-                    }));
+                    }), listener -> port.cdc(spec.config(), start, listener));
             // Bounded by what this channel's targets confirmed: a direct channel has no log to replay from.
             return Optional.of(sourceAcknowledgements.follow(meta, directChain, direct, health, false));
         }

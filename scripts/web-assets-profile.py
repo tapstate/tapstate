@@ -205,6 +205,38 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def validate_release_producer_metadata(metadata: object, profile: str, console_url: str | None) -> None:
+    """Reject a development producer even when release attestations are otherwise self-consistent."""
+    if not isinstance(metadata, dict):
+        raise WebAssetsError("unsupported Web producer metadata")
+    if metadata.get("purpose") == "local-development":
+        raise WebAssetsError("local-development Web artifacts cannot enter a release")
+    if type(metadata.get("schemaVersion")) is not int or metadata["schemaVersion"] != 1 or metadata.get("purpose") != "release":
+        raise WebAssetsError("unsupported Web producer metadata")
+    expected_profile = "cloud" if profile == "cloud" else "op"
+    if metadata.get("profile") != expected_profile:
+        raise WebAssetsError("Web producer profile disagrees with the selected release profile")
+    if profile == "cloud":
+        normalized = normalize_cloud_console_url(metadata.get("cloudConsoleUrl"))
+        if metadata.get("cloudConsoleUrl") != normalized or normalized != console_url:
+            raise WebAssetsError("Web producer Console URL disagrees with the selected release URL")
+    elif "cloudConsoleUrl" in metadata:
+        raise WebAssetsError("OP producer metadata must not contain Cloud Console configuration")
+
+
+def validate_release_producer(dist: Path, profile: str, console_url: str | None) -> None:
+    marker = dist / "tapstate-web-build.json"
+    if not marker.exists():
+        return
+    try:
+        if marker.stat().st_size > 64 * 1024:
+            raise WebAssetsError("Web producer metadata exceeds its size limit")
+        metadata = json.loads(marker.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WebAssetsError("Web producer metadata cannot be read") from exc
+    validate_release_producer_metadata(metadata, profile, console_url)
+
+
 def verify_bundle(root: Path, revision: str, profile: str, console_url: str | None) -> str:
     console_url = validate_profile(profile, console_url)
     root = validate_checkout(root, revision)
@@ -214,6 +246,7 @@ def verify_bundle(root: Path, revision: str, profile: str, console_url: str | No
         metadata = json.loads(marker.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise WebAssetsError("production bundle has no valid Web build attestation; use build-web-assets.sh") from exc
+    validate_release_producer(dist, profile, console_url)
     digest = hashlib.sha256(files_manifest(dist)).hexdigest()
     expected = marker_metadata(revision, profile, console_url, digest)
     if not isinstance(metadata, dict) or type(metadata.get("schemaVersion")) is not int or metadata != expected:
@@ -234,6 +267,7 @@ def build_bundle(root: Path, revision: str, profile: str, console_url: str | Non
     if marker.exists():
         marker.unlink()
     environment = {key: value for key, value in git_environment().items() if not key.startswith("VITE_")}
+    environment["TAPSTATE_LOCAL_DEVELOPMENT"] = "false"
     if console_url is not None:
         environment["VITE_CLOUD_CONSOLE_URL"] = console_url
     try:
@@ -245,6 +279,7 @@ def build_bundle(root: Path, revision: str, profile: str, console_url: str | Non
         raise WebAssetsError("Web build failed; no valid build attestation was created")
     validate_checkout(root, revision)
     dist_path(root)
+    validate_release_producer(dist, profile, console_url)
     digest = hashlib.sha256(files_manifest(dist)).hexdigest()
     metadata = marker_metadata(revision, profile, console_url, digest)
     with marker.open("x", encoding="utf-8") as output:

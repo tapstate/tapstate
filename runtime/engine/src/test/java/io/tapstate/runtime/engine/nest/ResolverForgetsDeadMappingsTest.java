@@ -95,6 +95,22 @@ class ResolverForgetsDeadMappingsTest {
     }
 
     @Test
+    void aDeletedKeyWithWaitingSurvivesEvenWhenItsParentDeletionIsBelowTheFloor() throws Exception {
+        feed(OWN_ROWS,policy(Op.INSERT,1,"p1","c1"),policy(Op.DELETE,2,"p1","c1"));
+        feed(1,Envelope.insert(3,"claim",row("claim_id","k1","policy_id","p1"),null).withOrder(new SourceOrder(1,3)));
+        floor.at("policy",new SourceOrder(1,10));processor.tryProcess();
+        assertThat(store.load(POLICY_1)).isNotNull();assertThat(store.load(POLICY_1).pending()).isEqualTo(1);
+    }
+    @Test
+    void aWaitingChildWithoutAKnownPositionStillPreventsTombstoneReclamation() throws Exception {
+        feed(OWN_ROWS,policy(Op.INSERT,1,"p1","c1"),policy(Op.DELETE,2,"p1","c1"));
+        var state=store.load(POLICY_1);
+        var child=new NestElement(new ElementRef(List.of("policies","claims"),List.of("p1"),List.of("k1"),null),row("claim_id","k1"),new SourceOrder(1,3),Map.of());
+        state.resolve(child,0);store.save(POLICY_1,state);
+        floor.at("policy",new SourceOrder(1,10));processor.tryProcess();
+        assertThat(store.load(POLICY_1)).isNotNull();assertThat(store.load(POLICY_1).waiting()).containsExactly(child);
+    }
+    @Test
     void forgets_nothing_while_the_floor_is_not_known() throws Exception {
         feed(OWN_ROWS, policy(Op.INSERT, 1, "p1", "c1"), policy(Op.DELETE, 2, "p1", "c1"));
 

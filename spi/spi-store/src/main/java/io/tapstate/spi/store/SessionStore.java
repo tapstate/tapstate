@@ -27,4 +27,9 @@ public interface SessionStore {
      * is deliberately not a precondition, making a repeated logout with the same valid credential succeed.
      */
     boolean revoke(String sessionId, String secretHash, String issuer, Instant now);
+
+    /** Atomically revokes a matching browser credential even after expiry; unknown stores refuse safely. */
+    default boolean revokeBrowserSession(String sessionId, String secretHash, String issuer) {
+        return false;
+    }
 }

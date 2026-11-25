@@ -116,6 +116,7 @@ try:
         "data_browser_find",
         "data_browser_stats",
         "connection_test_result",
+        "configuration_import_status",
         "connector_get",
         "connector_list",
         "pipeline_explain",
@@ -124,9 +125,13 @@ try:
         "pipeline_metrics",
         "pipeline_metrics_history",
         "pipeline_snapshot",
+        "pipeline_start_checks",
         "pipeline_status",
         "source_draft",
         "source_list",
+        "storage_recovery_status",
+        "storage_setup_status",
+        "storage_status",
         "system_version",
     }
     assert tool_names == expected, (
@@ -135,6 +140,10 @@ try:
     )
     # Source list is intentionally read-only on MCP; mutating and single-resource CRUD stay off it.
     assert tool_names.isdisjoint({"source_create", "source_get", "source_update", "source_delete"})
+    assert tool_names.isdisjoint({
+        "storage_test", "storage_setup_commit", "storage_recovery_plan", "storage_recovery_confirm",
+        "configuration_export", "configuration_import_preflight", "configuration_import_commit",
+    })
 
     process.stdin.close()
     process.wait(timeout=5)

@@ -10,9 +10,7 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -42,21 +40,21 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 @RequiresDocker
 class SrsConsumerOffsetsCeilingIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final String CHAIN = "orders@mysql-1";
     private static final int TABLES_PER_CONSUMER = 1_000;
     private static final Instant WRITTEN_AT = Instant.parse("2026-09-20T08:00:00Z");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(SrsConsumerOffsetsCeilingIT.class);
 
     @Test
     void consumerOffsetsCannotFillTheRecordUntilTheChainCanNoLongerRecordSourceProgress() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> roots =
-                    client.getDatabase("tapstate").getCollection("srs_meta");
+                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             MongoCollection<Document> consumerOffsets =
-                    client.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets");
             roots.drop();
             consumerOffsets.drop();
             MongoSrsMetaStore store = new MongoSrsMetaStore(client,

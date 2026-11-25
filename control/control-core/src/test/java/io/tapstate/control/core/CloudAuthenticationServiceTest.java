@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionRecord;
 import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.spi.store.IoError;
@@ -38,6 +39,100 @@ class CloudAuthenticationServiceTest {
         @Override public boolean matches(String secret, String hash) { return hash(secret).equals(hash); }
     };
     private final CloudSessionService sessions = new CloudSessionService(store, DEPLOYMENT, secrets, clock);
+
+    @Test
+    void identityAndContextComeFromOneValidationAndTheNextRequestStillSeesRevocation() {
+        var context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster", "region");
+        String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "user", "org-a", "cluster-a",
+                "single-read", Scope.WRITE, NOW.plusSeconds(900)), context).orElseThrow().token();
+        var service = new CloudAuthenticationService((code, cluster) -> { throw new AssertionError("no exchange"); },
+                (jwt, target, audience) -> { throw new AssertionError("no JWT refresh"); }, sessions);
+
+        var authenticated = service.authenticateWithContext(cookie).orElseThrow();
+        assertThat(authenticated.identity()).isEqualTo(new VerifiedToken("user", Scope.WRITE));
+        assertThat(authenticated.clusterContext()).isEqualTo(context);
+        assertThat(store.authentications).isEqualTo(1);
+        assertThat(service.logout(cookie)).isTrue();
+        assertThat(service.authenticateWithContext(cookie)).isEmpty();
+        assertThat(store.authentications).isEqualTo(2);
+    }
+
+    @Test
+    void contextualAuthenticationDoesNotGrantAnOrganizationForALegacySessionOrWrongSecret() {
+        String cookie = sessions.create(login("legacy-context", NOW.plusSeconds(900))).orElseThrow().token();
+        assertThat(sessions.authenticateWithContext(cookie)).isEmpty();
+        var context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster", "region");
+        String contextual = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "user", "org-a", "cluster-a",
+                "wrong-secret", Scope.WRITE, NOW.plusSeconds(900)), context).orElseThrow().token();
+        assertThat(sessions.authenticateWithContext(contextual.replace(".secret", ".incorrect"))).isEmpty();
+    }
+
+    @Test
+    void contextViewUsesTheCurrentAddressInsteadOfTheLoginSnapshot() {
+        CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", "198.51.100.1", "DYNAMIC");
+        String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
+                "address-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot).orElseThrow().token();
+        AtomicInteger providerCalls = new AtomicInteger();
+        CloudClusterEgressAddressProvider provider = (organizationId, clusterId) -> {
+            providerCalls.incrementAndGet();
+            assertThat(organizationId).isEqualTo("org-a");
+            assertThat(clusterId).isEqualTo("cluster-a");
+            return Optional.of(new CloudClusterEgressAddress("org-a", "cluster-a", "203.0.113.42", "STABLE"));
+        };
+        CloudAuthenticationService service = new CloudAuthenticationService((code, cluster) -> "unused",
+                (jwt, target, audience) -> {
+                    throw new AssertionError("context reads must not refresh authentication");
+                }, sessions, CloudAuthenticationObserver.NONE, provider);
+
+        assertThat(service.clusterContextView(cookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", "203.0.113.42", "STABLE"));
+        assertThat(service.authenticate(cookie)).isPresent();
+        assertThat(providerCalls).hasValue(1);
+    }
+
+    @Test
+    void contextViewDoesNotPresentTheLoginSnapshotAsCurrentWhenCloudIsUnavailable() {
+        CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", "198.51.100.1", "DYNAMIC");
+        String missingAddressCookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a",
+                "cluster-a", "missing-address-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot)
+                .orElseThrow().token();
+        CloudAuthenticationService service = new CloudAuthenticationService((code, cluster) -> "unused",
+                (jwt, target, audience) -> Optional.empty(), sessions, CloudAuthenticationObserver.NONE,
+                (organizationId, clusterId) -> Optional.empty());
+
+        assertThat(service.clusterContextView(missingAddressCookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
+    }
+
+    @Test
+    void legacyConstructorLeavesCurrentAddressUnavailableInsteadOfReusingTheLoginSnapshot() {
+        CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", "198.51.100.1", "DYNAMIC");
+        String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
+                "legacy-constructor-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot).orElseThrow().token();
+        CloudAuthenticationService service = new CloudAuthenticationService((code, cluster) -> "unused",
+                (jwt, target, audience) -> Optional.empty(), sessions);
+
+        assertThat(service.clusterContextView(cookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
+    }
+
+    @Test
+    void contextViewRejectsCurrentAddressMetadataForAnotherCluster() {
+        CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", "198.51.100.1", "DYNAMIC");
+        String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
+                "wrong-address-scope-jti", Scope.WRITE, NOW.plusSeconds(900)), snapshot).orElseThrow().token();
+        CloudAuthenticationService service = new CloudAuthenticationService((code, cluster) -> "unused",
+                (jwt, target, audience) -> Optional.empty(), sessions, CloudAuthenticationObserver.NONE,
+                (organizationId, clusterId) -> Optional.of(
+                        new CloudClusterEgressAddress("other-org", "cluster-a", "203.0.113.42", "STABLE")));
+
+        assertThat(service.clusterContextView(cookie).orElseThrow()).isEqualTo(new CloudClusterContextView(
+                "org-a", "cluster-a", "Organization", "Cluster", "us-east-1", null, null));
+    }
 
     @Test
     void diagnosticsIdentifyTheFailingPhaseWithoutRepeatingTheExchange() {
@@ -120,6 +215,50 @@ class CloudAuthenticationServiceTest {
         assertThat(saved.jwtId()).isEqualTo("jti-a");
         assertThat(saved.secretHash()).isEqualTo("hash-secret");
         assertThat(saved.toString()).doesNotContain("raw-cloud-jwt-sentinel", "hash-secret");
+    }
+
+    @Test
+    void unverifiedExchangeEmailIsNotStoredWhenTheVerifiedIdentityHasNoEmail() {
+        CloudSessionContext context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", null, null, "other@example.test");
+        CloudCodeExchanger exchanger = new CloudCodeExchanger() {
+            @Override public String exchange(String code, String cluster) { return "jwt"; }
+            @Override public CloudCodeExchangeResult exchangeWithContext(String code, String cluster) {
+                return new CloudCodeExchangeResult("jwt", context);
+            }
+        };
+        CloudAuthenticationService authentication = new CloudAuthenticationService(exchanger,
+                (jwt, target, audience) -> Optional.of(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a",
+                        "cluster-a", "jti-a", Scope.WRITE, NOW.plusSeconds(900))), sessions);
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
+        assertThat(authentication.clusterContext(cookie).orElseThrow().userEmail()).isNull();
+    }
+
+    @Test
+    void verifiedEmailOverridesMismatchedExchangeEmail() {
+        CloudSessionContext context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", null, null, "other@example.test");
+        CloudCodeExchanger exchanger = new CloudCodeExchanger() {
+            @Override public String exchange(String code, String cluster) { return "jwt"; }
+            @Override public CloudCodeExchangeResult exchangeWithContext(String code, String cluster) {
+                return new CloudCodeExchangeResult("jwt", context);
+            }
+        };
+        CloudAuthenticationService authentication = new CloudAuthenticationService(exchanger,
+                (jwt, target, audience) -> Optional.of(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a",
+                        "cluster-a", "jti-a", Scope.WRITE, NOW.plusSeconds(900), "verified@example.test")), sessions);
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
+        assertThat(authentication.clusterContext(cookie).orElseThrow().userEmail()).isEqualTo("verified@example.test");
+    }
+
+    @Test
+    void sessionCreationStoresOnlyVerifiedEmailEvenForDirectCallers() {
+        CloudSessionContext context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", null, null, "untrusted@example.test");
+        CloudLoginIdentity identity = new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
+                "jti-direct", Scope.WRITE, NOW.plusSeconds(900), "verified@example.test");
+        String cookie = sessions.create(identity, context).orElseThrow().token();
+        assertThat(sessions.clusterContext(cookie).orElseThrow().userEmail()).isEqualTo("verified@example.test");
     }
 
     @Test
@@ -269,6 +408,7 @@ class CloudAuthenticationServiceTest {
     private static final class MemoryStore implements CloudSessionStore {
         final Map<Key, CloudSessionRecord> records = new HashMap<>();
         final Set<Key> revoked = new HashSet<>();
+        int authentications;
 
         @Override public boolean create(CloudSessionRecord record) {
             Key key = new Key(record.identity(), record.jwtId());
@@ -279,6 +419,7 @@ class CloudAuthenticationServiceTest {
         }
         @Override public Optional<CloudSessionRecord> authenticate(CloudSessionIdentity identity, String jti,
                 String hash, Instant now, Instant expiry) {
+            authentications++;
             Key key = new Key(identity, jti);
             CloudSessionRecord existing = records.get(key);
             if (existing == null || revoked.contains(key) || !hash.equals(existing.secretHash())
@@ -286,7 +427,7 @@ class CloudAuthenticationServiceTest {
                 return Optional.empty();
             }
             CloudSessionRecord touched = new CloudSessionRecord(identity, jti, hash, existing.userId(), existing.scope(),
-                    false, existing.createdAt(), now, expiry);
+                    false, existing.createdAt(), now, expiry, existing.clusterContext());
             records.put(key, touched);
             return Optional.of(touched);
         }

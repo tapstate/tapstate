@@ -29,6 +29,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 /**
  * The production sink-ack factory carried onto the DAG: it confirms each source node's own per-table progress as
@@ -82,6 +85,7 @@ import java.util.Set;
 final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
     private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(StoreBackedSinkAckFactory.class);
 
     private final Map<String, SourceProgress> progressByTable;
     private final String pipelineId;
@@ -178,11 +182,29 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         };
     }
 
+    @Override
+    public Set<String> completedSnapshotInputs(HazelcastInstance member, Set<String> streams) {
+        SrsMetaStore meta = storeOn(member);
+        if (meta == null) return Set.of();
+        Map<String, List<ConsumerOffset>> consumers = new HashMap<>();
+        var completed = new HashSet<String>();
+        for (String stream : streams) {
+            SourceProgress source = sourceOf(progressByTable, stream);
+            if (recordedAsLanded(stream, source, consumers.computeIfAbsent(source.miningChainId(), meta::consumerOffsets))) {
+                completed.add(stream);
+            }
+        }
+        return Set.copyOf(completed);
+    }
+
+    private static boolean recordedAsLanded(String stream, SourceProgress source, List<ConsumerOffset> consumers) {
+        return consumers.stream().anyMatch(consumer -> consumer.pipelineId().equals(source.consumerId())
+                && consumer.snapshotCompletedTables().contains(source.table(stream)));
+    }
+
     private boolean landed(AwaitedLoad load, SourceProgress source, List<ConsumerOffset> consumers,
             Optional<WriterRun> run) {
-        boolean recorded = consumers.stream().anyMatch(consumer -> consumer.pipelineId().equals(source.consumerId())
-                && consumer.snapshotCompletedTables().contains(source.table(load.table())));
-        if (recorded) {
+        if (recordedAsLanded(load.table(), source, consumers)) {
             return true;
         }
         if (run.isEmpty() || !run.get().runId().equals(runId)) {
@@ -305,6 +327,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         private final Map<SourceProgress, String> cdcStarts = new HashMap<>();
         // The tables already recorded as loaded. The mark is idempotent; this only saves the round trip.
         private final Set<String> loaded = new HashSet<>();
+        // Logging only: the first confirmed change and each decade after it, per table and writer.
+        private final transient Map<String, Long> loggedUpdates = new HashMap<>();
         // Whether a later run has taken over the accounting, after which nothing this writer says lands.
         private boolean replaced;
 
@@ -474,9 +498,40 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     return false;
                 }
                 loaded.add(chain);
+                logProgress("Snapshot finished for table {} (target writes confirmed)", table);
             }
             landed.put(chain, now);
+            logCdcProgress(chain, table, now, before);
             return true;
+        }
+
+        private void logCdcProgress(String chain, String table, Landed now, Landed before) {
+            if (now.resumableAt() != null && !isSnapshotOf(now.resumableAt())
+                    && (before == null || now.durableThrough().compareTo(before.durableThrough()) > 0)) {
+                long updates = loggedUpdates.merge(chain, 1L, Long::sum);
+                long decade = updates;
+                while (decade > 1 && decade % 10 == 0) {
+                    decade /= 10;
+                }
+                if (decade == 1) {
+                    logProgress("CDC confirmed for table {} (epoch {}, seq {}; {} updates on writer {})",
+                            table, now.durableThrough().epoch(), now.durableThrough().seq(), updates, writerId);
+                }
+            }
+        }
+
+        private void logProgress(String message, Object... args) {
+            String previous = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+            MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+            try {
+                LOG.info(message, args);
+            } finally {
+                if (previous == null) {
+                    MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+                } else {
+                    MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previous);
+                }
+            }
         }
 
         private boolean advanceResumableProgress(SourceProgress source, WriterRun run, Landed now, Landed before,
@@ -484,7 +539,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             ChainPosition resumable = now.resumableAt();
             if (resumable != null && (before == null || before.resumableAt() == null
                     || resumable.order().compareTo(before.resumableAt().order()) > 0)) {
-                ChainPosition acked = ackedCandidate(source, run, resumable);
+                ChainPosition acked = ackedCandidate(source,run);
                 if (acked != null && !acked.equals(raised.get(source))) {
                     if (!raiseSinkAcked(source, acked, fence)) {
                         return false;
@@ -505,24 +560,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
          * how far another has got; and nowhere for a direct channel, whose position the store moves as its
          * recorded batches complete.
          */
-        private ChainPosition ackedCandidate(SourceProgress source, WriterRun run, ChainPosition resumable) {
-            if (source.kind() == ConsumerProgressKind.DIRECT_SOURCE) {
-                return null;
-            }
-            if (run.expected().size() == 1) {
-                return resumable;
-            }
-            ChainPosition lowest = null;
-            for (String table : run.expected().keySet()) {
-                ChainPosition at = SrsWriterFrontier.landed(run, table).map(Landed::resumableAt).orElse(null);
-                if (at == null) {
-                    return null;
-                }
-                if (lowest == null || at.order().compareTo(lowest.order()) < 0) {
-                    lowest = at;
-                }
-            }
-            return lowest != null && isSnapshotOf(lowest) ? lowest : null;
+        private ChainPosition ackedCandidate(SourceProgress source,WriterRun run) {
+            return source.kind() == ConsumerProgressKind.DIRECT_SOURCE ? null : io.tapstate.spi.store.WriterFrontier.resumableAt(run).orElse(null);
         }
 
         // Each write of the source node's record, fenced where the report was. A fenced write the store turned
@@ -560,10 +599,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      * position - an order a token from beneath it would be read back as reaching.
      */
     private static ChainPosition confirmedAt(Landed landed) {
-        ChainPosition resumable = landed.resumableAt();
-        String token = resumable != null && resumable.order().equals(landed.durableThrough())
-                ? resumable.token() : null;
-        return new ChainPosition(landed.durableThrough(), token);
+        return io.tapstate.spi.store.WriterFrontier.confirmedAt(
+                new io.tapstate.spi.store.WriterFrontier.Landed(landed.durableThrough(),landed.resumableAt()));
     }
 
     /**

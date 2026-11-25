@@ -41,13 +41,15 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
         if (pipeline.isEmpty()) {
             return Map.of();
         }
+        Runnable current=storePort instanceof ThreeLayerStorePort nativeStore?nativeStore.readingGuard(pipelineId):() -> {};
         Map<String, SourceCaptureResolution> resolutions = new LinkedHashMap<>();
-        for (String sourceId : pipeline.get().sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
+        for (String binding : pipeline.get().sourceBindings()) {
+            var ref = pipeline.get().sourceReference(binding);
+            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), ref.id());
             SourceCaptureResolution resolution;
             try {
-                resolution = SourceCaptureResolution.forPipeline(
-                        pipeline.get(), source, SourceDiscovery.model(storePort, source)).orElse(null);
+                resolution = SourceCaptureResolution.forStoredPipeline(
+                        storePort,pipeline.get(),ref,source,SourceDiscovery.model(storePort, source),true).orElse(null);
             } catch (TapstateException unresolved) {
                 if (unresolved.code() == ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED) {
                     // The read face treats a not-yet-resolvable selection as absent while discovery catches up.
@@ -56,7 +58,7 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                 throw unresolved;
             }
             if (resolution != null) {
-                resolutions.put(sourceId, resolution);
+                resolutions.put(binding, resolution);
             }
         }
         Map<String, String> positions = new LinkedHashMap<>();
@@ -77,12 +79,14 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                         confirmed = offset.sinkAcked();
                     }
                     if (confirmed != null && confirmed.token() != null) {
-                        positions.put(table, confirmed.token());
+                        String label = PipelineTableSelection.label(sourceId, table,
+                                resolutions.values().stream().map(SourceCaptureResolution::tables));
+                        positions.put(label, confirmed.token());
                     }
                 }
             });
         });
-        return positions;
+        current.run();return positions;
     }
 
     /** The stored pipeline for the id, or empty when its artifact is absent or names another kind. */

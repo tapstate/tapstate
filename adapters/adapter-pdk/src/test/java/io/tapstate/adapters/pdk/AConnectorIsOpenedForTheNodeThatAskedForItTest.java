@@ -49,7 +49,7 @@ class AConnectorIsOpenedForTheNodeThatAskedForItTest {
     @Test
     void theNamespaceIsBuiltFromBothIdsOfTheNode() {
         assertThat(ConnectorStateNamespace.of(new PipelineNode("p-orders", "src_pg_main")))
-                .isEqualTo("pdk.state.p-orders.src_pg_main");
+                .isEqualTo("pdk.state.p-orders.capture.src_pg_main");
     }
 
     /**
@@ -82,7 +82,7 @@ class AConnectorIsOpenedForTheNodeThatAskedForItTest {
 
         try (CaptureBatch batch = port.snapshot(config)) {
             assertThat(((PdkCaptureBatch) batch).connector().stateNamespace())
-                    .isEqualTo("pdk.state.p1.src_a");
+                    .isEqualTo("pdk.state.p1.capture.src_a");
         }
     }
 
@@ -112,7 +112,38 @@ class AConnectorIsOpenedForTheNodeThatAskedForItTest {
 
         try (SinkWriter writer = port.open(config)) {
             assertThat(((PdkSinkWriter) writer).connector().stateNamespace())
-                    .isEqualTo("pdk.state.p1.to_mongo");
+                    .isEqualTo("pdk.state.p1.sync.to_mongo");
+        }
+    }
+
+    @Test
+    void sameNamedCaptureViewAndSyncKeepTheirOwnNotesAcrossReopen(@TempDir Path dir) throws Exception {
+        PipelineNode node = new PipelineNode("p1", "shared");
+        HeapKeyedState state = new HeapKeyedState();
+        Path source = Synthetic.emittingSource(dir);
+        Path sink = Synthetic.countingSink(dir);
+        PdkCapturePort capture = new PdkCapturePort(provisioner(source, "synthetic.EmittingSource"), state);
+        SinkConfig config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null, node);
+        try (CaptureBatch batch = capture.snapshot(new CaptureConfig("demo", Map.of(), List.of("t1")).at(node))) {
+            ((PdkCaptureBatch) batch).connector().context().getStateMap().put("identity", "capture");
+        }
+        for (PipelineNode.Purpose purpose : List.of(PipelineNode.Purpose.VIEW, PipelineNode.Purpose.SYNC)) {
+            try (SinkWriter writer = new PdkSinkPort(provisioner(sink, "synthetic.CountingSink"), state, null, purpose)
+                    .open(config)) {
+                var context = ((PdkSinkWriter) writer).connector().context();
+                assertThat(context.getStateMap().get("identity")).isNull();
+                context.getStateMap().put("identity", purpose.segment());
+            }
+        }
+        try (CaptureBatch batch = capture.snapshot(new CaptureConfig("demo", Map.of(), List.of("t1")).at(node))) {
+            assertThat(((PdkCaptureBatch) batch).connector().context().getStateMap().get("identity")).isEqualTo("capture");
+        }
+        for (PipelineNode.Purpose purpose : List.of(PipelineNode.Purpose.VIEW, PipelineNode.Purpose.SYNC)) {
+            try (SinkWriter writer = new PdkSinkPort(provisioner(sink, "synthetic.CountingSink"), state, null, purpose)
+                    .open(config)) {
+                assertThat(((PdkSinkWriter) writer).connector().context().getStateMap().get("identity"))
+                        .isEqualTo(purpose.segment());
+            }
         }
     }
 

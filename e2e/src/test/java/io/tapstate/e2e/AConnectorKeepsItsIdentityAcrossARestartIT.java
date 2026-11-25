@@ -2,18 +2,15 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
+import org.bson.Document;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import org.bson.Document;
-import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -53,10 +50,6 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     /** Where a shared capture's connector notes are kept, before the chain the capture reads. */
     private static final String CHAIN_NAMESPACE_PREFIX = "pdk.chain.";
 
-    /** The database connector and operator state share, and the collection that holds it. */
-    private static final String STATE_DATABASE = "tapstate_nest";
-    private static final String STATE_COLLECTION = "operator_state";
-
     private static final String SEEDED = "seeded";
     private static final String BEFORE_THE_RESTART = "changed-before-the-restart";
     private static final String AFTER_THE_RESTART = "changed-after-the-restart";
@@ -75,17 +68,16 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE + "_" + suffix);
         seedOneRow(mysql);
 
-        String storeUri = SharedMongo.replicaSetUrl("identity_restart_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("identity_restart_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         byte[] minted;
         String namespace;
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle first = tier.launch(storeUri);
-                    StoreDocuments documents = StoreDocuments.at(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (ServerHandle first = tier.launch(storage);
+                    StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
@@ -110,26 +102,26 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 String notes = CHAIN_NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
                 namespace = notes;
                 Await.until("the connector to have filed the identity it minted",
-                        () -> note(storeUri, notes, SERVER_NAME).isPresent(),
+                        () -> note(storage, notes, SERVER_NAME).isPresent(),
                         () -> "nothing under " + notes);
-                minted = note(storeUri, notes, SERVER_NAME).orElseThrow();
+                minted = note(storage, notes, SERVER_NAME).orElseThrow();
             }
 
             // The server is gone; on the real-process tier its whole JVM is gone. The store it wrote, the
             // source database and the target are not.
-            try (ServerHandle second = tier.launch(storeUri)) {
+            try (ServerHandle second = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(second.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 // Liveness first: a run that never started would leave the stored value untouched too, and
                 // "unchanged" would then be satisfied by nothing having happened at all.
                 update(mysql, AFTER_THE_RESTART);
                 awaitCustomer(mongo, target, AFTER_THE_RESTART, "a change made after the restart");
 
-                assertThat(note(storeUri, namespace, SERVER_NAME))
+                assertThat(note(storage, namespace, SERVER_NAME))
                         .as("the identity after a run that came back and is carrying changes")
                         .isPresent();
-                assertThat(note(storeUri, namespace, SERVER_NAME).orElseThrow())
+                assertThat(note(storage, namespace, SERVER_NAME).orElseThrow())
                         .as("the run that came back is running under the identity the first one minted, "
                                 + "not one of its own: a fresh identity is what leaves a recorded position "
                                 + "filed under a name nothing looks it up by")
@@ -138,18 +130,9 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         }
     }
 
-    /** One of the connector's own notes, read straight out of the store as the bytes it was written as. */
-    private static Optional<byte[]> note(String storeUri, String namespace, String key) {
-        try (MongoClient client = MongoClients.create(storeUri)) {
-            Document id = new Document("ns", namespace).append("k", key);
-            Document found = client.getDatabase(STATE_DATABASE)
-                    .getCollection(STATE_COLLECTION)
-                    .find(new Document("_id", id))
-                    .first();
-            return Optional.ofNullable(found)
-                    .map(document -> document.get("state", Binary.class))
-                    .map(Binary::getData);
-        }
+    /** The connector receives these exact bytes after the native store decrypts its retained note. */
+    private static Optional<byte[]> note(PreparedNativeStore storage, String namespace, String key) {
+        return storage.chainNote(namespace.substring(CHAIN_NAMESPACE_PREFIX.length()), key);
     }
 
     private static void seedOneRow(Map<String, Object> settings) throws Exception {

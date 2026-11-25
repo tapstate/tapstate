@@ -21,11 +21,9 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.lang.reflect.InvocationTargetException;
@@ -45,8 +43,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class SourceConfigKeyringAcknowledgementIT {
 
-    @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @RegisterExtension
+    private static final SharedMongoCase MONGO =
+            SharedMongoCase.forSuite(SourceConfigKeyringAcknowledgementIT.class);
 
     private static final Duration TTL = Duration.ofSeconds(10);
 
@@ -425,7 +424,7 @@ class SourceConfigKeyringAcknowledgementIT {
                     .addCommandListener(switchAfterRead).build();
             try (MongoClient joining = MongoClients.create(settings)) {
                 SourceConfigKeyringHandle handle = new SourceConfigKeyringHandle(
-                        new SourceConfigKeyringStore(joining, joining.getDatabase(database.getName())));
+                        new SourceConfigKeyringStore(joining, joining.getDatabase(MONGO.database(database.getName()))));
                 assertThat(handle.epoch()).isEqualTo(1);
                 armed.set(true);
                 handle.acknowledge(node, TTL);
@@ -482,7 +481,7 @@ class SourceConfigKeyringAcknowledgementIT {
                     .addCommandListener(holdAfterFence).build();
             try (MongoClient acknowledging = MongoClients.create(settings)) {
                 SourceConfigKeyringHandle handle = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(
-                        acknowledging, acknowledging.getDatabase(database.getName())));
+                        acknowledging, acknowledging.getDatabase(MONGO.database(database.getName()))));
                 CompletableFuture<Void> ack = CompletableFuture.runAsync(() -> handle.acknowledge(node, TTL));
                 try {
                     assertThat(fenced.await(5, TimeUnit.SECONDS)).as("the actual server accepted the in-transaction fence")
@@ -516,7 +515,7 @@ class SourceConfigKeyringAcknowledgementIT {
     }
 
     private static MongoDatabase freshDatabase(MongoClient client) {
-        return client.getDatabase("keyring_ack_" + Long.toUnsignedString(System.nanoTime(), 16));
+        return client.getDatabase(MONGO.database("keyring_ack_" + Long.toUnsignedString(System.nanoTime(), 16)));
     }
 
     private static MongoWorkloadClaimStore claims(MongoDatabase database) {

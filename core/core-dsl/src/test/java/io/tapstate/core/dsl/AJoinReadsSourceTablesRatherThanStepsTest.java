@@ -79,7 +79,7 @@ class AJoinReadsSourceTablesRatherThanStepsTest {
 
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException ex = (DslException) thrown;
-        assertThat(ex.code().code()).isEqualTo("dsl.join-input-not-a-table");
+        assertThat(ex.code().code()).isEqualTo("TS0010030");
         assertThat(ex.path()).isEqualTo("transforms[1].from.t");
         assertThat(ex.args())
                 .containsEntry("step", "resolve")
@@ -93,7 +93,7 @@ class AJoinReadsSourceTablesRatherThanStepsTest {
 
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException ex = (DslException) thrown;
-        assertThat(ex.code().code()).isEqualTo("dsl.join-input-is-a-pattern");
+        assertThat(ex.code().code()).isEqualTo("TS0010031");
         assertThat(ex.path()).isEqualTo("transforms[1].from.t");
         assertThat(ex.args())
                 .containsEntry("step", "resolve")
@@ -112,7 +112,7 @@ class AJoinReadsSourceTablesRatherThanStepsTest {
 
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException ex = (DslException) thrown;
-        assertThat(ex.code().code()).isEqualTo("dsl.join-input-is-a-pattern");
+        assertThat(ex.code().code()).isEqualTo("TS0010031");
         assertThat(ex.path()).isEqualTo("transforms[1].from.t");
         assertThat(ex.args()).containsEntry("pattern", "tracks");
     }
@@ -148,7 +148,7 @@ class AJoinReadsSourceTablesRatherThanStepsTest {
 
         assertThat(thrown).isInstanceOf(DslException.class);
         DslException ex = (DslException) thrown;
-        assertThat(ex.code().code()).isEqualTo("dsl.join-input-not-a-table");
+        assertThat(ex.code().code()).isEqualTo("TS0010030");
         assertThat(ex.path()).isEqualTo("transforms[1].from.f");
         assertThat(ex.args()).containsEntry("ref", "first");
     }

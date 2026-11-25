@@ -15,6 +15,26 @@ import java.util.function.Predicate;
  */
 interface PipelineCaptureCoordinator {
 
+    /** A retained source pin may supply frozen planning observations without replacing discovery storage. */
+    default SourceModelSnapshot retainedPlanningModels(PipelineConvergencePass pass, ArtifactStore artifacts,
+            SourceModelSnapshot discovered) {
+        return discovered;
+    }
+
+    /** A scoped lifecycle captures the original run separately from its current command authority. */
+    default PipelineCaptureCoordinator forRun(io.tapstate.spi.store.PipelineIntentScope commandScope, io.tapstate.spi.store.WorkloadClaimFence command, ExecutionFence original) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
+    /** Only a scoped successful start can supply the immutable source results for its deferred DAG. */
+    default PipelineCaptureBindings captureBindings() {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+    /** Current native alias metadata only; callers separately authenticate the validation run. */
+    default ValidationCaptureRoute validationRoute(String alias,String table) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
     default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
     }
@@ -38,6 +58,11 @@ interface PipelineCaptureCoordinator {
      */
     default void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
         startCapture(pipelineId);
+    }
+
+    /** Explicit model-aware adapters consume the original per-start discovery choices. */
+    default void startCapture(String pipelineId,ArtifactStore artifactSnapshot,SourceModelSnapshot sourceModels) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
     }
 
     /**
@@ -71,6 +96,15 @@ interface PipelineCaptureCoordinator {
         return Optional.empty();
     }
 
+    default Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipelineId) {
+        return captureFailure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
+    }
+
+    /** A refused opening belongs to this start, not to a previous or replacement run. */
+    default io.tapstate.core.common.FailureFact openingFailureFact(String pipelineId, Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
     /**
      * Whether every table this pipeline reads has had its initial load confirmed at this pipeline's target.
      *
@@ -94,6 +128,14 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
+     * Records the load as landed after the exact bounded job has succeeded at every sink. False while
+     * its capture is still finishing, or when this member cannot account for the whole load.
+     */
+    default boolean confirmBoundedLoad(String pipelineId) {
+        return true;
+    }
+
+    /**
      * How far each of the pipeline's tables got through its initial load, keyed by table, with the moment
      * that load began; nothing when no capture is running for it. A coordinator that runs no capture
      * reports nothing.
@@ -108,6 +150,12 @@ interface PipelineCaptureCoordinator {
      */
     default SnapshotReading snapshotProgress(String pipelineId) {
         return SnapshotReading.NONE;
+    }
+
+    /** A current-run display projection, absent when the capture or its binding is unavailable. */
+    default io.tapstate.core.lifecycle.InitialLoad initialLoad(String pipelineId,
+            io.tapstate.core.lifecycle.ExecutionPlan plan, java.time.Instant at) {
+        return null;
     }
 
     /** The rows this run itself read during its bounded snapshot, without earlier completed loads. */

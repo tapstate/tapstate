@@ -17,6 +17,8 @@ import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
+import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
@@ -69,6 +71,21 @@ class AChangeWaitsForEveryLoadWrittenIntoItsTargetTableTest {
         assertThat(dag.getVertex("d_src").getMetaSupplier())
                 .as("a table written into a target with no key goes to one writer in order, and waits for nothing")
                 .isNotInstanceOf(LoadGatedSource.class);
+    }
+
+    @Test
+    void cdcOnlyHasNoSnapshotLoadsToWaitForEvenAtKeyedTargetsWithSeveralWriters() {
+        PipelineResource defaults = pipeline();
+        PipelineResource changesOnly = new PipelineResource(defaults.id(), defaults.metadata(), defaults.sources(),
+                defaults.transforms(), defaults.view(), defaults.serve(),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, null), defaults.experimental());
+        DAG dag = PipelineDagBuilder.build(changesOnly, bindings(), new NoAcks(), FRONTIER, shape());
+
+        for (String source : List.of("a_src", "b_src", "c_src", "d_src")) {
+            assertThat(dag.getVertex(source).getMetaSupplier())
+                    .as("%s cannot wait for a snapshot that this read mode never creates", source)
+                    .isNotInstanceOf(LoadGatedSource.class);
+        }
     }
 
     /**

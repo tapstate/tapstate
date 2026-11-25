@@ -17,12 +17,16 @@
        The connector plugins are never compile dependencies (they load at runtime inside per-connector
        class loaders). The PDK runtime is not a compile dependency either, but it cannot live inside the
        isolated connector loader: a connector's base class bootstraps the runtime through the host class
-       loader, so the runtime must be host-reachable. The default build stays PDK-runtime-free; the
-       runtime is provided on the host test classpath only under the pdk-it profile (real-connector
-       regression) below. -->
+       loader, so the runtime must be host-reachable. Production compile dependencies stay API-only;
+       tests provide the runtime on their host classpath to exercise the complete codec contract. -->
   <description>PDK runtime bridge: isolated per-connector class loading over the frozen PDK contract (capture + sink adapter)</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The frozen PDK contract surface (rule R3 locks it to this module). Compile scope: it is the
          shared API the per-connector class loaders expose to connectors, so it must sit on the host
          classpath as the one contract every connector binds to. -->
@@ -102,10 +106,28 @@
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Conversion tests exercise the PDK's own default codec and JSON providers. -->
+    <dependency>
+      <groupId>io.tapdata</groupId>
+      <artifactId>tapdata-pdk-runner</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Match the assembly host when initializing real connector classes in isolation tests. -->
+    <dependency>
+      <groupId>io.tapdata</groupId>
+      <artifactId>tapdata-common</artifactId>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
+    </dependency>
+    <!-- Validation parses declared JSON text with bounded streaming tokens and exact numbers.
+         This does not replace the connector framework's own parser provider. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
     </dependency>
     <!-- Test-only JSON implementation for the frozen parser interface; production uses the PDK provider. -->
     <dependency>
@@ -120,6 +142,14 @@
     <dependency>
       <groupId>org.mongodb</groupId>
       <artifactId>bson</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- The log4j API a connector built for the Tapdata engine logs through and does not bundle. The
+         application explicitly provides it at runtime; the loader cases need it on the
+         host test classpath to show a connector resolves it from the host. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -146,35 +176,4 @@
     </plugins>
   </build>
 
-  <profiles>
-    <!-- Real-connector regression. Activated by the same property the gated test keys on, so
-         `mvn -pl adapters/adapter-pdk test -Dtapstate.pdk.it.manifest=... -Dtapstate.pdk.it.dist=... -Dtapstate.pdk.it.bitmap=...`
-         both selects the test and puts the PDK runtime on the host classpath. A connector dist jar is a
-         thin plugin whose base class bootstraps the PDK runtime (TapRuntime, plus the error-code types it
-         references) via the host class loader, so the runtime must be host-reachable — it cannot ride in
-         the isolated connector loader. Test scope, so the default build never carries it and stays
-         PDK-runtime-free.
-
-         The runtime pulls its own transitive tree (ehcache, reflections, jaxb, jjwt, cglib, fastjson, the
-         tapdata error-code libraries). That tree resolves cleanly under the full enforcer — no rule is
-         relaxed for this profile: it converges, respects the upper-bound gate, and (crucially for rule
-         R3) carries no Spring and no Hazelcast, so the adapters-ring cross-ring blacklist stays fully in
-         force and green. The compile surface is unchanged (tapdata-pdk-api only), so the ArchUnit R3
-         import lock is untouched. -->
-    <profile>
-      <id>pdk-it</id>
-      <activation>
-        <property>
-          <name>tapstate.pdk.it.manifest</name>
-        </property>
-      </activation>
-      <dependencies>
-        <dependency>
-          <groupId>io.tapdata</groupId>
-          <artifactId>tapdata-pdk-runner</artifactId>
-          <scope>test</scope>
-        </dependency>
-      </dependencies>
-    </profile>
-  </profiles>
 </project>

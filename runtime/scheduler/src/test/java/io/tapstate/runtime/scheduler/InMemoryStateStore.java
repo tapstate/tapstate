@@ -1,5 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.spi.store.WorkloadClaimFence;
+
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.EpochCas;
@@ -27,6 +29,7 @@ final class InMemoryStateStore implements StateStore {
     private final Map<String, CheckpointDoc> docs = new HashMap<>();
     private Runnable beforeSwap = () -> {};
     private int swapAttempts = 0;
+    WorkloadClaimFence liveFence;
 
     @Override
     public Optional<CheckpointDoc> read(String pipelineId) {
@@ -48,6 +51,15 @@ final class InMemoryStateStore implements StateStore {
         return applySwap(pipelineId, expectedEpoch, nextStateJson, touchTime);
     }
 
+    @Override
+    public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson,
+            Instant touchTime, WorkloadClaimFence fence) {
+        swapAttempts++;
+        beforeSwap.run();
+        return fence.equals(liveFence) ? applySwap(pipelineId, expectedEpoch, nextStateJson, touchTime)
+                : new CasOutcome.Fenced(docs.get(pipelineId).epoch());
+    }
+
     /** Applies the fence without running the {@code beforeSwap} hook — the seam a competitor writes through. */
     CasOutcome applySwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
         CheckpointDoc current = docs.get(pipelineId);
@@ -59,6 +71,15 @@ final class InMemoryStateStore implements StateStore {
             docs.put(pipelineId, applied.next());
         }
         return outcome;
+    }
+
+    @Override public CasOutcome recordLeaseRecovery(String id, CheckpointDoc expected,
+            CheckpointDoc.LeaseRecovery recovery, Instant at) {
+        var old = docs.get(id);
+        if (!old.equals(expected)) return new CasOutcome.Fenced(old.epoch());
+        var next = new CheckpointDoc(id, old.stateJson(), old.epoch(), old.touchTime(), recovery);
+        docs.put(id, next);
+        return new CasOutcome.Applied(next);
     }
 
     void onBeforeSwap(Runnable hook) {

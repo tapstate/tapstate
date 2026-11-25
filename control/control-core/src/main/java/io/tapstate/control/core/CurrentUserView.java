@@ -3,8 +3,11 @@ package io.tapstate.control.core;
 import java.util.List;
 import java.util.Objects;
 
-/** Minimal verified user identity; it contains no credential or external profile fields. */
-public record CurrentUserView(String mode, String principal, List<String> scopes) {
+/** Current authenticated identity and optional display attributes. */
+public record CurrentUserView(String mode, String principal, List<String> scopes, String username, String email) {
+    public CurrentUserView(String mode, String principal, List<String> scopes) {
+        this(mode, principal, scopes, null, null);
+    }
     public CurrentUserView {
         mode = Objects.requireNonNull(mode, "mode");
         principal = Objects.requireNonNull(principal, "principal");

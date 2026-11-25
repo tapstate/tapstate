@@ -54,6 +54,20 @@ class PipelinePositionServiceTest {
             chains::get, meta, artifacts, new LivePipelines(desired, state),
             new AuditGate(audit, Clock.fixed(WRITTEN_AT, ZoneOffset.UTC)));
 
+    @Test void nativePreflightPrecedesAuditButAFailedAuditNeverInvokesItsCommand() {
+        onOneChain("orders_sync");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(1, 1), "old"), List.of(), List.of(), null, 1, WRITTEN_AT));
+        var events = new ArrayList<String>(); var actions = new java.util.concurrent.atomic.AtomicInteger();
+        var guarded = new PipelinePositionService(chains::get, meta, artifacts, new LivePipelines(desired, state),
+                new AuditGate(record -> { events.add("audit"); throw new IllegalStateException("fixture audit unavailable"); }, Clock.fixed(WRITTEN_AT, ZoneOffset.UTC)),
+                (pipeline, before, moves) -> { events.add("prepare"); return actions::incrementAndGet; });
+        var request = new PipelinePosition("orders_sync", List.of(new PipelinePosition.Chain(CHAIN, null, List.of(),
+                new PipelinePosition.Point("requested", null, null), null, null, List.of())));
+        var refused = catchThrowableOfType(TapstateException.class, () -> guarded.writeBack("admin", "orders_sync", request));
+        assertThat(refused.code()).isEqualTo(ControlError.AUDIT_BLOCKED);
+        assertThat(events).containsExactly("prepare", "audit"); assertThat(actions).hasValue(0); assertThat(meta.rewinds).isEmpty();
+    }
+
     // ------------------------------------------------------------------ reading
 
     @Test
@@ -192,6 +206,38 @@ class PipelinePositionServiceTest {
         assertThat(meta.advances).isEmpty();
         assertThat(after.chains().getFirst().resumeFrom().token()).isEqualTo("mysql-bin.000001:4");
         assertThat(audit.records).extracting(AuditRecord::operationId).containsExactly("pipeline.set-position");
+    }
+
+    @Test
+    void writesBackAFullDocumentWithTwoBindingsOnOneChain() {
+        String pipeline = "orders_sync";
+        chains.put(pipeline, List.of(
+                new PipelineChains.Chain(CHAIN, "left", List.of("orders")),
+                new PipelineChains.Chain(CHAIN, "right", List.of("items"))));
+        atRest(pipeline);
+        meta.put(seeded("original"));
+
+        var current = service.read(pipeline);
+        var first = current.chains().getFirst();
+        var second = current.chains().getLast();
+        var conflicting = new PipelinePosition(pipeline,
+                List.of(withResumeToken(first, "one"), withResumeToken(second, "two")));
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.writeBack("alice", pipeline, conflicting));
+        assertThat(refused.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+        assertThat(meta.rewinds).isEmpty();
+
+        var after = service.writeBack("alice", pipeline,
+                new PipelinePosition(pipeline, List.of(first, withResumeToken(second, "earlier"))));
+
+        assertThat(meta.rewinds).containsExactly(Map.entry(CHAIN, "earlier"));
+        assertThat(after.chains()).extracting(chain -> chain.resumeFrom().token())
+                .containsExactly("earlier", "earlier");
+    }
+
+    private static PipelinePosition.Chain withResumeToken(PipelinePosition.Chain row, String token) {
+        return new PipelinePosition.Chain(row.chainId(), row.sourceId(), row.tables(), PipelinePosition.Point.at(token),
+                row.recordedAt(), row.targetAcked(), row.sharedWith());
     }
 
     /**

@@ -25,10 +25,10 @@ class AFirstStartHonorsOnFullLoadIT {
 
     @Test
     void clearRemovesExistingRowsAndFailRefusesThemOnTheFirstStart(@TempDir Path directory) throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("first_start_on_full_load");
-        try (ServerHandle server = InProcessServer.start(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(
                     E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 

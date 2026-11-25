@@ -2,10 +2,8 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
-import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.spi.store.WriterRun;
 import java.util.Collection;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -51,29 +49,8 @@ public final class SrsWriterFrontier {
      * sink has landed something rather than the whole pipeline.
      */
     public static Optional<Landed> landed(WriterRun run, String table, Collection<String> writers) {
-        if (writers.isEmpty()) {
-            return Optional.empty();
-        }
-        Map<String, WriterProgress> progress = run.progressFor(table);
-        SourceOrder lowest = null;
-        for (String writer : writers) {
-            WriterProgress reported = progress.get(writer);
-            if (reported == null) {
-                return Optional.empty();
-            }
-            if (lowest == null || reported.durableThrough().compareTo(lowest) < 0) {
-                lowest = reported.durableThrough();
-            }
-        }
-        ChainPosition resumable = null;
-        for (String writer : writers) {
-            ChainPosition tokened = progress.get(writer).lastTokened();
-            if (tokened != null && tokened.order().compareTo(lowest) <= 0
-                    && (resumable == null || tokened.order().compareTo(resumable.order()) > 0)) {
-                resumable = tokened;
-            }
-        }
-        return Optional.of(new Landed(lowest, resumable));
+        return io.tapstate.spi.store.WriterFrontier.landed(run,table,writers)
+                .map(value -> new Landed(value.durableThrough(),value.resumableAt()));
     }
 
     /**
@@ -82,7 +59,7 @@ public final class SrsWriterFrontier {
      * every writer has written every load row it was given. Never true for a pipeline that recorded no load.
      */
     public static boolean passedLoad(Landed landed, Long snapshotEpoch) {
-        return snapshotEpoch != null
-                && landed.durableThrough().compareTo(SourceOrder.snapshotRow(snapshotEpoch)) >= 0;
+        return io.tapstate.spi.store.WriterFrontier.passedLoad(
+                new io.tapstate.spi.store.WriterFrontier.Landed(landed.durableThrough(),landed.resumableAt()),snapshotEpoch);
     }
 }

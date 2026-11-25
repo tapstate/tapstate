@@ -21,6 +21,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
@@ -88,6 +89,7 @@ public final class ApplyService {
     }
 
     private final Supplier<TapstateCatalog> catalog;
+    private final java.util.function.Function<String, ConnectorDetail> connectorDetail;
     private final ArtifactStore store;
     private final AuditGate auditGate;
     private final SchemaStore schemas;
@@ -152,7 +154,17 @@ public final class ApplyService {
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
             ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
             DeploymentProfile deploymentProfile) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                stateDatabasePolicy, deploymentProfile, id -> null);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
+            DeploymentProfile deploymentProfile, java.util.function.Function<String, ConnectorDetail> connectorDetail) {
         this.live = live;
+        this.connectorDetail = Objects.requireNonNull(connectorDetail, "connectorDetail");
         this.deploymentProfile = Objects.requireNonNull(deploymentProfile, "deploymentProfile");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -234,6 +246,15 @@ public final class ApplyService {
                 }
             }
         }
+        if (scope == ValidationScope.ONLINE_SOURCE && resources.size() == 1
+                && resources.getFirst() instanceof PipelineResource pipeline) {
+            // A standalone Pipeline preview can use the same persisted dependencies as draft compilation.
+            var inventory = store.draftPublicationInventory(pipeline);
+            if (inventory.isPresent()) {
+                return planResourcesAndWorkspace(resources, preconditions, scope,
+                        publicationReads(pipeline, inventory.orElseThrow(), true));
+            }
+        }
         return planResourcesAndWorkspace(resources, preconditions, scope);
     }
 
@@ -277,6 +298,15 @@ public final class ApplyService {
 
     private CandidateWorkspacePlan planResourcesAndWorkspace(
             List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        return planResourcesAndWorkspace(submitted, preconditions, validationScope, null);
+    }
+
+    private record PublicationReads(ArtifactStore.ReadableInventory inventory, Resource previous,
+            Optional<String> managedSource, Map<String, Optional<DiscoveredSourceModel>> models) {}
+
+    private CandidateWorkspacePlan planResourcesAndWorkspace(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope,
+            PublicationReads publication) {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
@@ -288,8 +318,17 @@ public final class ApplyService {
                         null);
             }
         }
+        (publication == null ? store.managedDefaultSourceId() : publication.managedSource()).ifPresent(managed -> {
+            for (Resource resource : submitted) {
+                if (resource instanceof PipelineResource pipeline && pipeline.sourceIds().contains(managed)
+                        || resource instanceof SourceResource source && storeMarked(source))
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "the managed default target is not an authored input source"), null);
+            }
+        });
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
-        List<Resource> storedResources = ReadableArtifactInventory.list(store);
+        List<Resource> storedResources = publication == null ? ReadableArtifactInventory.list(store)
+                : publication.inventory().resources();
         List<Resource> candidate = new ArrayList<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
@@ -309,7 +348,8 @@ public final class ApplyService {
                     Map.of("reason", "Cloud allows exactly one MongoDB Atlas state store without capture settings"),
                     null);
         }
-        TapstateCatalog liveCatalog = catalog.get();
+        TapstateCatalog liveCatalog = publication == null ? catalog.get()
+                : publication.inventory().connectorCatalog().orElseGet(catalog);
         List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
         stateDatabasePolicy.validate(validationResources);
         Workspace workspace = Workspace.of(validationResources, liveCatalog);
@@ -322,7 +362,7 @@ public final class ApplyService {
         }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources, publication);
         RowExpressionTypeRules.validate(validationResources, discovered);
         WriteKeyRules.validate(validationResources, discovered);
         // Judged over the submitted resources and resolved against the whole candidate workspace.
@@ -349,11 +389,30 @@ public final class ApplyService {
                 batchSources.put(source.id(), source);
             }
         }
+        Set<String> replacedConnectors = submitted.stream()
+                .filter(resource -> resource instanceof SourceResource source
+                        && connectorChanged(storedResources, source))
+                .map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        for (Resource resource : candidate) {
+            if (!(resource instanceof PipelineResource pipeline)) {
+                continue;
+            }
+            boolean submittedPipeline = submittedIds.contains(pipeline.id());
+            for (SourceRef ref : pipeline.sources()) {
+                if (!ref.nodeConfig().isEmpty() && (submittedPipeline || replacedConnectors.contains(ref.id()))) {
+                    SourceNodeConfigRules.validate(batchSources.get(ref.id()), ref.nodeConfig(), connectorDetail);
+                    if (!submittedPipeline && !workspacePreconditions.containsKey(pipeline.id())) {
+                        workspacePreconditions.put(pipeline.id(), storedHash(pipeline));
+                    }
+                }
+            }
+        }
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource submittedResource : submitted) {
             Resource resource = validatedById.get(submittedResource.id());
             Resource recorded = resource instanceof PipelineResource pipeline
-                    ? withOwnSrsSwitches(pipeline, batchSources) : resource;
+                    ? withOwnSrsSwitches(pipeline, batchSources, publication == null
+                            ? store.get(pipeline.id()).orElse(null) : publication.previous()) : resource;
             String canonicalForm = writer.write(recorded);
             prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
@@ -363,6 +422,20 @@ public final class ApplyService {
         ApplyPlan plan = new ApplyPlan(
                 prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
         return new CandidateWorkspacePlan(plan, List.copyOf(candidateById.values()));
+    }
+
+    private static boolean connectorChanged(List<Resource> stored, SourceResource replacement) {
+        SourceResource previous = storedSource(stored, replacement.id());
+        return previous != null && !previous.connector().equals(replacement.connector());
+    }
+
+    void validateDraftSourceNodeConfigs(Map<String, String> inputs, Map<String, Map<String, Object>> configs) {
+        configs.forEach((id, config) -> {
+            String sourceId = inputs.get(id);
+            SourceResource source = sourceId == null ? null : store.get(sourceId).filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast).orElse(null);
+            SourceNodeConfigRules.validate(source, config, connectorDetail);
+        });
     }
 
     /**
@@ -384,24 +457,28 @@ public final class ApplyService {
      * materialize again, one revision per apply on a file nobody touched.
      */
     private PipelineResource withOwnSrsSwitches(
-            PipelineResource pipeline, Map<String, SourceResource> batchSources) {
-        Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
-        if (store.get(pipeline.id()).orElse(null) instanceof PipelineResource stored) {
+            PipelineResource pipeline, Map<String, SourceResource> batchSources, Resource existing) {
+        Map<String, SourceRef.Spec> previousBindings = new LinkedHashMap<>();
+        Map<String, Boolean> previousSources = new LinkedHashMap<>();
+        if (existing instanceof PipelineResource stored) {
             for (SourceRef ref : stored.sources()) {
                 if (ref instanceof SourceRef.Spec spec) {
-                    alreadyRecorded.put(spec.id(), spec.srs());
+                    previousBindings.put(spec.binding(), spec);
+                    previousSources.putIfAbsent(spec.id(), spec.srs());
                 }
             }
         }
         List<SourceRef> refs = new ArrayList<>();
         boolean anyRecorded = false;
         for (SourceRef ref : pipeline.sources()) {
-            if (ref instanceof SourceRef.Spec) {
+            if (ref instanceof SourceRef.Spec spec && spec.srs() != null) {
                 refs.add(ref);
                 anyRecorded = true;
                 continue;
             }
-            Boolean own = alreadyRecorded.get(ref.id());
+            SourceRef.Spec previous = previousBindings.get(ref.binding());
+            Boolean own = previous != null && previous.id().equals(ref.id())
+                    ? previous.srs() : previousSources.get(ref.id());
             if (own == null) {
                 // The source is read from the batch alone, because the batch is the closure: a pipeline
                 // referencing a source that is not in it is refused before this runs. A reference left
@@ -410,7 +487,7 @@ public final class ApplyService {
                 SourceResource declaring = batchSources.get(ref.id());
                 own = declaring == null ? null : declaring.srsEnabled();
             }
-            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own));
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own, ref.nodeConfig(), ref.alias()));
             anyRecorded |= own != null;
         }
         return anyRecorded
@@ -570,6 +647,10 @@ public final class ApplyService {
     /** Validates and materializes one typed resource against the stored workspace without writing it. */
     public Resource prepareTyped(Resource resource) {
         Objects.requireNonNull(resource, "resource");
+        if (resource instanceof PipelineResource pipeline) {
+            return planResourcesAndWorkspace(List.of(pipeline), Map.of(), ValidationScope.ONLINE_SOURCE,
+                    capturePublicationReads(pipeline)).plan().artifacts().getFirst().resource();
+        }
         return planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE)
                 .artifacts().getFirst().resource();
     }
@@ -588,15 +669,59 @@ public final class ApplyService {
 
     /** Prepares a publication with the verified publisher's server-managed resource attribution. */
     public ApplyPlan planDraftPublication(String principal, Resource resource) {
+        return captureDraftPublication(principal, resource).plan();
+    }
+
+    record DraftPublicationPlan(ApplyPlan plan, SchemaDerivation.PublishedInputs inputs) {}
+
+    DraftPublicationPlan captureDraftPublication(String principal, Resource resource) {
         Objects.requireNonNull(principal, "principal");
-        return attributed(principal, planDraftPublication(resource));
+        Objects.requireNonNull(resource, "resource");
+        var reads = capturePublicationReads(resource);
+        var previous = Optional.ofNullable(reads.previous());
+        var planned = planResourcesAndWorkspace(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE, reads);
+        var plan = planned.plan();
+        var prepared = plan.artifacts().getFirst();
+        if (live != null && prepared.resource() instanceof PipelineResource replacement) {
+            live.refuseBufferingChangeWhileLive(
+                    previous.filter(PipelineResource.class::isInstance).map(PipelineResource.class::cast).orElse(null),
+                    replacement);
+        }
+        Resource attributed = attribution.attribute(principal, prepared.resource(), previous.orElse(null));
+        var publishedPlan = new ApplyPlan(List.of(new PreparedArtifact(attributed, writer.write(attributed), CanonicalHash.of(attributed))),
+                plan.warnings(), plan.preconditions(), plan.workspacePreconditions());
+        var definitions = new LinkedHashMap<String, Resource>();
+        for (Resource value : planned.resources()) {
+            if (plan.workspacePreconditions().containsKey(value.id())) definitions.put(value.id(), value);
+        }
+        definitions.put(attributed.id(), attributed);
+        return new DraftPublicationPlan(publishedPlan,
+                new SchemaDerivation.PublishedInputs(definitions, reads.models(), reads.managedSource()));
+    }
+
+    /** Preview and publication validate the same captured dependency closure. */
+    private PublicationReads capturePublicationReads(Resource resource) {
+        var dependencySlice = resource instanceof PipelineResource pipeline
+                ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
+        var inventory = dependencySlice.orElseGet(store::readableInventory);
+        return publicationReads(resource, inventory, dependencySlice.isPresent());
+    }
+
+    private PublicationReads publicationReads(
+            Resource resource, ArtifactStore.ReadableInventory inventory, boolean includesPrevious) {
+        var previous = includesPrevious || inventory.exactLookupIds().contains(resource.id())
+                ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
+                : store.get(resource.id());
+        return new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),
+                new LinkedHashMap<>());
     }
 
     /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
-    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId) {
+    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId,
+            SchemaDerivation.PublishedInputs inputs, long stateGeneration) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         try {
-            derivation.derive(pipelineId);
+            derivation.derivePublishedDraft(pipelineId, inputs, stateGeneration);
             return List.of();
         } catch (TapstateException failure) {
             return List.of(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
@@ -626,7 +751,7 @@ public final class ApplyService {
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
-        Map<String, String> enforced = new LinkedHashMap<>();
+        Map<String, String> enforced = new LinkedHashMap<>(plan.workspacePreconditions());
         // Read once for the refusal below, and only when there is a reading to judge against.
         ReadableArtifactInventory.Snapshot inventory = live == null
                 ? null : ReadableArtifactInventory.scan(store);
@@ -672,7 +797,10 @@ public final class ApplyService {
         // survives a concurrent writer.
         ApplyResult result = auditGate.dispatchAll(ControlOperations.ARTIFACT_APPLY, audited, () -> {
             String conflicted;
-            if (attribution.requiresSnapshotFence() && !toWrite.isEmpty()) {
+            if (toWrite.isEmpty()) {
+                return new ApplyResult(outcomes, plan.warnings());
+            }
+            if (attribution.requiresSnapshotFence()) {
                 List<ArtifactWrite> writes = new ArrayList<>(toWrite.stream().map(attributed::write).toList());
                 writes.set(0, writes.getFirst().guardedBy(enforced));
                 conflicted = store.writeAll(writes).refusedId();
@@ -703,10 +831,6 @@ public final class ApplyService {
             }
         }
         return new ApplyResult(result.outcomes(), warnings);
-    }
-
-    private ApplyPlan attributed(String principal, ApplyPlan planned) {
-        return attributedWithSnapshots(principal, planned).plan();
     }
 
     private AttributedPlan attributedWithSnapshots(String principal, ApplyPlan planned) {
@@ -759,7 +883,7 @@ public final class ApplyService {
         ONLINE_SOURCE
     }
 
-    private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources) {
+    private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources, PublicationReads publication) {
         Map<String, List<DiscoveredTable>> bySource = new LinkedHashMap<>();
         if (resources.stream().noneMatch(PipelineResource.class::isInstance)) {
             return bySource;
@@ -768,7 +892,9 @@ public final class ApplyService {
             if (!(resource instanceof SourceResource source)) {
                 continue;
             }
-            schemas.get(source.id())
+            var observed = publication == null ? schemas.get(source.id())
+                    : publication.models().computeIfAbsent(source.id(), schemas::get);
+            observed
                     .filter(discovered -> discovered.connectorId().equals(source.connector()))
                     .ifPresent(discovered -> {
                         List<DiscoveredTable> tables = new ArrayList<>();

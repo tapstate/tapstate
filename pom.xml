@@ -52,7 +52,7 @@
   </modules>
 
   <properties>
-    <revision>0.7.0</revision>
+    <revision>0.8.0</revision>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
     <!-- Reproducible build: the same commit must produce bit-identical artifacts -->
@@ -64,7 +64,7 @@
          4.1.x rides Spring Framework 7 (Jakarta EE 11 / Jackson 3 default) and runs on JDK 21. -->
     <spring.boot.version>4.1.0</spring.boot.version>
     <spring-ai.version>2.0.0</spring-ai.version>
-    <cloud.sdk.version>0.1.1-850e47e4-SNAPSHOT</cloud.sdk.version>
+    <cloud.sdk.version>0.1.1-1813f345-20261026.093742-1</cloud.sdk.version>
 
     <!-- All plugin versions pinned (enforced by requirePluginVersions) -->
     <plugin.assembly.version>3.7.1</plugin.assembly.version>
@@ -223,7 +223,9 @@
             <configuration>
               <rules>
                 <dependencyConvergence/>
-                <requireUpperBoundDeps/>
+                <requireUpperBoundDeps>
+                  <uniqueVersions>true</uniqueVersions>
+                </requireUpperBoundDeps>
                 <banDuplicatePomDependencyVersions/>
                 <requirePluginVersions/>
                 <bannedDependencies>

@@ -44,12 +44,16 @@ public final class ConnectorIntrospector {
     private static final String CLASS_SUFFIX = ".class";
 
     /** Reads {@code classpath} (a connector jar plus any bundled deps) into the connector it declares. */
-    public IntrospectedConnector introspect(List<Path> classpath) {
+    public IntrospectedConnector introspect(List<Path> classpath) { return introspect(classpath, false); }
+
+    IntrospectedConnector introspectDefaultTest(List<Path> classpath) { return introspect(classpath, true); }
+
+    private IntrospectedConnector introspect(List<Path> classpath, boolean defaultTest) {
         String artifact = artifact(classpath);
         List<Candidate> candidates = scanForAnnotatedClasses(classpath);
         Confirmed entry;
         try (ConnectorClassLoader loader = ConnectorClassLoader.open(classpath)) {
-            entry = confirmSingleEntryClass(loader, candidates, artifact);
+            entry = confirmSingleEntryClass(loader, candidates, artifact, defaultTest);
         }
         try (JarFile jar = new JarFile(entry.jar().toFile())) {
             String spec = readSpec(jar, entry, artifact);
@@ -92,13 +96,14 @@ public final class ConnectorIntrospector {
     }
 
     private static Confirmed confirmSingleEntryClass(ConnectorClassLoader loader, List<Candidate> candidates,
-                                                     String artifact) {
+                                                     String artifact, boolean defaultTest) {
         List<Confirmed> confirmed = new ArrayList<>();
         for (Candidate candidate : candidates) {
             Class<?> type;
             try {
                 type = loader.load(candidate.className());
             } catch (ClassNotFoundException | LinkageError e) {
+                if (defaultTest && e instanceof LinkageError defect) throw defect;
                 // A class the pre-filter flagged that will not load or link (e.g. a connector missing
                 // its bundled runtime) cannot be read: a load failure, not a missing connector.
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", artifact), e);
@@ -107,6 +112,7 @@ public final class ConnectorIntrospector {
             try {
                 annotation = type.getDeclaredAnnotation(TapConnectorClass.class);
             } catch (AnnotationFormatError e) {
+                if (defaultTest) throw e;
                 // The class loads but its annotation bytes are corrupt: an unreadable artifact, not a
                 // missing connector — and never an error that escapes to take the caller down.
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", artifact), e);

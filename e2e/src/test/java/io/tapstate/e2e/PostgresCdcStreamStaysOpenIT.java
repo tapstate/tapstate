@@ -46,11 +46,11 @@ class PostgresCdcStreamStaysOpenIT {
         }
 
         String targetUri = SharedMongo.replicaSetUrl("cdc_stream_stays_open_target_523");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("cdc_stream_stays_open_store_523"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

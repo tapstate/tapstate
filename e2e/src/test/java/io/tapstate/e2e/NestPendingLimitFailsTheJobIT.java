@@ -57,7 +57,7 @@ class NestPendingLimitFailsTheJobIT {
     private static final String PARENT_TABLE = "orders";
     private static final String CHILD_TABLE = "order_items";
     private static final String PIPELINE_ID = "pending_orders";
-    private static final String EXPECTED_CODE = "nest.pending-limit-exceeded";
+    private static final String EXPECTED_CODE = "TS0490021";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
@@ -87,19 +87,25 @@ class NestPendingLimitFailsTheJobIT {
     @EnumSource(Tiers.class)
     void oneKeyHoldingMoreThanItMayStopsTheRunAndSaysWhy(Tiers tier) throws Exception {
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
+            String owner = System.getProperty("tapstate.e2e.resource-owner");
+            if (owner != null && !owner.isBlank()) {
+                mysql.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
+                        "io.tapstate.e2e.resource-owner"), owner);
+                mysql.withTmpFs(Map.of("/var/lib/mysql", "rw,size=1g"));
+            }
             mysql.start();
             seedMysql(mysql);
             grantReplication(mysql);
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("pending_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("pending_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -123,11 +129,11 @@ class NestPendingLimitFailsTheJobIT {
                                 + "%d.%n  documents: %s%n  metrics: %s", ORPHANS, ABSENT_ROOT, PENDING_LIMIT,
                                 mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size(), control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);
 
-                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.failureCode(pipelineId))
                         .as("which bound it was. A run that died of anything else satisfies the state "
                                 + "above and says nothing about this one.%n  logs: %s",

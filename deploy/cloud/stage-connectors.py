@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the complete connector release lock and stage immutable Cloud image inputs.
+"""Verify the complete connector release lock and stage immutable image inputs.
 
 The lock is supplied by the release process after publication and license review.
 This script does not download, approve, or publish connector artifacts.
@@ -22,9 +22,16 @@ from typing import Any
 
 
 REQUIRED_IDS = (
+    "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy"
+)
+ONPREM_IDS = (
     "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
 REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
+MAX_JAR_BYTES = 512_000_000
+CLOUD_IDS = ("mongodb", "mysql", "postgres", "mongodb-atlas")
+PUBLISHED_ONPREM_IDS = ("mongodb", "mysql", "postgres", "mongodb-atlas", "oracle", "sqlserver", "aws-rds-mysql", "dummy")
+COORDINATE_KEYS = {"groupId", "artifactId", "version"}
 ENTRY_KEYS = {"id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath"}
 LICENSE_KEYS = {"name", "bytes", "sha256"}
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -46,28 +53,33 @@ def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
+              profile: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         lock = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise StageError(f"cannot read connector lock: {exc}") from exc
     if not isinstance(lock, dict) or set(lock) != {"schemaVersion", "connectors", "licenseFiles"}:
         raise StageError("connector lock must have schemaVersion, connectors, and licenseFiles")
-    if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] != 2:
-        raise StageError("connector lock schemaVersion must be 2")
+    if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] not in (2, 3):
+        raise StageError("connector lock schemaVersion must be 2 or 3")
+    if profile in ("cloud", "onprem"):
+        if lock["schemaVersion"] == 3:
+            required_ids = PUBLISHED_ONPREM_IDS if profile == "onprem" else CLOUD_IDS
+        else:
+            required_ids = ONPREM_IDS if profile == "onprem" else REQUIRED_IDS
     entries = lock["connectors"]
-    if not isinstance(entries, list) or len(entries) != len(REQUIRED_IDS):
-        raise StageError("connector lock must contain exactly eight entries")
+    if not isinstance(entries, list) or len(entries) != len(required_ids):
+        raise StageError(f"connector lock must contain exactly {len(required_ids)} entries")
     ids = []
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
+        expected_keys = ENTRY_KEYS | COORDINATE_KEYS if lock["schemaVersion"] == 3 else ENTRY_KEYS
+        if not isinstance(entry, dict) or set(entry) != expected_keys:
             raise StageError("connector entry has missing or unexpected fields")
         connector_id = entry["id"]
-        if not isinstance(connector_id, str) or connector_id not in REQUIRED_IDS:
+        if not isinstance(connector_id, str) or connector_id not in required_ids:
             raise StageError(f"unexpected connector id: {connector_id!r}")
-        # The Db2 artifact includes its native runtime; other connector budgets remain unchanged.
-        maximum = 256 * 1024 * 1024 if connector_id == "db2" else 128_000_000
-        if type(entry["bytes"]) is not int or not 1_000_000 <= entry["bytes"] <= maximum:
+        if type(entry["bytes"]) is not int or not 1_000_000 <= entry["bytes"] <= MAX_JAR_BYTES:
             raise StageError(f"{connector_id}: invalid shaded JAR length")
         if not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"]):
             raise StageError(f"{connector_id}: invalid SHA-256")
@@ -77,25 +89,33 @@ def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             raise StageError(f"{connector_id}: invalid PDK API version")
         if not isinstance(entry["specPath"], str) or not SPEC_PATH.fullmatch(entry["specPath"]):
             raise StageError(f"{connector_id}: unsafe spec path")
+        if lock["schemaVersion"] == 3:
+            for key in COORDINATE_KEYS:
+                if not isinstance(entry[key], str) or not VERSION.fullmatch(entry[key]):
+                    raise StageError(f"{connector_id}: invalid Maven coordinate {key}")
+            if "SNAPSHOT" in entry["version"]:
+                raise StageError(f"{connector_id}: a published release is required")
         ids.append(connector_id)
-    if sorted(ids) != sorted(REQUIRED_IDS):
+    if sorted(ids) != sorted(required_ids):
         raise StageError("connector lock has a duplicate or missing id")
     license_files = lock["licenseFiles"]
-    if not isinstance(license_files, list) or len(license_files) != len(REQUIRED_LICENSE_FILES):
-        raise StageError("connector lock must contain both companion license files")
+    cloud_profile = profile == "cloud" or (profile is None and set(required_ids) == set(CLOUD_IDS))
+    expected_licenses = () if lock["schemaVersion"] == 3 and cloud_profile else REQUIRED_LICENSE_FILES
+    if not isinstance(license_files, list) or len(license_files) != len(expected_licenses):
+        raise StageError("connector lock has missing or unexpected companion license files")
     names = []
     for entry in license_files:
         if not isinstance(entry, dict) or set(entry) != LICENSE_KEYS:
             raise StageError("companion license entry has missing or unexpected fields")
         name = entry["name"]
-        if not isinstance(name, str) or name not in REQUIRED_LICENSE_FILES:
+        if not isinstance(name, str) or name not in expected_licenses:
             raise StageError(f"unexpected companion license file: {name!r}")
         if type(entry["bytes"]) is not int or not 1 <= entry["bytes"] <= 1_000_000:
             raise StageError(f"{name}: invalid companion license length")
         if not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"]):
             raise StageError(f"{name}: invalid companion license SHA-256")
         names.append(name)
-    if sorted(names) != sorted(REQUIRED_LICENSE_FILES):
+    if sorted(names) != sorted(expected_licenses):
         raise StageError("connector lock has a duplicate or missing companion license file")
     return entries, license_files
 
@@ -155,8 +175,11 @@ def verify_jar(path: Path, entry: dict[str, Any]) -> None:
             spec = json.loads(jar.read(entry["specPath"]).decode("utf-8"))
     except (OSError, zipfile.BadZipFile, UnicodeError, json.JSONDecodeError) as exc:
         raise StageError(f"{connector_id}: JAR manifest or spec is unreadable") from exc
-    # The published SQL Server JAR is built from the upstream mssql module, while its PDK id is sqlserver.
-    implementation_title = "mssql-connector" if connector_id == "sqlserver" else f"{connector_id}-connector"
+    # Versioned locks record the Maven module name independently of the connector's PDK ID.
+    if "artifactId" in entry:
+        implementation_title = entry["artifactId"]
+    else:
+        implementation_title = "mssql-connector" if connector_id == "sqlserver" else f"{connector_id}-connector"
     expected_headers = {
         "Implementation-Title": implementation_title,
         "Git-Commit-Id": entry["upstreamRevision"],
@@ -184,8 +207,9 @@ def verify_companion_license(path: Path, entry: dict[str, Any]) -> None:
         raise StageError(f"{name}: companion license bytes differ from the release lock")
 
 
-def stage(lock_path: Path, jar_dir: Path, stage_dir: Path) -> None:
-    entries, license_files = read_lock(lock_path)
+def stage(lock_path: Path, jar_dir: Path, stage_dir: Path, required_ids: tuple[str, ...] = REQUIRED_IDS, *,
+          profile: str | None = None) -> int:
+    entries, license_files = read_lock(lock_path, required_ids, profile=profile)
     expected_names = {f"{entry['id']}-connector.jar" for entry in entries}
     if not jar_dir.is_dir():
         raise StageError("connector JAR directory is missing")
@@ -227,6 +251,7 @@ def stage(lock_path: Path, jar_dir: Path, stage_dir: Path) -> None:
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
+    return len(entries)
 
 
 def main() -> int:
@@ -234,13 +259,14 @@ def main() -> int:
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--jar-dir", required=True, type=Path)
     parser.add_argument("--stage-dir", required=True, type=Path)
+    parser.add_argument("--profile", choices=("cloud", "onprem"), default="cloud")
     args = parser.parse_args()
     try:
-        stage(args.lock, args.jar_dir, args.stage_dir)
+        count = stage(args.lock, args.jar_dir, args.stage_dir, profile=args.profile)
     except StageError as exc:
-        print(f"cloud connector staging refused: {exc}", file=sys.stderr)
+        print(f"connector staging refused: {exc}", file=sys.stderr)
         return 1
-    print(f"staged eight locked connectors in {args.stage_dir}")
+    print(f"staged {count} locked connectors in {args.stage_dir}")
     return 0
 
 

@@ -66,6 +66,11 @@
             }
           }
         },
+        "managed_target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Source file used to prepare the installation's managed default target; read for endpoint assertions and never included in setup.apply."
+        },
         "connectors": {
           "type": "array",
           "description": "Connector ids whose runtime jars are registered; idempotent by content hash.",
@@ -340,6 +345,20 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
+            "start_refused"
+          ],
+          "properties": {
+            "start_refused": {
+              "type": "string",
+              "description": "Exact canonical code returned by an HTTP 409 start admission refusal.",
+              "pattern": "^(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
             "assert"
           ],
           "properties": {
@@ -444,9 +463,10 @@
                     "additionalProperties": {
                       "type": [
                         "integer",
-                        "string"
+                        "string",
+                        "boolean"
                       ],
-                      "description": "An integer or a string; wider value types are a widening of the vocabulary."
+                      "description": "An integer, a string or a boolean; wider value types are a widening of the vocabulary."
                     }
                   },
                   "size": {
@@ -526,8 +546,8 @@
           "properties": {
             "failure_code": {
               "type": "string",
-              "description": "The canonical code of the failure the pipeline this specification names is expected to publish, written '<domain>.<symbol>'.",
-              "pattern": "^[a-z0-9]+\\.[a-z0-9-]+$"
+              "description": "The canonical code of the failure the pipeline this specification names is expected to publish, as a canonical TS identity or historical '<domain>.<symbol>'.",
+              "pattern": "^(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)$"
             }
           }
         },

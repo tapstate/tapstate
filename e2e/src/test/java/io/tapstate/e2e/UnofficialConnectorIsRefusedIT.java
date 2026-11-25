@@ -10,7 +10,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -51,16 +50,14 @@ class UnofficialConnectorIsRefusedIT {
     void registeringAConnectorOutsideTheOfficialSetIsRefusedAndNothingIsFiledUnderIt(
             Tiers tier, @TempDir Path directory) throws Exception {
         byte[] artifact = Files.readAllBytes(E2eConnectorJar.buildInto(directory, UNOFFICIAL_ID));
-        String storeUri =
-                SharedMongo.replicaSetUrl("unofficial_refused_" + tier.name().toLowerCase(Locale.ROOT));
 
-        try (ServerHandle server = tier.launch(storeUri)) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             ControlPlane.Refusal refusal = control.registerConnectorExpectingRefusal(artifact);
 
-            assertThat(refusal.code()).isEqualTo("connector.not-official");
+            assertThat(refusal.code()).isEqualTo("TS0060008");
             assertThat(refusal.status()).isEqualTo(400);
             assertThat(control.connectorIds()).doesNotContain(UNOFFICIAL_ID);
         }
@@ -95,19 +92,17 @@ class UnofficialConnectorIsRefusedIT {
     void anIndependentDatabaseProductIsRefusedByItsOwnId(String connectorId, @TempDir Path directory)
             throws Exception {
         byte[] artifact = Files.readAllBytes(E2eConnectorJar.buildInto(directory, connectorId));
-        String storeUri = SharedMongo.replicaSetUrl(
-                "unofficial_refused_" + connectorId.replace('-', '_'));
 
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             ControlPlane.Refusal refusal = control.registerConnectorExpectingRefusal(artifact);
 
             // The code, not the message: a refusal that reads right and codes wrong is the failure this
             // discriminates against, and the id is carried as a parameter so the code alone is not
             // asked to say which connector was refused.
-            assertThat(refusal.code()).isEqualTo("connector.not-official");
+            assertThat(refusal.code()).isEqualTo("TS0060008");
             assertThat(refusal.status()).isEqualTo(400);
             assertThat(refusal.params()).containsEntry("connector", connectorId);
         }

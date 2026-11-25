@@ -34,6 +34,7 @@ import java.util.logging.Logger;
 public final class MongoPipelineDraftStore implements PipelineDraftStore {
 
     private static final String REVISION = "revision";
+    private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final Logger LOG = Logger.getLogger(MongoPipelineDraftStore.class.getName());
     private final MongoClient client;
     private final MongoCollection<Document> drafts;
@@ -281,23 +282,10 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                     return drafts.find(activeDraft(publication.pipelineId())).first() == null
                             ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
                 }
-                while (true) {
-                    try {
-                        session.commitTransaction();
-                        break;
-                    } catch (MongoException commitError) {
-                        if (!commitError.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
-                            throw commitError;
-                        }
-                    }
-                }
+                commit(session, publication.pipelineId());
                 return PipelineDraftMutation.PUBLISHED;
             } catch (MongoException error) {
-                try {
-                    session.abortTransaction();
-                } catch (RuntimeException abortFailure) {
-                    error.addSuppressed(abortFailure);
-                }
+                abortAfterFailure(session, error);
                 if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
                     return PipelineDraftMutation.ARTIFACT_CONFLICT;
                 }
@@ -310,13 +298,88 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 }
                 throw error;
             } catch (RuntimeException error) {
-                try {
+                abortAfterFailure(session, error);
+                throw error;
+            }
+        }
+    }
+
+    @Override
+    public PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+        Objects.requireNonNull(change, "change");
+        return StoreIo.call(() -> changeDefinitionInTransaction(change));
+    }
+
+    /**
+     * The definition and the draft that would publish it back, in one transaction: the definition is
+     * replaced only while it is still the one the change was worked out against, and the draft only while
+     * it is based on that same definition and still at the revision read here.
+     */
+    private PipelineDraftMutation changeDefinitionInTransaction(PipelineDraft.DefinitionChange change) {
+        try (ClientSession session = client.startSession()) {
+            session.startTransaction();
+            try {
+                Document currentArtifact = artifacts.find(session, new Document("_id", change.pipelineId()))
+                        .projection(new Document("contentHash", 1).append("kind", 1)).first();
+                if (currentArtifact == null || !"pipeline".equals(currentArtifact.getString("kind"))
+                        || !change.expectedArtifactHash().equals(currentArtifact.getString("contentHash"))
+                        || hasStaleWorkspacePrecondition(session, change.workspacePreconditions())) {
                     session.abortTransaction();
-                } catch (RuntimeException abortFailure) {
-                    error.addSuppressed(abortFailure);
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+                if (artifacts.replaceOne(session, new Document("_id", change.pipelineId())
+                                .append("contentHash", change.expectedArtifactHash()),
+                        MongoArtifactStore.toDocument(change.artifact())).getMatchedCount() != 1) {
+                    session.abortTransaction();
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+                Document currentDraft = drafts.find(session, activeDraft(change.pipelineId())).first();
+                if (currentDraft != null
+                        && change.expectedArtifactHash().equals(currentDraft.getString("baseArtifactHash"))) {
+                    PipelineDraft draft = fromDocument(PipelineDraftMigrations.migrate(currentDraft));
+                    PipelineDraft changed = change.draftChange().apply(draft);
+                    if (!changed.equals(draft) && drafts.replaceOne(session, activeDraft(change.pipelineId())
+                            .append(REVISION, draft.revision()), toDocument(changed)).getMatchedCount() != 1) {
+                        session.abortTransaction();
+                        return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                    }
+                }
+                commit(session, change.pipelineId());
+                return PipelineDraftMutation.REPLACED;
+            } catch (RuntimeException error) {
+                abortAfterFailure(session, error);
+                if (error instanceof MongoException mongo
+                        && mongo.hasErrorLabel(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL)) {
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
                 }
                 throw error;
             }
+        }
+    }
+
+    private static void commit(ClientSession session, String pipelineId) {
+        for (int attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt++) {
+            try {
+                session.commitTransaction();
+                return;
+            } catch (MongoException error) {
+                if (!error.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
+                    throw error;
+                }
+            }
+        }
+        throw StoreIo.pipelineCommitOutcomeUnknown(pipelineId);
+    }
+
+    private static void abortAfterFailure(ClientSession session, RuntimeException error) {
+        // The commit may have taken effect. An abort cannot determine or undo its outcome.
+        if (error instanceof TapstateException diagnostic && diagnostic.code() == IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN) {
+            return;
+        }
+        try {
+            session.abortTransaction();
+        } catch (RuntimeException abortFailure) {
+            error.addSuppressed(abortFailure);
         }
     }
 
@@ -381,10 +444,11 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     }
 
     private static Document graphDocument(PipelineDraft.Graph graph) {
-        return new Document("nodes", graph.nodes().stream().map(MongoPipelineDraftStore::nodeDocument).toList())
+        Document document = new Document("nodes", graph.nodes().stream().map(MongoPipelineDraftStore::nodeDocument).toList())
                 .append("edges", graph.edges().stream().map(MongoPipelineDraftStore::edgeDocument).toList())
                 .append("viewport", new Document("x", graph.viewport().x()).append("y", graph.viewport().y())
                         .append("zoom", graph.viewport().zoom()));
+        return withSourceNodeConfigs(document, graph.sourceNodeConfigs());
     }
 
     private static Document nodeDocument(PipelineDraft.Node node) {
@@ -398,11 +462,31 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     }
 
     private static Document wizardDocument(PipelineDraft.Wizard wizard) {
-        return new Document("root", wizard.root() == null ? null : rootDocument(wizard.root()))
+        Document document = new Document("root", wizard.root() == null ? null : rootDocument(wizard.root()))
                 .append("related", wizard.related().stream().map(MongoPipelineDraftStore::relatedDocument).toList())
                 .append("transforms", wizard.transforms().stream().map(MongoPipelineDraftStore::transformDocument).toList())
                 .append("output", wizard.output() == null ? null
                         : new Document("kind", wizard.output().kind()).append("config", new Document(wizard.output().config())));
+        return withSourceNodeConfigs(document, wizard.sourceNodeConfigs());
+    }
+
+    private static Document withSourceNodeConfigs(Document payload, Map<String, Map<String, Object>> configs) {
+        if (!configs.isEmpty()) {
+            Document fields = new Document();
+            configs.forEach((id, config) -> fields.put(id, new Document(config)));
+            payload.put("sourceNodeConfigs", fields);
+        }
+        return payload;
+    }
+
+    private static Map<String, Map<String, Object>> sourceNodeConfigs(Document payload) {
+        Document configs = payload.get("sourceNodeConfigs", Document.class);
+        if (configs == null) {
+            return Map.of();
+        }
+        Map<String, Map<String, Object>> result = new LinkedHashMap<>();
+        configs.forEach((id, fields) -> result.put(id, MongoCatalogStore.normalizeMap((Document) fields)));
+        return result;
     }
 
     private static Document rootDocument(PipelineDraft.Root root) {
@@ -415,11 +499,19 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         PipelineDraft.Relation relation = related.relation();
         List<Document> pairs = relation.on().stream().map(pair -> new Document("childField", pair.childField())
                 .append("parentField", pair.parentField())).toList();
+        Document relationDocument = new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
+                .append("path", relation.path()).append("key", relation.key())
+                .append("arrayKey", relation.arrayKey());
+        // Written only when present, so a relation without rollup fields keeps the stored shape it always had.
+        if (relation.rollup() != null) {
+            relationDocument.append("rollup", new Document(relation.rollup()));
+        }
+        if (relation.trackKeyChanges() != null) {
+            relationDocument.append("trackKeyChanges", relation.trackKeyChanges());
+        }
         return new Document("id", related.id()).append("parentId", related.parentId())
                 .append("sourceId", related.sourceId()).append("table", related.table())
-                .append("relation", new Document("on", pairs).append("shape", relation.shape().name().toLowerCase())
-                        .append("path", relation.path()).append("key", relation.key())
-                        .append("arrayKey", relation.arrayKey()))
+                .append("relation", relationDocument)
                 .append("preTransforms", related.preTransforms().stream().map(MongoPipelineDraftStore::transformDocument).toList());
     }
 
@@ -436,7 +528,7 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 d.getString("id"), d.getString("source"), d.getString("target"))).toList();
         Document viewport = document.get("viewport", Document.class);
         return new PipelineDraft.Graph(nodes, edges, new PipelineDraft.Viewport(viewport.getDouble("x"),
-                viewport.getDouble("y"), viewport.getDouble("zoom")));
+                viewport.getDouble("y"), viewport.getDouble("zoom")), sourceNodeConfigs(document));
     }
 
     private static PipelineDraft.Wizard wizard(Document document) {
@@ -448,7 +540,8 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 : new PipelineDraft.Root(root.getString("id"), root.getString("sourceId"),
                         root.getString("table"), strings(root.get("key")), transforms(root.get("preTransforms"))),
                 documents(document, "related").stream().map(MongoPipelineDraftStore::related).toList(),
-                transforms(document.get("transforms")), output(document.get("output", Document.class)));
+                transforms(document.get("transforms")), output(document.get("output", Document.class)),
+                sourceNodeConfigs(document));
     }
 
     private static PipelineDraft readDraft(Document document) {
@@ -492,7 +585,10 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 document.getString("sourceId"), document.getString("table"), new PipelineDraft.Relation(on,
                         PipelineDraft.Shape.valueOf(relation.getString("shape").toUpperCase()),
                         relation.getString("path"), strings(relation.get("key")),
-                        strings(relation.get("arrayKey"))),
+                        strings(relation.get("arrayKey")),
+                        relation.get("rollup") instanceof Document rollup
+                                ? MongoCatalogStore.normalizeMap(rollup) : null,
+                        relation.get("trackKeyChanges") instanceof Boolean track ? track : null),
                 transforms(document.get("preTransforms")));
     }
 

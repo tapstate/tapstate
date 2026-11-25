@@ -56,7 +56,12 @@ final class FirstRunSummary {
      * to say about it — {@code apply: unchanged}, {@code start: already running} — empty when they did
      * something.
      */
-    record UpPipeline(String id, String state, List<String> notes) {
+    record UpPipeline(String id, String state, List<String> notes, Map<String, Object> startChecks) {
+
+        /** A pipeline whose start ran no start checks, or that was not started. */
+        UpPipeline(String id, String state, List<String> notes) {
+            this(id, state, notes, null);
+        }
     }
 
     /** One source as {@code up} left it, with the stages' notes, empty when they did something. */
@@ -108,6 +113,9 @@ final class FirstRunSummary {
             entry.put("state", pipeline.state());
             if (!pipeline.notes().isEmpty()) {
                 entry.put("notes", pipeline.notes());
+            }
+            if (pipeline.startChecks() != null) {
+                entry.put("startChecks", pipeline.startChecks());
             }
             lines.add(entry);
         }

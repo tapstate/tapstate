@@ -1,151 +1,201 @@
 package io.tapstate.control.core;
 
-import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.PipelineInputs;
+import java.util.Set;
 import io.tapstate.core.lifecycle.MetricAttributes;
-import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
-import io.tapstate.core.model.ServeBlock;
-import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.model.TableRef;
-import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.ViewResource;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Builds the Views read from stored definitions and one observation per maintaining pipeline. */
 public final class ViewCatalogService {
 
     private static final long FRESH_LIMIT_SECONDS = 60;
     private static final String LAG_METRIC = "tapstate.pipeline.lag";
+    private static final String INPUT_AGE_AGGREGATION = "max-input-table-event-age";
 
     private final ArtifactQueryService artifacts;
     private final PipelineObservationQueryService observations;
     private final DataBrowserService browser;
-    private final SourceSchemaQueryService schemas;
+    private final PipelineOutputNames outputs;
     private final Clock clock;
 
     public ViewCatalogService(ArtifactQueryService artifacts, PipelineObservationQueryService observations,
-            DataBrowserService browser, SourceSchemaQueryService schemas) {
-        this(artifacts, observations, browser, schemas, Clock.systemUTC());
+            DataBrowserService browser, PipelineOutputNames outputs) {
+        this(artifacts, observations, browser, outputs, Clock.systemUTC());
     }
 
     public ViewCatalogService(ArtifactQueryService artifacts, PipelineObservationQueryService observations,
-            DataBrowserService browser, SourceSchemaQueryService schemas, Clock clock) {
+            DataBrowserService browser, PipelineOutputNames outputs, Clock clock) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.browser = Objects.requireNonNull(browser, "browser");
-        this.schemas = Objects.requireNonNull(schemas, "schemas");
+        this.outputs = Objects.requireNonNull(outputs, "outputs");
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     public List<ViewCatalogItem> list() {
+        return catalog().items();
+    }
+
+    public record Catalog(List<ViewCatalogItem> items, List<PipelineOutputNames.Unresolved> unresolved) {
+        public Catalog {
+            items = List.copyOf(items);
+            unresolved = List.copyOf(unresolved);
+        }
+    }
+
+    public Catalog catalog() {
+        var inventory = artifacts.resourceInventory();
         Map<String, Resource> resources = new LinkedHashMap<>();
-        for (StoredResource stored : artifacts.listResources()) {
+        for (StoredResource stored : inventory.resources()) {
             resources.put(stored.resource().id(), stored.resource());
         }
-        String storeId = storeId(resources);
-        List<ViewCatalogItem> result = new ArrayList<>();
+        var resolved = new HashMap<String, Optional<Resource>>();
+        java.util.function.Function<String, Optional<Resource>> lookup = id -> resolved.computeIfAbsent(id, key ->
+                inventory.exactLookupIds().contains(key) ? Optional.of(resources.get(key))
+                        : artifacts.getResource(key).map(StoredResource::resource));
+        var describe = outputs.forCatalog(resources, lookup);
+        var targetStats = browser.catalogStats(lookup);
+        List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
+        Map<String, PipelineOutputNames.Description> descriptions = new LinkedHashMap<>();
         for (Resource resource : resources.values()) {
             if (!(resource instanceof PipelineResource pipeline)) continue;
-            PipelineStatus status = observations.findStatus(pipeline.id()).orElse(null);
-            PipelineMetrics metrics = status == null ? null : observations.metrics(pipeline.id());
-            PipelineSnapshot snapshot = status == null ? null : observations.snapshot(pipeline.id());
-            ViewBlock.Inline view = inlineView(pipeline.view(), resources);
-            if (view != null) {
-                String collection = view.storage() != null && view.storage().warm() != null
-                        ? view.storage().warm().collection() : view.id();
-                result.add(item("view", pipeline.id(), pipeline.id() + ":" + view.id(), storeId, collection,
-                        status, metrics, snapshot, resources));
-            }
-            List<SyncElement> sync = syncElements(pipeline.serve(), resources);
-            for (SyncElement element : sync) {
-                Map<String, String> explicitNames = element.rename() == null ? null : element.rename().map();
-                List<String> outputTables = explicitNames != null && !explicitNames.isEmpty()
-                        ? List.copyOf(explicitNames.keySet()) : sourceTables(pipeline, resources);
-                String kind = pipeline.transforms() != null && !pipeline.transforms().isEmpty()
-                        ? "view" : "replica";
-                for (String table : outputTables) {
-                    String collection = element.rename() != null && element.rename().map() != null
-                            ? element.rename().map().getOrDefault(table, table) : table;
-                    result.add(item(kind, pipeline.id(), pipeline.id() + ":" + element.id() + ":" + table,
-                            element.source(), collection, status, metrics, snapshot, resources));
-                }
+            var description = describe.apply(pipeline);
+            unresolved.addAll(description.names().unresolved());
+            if (!description.names().outputs().isEmpty()) descriptions.put(pipeline.id(), description);
+        }
+        var publications = observations.findReads(List.copyOf(descriptions.keySet()));
+        List<ViewCatalogItem> result = new ArrayList<>();
+        for (var entry : descriptions.entrySet()) {
+            String pipelineId = entry.getKey();
+            var description = entry.getValue();
+            var publication = publications.get(pipelineId);
+            PipelineStatus status = publication == null ? null : publication.status();
+            PipelineMetrics metrics = publication == null ? null : publication.metrics();
+            PipelineSnapshot snapshot = publication == null ? null : publication.snapshot();
+            for (PipelineOutputNames.Output output : description.names().outputs()) {
+                var stats = resources.get(output.connection()) instanceof SourceResource
+                        ? targetStats.apply(output.connection(), output.table()).orElse(null) : null;
+                result.add(item(output.kind(), pipelineId, pipelineId + ":" + output.identity(),
+                        output.connection(), output.table(), status, metrics, snapshot, resources,
+                        description.inputs().getOrDefault(output.identity(), Set.of()), description.qualifiedTables(),
+                        description.nestMeasurements().get(output.identity()), stats));
             }
         }
         result.sort(Comparator.comparing(ViewCatalogItem::pipelineId).thenComparing(ViewCatalogItem::id));
-        return List.copyOf(result);
+        return new Catalog(result, unresolved);
     }
 
     private ViewCatalogItem item(String kind, String pipelineId, String id, String sourceId,
             String collection, PipelineStatus pipelineStatus, PipelineMetrics metrics,
-            PipelineSnapshot snapshot, Map<String, Resource> resources) {
+            PipelineSnapshot snapshot, Map<String, Resource> resources, Set<PipelineInputs.Input> inputs,
+            Set<String> qualifiedTables, PipelineOutputNames.NestMeasurement nest, DataBrowserStatsReport stats) {
         Resource resource = resources.get(sourceId);
         String database = resource instanceof SourceResource source ? database(source) : null;
-        Long documents = null;
-        Long sizeBytes = null;
-        if (resource instanceof SourceResource) {
-            try {
-                DataBrowserStatsReport stats = browser.stats(sourceId, collection);
-                documents = stats.numOfRows();
-                sizeBytes = stats.storageSize();
-            } catch (TapstateException unavailable) {
-                // A declared output can precede its first collection. Keep the row and leave its size unknown.
-            }
-        }
         return new ViewCatalogItem(id, kind,
                 new ViewCatalogItem.Location(sourceId, database, collection), pipelineId,
-                freshness(pipelineStatus, metrics, snapshot), documents, sizeBytes, null);
+                freshness(pipelineStatus, metrics, snapshot, inputs, qualifiedTables, nest),
+                stats == null ? null : stats.numOfRows(), stats == null ? null : stats.storageSize(), null);
     }
 
     private ViewCatalogItem.Freshness freshness(PipelineStatus status, PipelineMetrics metrics,
-            PipelineSnapshot snapshot) {
-        if (status == null || status.state() == PipelineState.NEW) {
-            return new ViewCatalogItem.Freshness("not-loaded", null, null, null);
-        }
-        if (status.state() == PipelineState.RUNNING) {
-            Integer progress = snapshot == null ? null : snapshot.snapshot().values().stream()
-                    .map(TableSnapshot::donePct).filter(Objects::nonNull).min(Integer::compareTo).orElse(null);
-            if (progress != null && progress < 100) {
-                return new ViewCatalogItem.Freshness("loading", null, null, progress);
-            }
-            Long lag = lag(metrics);
-            if (lag != null && lag <= FRESH_LIMIT_SECONDS && status.state() == PipelineState.RUNNING) {
-                return new ViewCatalogItem.Freshness("fresh", lag, null, null);
-            }
-        }
-        Long stale = status.observedAt() == null ? null
-                : Math.max(0, Duration.between(status.observedAt(), Instant.now(clock)).toSeconds());
-        return new ViewCatalogItem.Freshness("stale", null, stale, null);
+            PipelineSnapshot snapshot, Set<PipelineInputs.Input> inputs, Set<String> qualifiedTables,
+            PipelineOutputNames.NestMeasurement nest) {
+        Instant now = clock.instant();
+        // An assembled event carries one source timestamp. It does not measure the age of every input.
+        String aggregation = nest == null ? INPUT_AGE_AGGREGATION : null;
+        if (status == null || status.state() == PipelineState.NEW)
+            return freshness("not-loaded", null, null, null, now, null, aggregation, "not-loaded");
+        var measurement = eventAge(metrics, inputs, qualifiedTables, nest, now);
+        Instant observed = status.observedAt();
+        Long eventAge = measurement == null ? null : measurement.seconds();
+        if (measurement != null && measurement.clockInvalid())
+            return freshness("stale", null, null, measurement.observedAt(), now, null, aggregation, "clock-or-time-unavailable");
+        if (observed == null || observed.isAfter(now))
+            return freshness("stale", eventAge, null, observed, now, null, aggregation, "clock-or-time-unavailable");
+        if (measurement != null && measurement.observedAt().isBefore(observed)) observed = measurement.observedAt();
+        long age = Duration.between(observed, now).toSeconds();
+        if (status.state() != PipelineState.RUNNING)
+            return freshness("stale", eventAge, age, observed, now, null, aggregation, "pipeline-inactive");
+        if (age > FRESH_LIMIT_SECONDS)
+            return freshness("stale", eventAge, age, observed, now, null, aggregation, "observation-stale");
+        var tables = inputTables(inputs, qualifiedTables);
+        List<TableSnapshot> progressByTable = snapshot == null ? List.of() : snapshot.snapshot().entrySet().stream()
+                .filter(entry -> tables.contains(entry.getKey())).map(Map.Entry::getValue).toList();
+        boolean awaitingDelivery = progressByTable.stream().anyMatch(table -> !table.landed());
+        boolean unknown = progressByTable.stream().anyMatch(table -> !table.landed() && table.donePct() == null);
+        Integer progress = unknown ? null : progressByTable.stream().map(TableSnapshot::donePct)
+                .filter(Objects::nonNull).min(Integer::compareTo).orElse(null);
+        if (awaitingDelivery || progress != null && progress < 100)
+            return freshness("loading", null, age, observed, now, progress, aggregation, "snapshot-loading");
+        if (measurement == null)
+            return freshness("stale", null, age, observed, now, null, aggregation, "measurement-unavailable");
+        return freshness("fresh", eventAge, age, observed, now, null, aggregation, "observed");
     }
 
-    private static Long lag(PipelineMetrics metrics) {
-        if (metrics == null) return null;
-        return metrics.facts().stream().filter(fact -> LAG_METRIC.equals(fact.name()))
-                .map(MetricFact::points).flatMap(List::stream)
-                .filter(point -> point.attributes().containsKey(MetricAttributes.TABLE_ID))
-                .map(MetricPoint::value).filter(Objects::nonNull).max(Long::compareTo).orElse(null);
+    private static ViewCatalogItem.Freshness freshness(String state, Long eventAge, Long age, Instant observed,
+            Instant now, Integer progress, String aggregation, String reason) {
+        return new ViewCatalogItem.Freshness(state, state.equals("fresh") ? eventAge : null,
+                state.equals("stale") ? age : null, progress, eventAge, observed, now, age, "s", aggregation, reason);
+    }
+    private record EventAge(Long seconds,Instant observedAt,boolean clockInvalid) { }
+    private static Set<String> inputTables(Set<PipelineInputs.Input> inputs,Set<String> qualifiedTables) {
+        var tables=new java.util.HashSet<String>();
+        for(var input:inputs)if(input.table()!=null){if(!qualifiedTables.contains(input.table()))tables.add(input.table());tables.add(input.source()+"."+input.table());}
+        return Set.copyOf(tables);
+    }
+    private static EventAge eventAge(PipelineMetrics metrics, Set<PipelineInputs.Input> inputs,
+            Set<String> qualifiedTables, PipelineOutputNames.NestMeasurement nest, Instant now) {
+        if(metrics==null || inputs.isEmpty() || inputs.stream().anyMatch(input->input.table()==null))return null;
+        if (nest != null && nest.key() == null) return null;
+        var points=new LinkedHashMap<String,MetricPoint>();
+        var tables = nest == null ? inputTables(inputs, qualifiedTables) : Set.of(nest.key());
+        for(var fact:metrics.facts())if(LAG_METRIC.equals(fact.name()) && fact.type()==io.tapstate.core.lifecycle.MetricType.GAUGE && fact.unit().equals("s"))
+            for(var point:fact.points()) {
+                String table=point.attributes().get(MetricAttributes.TABLE_ID);
+                if(table!=null && tables.contains(table) && point.value()!=null && point.value()>=0) {
+                    if(points.putIfAbsent(table,point)!=null)return null;
+                }
+            }
+        if (nest != null) return ageOf(points.get(nest.key()), now);
+        long maximum=0;Instant measured=null;
+        for(var input:inputs) {
+            var point=points.get(input.source()+"."+input.table());
+            if(point==null) {
+                if(qualifiedTables.contains(input.table()) || inputs.stream().filter(other->input.table().equals(other.table())).count()>1)return null;
+                point=points.get(input.table());
+            }
+            var reading = ageOf(point, now);
+            if (reading == null || reading.clockInvalid()) return reading;
+            maximum = Math.max(maximum, reading.seconds());
+            if (measured == null || reading.observedAt().isBefore(measured)) measured = reading.observedAt();
+        }
+        return new EventAge(maximum,measured,false);
     }
 
-    private static String storeId(Map<String, Resource> resources) {
-        return resources.values().stream().filter(SourceResource.class::isInstance)
-                .map(SourceResource.class::cast)
-                .filter(source -> source.metadata() != null
-                        && "true".equals(source.metadata().labels().get("store")))
-                .map(SourceResource::id).findFirst().orElse("views");
+    private static EventAge ageOf(MetricPoint point, Instant now) {
+        if (point == null) return null;
+        var observed = point.observedAt();
+        if (observed == null || observed.isAfter(now)) return new EventAge(null, observed, true);
+        long elapsed = Duration.between(observed, now).toSeconds();
+        long seconds = point.value() > Long.MAX_VALUE - elapsed ? Long.MAX_VALUE : point.value() + elapsed;
+        return new EventAge(seconds, observed, false);
     }
 
     private static String database(SourceResource source) {
@@ -161,35 +211,4 @@ public final class ViewCatalogService {
         return name.isBlank() ? null : name;
     }
 
-    private static ViewBlock.Inline inlineView(ViewBlock block, Map<String, Resource> resources) {
-        if (block instanceof ViewBlock.Inline inline) return inline;
-        if (block instanceof ViewBlock.Use use && resources.get(use.use()) instanceof ViewResource view) {
-            return new ViewBlock.Inline(use.id(), use.from(), view.primaryKey(), view.storage());
-        }
-        return null;
-    }
-
-    private static List<SyncElement> syncElements(ServeBlock block, Map<String, Resource> resources) {
-        if (block instanceof ServeBlock.Inline inline) return inline.sync() == null ? List.of() : inline.sync();
-        if (block instanceof ServeBlock.Use use && resources.get(use.use()) instanceof ServeResource serve) {
-            return serve.sync() == null ? List.of() : serve.sync();
-        }
-        return List.of();
-    }
-
-    private List<String> sourceTables(PipelineResource pipeline, Map<String, Resource> resources) {
-        List<String> names = new ArrayList<>();
-        for (String sourceId : pipeline.sourceIds()) {
-            if (!(resources.get(sourceId) instanceof SourceResource source)) continue;
-            if (source.tables() == null) {
-                schemas.find(sourceId).ifPresent(report -> report.tables().forEach(table -> names.add(table.name())));
-            } else {
-                for (TableRef table : source.tables()) {
-                    if (table instanceof TableRef.Literal literal) names.add(literal.name());
-                    if (table instanceof TableRef.Spec spec) names.add(spec.name());
-                }
-            }
-        }
-        return names;
-    }
 }

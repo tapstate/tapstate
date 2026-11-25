@@ -13,14 +13,36 @@ import java.util.Optional;
  * store. The runtime publishes it after converging; the control read faces read it. {@link #save}
  * upserts the observation for its pipeline; {@link #read} returns the current observation for a
  * pipeline, or empty when none has been published.
+ *
+ * <p>A scope-bound business view isolates writes by the original execution and the measured
+ * checkpoint epoch. Its read view chooses the observation that matches the current execution and
+ * checkpoint. Ordinary business views refuse physical removal.
  */
 public interface ObservationStore {
 
     /** Upserts the observation for its pipeline id (last write wins). */
     void save(Observation observation);
 
+    /** Publishes a sample measured against the given checkpoint, without adopting a newer epoch. */
+    default void save(Observation observation, long checkpointEpoch) { save(observation); }
+
+    /** Runs side effects after the save that precedes them has committed. */
+    default void afterSave(Runnable committed) { committed.run(); }
+
+    /** Final data measured immediately before the bounded execution completed. */
+    default Optional<Observation> beforeCompletion(String pipelineId, long checkpointEpoch) {
+        return read(pipelineId);
+    }
+
     /** Returns the current observation for a pipeline, or empty if none has been published. */
     Optional<Observation> read(String pipelineId);
+
+    /** Reads a page of observations, omitting unpublished rows. */
+    default java.util.Map<String, Observation> readAll(java.util.List<String> ids) {
+        var result = new java.util.HashMap<String, Observation>();
+        for (var id : ids) read(id).ifPresent(value -> result.put(id, value));
+        return java.util.Map.copyOf(result);
+    }
 
     /**
      * Removes a pipeline's observation, so the read faces stop projecting a pipeline that no longer

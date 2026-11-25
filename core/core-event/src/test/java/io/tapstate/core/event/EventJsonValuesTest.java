@@ -1,6 +1,7 @@
 package io.tapstate.core.event;
 
 import org.junit.jupiter.api.Test;
+import io.tapstate.core.common.TapstateException;
 
 import java.time.Instant;
 import java.util.Date;
@@ -35,9 +36,9 @@ class EventJsonValuesTest {
     @Test
     void rejectsNonStringFieldsUnsupportedValuesAndExcessiveNesting() {
         assertThatThrownBy(() -> EventJsonValues.normalize(Map.of(1, "value")))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(TapstateException.class);
         assertThatThrownBy(() -> EventJsonValues.encodedSize(Map.of(1, "value"), 100))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(TapstateException.class);
         assertThatThrownBy(() -> EventJsonValues.normalize(new Object()))
                 .isInstanceOf(IllegalArgumentException.class);
         Object nested = "leaf";
@@ -63,7 +64,11 @@ class EventJsonValuesTest {
         assertThat(EventJsonValues.encodedSize("large", 0)).isEqualTo(1);
         assertThat(EventJsonValues.encodedSize(Map.of("x", "y"), 2)).isEqualTo(3);
         assertThatThrownBy(() -> EventJsonValues.normalize(Map.of("outer", Map.of(2, "bad"))))
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$/outer", "keyType", "java.lang.Integer"));
+                });
         assertThatThrownBy(() -> EventJsonValues.encodedSize(new Object(), Long.MAX_VALUE))
                 .isInstanceOf(IllegalArgumentException.class);
     }

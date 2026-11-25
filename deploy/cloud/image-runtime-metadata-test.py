@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 
 SPEC = importlib.util.spec_from_file_location("runtime_metadata", Path(__file__).with_name("image-runtime-metadata.py"))
@@ -26,6 +27,22 @@ class MetadataTest(unittest.TestCase):
         original = SUBJECT.SDK_SHA
         SUBJECT.SDK_SHA = hashlib.sha256(self.sdk_bytes).hexdigest()
         self.addCleanup(setattr, SUBJECT, "SDK_SHA", original)
+
+    def test_locked_sdk_coordinate_matches_the_build_dependency(self):
+        pom = ET.parse(SUBJECT.ROOT / "pom.xml")
+        namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+        version = pom.findtext("m:properties/m:cloud.sdk.version", namespaces=namespace)
+        self.assertIsNotNone(version)
+        publisher_prefix = "-".join(version.split("-")[:2])
+        self.assertEqual(SUBJECT.SDK, f"BOOT-INF/lib/cloud-control-plane-sdk-{publisher_prefix}-SNAPSHOT.jar")
+
+    def test_timestamp_and_base_versions_name_the_same_packaged_snapshot(self):
+        expected = "BOOT-INF/lib/cloud-control-plane-sdk-0.1.1-1813f345-SNAPSHOT.jar"
+        for version in ("0.1.1-1813f345-SNAPSHOT", "0.1.1-1813f345-20261026.093742-1"):
+            self.assertEqual(SUBJECT.sdk_entry(version), expected)
+        for invalid in ("LATEST", "0.1.1-1813f34-SNAPSHOT", "0.1.1-1813f345-20261026.09374-1"):
+            with self.assertRaises(ValueError):
+                SUBJECT.sdk_entry(invalid)
 
     def inputs(self, profile):
         content = f"<script src=\"/assets/{profile}.js\"></script>".encode()
@@ -52,10 +69,10 @@ class MetadataTest(unittest.TestCase):
                   "io.tapstate.web.files.sha256": props["files.sha256"],
                   "io.tapstate.web.profile": profile, "io.tapstate.distribution": profile}
         env = ["PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+        env.append("TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors")
         if profile == "cloud":
             labels["io.tapstate.web.cloud-console-url"] = props["cloud.console.url"]
-            env.extend(["LD_PRELOAD=libstdc++.so.6",
-                        "TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"])
+            env.append("LD_PRELOAD=libstdc++.so.6")
         image = self.root / f"{profile}-image.json"
         image.write_text(json.dumps([{"Id": "sha256:" + ("c" if profile == "cloud" else "d") * 64,
                                      "Config": {"Labels": labels, "Env": env,

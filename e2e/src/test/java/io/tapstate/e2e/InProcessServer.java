@@ -1,9 +1,13 @@
 package io.tapstate.e2e;
 
 import io.tapstate.app.Bootstrap;
+import io.tapstate.app.IsolatedConnectionDiagnostics;
+import io.tapstate.app.ObservationWorkerFixture;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
 
@@ -30,9 +34,12 @@ final class InProcessServer implements ServerHandle {
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
     private final Path stagingDirectory;
+    private final List<ConfigurableApplicationContext> refreshedContexts;
 
-    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory) {
+    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory,
+            List<ConfigurableApplicationContext> refreshedContexts) {
         this.context = context;
+        this.refreshedContexts = refreshedContexts;
         this.baseUrl = baseUrl;
         this.stagingDirectory = stagingDirectory;
     }
@@ -42,6 +49,34 @@ final class InProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
     }
 
+    static InProcessServer startPrepared(PreparedNativeStore storage) {
+        return startPrepared(storage, List.of());
+    }
+
+    static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments) {
+        return startPrepared(storage, additionalArguments, null);
+    }
+    static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider) {
+        return startPrepared(storage, additionalArguments, provider, null);
+    }
+
+    static InProcessServer startWithConnectionDiagnostics(PreparedNativeStore storage) {
+        return startPrepared(storage, List.of(), null, new IsolatedConnectionDiagnostics(storage.clusterId(), storage.cacheDatabase()));
+    }
+
+    private static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
+        var arguments = new java.util.ArrayList<String>();
+        for (String value : List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2")) {
+            String key = value.substring(0, value.indexOf('=') + 1);
+            if (additionalArguments.stream().noneMatch(argument -> argument.startsWith(key))) arguments.add(value);
+        }
+        arguments.addAll(additionalArguments);
+        return start(storage.configurationUri(), null, arguments, provider, diagnostics);
+    }
+
     /** Boots the assembly with an explicit operator-state database. */
     static InProcessServer start(String storeUri, String operatorStateDatabase) {
         return start(storeUri, operatorStateDatabase, List.of());
@@ -49,10 +84,21 @@ final class InProcessServer implements ServerHandle {
 
     /** Additional settings let a focused witness select the actual Cloud assembly. */
     static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
+        return start(storeUri, operatorStateDatabase, additionalArguments, null);
+    }
+
+    static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider) {
+        return start(storeUri, operatorStateDatabase, additionalArguments, provider, null);
+    }
+
+    private static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
         ConfigurableApplicationContext context;
+        var refreshed = new java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext>();
         try {
-            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments);
+            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed, provider, diagnostics);
         } catch (RuntimeException e) {
             // Nothing is handed back to close, so nothing else will ever clear this up. Attached rather
             // than thrown: why the assembly did not boot is the thing a reader needs.
@@ -66,25 +112,47 @@ final class InProcessServer implements ServerHandle {
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
         // one of those is the address bound below.
-        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory);
+        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory, refreshed);
     }
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
-            Path stagingDirectory, List<String> additionalArguments) {
+            Path stagingDirectory, List<String> additionalArguments,
+            java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
         java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0"));
         arguments.addAll(additionalArguments);
-        return new SpringApplicationBuilder(Bootstrap.class)
-                .properties(
+        var defaults = new java.util.ArrayList<>(List.of(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
-                        ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                         // The container speaks plaintext; store TLS is opt-in, so no flag is needed.
                         "tapstate.store.mongo.server-selection-timeout=5s",
                         // This tier's working directory is the harness's own module, and the setting's
                         // default is relative to it.
                         ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
-                        ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID)
+                        ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
+        var builder = new SpringApplicationBuilder(Bootstrap.class);
+        if (diagnostics != null) {
+            builder.initializers(context -> context.getBeanFactory().registerSingleton("isolatedConnectionDiagnostics", diagnostics));
+        }
+        if (provider != null) {
+            builder.initializers(context -> context.addBeanFactoryPostProcessor(factory -> {
+                var registry = (org.springframework.beans.factory.support.BeanDefinitionRegistry) factory;
+                if (registry.containsBeanDefinition("aiProviderClient")) registry.removeBeanDefinition("aiProviderClient");
+                var definition = new org.springframework.beans.factory.support.RootBeanDefinition(
+                        io.tapstate.control.core.AiProviderClient.class, () -> provider);
+                definition.setPrimary(true);
+                if (provider instanceof AutoCloseable) definition.setDestroyMethodName("close");
+                registry.registerBeanDefinition("aiProviderClient", definition);
+            }));
+        }
+        return builder
+                .listeners((ApplicationListener<ContextRefreshedEvent>) event -> {
+                    if (event.getApplicationContext() instanceof ConfigurableApplicationContext refreshed)
+                        refreshedContexts.addIfAbsent(refreshed);
+                })
+                .properties(defaults.toArray(String[]::new))
                 // Port zero, then read back what was granted: a hard-coded port turns a busy machine
                 // into a flaky suite. Both are command-line arguments rather than default properties
                 // because the product's application configuration publishes 8080 as its default, and a
@@ -128,25 +196,88 @@ final class InProcessServer implements ServerHandle {
      *
      * @return how many scheduled tasks were cancelled; a caller must refuse anything but what it expects
      */
+    private final java.util.List<Runnable> stoppedPublishers=new java.util.concurrent.CopyOnWriteArrayList<>();
+    int publishObservationsOnce(){stoppedPublishers.forEach(Runnable::run);return stoppedPublishers.size();}
     int stopPublishingObservations() {
         int cancelled = 0;
-        for (ScheduledTaskHolder holder : context.getBeansOfType(ScheduledTaskHolder.class).values()) {
-            for (ScheduledTask task : holder.getScheduledTasks()) {
-                // The runnable itself is wrapped by the scheduler, so it is matched by how it renders
-                // rather than by its type: the wrapper delegates toString to the scheduled method, which
-                // renders as its declaring class and method name.
-                if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
-                    task.cancel();
-                    cancelled++;
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values()) {
+                for (ScheduledTask task : holder.getScheduledTasks()) {
+                    // The runnable is wrapped by the scheduler; its rendering names the scheduled method.
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
+                        stoppedPublishers.add(task.getTask().getRunnable());task.cancel();
+                        cancelled++;
+                    }
                 }
             }
         }
         return cancelled;
     }
 
+    /** Stops future dispatch and waits for in-flight writes before a test plants its own observation. */
+    int stopPublishingObservationsAndAwaitWorkers() {
+        int cancelled = stopPublishingObservations();
+        ObservationWorkerFixture.stopAndAwait(refreshedContexts.stream()
+                .filter(owner -> owner.isActive() && belongsToThisServer(owner)).toList());
+        return cancelled;
+    }
+
+    /** The real scheduled pass, for a case that controls its storage interleaving. */
+    Runnable publishingObservations() {
+        var passes = new java.util.ArrayList<Runnable>();
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values()) {
+                for (ScheduledTask task : holder.getScheduledTasks()) {
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
+                        passes.add(task.getTask().getRunnable());
+                }
+            }
+        }
+        if (passes.size() != 1) throw new AssertionError("expected one native convergence pass: " + passes.size());
+        return passes.getFirst();
+    }
+
+    private boolean belongsToThisServer(ConfigurableApplicationContext candidate) {
+        for (org.springframework.context.ApplicationContext owner = candidate; owner != null; owner = owner.getParent())
+            if (owner == context) return true;
+        return false;
+    }
+
+    /** Observe the real selected guard on its executing thread; the original check always runs. */
+    AutoCloseable observeManagedAuthorization(java.util.function.Consumer<String> before,
+            java.util.function.BiConsumer<String, java.util.Map<String, Object>> after) {
+        String name = "managedAuthenticationContexts";
+        var beans = (org.springframework.beans.factory.support.DefaultListableBeanFactory) context.getBeanFactory();
+        var original = beans.getBean(name, io.tapstate.control.core.ManagedAuthenticationContext.Provider.class);
+        io.tapstate.control.core.ManagedAuthenticationContext.Provider observed = () -> {
+            var selected = original.current();
+            if (selected == null) return null;
+            return new io.tapstate.control.core.ManagedAuthenticationContext(selected.service(), () -> {
+                try (var measurement = io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.open()) {
+                    String thread = Thread.currentThread().getName();
+                    before.accept(thread);
+                    selected.requireActive().run();
+                    after.accept(thread, measurement.snapshot());
+                }
+            });
+        };
+        beans.destroySingleton(name);
+        beans.registerSingleton(name, observed);
+        return () -> {
+            if (beans.getSingleton(name) != observed) throw new AssertionError("the observed context provider changed");
+            beans.destroySingleton(name);
+            beans.registerSingleton(name, original);
+        };
+    }
+
     @Override
     public void close() {
-        context.close();
-        ServerHandle.discardStagingDirectory(stagingDirectory);
+        try { context.close(); }
+        finally {
+            refreshedContexts.clear();
+            ServerHandle.discardStagingDirectory(stagingDirectory);
+        }
     }
 }

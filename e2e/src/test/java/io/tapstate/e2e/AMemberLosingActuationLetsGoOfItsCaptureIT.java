@@ -1,8 +1,8 @@
 package io.tapstate.e2e;
 
-import io.tapstate.adapters.mongostore.MongoConnection;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -38,16 +38,17 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
     void theSuccessorRestartsAfterPurgeWithoutRestartingTheOldCaptureHolder() {
         String sourceUri = SharedMongo.replicaSetUrl("e2e_actuation_handoff_source");
         String targetUri = SharedMongo.replicaSetUrl("e2e_actuation_handoff_target");
-        String storeUri = SharedMongo.replicaSetUrl("e2e_actuation_handoff_store");
-        try (MongoEndpoints mongo = new MongoEndpoints();
-             StoreDocuments documents = StoreDocuments.at(storeUri);
-             MongoConnection connection = new MongoConnection(new MongoConnectionSettings(storeUri, null, BOUND))) {
-            connection.verify();
-            MongoStorePort store = new MongoStorePort(connection, SharedMongo.OPERATOR_STATE_DATABASE);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
+                     new MongoConnectionSettings(storage.configurationUri(), null, BOUND));
+             MongoCacheDomain cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(), BOUND, "handoff-witness");
+             MongoEndpoints mongo = new MongoEndpoints();
+             StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
+            var claims = cache.workloadClaims(configuration.bindings().cachePreparation().orElseThrow().businessScope());
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             EndpointAddress target = EndpointAddress.uri(targetUri);
             mongo.seed(source, TABLE, List.of(Map.of("id", 1L), Map.of("id", 2L)));
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(storeUri, "e2e-actuation-handoff")) {
+            try (TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
@@ -58,8 +59,11 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         () -> mongo.count(target, TABLE) == 2,
                         () -> "target rows=" + mongo.count(target, TABLE) + ", state=" + control.state(PIPELINE));
                 Await.until("the target to confirm the original load", BOUND,
-                        () -> control.snapshotTable(PIPELINE, TABLE).filter(TableSnapshot::landed).isPresent(),
-                        () -> "snapshot=" + control.snapshotTable(PIPELINE, TABLE));
+                        () -> {
+                            TableSnapshot snapshot = control.snapshotTables(PIPELINE).get(TABLE);
+                            return snapshot != null && snapshot.landed();
+                        },
+                        () -> "snapshot=" + control.snapshotTables(PIPELINE));
                 Map<String, String> captures = control.captureOwnersOf(PIPELINE);
                 assertThat(captures).hasSize(1);
                 String captureId = captures.keySet().iterator().next();
@@ -69,7 +73,7 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
                 WorkloadClaimKey capture = new WorkloadClaimKey(
                         control.clusterId(), WorkloadClaimType.CAPTURE, captureId);
-                assertThat(store.workloadClaims().read(capture)).hasValueSatisfying(reading -> {
+                assertThat(claims.read(capture)).hasValueSatisfying(reading -> {
                     assertThat(reading.leased()).as("the original capture claim is live").isTrue();
                     assertThat(reading.claim().owner().nodeId()).isEqualTo(oldNode);
                 });
@@ -77,34 +81,35 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         control.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
 
                 documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
-                Instant handedOffLease = store.workloadClaims().read(actuation).orElseThrow().claim().leaseUntil();
+                Instant handedOffLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
                 Await.until("the other member to hold actuation", BOUND,
                         () -> control.pipelineControllerOf(PIPELINE).filter(successor::equals).isPresent(),
                         () -> "controller=" + control.pipelineControllerOf(PIPELINE));
                 // Seeing the changed document alone does not mean the old driver's cached permit is gone.
                 Await.until("the successor to adopt its actuation claim", BOUND,
-                        () -> store.workloadClaims().read(actuation)
+                        () -> claims.read(actuation)
                                 .filter(reading -> reading.claim().owner().nodeId().equals(successor)
                                         && !reading.claim().leaseUntil().equals(handedOffLease)).isPresent(),
-                        () -> "actuation=" + store.workloadClaims().read(actuation));
-                Instant adoptedLease = store.workloadClaims().read(actuation).orElseThrow().claim().leaseUntil();
+                        () -> "actuation=" + claims.read(actuation));
+                Instant adoptedLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
                 Await.until("the successor to renew its adopted claim before the stop", BOUND,
-                        () -> store.workloadClaims().read(actuation)
+                        () -> claims.read(actuation)
                                 .filter(reading -> reading.claim().owner().nodeId().equals(successor)
                                         && reading.claim().leaseUntil().isAfter(adoptedLease)).isPresent(),
-                        () -> "actuation=" + store.workloadClaims().read(actuation));
+                        () -> "actuation=" + claims.read(actuation));
                 control.stop(PIPELINE, true);
                 Await.until("the successor to drive the purging stop", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));
                 Await.until("the old member to stop holding the capture", BOUND,
-                        () -> store.workloadClaims().read(capture)
+                        () -> claims.read(capture)
                                 .filter(reading -> reading.leased() && reading.claim().owner().nodeId().equals(oldNode))
                                 .isEmpty(),
-                        () -> "capture=" + store.workloadClaims().read(capture));
+                        () -> "capture=" + claims.read(capture));
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
 
-                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                // Purging capture state requires a full load; retain the target rows from the first run.
+                control.startAnswering(PIPELINE, "target-not-empty", "keep");
                 Await.until("the restarted pipeline to run", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));
@@ -115,6 +120,81 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         () -> "target rows=" + mongo.count(target, TABLE) + ", before=" + before);
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
                 control.stop(PIPELINE, false);
+            }
+        }
+    }
+
+    @Test
+    void aNonPurgingStopReleasesTheSupersededMembersCapture() {
+        String sourceUri = SharedMongo.replicaSetUrl("e2e_actuation_stop_source");
+        String targetUri = SharedMongo.replicaSetUrl("e2e_actuation_stop_target");
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
+                     new MongoConnectionSettings(storage.configurationUri(), null, BOUND));
+             MongoCacheDomain cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(), BOUND, "stop-witness");
+             MongoEndpoints mongo = new MongoEndpoints();
+             StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
+            var claims = cache.workloadClaims(configuration.bindings().cachePreparation().orElseThrow().businessScope());
+            EndpointAddress source = EndpointAddress.uri(sourceUri);
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            mongo.seed(source, TABLE, List.of(Map.of("id", 1L), Map.of("id", 2L)));
+            try (TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
+                cluster.awaitBothMembers();
+                ControlPlane control = cluster.first();
+                control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
+                control.discoverSchema("handoff_src", CONNECTOR, Map.of("uri", sourceUri));
+                control.apply(resources(sourceUri, targetUri));
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Await.until("the original pipeline to deliver its load", BOUND,
+                        () -> mongo.count(target, TABLE) == 2,
+                        () -> "target rows=" + mongo.count(target, TABLE));
+                Await.until("the target to confirm the original load", BOUND,
+                        () -> {
+                            TableSnapshot snapshot = control.snapshotTables(PIPELINE).get(TABLE);
+                            return snapshot != null && snapshot.landed();
+                        },
+                        () -> "snapshot=" + control.snapshotTables(PIPELINE));
+                Map<String, String> captures = control.captureOwnersOf(PIPELINE);
+                assertThat(captures).hasSize(1);
+                String captureId = captures.keySet().iterator().next();
+                String oldNode = captures.get(captureId);
+                assertThat(control.pipelineControllerOf(PIPELINE)).contains(oldNode);
+                String successor = oldNode.equals(TwoMemberCluster.NODE_A)
+                        ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
+                WorkloadClaimKey capture = new WorkloadClaimKey(
+                        control.clusterId(), WorkloadClaimType.CAPTURE, captureId);
+                WorkloadClaimKey actuation = new WorkloadClaimKey(
+                        control.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+                assertThat(claims.read(capture)).hasValueSatisfying(reading -> {
+                    assertThat(reading.leased()).isTrue();
+                    assertThat(reading.claim().owner().nodeId()).isEqualTo(oldNode);
+                });
+
+                documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
+                Instant handedOffLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
+                Await.until("the successor to adopt its actuation claim", BOUND,
+                        () -> claims.read(actuation)
+                                .filter(reading -> reading.claim().owner().nodeId().equals(successor)
+                                        && !reading.claim().leaseUntil().equals(handedOffLease)).isPresent(),
+                        () -> "actuation=" + claims.read(actuation));
+                Instant adoptedLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
+                Await.until("the successor to renew its adopted claim before the stop", BOUND,
+                        () -> claims.read(actuation)
+                                .filter(reading -> reading.claim().owner().nodeId().equals(successor)
+                                        && reading.claim().leaseUntil().isAfter(adoptedLease)).isPresent(),
+                        () -> "actuation=" + claims.read(actuation));
+
+                // A non-purging stop retains its capture record; absence cannot prove lease release.
+                control.stop(PIPELINE, false);
+                Await.until("the successor to drive the non-purging stop", BOUND,
+                        () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                        () -> "state=" + control.state(PIPELINE));
+                Await.until("the superseded member to release the unused capture without purge", BOUND,
+                        () -> claims.read(capture).filter(reading -> !reading.leased()).isPresent(),
+                        () -> "capture=" + claims.read(capture));
+                assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
+                assertThat(cluster.processCarrying(successor).isAlive()).isTrue();
+                assertThat(mongo.count(target, TABLE)).isEqualTo(2);
             }
         }
     }

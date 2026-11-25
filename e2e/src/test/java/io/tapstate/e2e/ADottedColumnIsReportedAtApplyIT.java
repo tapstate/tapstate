@@ -34,7 +34,7 @@ class ADottedColumnIsReportedAtApplyIT {
     /** Legal in MySQL, and a key a document store reads as a step into a {@code price} that is not there. */
     private static final String DOTTED_COLUMN = "price.usd";
 
-    private static final String READS_AS_A_PATH = "schema.column-name-reads-as-a-path";
+    private static final String READS_AS_A_PATH = "TS0270001";
 
     /** A database of this run's own on the server every specification here shares. */
     private static Map<String, Object> mysql;
@@ -49,8 +49,9 @@ class ADottedColumnIsReportedAtApplyIT {
     @Test
     @DisplayName("a real column named price.usd is applied to a document store, and reported on")
     void aColumnWhoseNameHoldsADotIsAppliedAndReportedOn() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("dotted_column"))) {
-            ControlPlane control = NumericSource.connected(server);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = NumericSource.connected(server, storage);
             Map<String, Object> config = mysql;
             String target = SharedMongo.replicaSetUrl("dotted_column_target");
 

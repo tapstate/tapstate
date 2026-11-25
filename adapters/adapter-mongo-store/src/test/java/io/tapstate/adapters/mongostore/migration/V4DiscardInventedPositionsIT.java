@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore.migration;
 
+import io.tapstate.adapters.mongostore.SharedMongoCase;
+
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -8,11 +10,9 @@ import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
-import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -43,7 +43,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class V4DiscardInventedPositionsIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
     /** The fixed seam the released build wrote in place of one sampled at the source. */
     private static final String INVENTED_SEAM = "cdc-start-0";
@@ -51,15 +50,20 @@ class V4DiscardInventedPositionsIT {
     /** The counter it advanced in place of a watermark the connector issued. */
     private static final String INVENTED_WATERMARK = "w7";
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(V4DiscardInventedPositionsIT.class);
 
     private static MongoClient client;
 
-    @AfterAll
-    static void closeClient() {
-        if (client != null) {
-            client.close();
+    @AfterEach
+    void closeClient() {
+        try {
+            if (client != null) {
+                client.close();
+            }
+        } finally {
+            client = null;
         }
     }
 
@@ -158,7 +162,7 @@ class V4DiscardInventedPositionsIT {
         if (client == null) {
             client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
         }
-        MongoDatabase database = client.getDatabase(name);
+        MongoDatabase database = client.getDatabase(REPLICA_SET.database(name));
         database.drop();
         return database;
     }

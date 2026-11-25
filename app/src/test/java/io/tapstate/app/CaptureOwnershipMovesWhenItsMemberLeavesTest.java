@@ -200,6 +200,7 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         properties.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
         properties.setBootstrapMinMembers(2);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.observeNodeSession(() -> true);
         gate.install(new ClusterMembership(CLUSTER, 3, Set.of("node-a", "node-b")));
         gate.canCommit(Set.of("node-a", "node-b"));
         return gate;

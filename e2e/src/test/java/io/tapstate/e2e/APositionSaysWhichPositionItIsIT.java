@@ -11,11 +11,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -93,13 +89,13 @@ class APositionSaysWhichPositionItIsIT {
         String targetUri = SharedMongo.replicaSetUrl(PIPELINE_ID + "_tgt");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl(PIPELINE_ID + "_state"))) {
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
 
             seed(source, database);
-            ControlPlane control = start(server, sourceUri, targetUri, database);
+            ControlPlane control = start(server, storage, sourceUri, targetUri, database);
 
             // The load's completion is the barrier: it says the source is being read, so the change made
             // after it is one the tail is in a position to see and to have confirmed.
@@ -199,20 +195,16 @@ class APositionSaysWhichPositionItIsIT {
     }
 
     private static String fingerprintOf(String position) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(position.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest, 0, 8);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("every Java platform provides SHA-256", e);
-        }
+        assertThat(position).as("the metrics wire carries an opaque fingerprint")
+                .matches("opaque-v1:[0-9a-f]{64}");
+        return position.substring("opaque-v1:".length(), "opaque-v1:".length() + 16);
     }
 
     /** Everything up to and including the start. */
     private static ControlPlane start(
-            ServerHandle server, String sourceUri, String targetUri, String database) {
+            ServerHandle server, PreparedNativeStore storage, String sourceUri, String targetUri, String database) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin(USER, PASSWORD);
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
         Map<String, String> resources = new LinkedHashMap<>();

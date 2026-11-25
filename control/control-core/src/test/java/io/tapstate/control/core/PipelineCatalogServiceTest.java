@@ -29,12 +29,89 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class PipelineCatalogServiceTest {
 
+    @Test void aStopReadAfterADiagnosisCannotDiscardItsEffectiveFailure() {
+        var artifacts = new ArtifactQueryService(artifactStore(List.of(pipeline("orders", null))));
+        var desired = new MemoryDesiredStore(); desired.save(intent("orders", PipelineState.RUNNING));
+        var observations = new MemoryObservationStore();
+        var at = Instant.parse("2026-10-23T00:00:00Z");
+        var stored = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at);
+        observations.save(stored);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0440009", Map.of("pipeline", "orders"));
+        var query = new PipelineObservationQueryService(artifacts, observations,
+                io.tapstate.core.lifecycle.ExecutionPlans.NONE, List::of, (pipeline, state) -> {
+                    calls.incrementAndGet(); desired.save(intent("orders", PipelineState.STOPPED)); return Optional.of(failure);
+                });
+        var service = new PipelineCatalogService(artifacts, new PipelineDraftService(new MemoryDraftStore()), desired, query);
+        var item = service.find("orders").orElseThrow();
+        assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.STOPPING);
+        assertThat(item.status().observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(item.status().desiredState()).isEqualTo(PipelineState.STOPPED);
+        var status = query.findStatusWithPlan(item).orElseThrow();
+        assertThat(status.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(status.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(status.observedAt()).isEqualTo(at); assertThat(status.failure()).isEqualTo(failure);
+        assertThat(calls).hasValue(1); assertThat(observations.read("orders")).contains(stored);
+    }
+
+    @Test void aDraftWithoutAnArtifactDoesNotReadRuntimeStateFromAnAbsentOrRetiredScope() {
+        var artifacts = new ArtifactQueryService(artifactStore(List.of()));
+        var drafts = new MemoryDraftStore(); drafts.seed(draft("draft-only", "Draft", null, 1));
+        var observations = new ObservationStore() {
+            public Optional<Observation> read(String id) { throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }
+            public void save(Observation value) { throw new AssertionError("a draft has no runtime observation"); }
+            public void delete(String id) { throw new AssertionError("a draft has no runtime observation"); }
+        };
+        var desired = new DesiredStore() {
+            public Optional<DesiredState> read(String id) { throw new AssertionError("a draft has no runtime intent"); }
+            public void save(DesiredState value) { throw new AssertionError("a draft has no runtime intent"); }
+            public List<String> pipelineIds() { throw new AssertionError("a draft has no runtime intent"); }
+            public void delete(String id) { throw new AssertionError("a draft has no runtime intent"); }
+        };
+        var service = new PipelineCatalogService(artifacts, new PipelineDraftService(drafts), desired,
+                new PipelineObservationQueryService(artifacts, observations));
+        var item = service.find("draft-only").orElseThrow();
+        assertThat(item.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.DRAFT);
+        assertThat(item.hasArtifact()).isFalse();
+    }
+
+    @Test void anExplicitFullRequirementIsNotAnInventedObservationOrAPendingStop() {
+        var artifacts=new ArtifactQueryService(artifactStore(List.of(pipeline("recover",null))));
+        var desired=new MemoryDesiredStore();desired.save(intent("recover",PipelineState.STOPPED));
+        var observations=new MemoryObservationStore();
+        var service=new PipelineCatalogService(artifacts,new PipelineDraftService(new MemoryDraftStore()),desired,
+                new PipelineObservationQueryService(artifacts,observations),id -> id.equals("recover"));
+        var item=service.find("recover").orElseThrow();
+        assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
+        assertThat(item.status().state()).isNull();
+        assertThat(item.status().desiredState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(item.status().observedState()).isNull();assertThat(item.status().observedAt()).isNull();
+    }
+
+    @Test void anUnfinishedFullKeepsCurrentRuntimeFactsWhileItsStopIsStillConverging() {
+        for(var actual:List.of(PipelineState.RUNNING,PipelineState.PAUSED,PipelineState.FAILED,PipelineState.STOPPED,PipelineState.NEW)) {
+            var artifacts=new ArtifactQueryService(artifactStore(List.of(pipeline("recover",null))));
+            var desired=new MemoryDesiredStore();desired.save(intent("recover",PipelineState.STOPPED));
+            var observations=new MemoryObservationStore();var time=Instant.parse("2026-10-21T00:00:00Z");
+            var failure=new io.tapstate.core.lifecycle.ObservationFailure(IoError.WORKLOAD_CLAIM_FENCED.code(),Map.of());
+            observations.save(new Observation("recover",actual,Map.of(),Map.of(),Map.of(),failure,time));
+            var service=new PipelineCatalogService(artifacts,new PipelineDraftService(new MemoryDraftStore()),desired,
+                    new PipelineObservationQueryService(artifacts,observations),id -> true);
+            var item=service.find("recover").orElseThrow();
+            assertThat(item.status().displayState()).isEqualTo(actual==PipelineState.STOPPED || actual==PipelineState.NEW
+                    ?PipelineCatalogItem.UiState.RECOVERY_REQUIRED:PipelineCatalogItem.UiState.STOPPING);
+            assertThat(item.status().observedState()).isEqualTo(actual);assertThat(item.status().failure()).isEqualTo(failure);
+            assertThat(item.status().observedAt()).isEqualTo(time);
+        }
+    }
+
     @Test
     void mergesArtifactsAndDraftsAndProjectsEveryLifecycleTransition() {
         List<Resource> resources = new ArrayList<>();
         for (String id : List.of("artifact-stop", "failed", "resuming", "starting", "pausing", "running",
                 "paused", "desired-running", "desired-paused", "desired-stopped", "desired-failed",
-                "desired-new", "desired-completed", "completed-running-intent", "corrupt-intent", "new")) {
+                "desired-new", "desired-completed", "completed-running-intent", "new")) {
             resources.add(pipeline(id, id.equals("artifact-stop") ? "artifact description" : null));
         }
         resources.add(new DslParser().parse("""
@@ -62,7 +139,6 @@ class PipelineCatalogServiceTest {
         desired.save(intent("desired-new", PipelineState.NEW));
         desired.save(intent("desired-completed", PipelineState.COMPLETED));
         desired.save(intent("completed-running-intent", PipelineState.RUNNING));
-        desired.corrupt("corrupt-intent");
         MemoryObservationStore observations = new MemoryObservationStore();
         observations.save(observation("artifact-stop", PipelineState.RUNNING));
         observations.save(observation("failed", PipelineState.FAILED));
@@ -85,7 +161,7 @@ class PipelineCatalogServiceTest {
         assertThat(items).extracting(PipelineCatalogItem::id).isSorted().doesNotContain("unrelated");
         assertThat(byId).containsOnlyKeys("artifact-stop", "failed", "resuming", "starting", "pausing", "running",
                 "paused", "desired-running", "desired-paused", "desired-stopped", "desired-failed",
-                "desired-new", "desired-completed", "completed-running-intent", "corrupt-intent", "new",
+                "desired-new", "desired-completed", "completed-running-intent", "new",
                 "draft-only");
         assertThat(byId.get("failed").name()).isEqualTo("failed");
         assertThat(byId.get("failed").description()).isEqualTo("draft description");
@@ -114,13 +190,53 @@ class PipelineCatalogServiceTest {
         assertThat(byId.get("desired-completed").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
         assertThat(byId.get("completed-running-intent").status().state())
                 .isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
-        assertThat(byId.get("corrupt-intent").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").hasArtifact()).isTrue();
-        assertThat(byId.get("new").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.NEW);
+        assertThat(byId.get("new").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.NOT_STARTED);
         assertThat(service.find("new")).contains(byId.get("new"));
         assertThat(service.list(0, 2)).extracting(PipelineCatalogItem::id)
                 .containsExactly("artifact-stop", "completed-running-intent");
+    }
+
+    @Test
+    void listDoesNotProjectAnUnreadableIntentAsNotStarted() {
+        List<Resource> resources = List.of(pipeline("corrupt-intent", null));
+        MemoryDesiredStore desired = new MemoryDesiredStore();
+        desired.corrupt("corrupt-intent");
+        ArtifactQueryService artifacts = new ArtifactQueryService(artifactStore(resources));
+        PipelineCatalogService service = new PipelineCatalogService(artifacts,
+                new PipelineDraftService(new MemoryDraftStore()), desired,
+                new PipelineObservationQueryService(artifacts, new MemoryObservationStore()));
+
+        PipelineCatalogItem item = service.list().getFirst();
+
+        assertThat(item.status().state()).isNull();
+        assertThat(item.status().displayState()).isNull();
+        assertThat(item.status().intentReadFailure()).isNotNull();
+        assertThat(item.status().intentReadFailure().code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+        assertThat(item.hasArtifact()).isTrue();
+    }
+
+    @Test
+    void findPreservesRuntimeFactsWhenIntentCannotBeRead() {
+        List<Resource> resources = List.of(pipeline("corrupt-intent", null));
+        MemoryDesiredStore desired = new MemoryDesiredStore();
+        desired.corrupt("corrupt-intent");
+        MemoryObservationStore observations = new MemoryObservationStore();
+        observations.save(observation("corrupt-intent", PipelineState.RUNNING,
+                Instant.parse("2026-01-01T00:00:00Z")));
+        ArtifactQueryService artifacts = new ArtifactQueryService(artifactStore(resources));
+        PipelineCatalogService service = new PipelineCatalogService(artifacts,
+                new PipelineDraftService(new MemoryDraftStore()), desired,
+                new PipelineObservationQueryService(artifacts, observations));
+
+        PipelineCatalogItem item = service.find("corrupt-intent").orElseThrow();
+
+        assertThat(item.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.RUNNING);
+        assertThat(item.status().desiredState()).isNull();
+        assertThat(item.status().observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(item.status().observedAt()).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(item.status().intentReadFailure().code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
     }
 
     private static Resource pipeline(String id, String description) {
@@ -141,7 +257,11 @@ class PipelineCatalogServiceTest {
     }
 
     private static Observation observation(String id, PipelineState state) {
-        return new Observation(id, state, Map.of(), Map.of(), Map.of());
+        return observation(id, state, null);
+    }
+
+    private static Observation observation(String id, PipelineState state, Instant observedAt) {
+        return new Observation(id, state, Map.of(), Map.of(), Map.of(), null, observedAt);
     }
 
     private static ArtifactStore artifactStore(List<Resource> resources) {

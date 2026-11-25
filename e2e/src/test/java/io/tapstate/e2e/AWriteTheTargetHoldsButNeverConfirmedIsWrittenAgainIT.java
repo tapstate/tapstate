@@ -75,8 +75,9 @@ class AWriteTheTargetHoldsButNeverConfirmedIsWrittenAgainIT {
 
         try (MongoEndpoints mongo = new MongoEndpoints(); FileEndpoints file = new FileEndpoints()) {
             mongo.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
-            String store = SharedMongo.replicaSetUrl("e2e_unconfirmed_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-unconfirmed")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
+                String store = storage.cacheUri();
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
@@ -144,8 +145,9 @@ class AWriteTheTargetHoldsButNeverConfirmedIsWrittenAgainIT {
                 // Nothing is asked of the product from here until the assertions below, bar the change made after.
                 mongo.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
                 long every = SEEDED_ROWS + 2 + 6 + 1;
-                Await.until("every change, the one made after the kill included, to be in the target", TAKEOVER,
-                        () -> file.countRows(targetAddress, TABLE) == every,
+                Await.until("every change to reach the target and the pipeline to be RUNNING", TAKEOVER,
+                        () -> file.countRows(targetAddress, TABLE) == every
+                                && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "rows at the target = " + file.countRows(targetAddress, TABLE) + " of " + every
                                 + "; the pipeline is " + survivor.state(PIPELINE));
                 assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);

@@ -3,6 +3,9 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateWindow;
 import io.tapstate.core.lifecycle.Observation;
@@ -14,7 +17,12 @@ import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -22,10 +30,12 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,6 +51,20 @@ import static org.assertj.core.api.Assertions.entry;
  * left unobserved rather than published as an empty doc.
  */
 class ObservationPublisherTest {
+
+    @Test
+    void keyInstrumentsAreAdditionalAndKeepTheLegacyFactsAndFlatValues() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = withWatch(NestColdLayerAlert.NONE,
+                id -> Map.of("nest.orders.doc.$root",
+                        new NestStateReading(8, 100, 400, 2_000).withKeyCounts(800, 400)));
+        wired.publish("orders");
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsEntry("nestStateAccesses.nest.orders.doc.$root", 100L)
+                .containsEntry("nestStateBackfills.nest.orders.doc.$root", 400L)
+                .containsEntry("nestStateKeyAccesses.nest.orders.doc.$root", 800L)
+                .containsEntry("nestStateColdKeys.nest.orders.doc.$root", 400L);
+    }
 
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
     private static final Instant OBSERVED_AT = Instant.parse("2026-07-01T12:34:56.789Z");
@@ -82,6 +106,64 @@ class ObservationPublisherTest {
         public void cleared(String pipelineId, String namespace, NestStateWindow window) {
             cleared.add(namespace);
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aPeriodicReadingLosesItsOriginalExecutionWhileCollecting(boolean batched) {
+        state.seed("orders", PipelineState.RUNNING);
+        var previous = publisher.publish("orders").orElseThrow();
+        var checkpoint = state.read("orders").orElseThrow();
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var current = new AtomicBoolean(true);
+        var collecting = withWatch(NestColdLayerAlert.NONE, id -> {
+            current.set(false);
+            return Map.of("nest.orders", new NestStateReading(8, 100, 400, 2_000));
+        });
+
+        var capture = new ObservationPublisher.CaptureSample(SnapshotReading.NONE, SnapshotReading.NONE, Map.of(), null);
+        var result = batched
+                ? collecting.publishRunning(scope, checkpoint, observations, capture, current::get)
+                : collecting.publishRunningScoped(scope, checkpoint, observations, current::get);
+        assertThat(result).isEmpty();
+        assertThat(current).isFalse();
+        assertThat(observations.read("orders").orElseThrow()).isSameAs(previous);
+    }
+
+    @Test
+    void aFailedPassRetainsTheOriginalFlatValuesWhenItsStoredLagFactsHaveOverflow() {
+        state.seed("orders", PipelineState.RUNNING);
+        Map<String, Long> times = new LinkedHashMap<>();
+        for (int i = 0; i < 1002; i++) {
+            times.put("table_" + i, T0.toEpochMilli());
+        }
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> Map.of(),
+                id -> new SnapshotReading(Map.of("landed", new TableSnapshot(1, 1L, 100, true)), T0),
+                id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(), new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> io.tapstate.core.lifecycle.CaptureReading.NONE,
+                id -> new io.tapstate.core.lifecycle.DeliveryReading(Map.of(), Map.of(), times, T0),
+                Clock.fixed(OBSERVED_AT, ZoneOffset.UTC));
+        var raw = wired.publish("orders").orElseThrow();
+        assertThat(observations.read("orders").orElseThrow().facts()).anySatisfy(fact ->
+                assertThat(fact.points()).anySatisfy(point ->
+                        assertThat(point.attributes()).containsEntry("otel.metric.overflow", "true")));
+
+        wired.publishReconcileFailure("orders", 2);
+
+        var saved = observations.read("orders").orElseThrow();
+        assertThat(saved.metrics()).containsAllEntriesOf(raw.metrics()).containsEntry("reconcileFailuresInARow", 2L);
+        assertThat(saved.snapshot()).isEqualTo(raw.snapshot());
+
+        state.seed("orders", PipelineState.COMPLETED);
+        observations.save(new Observation(saved.pipelineId(), PipelineState.COMPLETED, saved.metrics(),
+                saved.snapshot(), saved.positions(), saved.failure(), saved.observedAt(), saved.facts(), saved.initialLoad()));
+        var terminal = wired.publish("orders").orElseThrow();
+        assertThat(terminal.metrics()).isEqualTo(raw.metrics());
+        assertThat(terminal.facts()).filteredOn(fact -> fact.name().equals("tapstate.pipeline.lag"))
+                .singleElement().satisfies(fact -> assertThat(fact.points()).hasSize(1001));
+        assertThat(observations.read("orders").orElseThrow()).isEqualTo(terminal);
     }
 
     @Test
@@ -215,6 +297,72 @@ class ObservationPublisherTest {
                         entry("nestStateBackfills.nest.orders.doc.$root", 30L),
                         entry("nestStateBackfillMillis.nest.orders.doc.$root", 210L),
                         entry("nestStatePendingHighWater.nest.orders.doc.$root", 0L));
+    }
+
+    @Test void coherentKeyCountsAreAdditionalFactsAndKeepLegacyUnits() {
+        state.seed("orders", PipelineState.RUNNING);
+        var reading = new NestStateReading(4, 2, 3, 21, 0, OptionalLong.empty(),
+                new io.tapstate.core.lifecycle.NestKeyAccess(100, 50, 90, "member"));
+        var wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("ns", reading));
+        wired.publish("orders");
+        assertThat(observations.read("orders").orElseThrow().metrics()).contains(
+                entry("nestStateAccesses.ns", 2L), entry("nestStateBackfills.ns", 3L),
+                entry("nestStateReadKeys.ns", 100L), entry("nestStateWriteKeys.ns", 50L), entry("nestStateColdKeys.ns", 90L));
+    }
+
+    /**
+     * A namespace is named by a digest of its coordinates, which keeps it apart from every other and tells a
+     * reader nothing. Where the reporter knows which step, level and map it is, that is published once per
+     * namespace as an info reading beside the counts, so a reader can name it without the names riding on
+     * every count's series. The flat face is unchanged: it has no spelling for a mapping, and the counts
+     * keep the keys every reader was built against.
+     */
+    @Test
+    void publishCarriesWhereEachNestNamespaceComesFromBesideItsCounts() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("nest.ab12.run.cd34", new NestStateReading(4_000L, 900L, 30L, 210L, 0L,
+                        OptionalLong.empty(), new NestOrigin("order_doc", "[\"lines\"]", "state"))));
+
+        wired.publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        assertThat(published.facts())
+                .filteredOn(fact -> fact.name().equals("tapstate.pipeline.nest.namespace.info"))
+                .singleElement().satisfies(fact -> {
+                    assertThat(fact.type()).isEqualTo(MetricType.GAUGE);
+                    assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.value()).isEqualTo(1L);
+                        assertThat(point.attributes()).containsOnly(
+                                entry("tapstate.pipeline.id", "orders"),
+                                entry("tapstate.nest.namespace", "nest.ab12.run.cd34"),
+                                entry("tapstate.nest.step", "order_doc"),
+                                entry("tapstate.nest.path", "[\"lines\"]"),
+                                entry("tapstate.nest.map", "state"));
+                    });
+                });
+        assertThat(published.metrics()).containsOnlyKeys(
+                "nestStateEntries.nest.ab12.run.cd34",
+                "nestStateAccesses.nest.ab12.run.cd34",
+                "nestStateBackfills.nest.ab12.run.cd34",
+                "nestStateBackfillMillis.nest.ab12.run.cd34",
+                "nestStatePendingHighWater.nest.ab12.run.cd34");
+    }
+
+    @Test
+    void aNamespaceWhoseOriginTheReporterCannotSayHasNoInfoReading() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("nest.ab12.run.cd34", new NestStateReading(4_000L, 900L, 30L, 210L)));
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().facts()).extracting(MetricFact::name)
+                .doesNotContain("tapstate.pipeline.nest.namespace.info");
     }
 
     /**
@@ -382,7 +530,7 @@ class ObservationPublisherTest {
         RecordingAlert alert = new RecordingAlert();
         ObservationPublisher wired = withWatch(alert,
                 id -> Map.of("nest.orders.doc.$root",
-                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L))));
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L)).withKeyCounts(4_000L, 3_800L)));
 
         wired.publish("orders");
 
@@ -399,12 +547,12 @@ class ObservationPublisherTest {
         RecordingAlert alert = new RecordingAlert();
         Map<String, NestStateReading> readings = new HashMap<>();
         readings.put("nest.orders.doc.$root",
-                new NestStateReading(100L, 4_000L, 40L, 200L, OptionalLong.of(400_000L)));
+                new NestStateReading(100L, 4_000L, 40L, 200L, OptionalLong.of(400_000L)).withKeyCounts(4_000L, 40L));
         ObservationPublisher wired = withWatch(alert, id -> Map.copyOf(readings));
 
         wired.publish("orders");
         readings.put("nest.orders.doc.$root",
-                new NestStateReading(100L, 5_000L, 990L, 4_750L, OptionalLong.of(400_000L)));
+                new NestStateReading(100L, 5_000L, 990L, 4_750L, OptionalLong.of(400_000L)).withKeyCounts(5_000L, 990L));
         wired.publish("orders");
 
         // The totals read 20% served from storage and the interval between the passes read 95%. Judging the
@@ -433,7 +581,7 @@ class ObservationPublisherTest {
         };
         ObservationPublisher wired = withWatch(throwing,
                 id -> Map.of("nest.orders.doc.$root",
-                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L))));
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L)).withKeyCounts(4_000L, 3_800L)));
 
         assertThatThrownBy(() -> wired.publish("orders")).isInstanceOf(IllegalStateException.class);
 
@@ -467,6 +615,136 @@ class ObservationPublisherTest {
     }
 
     @Test
+    void anUnreadablePositionCannotHideAKnownFailureOrReplaceItsLastConfirmedFacts() {
+        var broken = new java.util.concurrent.atomic.AtomicBoolean();
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var cause = new ObservationFailure(IoError.DOCUMENT_UNREADABLE.code(),
+                Map.of("id", "original-checkpoint", "field", "progress"));
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.of(17),
+                id -> { if (broken.get()) throw unavailable; return Map.of("orders", "original-position"); },
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(1, 1L, 100, true)), T0));
+        state.seed("orders", PipelineState.RUNNING);
+        var previous = wired.publish("orders").orElseThrow();
+        state.seed("orders", PipelineState.FAILED); broken.set(true);
+        var failed = wired.publish("orders", cause).orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.failure()).isEqualTo(cause);
+        assertThat(failed.positions()).isEqualTo(previous.positions());
+        assertThat(failed.snapshot()).isEqualTo(previous.snapshot());
+        assertThat(failed.metrics()).containsOnly(entry("errors." + cause.code(), 1L));
+        var next = wired.publish("orders").orElseThrow();
+        assertThat(next.failure()).isEqualTo(cause);
+        assertThat(next.metrics()).isEqualTo(failed.metrics());
+        assertThat(next.positions()).isEqualTo(previous.positions());
+    }
+
+    @Test
+    void aFailedCheckpointWithoutAPreviousObservationNeedsNoInventedMeasurement() {
+        var unavailable = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", "orders"), null);
+        var cause = new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders"));
+        var wired = new ObservationPublisher(state, observations,
+                id -> { throw unavailable; }, id -> Map.of());
+        state.seed("orders", PipelineState.FAILED);
+        var failed = wired.publish("orders", cause).orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.failure()).isEqualTo(cause);
+        assertThat(failed.positions()).isEmpty(); assertThat(failed.snapshot()).isEmpty();
+        assertThat(failed.metrics()).containsOnly(entry("errors." + cause.code(), 1L));
+    }
+
+    @Test
+    void aRunningCheckpointCannotTurnAMeasurementRefusalIntoATerminalResult() {
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw unavailable; });
+        state.seed("orders", PipelineState.RUNNING);
+        assertThatThrownBy(() -> wired.publish("orders")).isSameAs(unavailable);
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
+    void aProgrammerDefectStillEscapesEvenWhenTheCheckpointIsFailed() {
+        var defect = new IllegalStateException("broken measurement invariant");
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw defect; });
+        state.seed("orders", PipelineState.FAILED);
+        assertThatThrownBy(() -> wired.publish("orders")).isSameAs(defect);
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
+    void aTerminalDiagnosticCannotBypassItsScopedObservationWriteFence() {
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw unavailable; });
+        var scoped = new ObservationStore() {
+            @Override public void save(Observation value) { throw fenced; }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { throw new UnsupportedOperationException(); }
+        };
+        state.seed("orders", PipelineState.FAILED);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        assertThatThrownBy(() -> wired.publishScoped(scope, state, scoped,
+                new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders")))).isSameAs(fenced);
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
+    void anIncompleteMeasurementDoesNotAdvanceEitherAlertWatch() {
+        var broken = new java.util.concurrent.atomic.AtomicBoolean();
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var alert = new RecordingAlert();
+        var cold = new NestColdLayerWatch(new NestColdLayerPressure(0.5, 100), alert);
+        var frontierEdges = new ArrayList<String>();
+        var frontier = new FrontierStallWatch(FrontierStallPressure.EXPLAIN, new FrontierStallAlert() {
+            @Override public void crossed(String id, io.tapstate.core.lifecycle.FrontierStall stall) {
+                frontierEdges.add("crossed:" + stall.chain());
+            }
+            @Override public void cleared(String id, io.tapstate.core.lifecycle.FrontierStall stall) {
+                frontierEdges.add("cleared:" + stall.chain());
+            }
+        });
+        var wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> { if (broken.get()) throw unavailable; return Map.of(); },
+                id -> SnapshotReading.NONE, id -> Map.of("chain", 4L),
+                id -> Map.of(broken.get() ? "unpublished" : "original",
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.empty())
+                                .withKeyCounts(4_000L, 3_800L)),
+                cold, id -> Map.of(broken.get() ? "unpublished" : "original", 96_000L), frontier,
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), Clock.fixed(OBSERVED_AT, ZoneOffset.UTC));
+        state.seed("orders", PipelineState.RUNNING);
+        wired.publish("orders");
+        assertThat(alert.crossed).containsExactly("original");
+        assertThat(frontierEdges).containsExactly("crossed:original");
+        state.seed("orders", PipelineState.FAILED); broken.set(true);
+        wired.publish("orders", new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders")));
+        assertThat(cold.watching()).containsExactly("orders/original");
+        assertThat(frontier.watching()).containsExactly("orders/original");
+        assertThat(alert.crossed).containsExactly("original");
+        assertThat(alert.cleared).isEmpty();
+        assertThat(frontierEdges).containsExactly("crossed:original");
+    }
+
+    @Test
+    void aFailedDiagnosticRetainsOnlyTheOriginalScopedObservation() {
+        var scoped = new RecordingObservationStore();
+        state.seed("orders", PipelineState.RUNNING);
+        new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> Map.of("orders", "global"))
+                .publish("orders");
+        new ObservationPublisher(state, scoped, id -> OptionalLong.empty(), id -> Map.of("orders", "scoped"))
+                .publish("orders");
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw unavailable; });
+        state.seed("orders", PipelineState.FAILED);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var failed = wired.publishScoped(scope, state, scoped,
+                new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders"))).orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.positions()).containsOnly(entry("orders", "scoped"));
+        assertThat(scoped.read("orders")).contains(failed);
+        assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(observations.read("orders").orElseThrow().positions()).containsOnly(entry("orders", "global"));
+    }
+
+    @Test
     void aFailedStateOnItsOwnPublishesNoFailureMetric() {
         state.seed("orders", PipelineState.FAILED);
 
@@ -485,9 +763,9 @@ class ObservationPublisherTest {
     @Test
     void aRecoveredPipelineKeepsTheFailuresItAlreadyHad() {
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of()));
+        publisher.publish("orders", new ObservationFailure("TS0440008", Map.of()));
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
 
         // Recovery goes through STOPPED (stop -> start). The other inversion: the number used to drop back
         // to zero here, because it tracked the state. A counter that went down on recovery is one every
@@ -497,7 +775,7 @@ class ObservationPublisherTest {
         publisher.publish("orders");
 
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
     }
 
     @Test
@@ -526,17 +804,37 @@ class ObservationPublisherTest {
     }
 
     @Test
+    void completedObservationRetainsItsFinalConfirmedLoadAfterCaptureIsReleased() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher running = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(),
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(3, 3L, 100, true)), T0));
+        Observation last = running.publish("orders").orElseThrow();
+        state.seed("orders", PipelineState.COMPLETED);
+
+        Observation completed = publisher.publish("orders").orElseThrow();
+        assertThat(completed.snapshot()).isEqualTo(last.snapshot());
+        assertThat(completed.facts()).isEqualTo(last.facts());
+        assertThat(completed.state()).isEqualTo(PipelineState.COMPLETED);
+        assertThat(new ObservationPublisher(state, observations).publish("orders").orElseThrow().snapshot())
+                .isEqualTo(last.snapshot());
+
+        state.seed("orders", PipelineState.STOPPED);
+        assertThat(publisher.publish("orders").orElseThrow().snapshot()).isEmpty();
+    }
+
+    @Test
     void publishCarriesTheCodedFailureOfAJobThatDied() {
         state.seed("orders", PipelineState.FAILED);
 
         publisher.publish("orders", new ObservationFailure(
-                "engine.job-failed", Map.of("pipeline", "orders", "cause", "the sink rejected the batch")));
+                "TS0440008", Map.of("pipeline", "orders", "cause", "the sink rejected the batch")));
 
         Observation published = observations.read("orders").orElseThrow();
         // A dead job is observable as a state and a count, but neither says why. The failure carries the
         // canonical code and its named arguments, so the read face can answer that from the store alone.
         assertThat(published.failure()).isNotNull();
-        assertThat(published.failure().code()).isEqualTo("engine.job-failed");
+        assertThat(published.failure().code()).isEqualTo("TS0440008");
         assertThat(published.failure().params())
                 .containsOnly(entry("pipeline", "orders"), entry("cause", "the sink rejected the batch"));
     }
@@ -558,20 +856,20 @@ class ObservationPublisherTest {
         // still-FAILED pipeline keeps the reason it already published rather than going reasonless the
         // moment its publisher loses whatever in-memory copy it held.
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of("cause", "boom")));
+        publisher.publish("orders", new ObservationFailure("TS0440008", Map.of("cause", "boom")));
 
         publisher.publish("orders", null);
 
         ObservationFailure kept = observations.read("orders").orElseThrow().failure();
         assertThat(kept).isNotNull();
-        assertThat(kept.code()).isEqualTo("engine.job-failed");
+        assertThat(kept.code()).isEqualTo("TS0440008");
         assertThat(kept.params()).containsOnly(entry("cause", "boom"));
     }
 
     @Test
     void republishClearsTheFailureWhenThePipelineRecovers() {
         state.seed("orders", PipelineState.FAILED);
-        publisher.publish("orders", new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders")));
+        publisher.publish("orders", new ObservationFailure("TS0440008", Map.of("pipeline", "orders")));
         assertThat(observations.read("orders").orElseThrow().failure()).isNotNull();
 
         state.seed("orders", PipelineState.RUNNING);
@@ -630,7 +928,7 @@ class ObservationPublisherTest {
         // A pass that could not run witnessed no transition in the failure reason or the source positions,
         // any more than it witnessed one in the state: a dead pipeline whose reconcile then starts throwing
         // must keep saying why it died and where each table's read had gotten to, not go blank on both.
-        ObservationFailure priorFailure = new ObservationFailure("engine.job-failed", Map.of("cause", "boom"));
+        ObservationFailure priorFailure = new ObservationFailure("TS0440008", Map.of("cause", "boom"));
         Map<String, String> priorPositions = Map.of("orders", "binlog.000123:456");
         observations.save(new Observation(
                 "orders", PipelineState.FAILED, Map.of("reconcileFailuresInARow", 1L), Map.of(),

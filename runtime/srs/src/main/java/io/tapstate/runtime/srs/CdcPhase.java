@@ -148,6 +148,13 @@ public final class CdcPhase {
             CaptureStart start,
             Map<String, TableRoute> routes,
             CaptureHealth health) {
+        return run(port, config, start, routes, health, CaptureObservation.none());
+    }
+
+    /** Installs an optional observer on this physical opening without changing the source port. */
+    public static Subscription run(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start");
@@ -157,8 +164,9 @@ public final class CdcPhase {
         // The last position actually persisted, for the life of this subscription. It is what lets a run
         // that resolves the same frontier as the one before it write nothing: see writeBatch.
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)));
+        return observation.start(health.recording(
+                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)),
+                listener -> port.cdc(config, start, listener));
     }
 
     /**
@@ -190,11 +198,18 @@ public final class CdcPhase {
      */
     public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
             Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder) {
+        return runDurable(port, config, start, routes, health, batchOrder, CaptureObservation.none());
+    }
+
+    /** The observer sits outside health recording, so source errors reach both components. */
+    public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder, CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Map<String, TableRoute> selected = Map.copyOf(routes);
         List<String> servedTables = List.copyOf(selected.keySet());
         CdcChain physical = selected.values().iterator().next().chain();
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(new CaptureStartedListener() {
+        return observation.start(health.recording(new CaptureStartedListener() {
             @Override
             public void onStart(SourcePosition position) {
                 if (physical.meta().read(physical.miningChainId()).orElseThrow().sourceRead() == null) {
@@ -212,7 +227,7 @@ public final class CdcPhase {
                                 new SourceOrder(physical.epoch(), batchOrder.incrementAndGet()), token.token()),
                         servedTables));
             }
-        }));
+        }), listener -> port.cdc(config, start, listener));
     }
 
     /**
@@ -335,8 +350,17 @@ public final class CdcPhase {
      * connector hands over is the connector's to decide.
      */
     private static Admitted admit(TableRoute route, String table, List<SrsItem> items, boolean durable) {
-        SrsWriteGate gate = route.chain().gate();
-        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table), Integer.MAX_VALUE);
+        return admit(route.chain().gate(), route.consumers(), table, items, durable, () -> {});
+    }
+
+    /** Uses the same bounded ring admission path for a native durable capture without legacy metadata. */
+    static long admitDurable(SrsWriteGate gate, String table, List<SrsItem> items, Runnable requireActive) {
+        return admit(gate, List::of, table, items, true, requireActive).lastSeq();
+    }
+
+    private static Admitted admit(SrsWriteGate gate, Supplier<Collection<ConsumerOffset>> consumers,
+                                   String table, List<SrsItem> items, boolean durable, Runnable requireActive) {
+        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table, requireActive), Integer.MAX_VALUE);
         long lastSeq = -1;
         Collection<ConsumerOffset> offsets = List.of();
         for (int from = 0; from < items.size(); from += capacity) {
@@ -346,11 +370,15 @@ public final class CdcPhase {
                 // Re-read on every attempt, not once for the run: this is the only thing that can tell a
                 // parked write that a consumer has moved, so a bound hoisted out of the loop would park
                 // for ever waiting for room it could no longer see being freed.
-                offsets = route.consumers().get();
+                requireActive.run();
+                offsets = consumers.get();
                 OptionalLong appended;
                 try {
+                    requireActive.run();
                     appended = gate.appendAll(piece, durable ? Long.MAX_VALUE : headroomBound(offsets, table));
+                    requireActive.run();
                 } catch (RingWriteRefusedException refused) {
+                    requireActive.run();
                     // The cluster refused, not the headroom: nothing was written, and what refused clears
                     // itself as the members' verdicts converge. Waiting here is what pauses the source
                     // read, which is the same answer a full ring already gets.
@@ -377,11 +405,14 @@ public final class CdcPhase {
      * capture on precisely the refusal the wait exists to absorb -- and would do so before a single change
      * had been offered, which is the moment just after a cluster forms.
      */
-    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table) {
+    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table, Runnable requireActive) {
         OptionalLong refusedUntil = OptionalLong.empty();
         while (true) {
+            requireActive.run();
             try {
-                return gate.capacity();
+                long capacity = gate.capacity();
+                requireActive.run();
+                return capacity;
             } catch (RingWriteRefusedException refused) {
                 refusedUntil = OptionalLong.of(waitOutTheRefusal(refused, refusedUntil, table));
             }

@@ -7,7 +7,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
-/** Reads the selected mode's already-verified user, without acquiring another credential or profile. */
+/** Projects the selected mode's authenticated user and optional session email. */
 public final class CurrentUserQueryService {
     private final AuthenticationMode mode;
 
@@ -16,6 +16,10 @@ public final class CurrentUserQueryService {
     }
 
     public CurrentUserView get(TapstatePrincipal principal) {
+        return get(principal, null);
+    }
+
+    public CurrentUserView get(TapstatePrincipal principal, String cloudEmail) {
         Objects.requireNonNull(principal, "principal");
         CredentialType expected = mode == AuthenticationMode.CLOUD
                 ? CredentialType.CLOUD_SESSION : CredentialType.HUMAN_JWT;
@@ -24,7 +28,12 @@ public final class CurrentUserQueryService {
         }
         var scopes = Arrays.stream(Scope.values()).filter(principal::permits)
                 .map(scope -> scope.name().toLowerCase(Locale.ROOT)).toList();
+        String username = mode == AuthenticationMode.ON_PREM ? principal.subject() : null;
+        String email = cloudEmail;
+        if (mode == AuthenticationMode.ON_PREM) {
+            email = username.matches("[^@\\s]+@[^@\\s]+") ? username : null;
+        }
         return new CurrentUserView(mode == AuthenticationMode.CLOUD ? "cloud" : "on-prem",
-                principal.subject(), scopes);
+                principal.subject(), scopes, username, email);
     }
 }

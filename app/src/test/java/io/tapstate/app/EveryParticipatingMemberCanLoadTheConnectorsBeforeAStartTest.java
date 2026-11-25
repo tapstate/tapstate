@@ -115,7 +115,7 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
         assertThat(refused.args()).containsEntry("pipeline", pipe).containsEntry("member", "m2")
                 .containsEntry("connector", "pg");
         assertThat((String) refused.args().get("reason"))
-                .isEqualTo("connector.load-failed {connector=pg}");
+                .isEqualTo("TS0060009 {connector=pg}");
         started.nothingWasStarted();
     }
 
@@ -132,7 +132,7 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
 
         assertThat(refused.code()).isEqualTo(ActuationError.CONNECTOR_UNAVAILABLE_ON_MEMBER);
         assertThat(refused.args()).containsEntry("member", "m3")
-                .containsEntry("reason", "connector.load-failed {connector=pg}");
+                .containsEntry("reason", "TS0060009 {connector=pg}");
         started.nothingWasStarted();
     }
 
@@ -348,6 +348,10 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
 
                 @Override
                 public void forget(String pipelineId) {
+                }
+
+                @Override
+                public void forget(ExecutionPlan expected) {
                 }
             };
             return new EngineLifecycleActuator(new Engine(m1), source, capture,

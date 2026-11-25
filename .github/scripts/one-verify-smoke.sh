@@ -71,6 +71,26 @@ for wrapped in ["bash -c 'mvn -B verify'", 'timeout 30m mvn verify', 'nice -n 5 
                 'stdbuf -o0 mvn verify', 'env -i mvn verify']:
     cases.append(('one wrapped call: '+wrapped, {'one.yml': workflow(wrapped)}, True, ['found 1']))
 cases.append(('quoted shell diagnostic', {'one.yml': workflow("bash -c 'echo mvn verify'\nmvn verify")}, True, ['found 1']))
+observer='.github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/observation" --output "$RUNNER_TEMP/observation/summary.json" --shard-id build -- '
+cases.extend([
+    ('observed skipped install', {'one.yml':workflow(observer+'mvn -B -DskipTests install\nmvn verify')}, True, ['found 1']),
+    ('observed full suite', {'one.yml':workflow(observer+'mvn -B verify')}, True, ['found 1']),
+    ('observed duplicate suite', {'one.yml':workflow(observer+'mvn -B verify\nmvn verify')}, False, ['found 2']),
+    ('observed suite under shell', {'one.yml':workflow('bash '+observer+'mvn verify\nmvn verify')}, False, ['found 2']),
+    ('observer missing separator', {'one.yml':workflow(observer.replace(' -- ', ' ')+'mvn verify')}, False, ['unsupported']),
+    ('observer missing scope', {'one.yml':workflow(observer.replace(' --shard-id build', '')+'mvn verify')}, False, ['incomplete']),
+    ('observer unknown option', {'one.yml':workflow(observer.replace(' -- ', ' --other hidden -- ')+'mvn verify')}, False, ['unsupported']),
+])
+supervisor='.github/scripts/ci-pr-work.sh --root . --event-inputs event.json --output work.json --phase verify -- '
+cases.extend([
+    ('supervised skipped prepare', {'one.yml':workflow(supervisor+observer+'mvn -B -DskipTests install\nmvn verify')}, True, ['found 1']),
+    ('supervised shard suite', {'one.yml':workflow(supervisor+'.github/scripts/ci-shard.sh run --plan plan.json --shard rest')}, True, ['found 1']),
+    ('supervised duplicate suite', {'one.yml':workflow(supervisor+'mvn verify\nmvn verify')}, False, ['found 2']),
+    ('supervisor missing separator', {'one.yml':workflow(supervisor.replace(' -- ', ' ')+'mvn verify')}, False, ['unsupported']),
+    ('supervisor missing source', {'one.yml':workflow(supervisor.replace(' --event-inputs event.json', '')+'mvn verify')}, False, ['incomplete']),
+    ('supervisor unknown option', {'one.yml':workflow(supervisor.replace(' -- ', ' --other hidden -- ')+'mvn verify')}, False, ['unsupported']),
+    ('supervisor duplicate option', {'one.yml':workflow(supervisor.replace(' -- ', ' --phase verify -- ')+'mvn verify')}, False, ['unsupported']),
+])
 # Prove that the wrapper fixture executes a second suite using a harmless recorder.
 # This is an independent shell observation, not a prediction from the gate parser.
 with tempfile.TemporaryDirectory() as temporary:

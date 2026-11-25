@@ -1,22 +1,32 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.LongSupplier;
 import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.context.event.EventListener;
@@ -50,8 +60,10 @@ import org.springframework.context.event.EventListener;
  * run independent.
  */
 final class PipelineActuationOwnership {
+    private static final long RENEW_RETRY_NANOS = TimeUnit.SECONDS.toNanos(1);
+    private static final System.Logger LOG=System.getLogger(PipelineActuationOwnership.class.getName());
 
-    /** Whether this member may drive the pipeline, and the claim that says so ({@code null} on a single node). */
+    /** Whether this member may drive the pipeline, and the claim that says so ({@code null} only in an explicit fixture). */
     record Permit(boolean granted, WorkloadClaim claim) {
 
         static Permit unfenced() {
@@ -64,21 +76,241 @@ final class PipelineActuationOwnership {
     }
 
     private final String clusterId;
+    private final CacheBusinessScope businessScope;
     private final WorkloadOwner owner;
+    private final WorkloadClaimFence nodeSession;
     private final ClusterMembershipGate membership;
     private final ClusterWorkloadClaims claims;
     private final Duration ttl;
     private final long renewIntervalNanos;
     private final LongSupplier nanoTime;
     private final boolean fenced;
-    private final Map<String, Held> held = new HashMap<>();
+    private final Map<String, Held> held = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Control> controls = new HashMap<>();
+    private final Map<String, ScopedAcquisition> acquisitions = new HashMap<>();
+    private final Map<String, PendingRelease> pendingReleases = new HashMap<>();
+    private static final class PendingRelease {
+        private final PipelineIntentScope scope;
+        private final WorkloadClaim claim;
+        private boolean inFlight;
+        private PendingRelease(PipelineIntentScope scope, WorkloadClaim claim) { this.scope = scope; this.claim = claim; }
+    }
+    private record ScopedAcquisition(Held previous, Held candidate, WorkloadClaim original) {}
+    /** Local scheduling order only; neither a lease deadline nor an authority token. */
+    private long leaseProofSequence;
+
+    /** A synchronous control command pins the existing holder; it creates no second durable lease. */
+    final class Control implements AutoCloseable {
+        private final PipelineIntentScope scope;
+        private final WorkloadClaimFence claim;
+        private boolean tenureEnded;
+        private Control(PipelineIntentScope scope, WorkloadClaimFence claim) { this.scope = scope; this.claim = claim; }
+        WorkloadClaimFence claim() { return claim; }
+        void requireHeld() {
+            synchronized (PipelineActuationOwnership.this) {
+                if (closing || controls.get(scope.pipelineId()) != this || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
+            }
+        }
+        void requireActive() {
+            synchronized (PipelineActuationOwnership.this) {
+                if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
+            }
+            if (claim == null ? closing || !membership.businessEligible() : !proveClaim(scope, claim)) throw ThreeLayerStorePort.refused();
+            synchronized (PipelineActuationOwnership.this) {
+                if (controls.get(scope.pipelineId()) != this) throw ThreeLayerStorePort.refused();
+            }
+        }
+        void released() {
+            synchronized (PipelineActuationOwnership.this) {
+                requireHeld(); var old = held.get(scope.pipelineId());
+                if (old != null && old.scope.equals(scope) && (old.claim == null || WorkloadClaimFence.from(old.claim).equals(claim))) held.remove(scope.pipelineId());
+            }
+        }
+        /** Ends this exact durable tenure while retaining the local exclusion against new passes. */
+        void endTenure() {
+            admittedCall(()->{endTenureOwned();return null;},()->{throw ThreeLayerStorePort.refused();});
+        }
+        private void endTenureOwned() {
+            synchronized (PipelineActuationOwnership.this) {
+                requireHeld();
+                if(!fenced || businessScope==null || claim==null || !accepts(scope))throw ThreeLayerStorePort.refused();
+                if(tenureEnded)return;
+                if(!owner.equals(claim.owner()))throw ThreeLayerStorePort.refused();
+                var local=held.get(scope.pipelineId());
+                if(local!=null && (!scope.equals(local.scope) || local.claim!=null && !claim.equals(WorkloadClaimFence.from(local.claim))))
+                    throw ThreeLayerStorePort.refused();
+                var before=claims.readPipeline(scope).orElseThrow(ThreeLayerStorePort::refused);
+                if(!claim.equals(WorkloadClaimFence.from(before.claim())))throw ThreeLayerStorePort.refused();
+                if(before.leased() && !claims.release(before.claim()))throw ThreeLayerStorePort.refused();
+                var after=claims.readPipeline(scope).orElseThrow(ThreeLayerStorePort::refused);
+                if(after.leased() || !claim.equals(WorkloadClaimFence.from(after.claim())))throw ThreeLayerStorePort.refused();
+                if(local!=null)held.remove(scope.pipelineId(),local);
+                tenureEnded=true;
+            }
+        }
+        @Override public void close() {
+            synchronized (PipelineActuationOwnership.this) { controls.remove(scope.pipelineId(), this); }
+        }
+    }
+    private final Map<String, Pass> passes = new HashMap<>();
+    private final Set<String> waitingControls = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    final class Pass implements AutoCloseable {
+        private final String pipeline;
+        private final Thread thread = Thread.currentThread();
+        private Pass(String pipeline) { this.pipeline = pipeline; }
+        @Override public void close() {
+            synchronized (PipelineActuationOwnership.this) {
+                passes.remove(pipeline, this);
+                PipelineActuationOwnership.this.notifyAll();
+            }
+        }
+    }
+    synchronized Pass enterPass(PipelineIntentScope scope) {
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
+                || advancing(scope.pipelineId())
+                || waitingControls.contains(scope.pipelineId())) throw ThreeLayerStorePort.refused();
+        var pass = new Pass(scope.pipelineId()); passes.put(scope.pipelineId(), pass); return pass;
+    }
+    Control control(PipelineIntentScope scope) {return admittedCall(()->controlOwned(scope),()->{throw ThreeLayerStorePort.refused();});}
+    private synchronized Control controlOwned(PipelineIntentScope scope) {
+        if (passes.containsKey(scope.pipelineId())) throw ThreeLayerStorePort.refused();
+        var admitted = admittedPermit(scope);
+        if (!admitted.granted() || admitted.claim() == null) throw ThreeLayerStorePort.refused();
+        var command = new Control(scope, WorkloadClaimFence.from(admitted.claim()));
+        controls.put(scope.pipelineId(), command); return command;
+    }
+    /** Waits only for a local pass; the original durable admission is attempted once after it returns. */
+    Control controlAfterPass(PipelineIntentScope scope, boolean unprepared, Duration timeout) {
+        long budget = Objects.requireNonNull(timeout, "timeout").toNanos();
+        if (budget < 0) throw new IllegalArgumentException("the local pass wait must not be negative");
+        String pipeline = scope.pipelineId();
+        if(!admission.enter())throw ThreeLayerStorePort.refused();
+        boolean reserved=false;
+        try {
+            admittedCall(()->{synchronized(this){
+                if(closing || !accepts(scope) || controls.containsKey(pipeline) || !membership.businessEligible()
+                        || !waitingControls.add(pipeline))throw ThreeLayerStorePort.refused();
+                return true;
+            }},()->{throw ThreeLayerStorePort.refused();});
+            reserved=true;long started=System.nanoTime();
+            for(;;) {
+                var result=admittedCall(()->{synchronized(this){
+                    if(closing || !accepts(scope) || !membership.businessEligible())throw ThreeLayerStorePort.refused();
+                    var pass=passes.get(pipeline);
+                    if(pass!=null) {
+                        if(pass.thread==Thread.currentThread() || budget-(System.nanoTime()-started)<=0)
+                            throw ThreeLayerStorePort.refused();
+                        return null;
+                    }
+                    return unprepared?unpreparedControl(scope):control(scope);
+                }},()->{throw ThreeLayerStorePort.refused();});
+                if(result!=null)return result;
+                long remaining=Math.min(admission.remainingNanos(),budget-(System.nanoTime()-started));
+                if(remaining<=0 || Thread.currentThread().isInterrupted())throw ThreeLayerStorePort.refused();
+                java.util.concurrent.locks.LockSupport.parkNanos(Math.min(remaining,java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(25)));
+                }
+        } finally {
+            if(reserved)waitingControls.remove(pipeline);
+            admission.leave();
+        }
+    }
+    /** Holds a proven ended tuple locally without acquiring another durable tenure or execution permission. */
+    Control retiredControl(PipelineIntentScope scope,WorkloadClaimFence original) {
+        return admittedCall(()->retiredControlOwned(scope,original),()->{throw ThreeLayerStorePort.refused();});
+    }
+    private synchronized Control retiredControlOwned(PipelineIntentScope scope,WorkloadClaimFence original) {
+        requireFreeControl(scope,original);
+        var local=held.get(scope.pipelineId());
+        if(local!=null && (!scope.equals(local.scope) || local.claim!=null && !original.equals(WorkloadClaimFence.from(local.claim))))
+            throw ThreeLayerStorePort.refused();
+        var observed=claims.readPipeline(scope).orElseThrow(ThreeLayerStorePort::refused);
+        if(observed.leased() || !original.equals(WorkloadClaimFence.from(observed.claim())) || !membership.businessEligible())
+            throw ThreeLayerStorePort.refused();
+        var command=new Control(scope,original);command.tenureEnded=true;
+        if(local!=null)held.remove(scope.pipelineId(),local);
+        controls.put(scope.pipelineId(),command);return command;
+    }
+    /** Blocks local acquisition and execution without adopting the transported tuple as a lease. */
+    synchronized Control freezeControl(PipelineIntentScope scope,WorkloadClaimFence original) {
+        requireFreeControl(scope,original);
+        var command=new Control(scope,original);controls.put(scope.pipelineId(),command);return command;
+    }
+    private void requireFreeControl(PipelineIntentScope scope,WorkloadClaimFence original) {
+        String reason;
+        if(closing)reason="closing";
+        else if(!fenced)reason="unfenced";
+        else if(!accepts(scope))reason="scope-mismatch";
+        else if(original==null)reason="missing-original-claim";
+        else if(!membership.businessEligible())reason="membership-ineligible";
+        else if(controls.containsKey(scope.pipelineId()))reason="control-busy";
+        else if(acquisitions.containsKey(scope.pipelineId()))reason="acquisition-in-flight";
+        else if(advancing(scope.pipelineId()))reason="execution-advancing";
+        else if(pendingReleases.containsKey(scope.pipelineId()))reason="claim-release-pending";
+        else if(passes.containsKey(scope.pipelineId()))reason="pass-active";
+        else if(original.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION)reason="claim-kind";
+        else if(!scope.clusterId().equals(original.key().clusterId()))reason="claim-cluster";
+        else if(!scope.pipelineId().equals(original.key().resourceId()))reason="claim-resource";
+        else return;
+        LOG.log(System.Logger.Level.DEBUG,"Native control admission for {0} refused: {1}",scope==null?"<missing>":scope.pipelineId(),reason);
+        throw ThreeLayerStorePort.refused();
+    }
+    synchronized Control unpreparedControl(PipelineIntentScope scope) {
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || acquisitions.containsKey(scope.pipelineId())
+                || pendingReleases.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
+                || advancing(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
+        var command = new Control(scope, null); controls.put(scope.pipelineId(), command); return command;
+    }
     private volatile boolean closing;
+    private final AdmissionDrain admission = new AdmissionDrain();
+    private final java.util.concurrent.locks.ReentrantLock ioAdmission = new java.util.concurrent.locks.ReentrantLock(true);
+
+    private <T>T admittedCall(java.util.function.Supplier<T> action,java.util.function.Supplier<T> refused) {
+        if(!admission.enter())return refused.get();
+        boolean locked=false;
+        try {
+            long remaining=admission.remainingNanos();
+            if(remaining<=0)return refused.get();
+            try {locked=ioAdmission.tryLock(remaining,java.util.concurrent.TimeUnit.NANOSECONDS);}
+            catch(InterruptedException interrupted){Thread.currentThread().interrupt();return refused.get();}
+            if(!locked || !admission.current())return refused.get();
+            return action.get();
+        }finally {if(locked)ioAdmission.unlock();admission.leave();}
+    }
+
+    private record ScopedLease(WorkloadClaim expected, long deadline, long due, int retries,
+                               boolean inFlight, boolean confirm, RenewalOutcome loss) {
+        boolean lost() { return loss != null; }
+        boolean retry() { return retries > 0; }
+
+        ScopedLease inFlightCopy() {
+            return new ScopedLease(expected, deadline, due, retries, true, confirm, null);
+        }
+    }
 
     /** One pipeline's local view: the claim this member proved, and when the next round trip is due. */
     private static final class Held {
-        private WorkloadClaim claim;
+        private final PipelineIntentScope scope;
+        /** Highest candidate already probed; lower retries share its bounded contact interval. */
+        private PipelineIntentScope probedScope;
+        private long nextScopeProbeNanos;
+        // Claims and renewal failures carry immutable snapshots across the ownership and renewal paths.
+        @SuppressWarnings("java:S3077")
+        private volatile WorkloadClaim claim;
+        private volatile boolean executionAdvancing;
+        // The renewer never needs the ownership monitor or ordinary IO admission to read or publish this proof.
+        private final java.util.concurrent.atomic.AtomicReference<ScopedLease> scopedLease =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        @SuppressWarnings("java:S3077")
+        private volatile RenewalFailure renewalFailure;
+        private long leaseDeadlineNanos;
+
+        private Held(PipelineIntentScope scope) {
+            this.scope = scope;
+        }
         private long nextContactNanos;
         private boolean contacted;
+        /** Successful acquire/renew replies are serialized by the ownership IO gate. */
+        private long leaseProofOrder;
         /**
          * The members the run this member last submitted was planned over -- the ones in sight when it
          * was submitted -- or null while it has submitted none. Kept apart from the claim, whose own
@@ -122,6 +354,7 @@ final class PipelineActuationOwnership {
 
     private PipelineActuationOwnership() {
         this.clusterId = "single";
+        this.businessScope = null;
         this.owner = null;
         this.membership = null;
         this.claims = null;
@@ -129,9 +362,10 @@ final class PipelineActuationOwnership {
         this.renewIntervalNanos = 0;
         this.nanoTime = System::nanoTime;
         this.fenced = false;
+        this.nodeSession = null;
     }
 
-    /** A single-node run has one member, so nothing is fenced and every pipeline is this member's to drive. */
+    /** An explicit fixture owner for a port with no coordinated store. */
     static PipelineActuationOwnership single() {
         return new PipelineActuationOwnership();
     }
@@ -154,10 +388,33 @@ final class PipelineActuationOwnership {
             Duration ttl,
             Duration renewInterval,
             LongSupplier nanoTime) {
+        this(clusterId, null, owner, membership, claims, ttl, renewInterval, nanoTime, null);
+    }
+
+    static PipelineActuationOwnership scoped(CacheBusinessScope scope, WorkloadOwner owner,
+            ClusterMembershipGate membership, ClusterWorkloadClaims claims, Duration ttl,
+            Duration renewInterval, LongSupplier nanoTime) {
+        Objects.requireNonNull(scope, "scope");
+        return new PipelineActuationOwnership(scope.clusterId(), scope, owner, membership, claims,
+                ttl, renewInterval, nanoTime, null);
+    }
+
+    static PipelineActuationOwnership nodeBacked(CacheBusinessScope scope, WorkloadClaimFence node,
+            ClusterMembershipGate membership, ClusterWorkloadClaims claims, Duration ttl,
+            Duration renewInterval, LongSupplier nanoTime) {
+        return new PipelineActuationOwnership(scope.clusterId(), scope, node.owner(), membership, claims,
+                ttl, renewInterval, nanoTime, node);
+    }
+
+    private PipelineActuationOwnership(String clusterId, CacheBusinessScope businessScope,
+            WorkloadOwner owner, ClusterMembershipGate membership, ClusterWorkloadClaims claims,
+            Duration ttl, Duration renewInterval, LongSupplier nanoTime, WorkloadClaimFence nodeSession) {
+        this.businessScope = businessScope;
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.owner = Objects.requireNonNull(owner, "owner");
+        this.nodeSession = nodeSession;
         this.membership = Objects.requireNonNull(membership, "membership");
-        this.claims = Objects.requireNonNull(claims, "claims");
+        this.claims = Objects.requireNonNull(claims, "claims").draining(admission);
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         Objects.requireNonNull(renewInterval, "renewInterval");
@@ -169,20 +426,207 @@ final class PipelineActuationOwnership {
     }
 
     /** Answers whether this member drives {@code pipelineId} right now, renewing or acquiring when due. */
-    synchronized Permit permit(String pipelineId) {
+    Permit permit(String pipelineId) {
+        return admittedCall(()->{synchronized(this){return admittedPermit(pipelineId);}},Permit::denied);
+    }
+    private Permit admittedPermit(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (closing) {
+        if (closing || businessScope != null) return Permit.denied();
+        if (!fenced) return Permit.unfenced();
+        Held state = held.computeIfAbsent(pipelineId, id -> new Held(null));
+        return permit(pipelineId, state);
+    }
+
+    /** A new physical scope must be admitted by the store before it can replace the local holder. */
+    Permit permit(PipelineIntentScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        if (!admission.enter()) return Permit.denied();
+        ScopedAcquisition acquisition = null;
+        try {
+            Held state;
+            synchronized (this) {
+                if (closing || !admission.current() || !accepts(scope)
+                        || controls.containsKey(scope.pipelineId()) || acquisitions.containsKey(scope.pipelineId())
+                        || pendingReleases.containsKey(scope.pipelineId()) || advancing(scope.pipelineId())) {
+                    return Permit.denied();
+                }
+                state = held.get(scope.pipelineId());
+            }
+            if (state != null && scope.equals(state.scope) && nodeSession == null) {
+                var lease = state.scopedLease.get();
+                if (lease != null && !lease.retry()) renewScoped(state, nanoTime.getAsLong());
+            }
+            synchronized (this) {
+                if (closing || !admission.current() || !accepts(scope)
+                        || controls.containsKey(scope.pipelineId()) || acquisitions.containsKey(scope.pipelineId())
+                        || pendingReleases.containsKey(scope.pipelineId()) || advancing(scope.pipelineId())) {
+                    return Permit.denied();
+                }
+                state = held.computeIfAbsent(scope.pipelineId(), ignored -> new Held(scope));
+                long now = nanoTime.getAsLong();
+                if (scope.equals(state.scope) && state.claim != null) return permit(scope.pipelineId(), state, false);
+                acquisition = reserveAcquisition(scope, state, now);
+                if (acquisition == null) return Permit.denied();
+            }
+            long started = nanoTime.getAsLong();
+            var planned = membership.committed();
+            if (planned == null) return Permit.denied();
+            var grant = requestClaim(scope.pipelineId(), scope, planned.revision());
+            if (grant.isEmpty()) return Permit.denied();
+            var claim = grant.orElseThrow();
+            PendingRelease pending;
+            synchronized (this) {
+                if (canAdopt(claim, planned)
+                        && acquisitions.get(scope.pipelineId()) == acquisition
+                        && held.get(scope.pipelineId()) == acquisition.previous()
+                        && acquisition.previous().claim == acquisition.original()
+                        && !controls.containsKey(scope.pipelineId())) {
+                    adoptAcquisition(acquisition.candidate(), claim, started);
+                    held.put(scope.pipelineId(), acquisition.candidate());
+                    return new Permit(true, claim);
+                }
+                pending = registerUnadoptedGrant(scope, claim);
+            }
+            if (pending != null) releasePending(pending);
             return Permit.denied();
+        } finally {
+            if (acquisition != null) {
+                synchronized (this) { acquisitions.remove(scope.pipelineId(), acquisition); }
+            }
+            admission.leave();
         }
-        if (!fenced) {
-            return Permit.unfenced();
+    }
+
+    /** Caller holds the monitor. A placeholder or a holder of another fence cannot account for this grant. */
+    private PendingRelease registerUnadoptedGrant(PipelineIntentScope scope, WorkloadClaim claim) {
+        if (closing) return null;
+        var local = held.get(scope.pipelineId());
+        if (local != null && scope.equals(local.scope) && local.claim != null
+                && WorkloadClaimFence.from(local.claim).equals(WorkloadClaimFence.from(claim))) return null;
+        var pending = new PendingRelease(scope, claim);
+        pendingReleases.put(scope.pipelineId(), pending);
+        return pending;
+    }
+
+    private void releasePending(PendingRelease pending) {
+        synchronized (this) {
+            if (closing || !admission.current() || !membership.businessEligible() || pending.inFlight
+                    || pendingReleases.get(pending.scope.pipelineId()) != pending) return;
+            pending.inFlight = true;
         }
-        Held state = held.computeIfAbsent(pipelineId, id -> new Held());
+        boolean released = false;
+        try {
+            var expected = WorkloadClaimFence.from(pending.claim);
+            var stored = claims.readPipelineForRelease(pending.scope);
+            if (closing || !admission.current() || !membership.businessEligible()) return;
+            released = stored.isEmpty() || !stored.orElseThrow().leased()
+                    || !expected.equals(WorkloadClaimFence.from(stored.orElseThrow().claim()));
+            if (!released) released = claims.release(pending.claim);
+            if (closing || !admission.current() || !membership.businessEligible()) released = false;
+        } catch (TapstateException refused) {
+            // A definitive refusal of this physical scope cannot authorize a write to its successor.
+            released = !closing && admission.current() && membership.businessEligible()
+                    && refused.code() == IoError.WORKLOAD_CLAIM_FENCED && refused.getCause() == null;
+        } catch (RuntimeException unavailable) {
+            // Retain the original tuple for a later retention pass after a transient store failure.
+        } finally {
+            synchronized (this) {
+                pending.inFlight = false;
+                if (released) pendingReleases.remove(pending.scope.pipelineId(), pending);
+            }
+        }
+    }
+
+    private ScopedAcquisition reserveAcquisition(PipelineIntentScope scope, Held state, long now) {
+        if (scope.equals(state.scope)) {
+            if (state.contacted && now - state.nextContactNanos < 0) return null;
+            state.contacted = true;
+            state.nextContactNanos = now + renewIntervalNanos;
+        } else {
+            if (scope.stateGeneration() < state.scope.stateGeneration()
+                    || state.probedScope != null && scope.stateGeneration() <= state.probedScope.stateGeneration()
+                        && now - state.nextScopeProbeNanos < 0) return null;
+            state.probedScope = scope;
+            state.nextScopeProbeNanos = now + renewIntervalNanos;
+        }
+        var candidate = new Held(scope);
+        if (scope.equals(state.scope)) {
+            candidate.runMembers = state.runMembers;
+            candidate.runExecutionGeneration = state.runExecutionGeneration;
+            candidate.startRefusedAtGeneration = state.startRefusedAtGeneration;
+            candidate.lostAMemberAtNanos = state.lostAMemberAtNanos;
+            candidate.renewalFailure = state.renewalFailure;
+        }
+        var acquisition = new ScopedAcquisition(state, candidate, state.claim);
+        acquisitions.put(scope.pipelineId(), acquisition);
+        return acquisition;
+    }
+    private Permit admittedPermit(PipelineIntentScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        if (closing || !admission.current() || !accepts(scope) || controls.containsKey(scope.pipelineId())
+                || acquisitions.containsKey(scope.pipelineId()) || pendingReleases.containsKey(scope.pipelineId())
+                || advancing(scope.pipelineId())) return Permit.denied();
+        String pipelineId = scope.pipelineId();
+        Held state = held.get(pipelineId);
+        if (state == null) {
+            state = new Held(scope);
+            held.put(pipelineId, state);
+        } else if (!scope.equals(state.scope)) {
+            if (scope.stateGeneration() < state.scope.stateGeneration()) return Permit.denied();
+            long now = nanoTime.getAsLong();
+            if (state.probedScope != null && scope.stateGeneration() <= state.probedScope.stateGeneration()
+                    && now - state.nextScopeProbeNanos < 0) return Permit.denied();
+            if (state.probedScope == null || scope.stateGeneration() > state.probedScope.stateGeneration()) {
+                state.probedScope = scope;
+            }
+            state.nextScopeProbeNanos = now + renewIntervalNanos;
+            Held candidate = new Held(scope);
+            Permit admitted = acquire(pipelineId, candidate, now);
+            if (admitted.granted()) held.put(pipelineId, candidate);
+            return admitted;
+        }
+        return permit(pipelineId, state);
+    }
+
+    private boolean accepts(PipelineIntentScope scope) {
+        return businessScope != null && scope.clusterId().equals(businessScope.clusterId())
+                && scope.bindingVersion() == businessScope.bindingVersion()
+                && scope.cacheIncarnation().equals(businessScope.cacheIncarnation());
+    }
+
+    private Permit permit(String pipelineId, Held state) {
+        return permit(pipelineId, state, true);
+    }
+
+    private Permit permit(String pipelineId, Held state, boolean renew) {
         // Every pass, not every round trip: this reads a local reference the membership reconciler
         // publishes into, so it costs nothing, and the shorter the interval between looks the shorter
         // the absence that can pass unseen between two of them.
         observeMembership(state);
         long now = nanoTime.getAsLong();
+        if (state.scope != null && state.claim != null) {
+            if (nodeSession != null) return membership.businessEligible() || membership.singleControlEligible(state.claim)
+                    ? new Permit(true, state.claim) : Permit.denied();
+            var lease = state.scopedLease.get();
+            if (renew && lease != null && !lease.retry() && now - lease.due() >= 0) renewScoped(state, now);
+            lease = state.scopedLease.get();
+            if (lease == null || lease.lost() || now - lease.deadline() >= 0 && !lease.inFlight()) {
+                if (lease != null) state.renewalFailure = new RenewalFailure(lease.expected(),
+                        lease.lost() ? lease.loss() : RenewalOutcome.UNCONFIRMED);
+                state.claim = null;
+                state.scopedLease.compareAndSet(lease, null);
+                state.nextContactNanos = now + renewIntervalNanos;
+                return Permit.denied();
+            }
+            if (lease.retry() || now - lease.deadline() >= 0) return Permit.denied();
+            var local = state.claim;
+            var refreshed = lease.expected();
+            if (local.leaseUntil().equals(refreshed.leaseUntil())) return new Permit(true, local);
+            return new Permit(true, new WorkloadClaim(local.key(), local.owner(), local.claimGeneration(),
+                    local.executionGeneration(), local.topologyRevision(), refreshed.leaseUntil(),
+                    local.contextExecutionGeneration(), local.executionClaimGeneration(), local.executionNodeIds(),
+                    local.failureClaimGeneration(), local.failureAfterMemberLoss()));
+        }
         boolean due = !state.contacted || now - state.nextContactNanos >= 0;
         if (state.claim != null && !due) {
             return new Permit(true, state.claim);
@@ -198,16 +642,30 @@ final class PipelineActuationOwnership {
 
     /**
      * Whether a run may be submitted, the generations that fence it, and the committed topology the claim behind
-     * it was held under - none of either on a single node.
+     * it was held under - none of either in an explicit uncoordinated fixture.
      */
-    record Execution(boolean allowed, ExecutionFence fence, Long topologyRevision) {
+    record Execution(boolean allowed, ExecutionFence fence, Long topologyRevision, WorkloadClaimFence claimFence) {
+        Execution {
+            boolean hasIdentity = fence != null || topologyRevision != null || claimFence != null;
+            if ((!allowed && hasIdentity) || (hasIdentity && (fence == null || topologyRevision == null || claimFence == null)))
+                throw new IllegalArgumentException("an execution carries either its complete identity or none");
+            if (hasIdentity && (claimFence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                    || !fence.pipelineId().equals(claimFence.key().resourceId()) || fence.claimGeneration() != claimFence.claimGeneration()
+                    || fence.executionGeneration() != claimFence.executionGeneration() || topologyRevision.longValue() != claimFence.topologyRevision()))
+                throw new IllegalArgumentException("the execution identity must match its original advanced claim");
+            if (hasIdentity && fence.scope() != null && (!fence.scope().clusterId().equals(claimFence.key().clusterId())
+                    || !fence.ownerNodeId().equals(claimFence.owner().nodeId())
+                    || !fence.ownerBootId().equals(claimFence.owner().bootId())
+                    || fence.topologyRevision().longValue() != claimFence.topologyRevision()))
+                throw new IllegalArgumentException("the scoped execution must retain its original claim owner");
+        }
 
         static Execution unfenced() {
-            return new Execution(true, null, null);
+            return new Execution(true, null, null, null);
         }
 
         static Execution refused() {
-            return new Execution(false, null, null);
+            return new Execution(false, null, null, null);
         }
     }
 
@@ -229,38 +687,171 @@ final class PipelineActuationOwnership {
      */
     synchronized void startRefusedBeforeItsRun(String pipelineId) {
         Held state = held.get(Objects.requireNonNull(pipelineId, "pipelineId"));
-        if (state != null && state.claim != null) {
+        if (businessScope == null && state != null && state.claim != null) {
             state.startRefusedAtGeneration = state.claim.executionGeneration();
         }
     }
 
-    synchronized Execution beginExecution(String pipelineId) {
+    /** A refusal witnessed by an old pass cannot alter the later held run's failure attribution. */
+    synchronized void startRefusedBeforeItsRun(String pipelineId, WorkloadClaimFence expected) {
+        Objects.requireNonNull(expected, "expected");
+        Held state = held.get(Objects.requireNonNull(pipelineId, "pipelineId"));
+        if (businessScope == null && state != null && state.claim != null && expected.equals(WorkloadClaimFence.from(state.claim))) {
+            state.startRefusedAtGeneration = state.claim.executionGeneration();
+        }
+    }
+
+    synchronized void startRefusedBeforeItsRun(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(expected, "expected");
+        Held state = held.get(scope.pipelineId());
+        if (accepts(scope) && state != null && !state.executionAdvancing && scope.equals(state.scope) && state.claim != null
+                && expected.equals(WorkloadClaimFence.from(state.claim))) {
+            state.startRefusedAtGeneration = state.claim.executionGeneration();
+        }
+    }
+
+    Execution beginExecution(String pipelineId) {return admittedCall(()->beginExecutionOwned(pipelineId),Execution::refused);}
+    private synchronized Execution beginExecutionOwned(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (closing) {
+        if (closing || businessScope != null) {
             return Execution.refused();
         }
         if (!fenced) {
             return Execution.unfenced();
         }
         Held state = held.get(pipelineId);
-        if (state == null || state.claim == null) {
-            return Execution.refused();
-        }
-        ClusterMembership planned = membership.committed();
-        Set<String> runMembers = planned == null ? Set.of() : plannedOver(planned);
-        Optional<WorkloadClaim> advanced;
+        if (state == null || state.claim == null) return Execution.refused();
+        return beginExecution(pipelineId, WorkloadClaimFence.from(state.claim));
+    }
+
+    /** Advances only the immutable claim captured by this pass, never a later claim held under its id. */
+    Execution beginExecution(String pipelineId, WorkloadClaimFence expected) {
+        return admittedCall(()->beginExecutionOwned(pipelineId,expected),Execution::refused);
+    }
+    private synchronized Execution beginExecutionOwned(String pipelineId, WorkloadClaimFence expected) {
+        Objects.requireNonNull(pipelineId, "pipelineId"); Objects.requireNonNull(expected, "expected");
+        return businessScope == null ? beginLegacyExecution(pipelineId, expected) : Execution.refused();
+    }
+
+    Execution beginExecution(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(expected, "expected");
+        if (!admission.enter()) return Execution.refused();
         try {
-            // At the claim's own topology revision, which is the committed one: a revision change refuses
-            // the renew above, so a claim still held is a claim granted under the current topology.
-            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision(), runMembers);
-        } catch (RuntimeException unreachable) {
-            advanced = Optional.empty();
+            var reserved = reserveAdvance(scope, expected);
+            if (reserved == null) return Execution.refused();
+            try {
+                return advanceScopedExecution(scope, reserved);
+            } finally {
+                synchronized (this) {
+                    reserved.state().executionAdvancing = false;
+                }
+            }
+        } finally {
+            admission.leave();
         }
-        if (advanced.isEmpty()) {
+    }
+
+    private record ScopedAdvance(Held state, WorkloadClaim original, ClusterMembership planned, Set<String> runMembers) {}
+
+    private synchronized ScopedAdvance reserveAdvance(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        String id = scope.pipelineId();
+        if (closing || !fenced || !accepts(scope) || controls.containsKey(id)
+                || acquisitions.containsKey(id) || pendingReleases.containsKey(id)) return null;
+        var state = held.get(id);
+        if (state == null || !scope.equals(state.scope) || state.executionAdvancing || state.claim == null
+                || !expected.equals(WorkloadClaimFence.from(state.claim))) return null;
+        if (nodeSession == null) {
+            var lease = state.scopedLease.get();
+            if (lease == null || lease.retry() || lease.lost() || nanoTime.getAsLong() - lease.deadline() >= 0)
+                return null;
+        }
+        var planned = membership.committed();
+        if (!admission.current() || planned == null || !membership.businessEligible()
+                || planned.revision() < expected.topologyRevision()
+                || nodeSession != null && planned.revision() != expected.topologyRevision()) return null;
+        var runMembers = plannedOver(planned);
+        state.executionAdvancing = true;
+        return new ScopedAdvance(state, state.claim, planned, runMembers);
+    }
+
+    private Execution advanceScopedExecution(PipelineIntentScope scope, ScopedAdvance reserved) {
+        var original = reserved.original();
+        if (original.topologyRevision() != reserved.planned().revision()) {
+            original = rebaseForAdvance(scope, reserved);
+            if (original == null) return Execution.refused();
+        }
+        // The durable CAS still uses the exact claim and original topology of this submission.
+        var next = advanceClaim(original, reserved.runMembers());
+        synchronized (this) {
+            var state = reserved.state();
+            if (!holdsAdvance(scope, state, original)) return Execution.refused();
+            if (next.isEmpty() || !admission.current() || !reserved.planned().equals(membership.committed())
+                    || !membership.businessEligible()) {
+                state.claim = null;
+                next.ifPresent(claim -> registerUnadoptedGrant(scope, claim));
+                return Execution.refused();
+            }
+            state.claim = next.orElseThrow();
+            advanceScopedProof(state, state.claim);
+            return submittedExecution(scope.pipelineId(), scope, state, reserved.planned(), reserved.runMembers());
+        }
+    }
+
+    private WorkloadClaim rebaseForAdvance(PipelineIntentScope scope, ScopedAdvance reserved) {
+        var original = reserved.original();
+        long started = nanoTime.getAsLong();
+        var grant = requestClaim(scope.pipelineId(), scope, reserved.planned().revision());
+        synchronized (this) {
+            var state = reserved.state();
+            if (grant.isEmpty()) return null;
+            var claim = grant.orElseThrow();
+            if (!holdsAdvance(scope, state, original) || !canAdopt(claim, reserved.planned())
+                    || !sameClaim(WorkloadClaimFence.from(claim), WorkloadClaimFence.from(original), false)) {
+                if (holdsAdvance(scope, state, original)) state.claim = null;
+                registerUnadoptedGrant(scope, claim);
+                return null;
+            }
+            recordLeaseProof(state, claim, started);
+            return claim;
+        }
+    }
+
+    private boolean holdsAdvance(PipelineIntentScope scope, Held state, WorkloadClaim original) {
+        return !closing && state.executionAdvancing && held.get(scope.pipelineId()) == state && state.claim == original;
+    }
+
+    private boolean advancing(String pipelineId) {
+        var state = held.get(pipelineId);
+        return state != null && state.executionAdvancing;
+    }
+
+    private Execution beginLegacyExecution(String pipelineId, WorkloadClaimFence expected) {
+        if (closing || !fenced || controls.containsKey(pipelineId)) return Execution.refused();
+        var state = held.get(pipelineId);
+        if (state == null || state.claim == null || !expected.equals(WorkloadClaimFence.from(state.claim)))
+            return Execution.refused();
+        var planned = membership.committed();
+        var runMembers = planned == null ? Set.<String>of() : plannedOver(planned);
+        var advanced = advanceClaim(state.claim, runMembers);
+        if (closing || advanced.isEmpty()) {
             state.claim = null;
             return Execution.refused();
         }
-        state.claim = advanced.get();
+        state.claim = advanced.orElseThrow();
+        return submittedExecution(pipelineId, null, state, planned, runMembers);
+    }
+
+    private Optional<WorkloadClaim> advanceClaim(WorkloadClaim original, Set<String> runMembers) {
+        try {
+            return claims.advanceExecution(original, original.topologyRevision(), runMembers);
+        } catch (RuntimeException unreachable) {
+            return Optional.empty();
+        }
+    }
+
+    private Execution submittedExecution(String pipelineId, PipelineIntentScope scope, Held state,
+            ClusterMembership planned, Set<String> runMembers) {
         state.failureObservedAtNanos = NEVER;
         state.visibilityRevisionAtDetectionWindow = NEVER;
         // What this run is planned over. Null rather than empty when nothing is committed -- which the
@@ -272,9 +863,11 @@ final class PipelineActuationOwnership {
         // all present, so the comparison below will find nothing missing from it -- and the run is being
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
         // the moment here would make the very next death of this run read as the pipeline's own.
-        return new Execution(true, new ExecutionFence(
-                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()),
-                state.claim.topologyRevision());
+        WorkloadClaimFence advancedFence = WorkloadClaimFence.from(state.claim);
+        ExecutionFence run = scope == null
+                ? new ExecutionFence(pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration())
+                : new ExecutionFence(scope, advancedFence);
+        return new Execution(true, run, state.claim.topologyRevision(), advancedFence);
     }
 
     /**
@@ -399,19 +992,193 @@ final class PipelineActuationOwnership {
      * Renews every claim this member holds whose renewal is due, whatever the convergence pass is doing.
      * Called on a renewer of its own, so a start that holds the pass for longer than a lease -- an
      * overloaded host, a slow source, many tables -- runs out no claim of this member, its own included.
-     * A claim the store will not renew is dropped here exactly as the pass would drop it, and the pass
-     * takes it from there.
+     * A definitive refusal drops the claim. A timed-out scoped renewal can retry the same fence before
+     * the last confirmed lease deadline.
      */
-    synchronized void renewDue() {
-        if (!fenced || closing) {
+    void renewDue() {
+        if (nodeSession != null) return;
+        if (businessScope != null) {
+            long now = nanoTime.getAsLong();
+            held.values().stream().filter(state -> {
+                var lease = state.scopedLease.get();
+                return lease != null && !lease.lost() && now - lease.due() >= 0;
+            }).sorted(Comparator.comparingLong(state -> {
+                var lease = state.scopedLease.get();
+                return lease == null ? Long.MAX_VALUE : lease.deadline();
+            })).toList().forEach(state -> renewScoped(state, nanoTime.getAsLong()));
             return;
         }
-        long now = nanoTime.getAsLong();
-        for (Held state : held.values()) {
-            if (state.claim != null && state.contacted && now - state.nextContactNanos >= 0) {
-                renew(state, now);
-            }
+        // A finite pass lets previously renewed claims compete again even under continuous arrivals.
+        List<Held> due = admittedCall(this::dueRenewals, List::of);
+        for (Held state : due) {
+            // Each independent renewal owns one allowance and yields the fair IO gate afterward.
+            long queued = nanoTime.getAsLong();
+            admittedCall(() -> { renewIfDue(state, queued);return null; }, () -> null);
         }
+    }
+
+    private void renewScoped(Held state, long now) {
+        var lease = state.scopedLease.get();
+        if (lease == null || lease.lost() || lease.inFlight() || now - lease.due() < 0
+                || !stillHeld(state, lease) || !admission.enter()) return;
+        try {
+            if (now - lease.deadline() >= 0) {
+                state.scopedLease.compareAndSet(lease, new ScopedLease(lease.expected(), lease.deadline(),
+                        lease.due(), lease.retries(), false, false, RenewalOutcome.UNCONFIRMED));
+                return;
+            }
+            var pending = lease.inFlightCopy();
+            if (!state.scopedLease.compareAndSet(lease, pending)) return;
+            Optional<WorkloadClaim> renewed = Optional.empty();
+            long renewedDeadline = now + ttl.toNanos();
+            long renewedDue = now + renewIntervalNanos;
+            boolean retry = false;
+            boolean failed = false;
+            boolean confirm = lease.confirm();
+            try {
+                long budget = Math.max(1, Math.min(lease.deadline() - now, renewIntervalNanos / 2));
+                LOG.log(System.Logger.Level.DEBUG,
+                        "Pipeline renewal dispatch {0}, claim={1}, execution={2}, remainingMs={3}, leaseUntil={4}, attempt={5}",
+                        lease.expected().key().resourceId(), lease.expected().claimGeneration(),
+                        lease.expected().executionGeneration(), TimeUnit.NANOSECONDS.toMillis(lease.deadline() - now),
+                        lease.expected().leaseUntil(), lease.retries() + 1);
+                long attemptDeadline = now + budget;
+                if (confirm) {
+                    var readback = claims.confirmPipelineRenewal(state.scope, lease.expected(), budget);
+                    var exact = WorkloadClaimFence.from(lease.expected());
+                    var current = readback.filter(WorkloadClaimReading::leased)
+                            .filter(reading -> exact.equals(WorkloadClaimFence.from(reading.claim())));
+                    confirm = false;
+                    if (current.isPresent()) {
+                        var reading = current.orElseThrow();
+                        if (reading.claim().leaseUntil().isAfter(lease.expected().leaseUntil())) {
+                            long remaining = Math.min(ttl.toNanos(), reading.leaseRemaining().toNanos());
+                            renewed = Optional.of(reading.claim());
+                            renewedDeadline = now + remaining;
+                            renewedDue = now + Math.min(renewIntervalNanos, remaining / 2);
+                            LOG.log(System.Logger.Level.DEBUG, "Confirmed earlier Pipeline renewal for {0}", exact.key().resourceId());
+                        } else {
+                            long started = nanoTime.getAsLong();
+                            renewed = renewOriginal(lease, attemptDeadline - started);
+                            renewedDeadline = started + ttl.toNanos();
+                            renewedDue = started + renewIntervalNanos;
+                        }
+                    }
+                } else renewed = renewOriginal(lease, budget);
+            } catch (RuntimeException failure) {
+                failed = true;
+                retry = retryableRenewal(failure);
+                confirm = confirm || claimIoTimedOut(failure) || failure instanceof WorkloadClaimRenewalException renewal
+                        && renewal.reason() == WorkloadClaimRenewalException.Reason.UNCONFIRMED;
+                if (!lease.retry()) LOG.log(System.Logger.Level.WARNING,
+                        "Pipeline renewal first failure {0}, claim={1}, execution={2}, retryable={3}, result={4}",
+                        lease.expected().key().resourceId(), lease.expected().claimGeneration(),
+                        lease.expected().executionGeneration(), retry, failure.toString());
+            }
+            long after = nanoTime.getAsLong();
+            ClusterMembership committed = membership.committed();
+            boolean eligible = stillHeld(state, lease) && (membership.businessEligible()
+                    ? committed != null && committed.clusterId().equals(lease.expected().key().clusterId())
+                            && (lease.expected().executionGeneration() == 0
+                                ? committed.revision() == lease.expected().topologyRevision()
+                                : committed.revision() >= lease.expected().topologyRevision())
+                    : membership.singleControlEligible(lease.expected()));
+            LOG.log(System.Logger.Level.DEBUG,
+                    "Pipeline renewal response {0}, claim={1}, execution={2}, elapsedMs={3}, matched={4}, attempt={5}",
+                    lease.expected().key().resourceId(), lease.expected().claimGeneration(),
+                    lease.expected().executionGeneration(), TimeUnit.NANOSECONDS.toMillis(after - now), renewed.isPresent(),
+                    lease.retries() + 1);
+            if (!failed && eligible && renewed.isEmpty() && !lease.retry())
+                LOG.log(System.Logger.Level.WARNING, "Pipeline renewal first refusal {0}, claim={1}, execution={2}, no matching lease",
+                        lease.expected().key().resourceId(), lease.expected().claimGeneration(), lease.expected().executionGeneration());
+            if (eligible && after - lease.deadline() < 0 && after - renewedDeadline < 0 && renewed.isPresent()
+                    && WorkloadClaimFence.from(lease.expected()).equals(WorkloadClaimFence.from(renewed.orElseThrow()))) {
+                state.scopedLease.compareAndSet(pending, new ScopedLease(renewed.orElseThrow(),
+                        renewedDeadline, renewedDue, 0, false, false, null));
+            } else {
+                boolean retryable = eligible && retry && after - lease.deadline() < 0;
+                if (eligible && retry && !retryable) LOG.log(System.Logger.Level.WARNING,
+                        "Pipeline renewal reached its last confirmed deadline {0}, claim={1}, execution={2}, attempts={3}, leaseUntil={4}",
+                        lease.expected().key().resourceId(), lease.expected().claimGeneration(),
+                        lease.expected().executionGeneration(), lease.retries() + 1, lease.expected().leaseUntil());
+                long due = retryable ? Math.min(lease.deadline(), after + Math.min(renewIntervalNanos, RENEW_RETRY_NANOS)) : after;
+                var outcome = !eligible ? RenewalOutcome.MEMBERSHIP_CHANGED
+                        : !failed && renewed.isEmpty() ? RenewalOutcome.REFUSED : RenewalOutcome.UNCONFIRMED;
+                state.scopedLease.compareAndSet(pending, new ScopedLease(lease.expected(), lease.deadline(),
+                        due, lease.retries() + (retryable ? 1 : 0), false, confirm, retryable ? null : outcome));
+            }
+        } finally {
+            admission.leave();
+        }
+    }
+
+    private Optional<WorkloadClaim> renewOriginal(ScopedLease lease, long budget) {
+        if (budget <= 0) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), new TimeoutException());
+        return membership.businessEligible() ? claims.renewScopedActuation(lease.expected(), ttl, budget)
+                : claims.renewActuationControl(lease.expected(), ttl, budget);
+    }
+
+    private enum RenewalOutcome { REFUSED, UNCONFIRMED, MEMBERSHIP_CHANGED }
+    private record RenewalFailure(WorkloadClaim expected, RenewalOutcome outcome) {}
+
+    Optional<TapstateException> renewalFailure(PipelineIntentScope scope, WorkloadClaim current) {
+        var state = held.get(scope.pipelineId());
+        var failure = state == null ? null : state.renewalFailure;
+        if (failure == null || failure.outcome() == RenewalOutcome.MEMBERSHIP_CHANGED || !scope.equals(state.scope) || current.executionGeneration() <= 0
+                || current.executionGeneration() != failure.expected().executionGeneration()
+                || current.claimGeneration() <= failure.expected().claimGeneration()) return Optional.empty();
+        var code = failure.outcome() == RenewalOutcome.REFUSED
+                ? io.tapstate.runtime.engine.EngineError.EXECUTION_LEASE_LOST
+                : io.tapstate.runtime.engine.EngineError.EXECUTION_RENEWAL_FAILED;
+        return Optional.of(new TapstateException(code, Map.of("pipeline", scope.pipelineId()), null));
+    }
+
+    private static boolean retryableRenewal(RuntimeException failure) {
+        return failure instanceof WorkloadClaimRenewalException || claimIoTimedOut(failure) || failure instanceof TapstateException coded
+                && coded.code() == IoError.STORE_UNAVAILABLE
+                && coded.args().get("detail") instanceof String detail && detail.endsWith(" code=112");
+    }
+
+    private boolean stillHeld(Held state, ScopedLease lease) {
+        var current = state.claim;
+        return !closing && current != null && held.get(current.key().resourceId()) == state
+                && WorkloadClaimFence.from(current).equals(WorkloadClaimFence.from(lease.expected()));
+    }
+
+    private void advanceScopedProof(Held state, WorkloadClaim next) {
+        if (nodeSession != null) return;
+        state.scopedLease.updateAndGet(previous -> {
+            if (previous == null) return new ScopedLease(next, state.leaseDeadlineNanos,
+                    state.nextContactNanos, 0, false, false, null);
+            if (WorkloadClaimFence.from(previous.expected()).equals(WorkloadClaimFence.from(next))) return previous;
+            long extension = Math.max(0, Duration.between(previous.expected().leaseUntil(), next.leaseUntil()).toNanos());
+            return new ScopedLease(next, previous.deadline() + extension, previous.due(), 0, false, false, null);
+        });
+    }
+
+    private synchronized List<Held> dueRenewals() {
+        if (!fenced || closing || !admission.current()) return List.of();
+        long now = nanoTime.getAsLong();
+        // Earlier successful lease proofs take priority over subsequently renewed tails. This also
+        // gives mid-pass arrivals their turn without interpreting the store's absolute deadlines.
+        return held.values().stream().filter(state -> due(state, now))
+                .sorted(Comparator.comparingLong((Held state) -> state.leaseDeadlineNanos)
+                        .thenComparingLong(state -> state.leaseProofOrder)).toList();
+    }
+
+    private synchronized void renewIfDue(Held state, long queued) {
+        long now = nanoTime.getAsLong();
+        if (!closing && admission.current() && due(state, now)
+                && held.get(state.claim.key().resourceId()) == state) {
+            LOG.log(System.Logger.Level.DEBUG, "Pipeline renewal admitted {0}, waitMs={1}, remainingMs={2}",
+                    state.claim.key().resourceId(), TimeUnit.NANOSECONDS.toMillis(now - queued),
+                    TimeUnit.NANOSECONDS.toMillis(state.leaseDeadlineNanos - now));
+            renew(state, now);
+        }
+    }
+
+    private static boolean due(Held state, long now) {
+        return state.claim != null && state.contacted && now - state.nextContactNanos >= 0;
     }
 
     /**
@@ -423,35 +1190,130 @@ final class PipelineActuationOwnership {
      *
      * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
      * also refused for a claim granted under a topology revision a member joining has since moved, which
-     * the same owner takes again on its next pass under the same generations. True on a single node, where
-     * nothing is fenced.
+     * the same owner takes again on its next pass under the same generations. A later scoped claim is a
+     * separate proof and cannot be borrowed here. A missing fence is valid only in an explicit uncoordinated fixture.
      */
     boolean proveExecution(ExecutionFence fence) {
-        if (!fenced || fence == null) {
-            return true;
-        }
-        if (closing) {
+        if (!fenced) return fence == null || fence.scope() == null;
+        if (fence == null || closing || (businessScope == null ? fence.scope() != null
+                : fence.scope() == null || !accepts(fence.scope())
+                        || !owner.nodeId().equals(fence.ownerNodeId()) || !owner.bootId().equals(fence.ownerBootId()))) return false;
+        WorkloadClaimFence expected = new WorkloadClaimFence(
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId()),
+                owner, fence.claimGeneration(), fence.executionGeneration(),
+                fence.scope() == null ? 0 : fence.topologyRevision());
+        return proveClaim(fence.scope(), expected, fence.scope() != null);
+    }
+
+    /** Proves the exact admitted command, including a first claim whose execution counter is still zero. */
+    boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(expected, "expected");
+        return proveClaim(scope, expected, true);
+    }
+
+    /** Reports against the original claim without holding the serialized actuation IO lock. */
+    boolean proveObservationClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        if (!admission.enter()) {
             return false;
         }
-        WorkloadClaimKey key =
-                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId());
-        Optional<WorkloadClaimReading> reading;
         try {
-            reading = claims.read(key);
-        } catch (RuntimeException unreachable) {
-            return false;
+            return admission.current() && proveClaimOwned(scope, expected, true, false);
+        } finally {
+            admission.leave();
         }
-        // The claim generation alone says whose tenure it is: every change of holder takes the next one, a
-        // restarted member included, so a match on it is a match on this member.
-        return reading.filter(WorkloadClaimReading::leased)
-                .map(WorkloadClaimReading::claim)
-                .filter(claim -> claim.claimGeneration() == fence.claimGeneration()
-                        && claim.executionGeneration() == fence.executionGeneration())
-                .isPresent();
+    }
+
+    /** Retries only the start's proof read, under the same admission deadline. */
+    boolean proveStartClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        return admittedCall(() -> proveClaimOwned(scope, expected, true, true), () -> false);
+    }
+
+    /** Captures a conservative original lease outside CONFIG; the returned guard performs no IO. */
+    Optional<Runnable> evaluationProof(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        return admittedCall(()->evaluationProofOwned(scope,expected),Optional::empty);
+    }
+    private Optional<Runnable> evaluationProofOwned(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        Objects.requireNonNull(scope);Objects.requireNonNull(expected);
+        if(!fenced||closing||!accepts(scope)||!expected.owner().equals(owner)
+                ||expected.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION||!scope.pipelineId().equals(expected.key().resourceId()))return Optional.empty();
+        WorkloadClaim original;
+        synchronized(this){var local=held.get(scope.pipelineId());
+            if(local==null||local.executionAdvancing||!scope.equals(local.scope)||local.claim==null
+                    ||!WorkloadClaimFence.from(local.claim).equals(expected))return Optional.empty();
+            original=local.claim;
+        }
+        long askedAt=nanoTime.getAsLong();
+        var reading=membership.businessEligible()?claims.readPipeline(scope):claims.readActuationControl(scope,original);
+        if(reading.isEmpty()||!WorkloadClaimFence.from(reading.orElseThrow().claim()).equals(expected))return Optional.empty();
+        long budget=Math.min(Math.min(reading.orElseThrow().leaseRemaining().toNanos(),ttl.toNanos()),TimeUnit.SECONDS.toNanos(10));
+        Runnable guard=()->{
+            synchronized(this){var current=held.get(scope.pipelineId());long elapsed=nanoTime.getAsLong()-askedAt;
+                if(closing||elapsed<0||elapsed>=budget||!accepts(scope)
+                        ||!(membership.businessEligible()||membership.singleControlEligible(reading.orElseThrow().claim()))
+                        ||current==null||current.executionAdvancing||!scope.equals(current.scope)||current.claim==null
+                        ||!WorkloadClaimFence.from(current.claim).equals(expected))throw ThreeLayerStorePort.refused();}
+        };
+        try{guard.run();return Optional.of(guard);}catch(io.tapstate.core.common.TapstateException expired){return Optional.empty();}
+    }
+
+    private boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology) {
+        return admittedCall(()->proveClaimOwned(scope,expected,compareTopology,false),()->false);
+    }
+    private boolean proveClaimOwned(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology,
+            boolean retryTimeout) {
+        if (!fenced || closing || (scope != null && !accepts(scope)) || !expected.owner().equals(owner)
+                || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !clusterId.equals(expected.key().clusterId())
+                || (scope != null && !scope.pipelineId().equals(expected.key().resourceId()))) return false;
+        long askedAt = nanoTime.getAsLong();
+        Optional<WorkloadClaimReading> reading;
+        for (int attempt = 0; ; attempt++) {
+            try {
+                reading = scope == null ? claims.read(expected.key()) : claims.readPipeline(scope);
+                break;
+            } catch (RuntimeException unavailable) {
+                if (scope != null && !retryTimeout && retryableRenewal(unavailable)) {
+                    if (unavailable instanceof TapstateException coded && coded.code() == IoError.STORE_UNAVAILABLE) throw coded;
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "pipeline claim read timed out"), unavailable);
+                }
+                if (!retryTimeout || !claimIoTimedOut(unavailable)) return false;
+                if (attempt != 0 || !admission.current()) {
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "startup claim read timed out"), unavailable);
+                }
+            }
+        }
+        if (reading.isEmpty()) return false;
+        if (closing || !membership.businessEligible()) return false;
+        Duration remaining = reading.get().leaseRemaining();
+        long bound = remaining.compareTo(ttl) < 0 ? remaining.toNanos() : ttl.toNanos();
+        long checkedAt = nanoTime.getAsLong();
+        Held state = held.get(expected.key().resourceId());
+        WorkloadClaim local = state == null ? null : state.claim;
+        WorkloadClaim claim = reading.get().claim();
+        if (closing || bound <= 0 || checkedAt - askedAt >= bound || state == null
+                || !Objects.equals(state.scope, scope) || local == null || state.executionAdvancing) return false;
+        // Recheck the mutable ownership facts after comparing the store and local claims.
+        return sameClaim(WorkloadClaimFence.from(local), expected, compareTopology)
+                && sameClaim(WorkloadClaimFence.from(claim), expected, compareTopology)
+                && held.get(expected.key().resourceId()) == state && state.claim == local && !state.executionAdvancing
+                && !closing && membership.businessEligible();
+    }
+
+    private static boolean sameClaim(WorkloadClaimFence actual, WorkloadClaimFence expected, boolean compareTopology) {
+        return actual.key().equals(expected.key()) && actual.owner().equals(expected.owner())
+                && actual.claimGeneration() == expected.claimGeneration()
+                && actual.executionGeneration() == expected.executionGeneration()
+                && (!compareTopology || actual.topologyRevision() == expected.topologyRevision());
     }
 
     /** Whether a local capture still serves a pipeline this member holds; never acquires or renews a claim. */
     boolean isDriving(String pipelineId) {
+        return admittedCall(()->isDrivingOwned(pipelineId),()->!closing&&businessScope==null);
+    }
+    private boolean isDrivingOwned(String pipelineId) {
+        if (businessScope != null) return false;
         if (closing) {
             return false;
         }
@@ -476,14 +1338,112 @@ final class PipelineActuationOwnership {
         }
     }
 
+    boolean isDriving(PipelineIntentScope scope) {
+        Objects.requireNonNull(scope,"scope");
+        return admittedCall(()->isDrivingOwned(scope),()->!closing&&accepts(scope));
+    }
+    private boolean isDrivingOwned(PipelineIntentScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        if (closing || !accepts(scope)) return false;
+        synchronized (this) {
+            Held state = held.get(scope.pipelineId());
+            if (state != null && !scope.equals(state.scope)) return false;
+            if (state != null && state.claim != null) return true;
+        }
+        try {
+            return claims.readPipeline(scope).filter(WorkloadClaimReading::leased)
+                    .map(WorkloadClaimReading::claim).filter(claim -> claim.owner().equals(owner)).isPresent();
+        } catch (RuntimeException unavailable) {
+            // Retaining a capture does not grant it work; its original capture claim still fences it.
+            return true;
+        }
+    }
+
+    /** One bounded read proof; it grants no mutation or engine operation. */
+    final class ReportingExecution {
+        private final PipelineIntentScope scope;
+        private final WorkloadClaim expected;
+        private final long askedAt;
+        private final long remainingNanos;
+        private ReportingExecution(PipelineIntentScope scope, WorkloadClaim expected, long askedAt, long remainingNanos) {
+            this.scope = scope; this.expected = expected; this.askedAt = askedAt; this.remainingNanos = remainingNanos;
+        }
+        ExecutionFence execution() { return new ExecutionFence(scope, WorkloadClaimFence.from(expected)); }
+        boolean current() {
+            synchronized (PipelineActuationOwnership.this) {
+                long elapsed = nanoTime.getAsLong() - askedAt;
+                Held state = held.get(scope.pipelineId());
+                return !closing && accepts(scope) && elapsed >= 0 && elapsed < remainingNanos
+                        && membership.singleControlEligible(expected) && state != null && !state.executionAdvancing && scope.equals(state.scope)
+                        && state.claim != null && WorkloadClaimFence.from(state.claim).equals(WorkloadClaimFence.from(expected))
+                        && state.runExecutionGeneration == expected.executionGeneration()
+                        && Set.of(owner.nodeId()).equals(state.runMembers);
+            }
+        }
+    }
+
+    Optional<ReportingExecution> reportingExecution(PipelineIntentScope scope) {
+        return admittedCall(()->reportingExecutionOwned(scope),Optional::empty);
+    }
+    private Optional<ReportingExecution> reportingExecutionOwned(PipelineIntentScope scope) {
+        WorkloadClaim expected;
+        synchronized (this) {
+            Held state = held.get(scope.pipelineId());
+            if (!fenced || businessScope == null || closing || !accepts(scope) || state == null || state.executionAdvancing
+                    || !scope.equals(state.scope) || state.claim == null || state.claim.executionGeneration() < 1
+                    || state.runExecutionGeneration != state.claim.executionGeneration()
+                    || !Set.of(owner.nodeId()).equals(state.runMembers)) return Optional.empty();
+            expected = state.claim;
+        }
+        long askedAt = nanoTime.getAsLong();
+        var reading = claims.readActuationControl(scope, expected);
+        if (reading.isEmpty()) return Optional.empty();
+        Duration remaining = reading.orElseThrow().leaseRemaining();
+        long budget = remaining.compareTo(ttl) < 0 ? remaining.toNanos() : ttl.toNanos();
+        var proof = new ReportingExecution(scope, expected, askedAt, budget);
+        return proof.current() ? Optional.of(proof) : Optional.empty();
+    }
+
     /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */
     synchronized long heldExecutionGeneration(String pipelineId) {
         Held state = fenced ? held.get(pipelineId) : null;
         return state == null || state.claim == null ? 0 : state.claim.executionGeneration();
     }
 
+    /** A store-side proof for the named run, never substituting a replacement's generations. */
+    synchronized WorkloadClaimFence completionFence(ExecutionFence run) {
+        if (run == null) {
+            return null;
+        }
+        Held current = held.get(run.pipelineId());
+        long topology = current == null || current.claim == null ? 0L : current.claim.topologyRevision();
+        return new WorkloadClaimFence(
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, run.pipelineId()),
+                owner, run.claimGeneration(), run.executionGeneration(), topology);
+    }
+
     /** Records FAILED once member loss is visible or a post-detection view confirms none. */
-    synchronized void recordFailure(String pipelineId, long settlingNanos, long detectionWindowNanos) {
+    void recordFailure(String pipelineId, long settlingNanos, long detectionWindowNanos) {
+        admittedCall(()->{recordFailureOwned(pipelineId,settlingNanos,detectionWindowNanos);return null;},()->null);
+    }
+    private synchronized void recordFailureOwned(String pipelineId, long settlingNanos, long detectionWindowNanos) {
+        if (businessScope == null) recordHeldFailure(pipelineId, settlingNanos, detectionWindowNanos);
+    }
+
+    void recordFailure(PipelineIntentScope scope,WorkloadClaimFence expected,long settlingNanos,long detectionWindowNanos) {
+        admittedCall(()->{recordFailureOwned(scope,expected,settlingNanos,detectionWindowNanos);return null;},()->null);
+    }
+    private synchronized void recordFailureOwned(PipelineIntentScope scope, WorkloadClaimFence expected,
+            long settlingNanos, long detectionWindowNanos) {
+        Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(expected, "expected");
+        Held state = held.get(scope.pipelineId());
+        if (accepts(scope) && state != null && !state.executionAdvancing && scope.equals(state.scope) && state.claim != null
+                && expected.equals(WorkloadClaimFence.from(state.claim))) {
+            recordHeldFailure(scope.pipelineId(), settlingNanos, detectionWindowNanos);
+        }
+    }
+
+    private void recordHeldFailure(String pipelineId, long settlingNanos, long detectionWindowNanos) {
         if (!fenced || closing) {
             return;
         }
@@ -537,12 +1497,18 @@ final class PipelineActuationOwnership {
             return;
         }
         state.claim = recorded.get();
+        if (state.scope != null) advanceScopedProof(state, state.claim);
     }
 
     /** A shutting-down member must leave its dying run unclassified for the next holder to recover. */
     @EventListener(ContextClosedEvent.class)
-    synchronized void stopForShutdown() {
+    void stopForShutdown() {
         closing = true;
+        admission.stop();
+    }
+    void awaitStopped(long deadline) {
+        admission.await(deadline);
+        if(claims!=null)claims.awaitStopped(deadline);
     }
 
     /**
@@ -607,14 +1573,38 @@ final class PipelineActuationOwnership {
      * this member named as its driver until the lease runs out. Releasing expires the lease and leaves the
      * generation where it is, so the next holder still moves forward from it.
      */
-    synchronized void retain(Collection<String> pipelineIds) {
+    void retain(Collection<String> pipelineIds) {
+        if (businessScope == null) {
+            admittedCall(() -> { retainOwned(pipelineIds); return null; }, () -> null);
+            return;
+        }
+        // A later tick retries cleanup while a lifecycle command owns the ordinary I/O gate.
+        if (!admission.enter()) return;
+        try {
+            if (!ioAdmission.tryLock()) return;
+            try {
+                if (admission.current()) {
+                    List<PendingRelease> pending;
+                    synchronized (this) { pending = List.copyOf(pendingReleases.values()); }
+                    pending.forEach(this::releasePending);
+                    retainOwned(pipelineIds);
+                }
+            } finally {
+                ioAdmission.unlock();
+            }
+        } finally {
+            admission.leave();
+        }
+    }
+    private synchronized void retainOwned(Collection<String> pipelineIds) {
         if (!fenced) {
             return;
         }
         Iterator<Map.Entry<String, Held>> entries = held.entrySet().iterator();
         while (entries.hasNext()) {
             Map.Entry<String, Held> entry = entries.next();
-            if (pipelineIds.contains(entry.getKey())) {
+            if (pipelineIds.contains(entry.getKey()) || controls.containsKey(entry.getKey())
+                    || entry.getValue().executionAdvancing) {
                 continue;
             }
             WorkloadClaim claim = entry.getValue().claim;
@@ -625,54 +1615,100 @@ final class PipelineActuationOwnership {
         }
     }
 
+    /** Legacy unscoped ownership uses the ordinary admission gate. */
     private Permit renew(Held state, long now) {
+        WorkloadClaim original = state.claim;
         Optional<WorkloadClaim> renewed;
         try {
-            renewed = claims.renew(state.claim, ttl);
-        } catch (RuntimeException unreachable) {
-            // The coordination store is the only thing that can say this member still owns the pipeline,
-            // and it did not answer. Unproved is the same as lost here: the alternative is to keep driving
-            // on a claim that may already belong to someone else.
+            renewed = membership.businessEligible() ? claims.renew(original, ttl)
+                    : claims.renewActuationControl(original, ttl);
+        } catch (RuntimeException failure) {
             renewed = Optional.empty();
         }
         state.contacted = true;
         state.nextContactNanos = now + renewIntervalNanos;
-        if (renewed.isEmpty()) {
+        ClusterMembership current = membership.committed();
+        boolean qualified = membership.businessEligible()
+                ? current != null && current.clusterId().equals(original.key().clusterId())
+                        && current.revision() == original.topologyRevision()
+                : membership.singleControlEligible(original);
+        if (closing || held.get(original.key().resourceId()) != state || state.claim != original)
+            return Permit.denied();
+        if (!qualified || renewed.isEmpty()
+                || !WorkloadClaimFence.from(original).equals(WorkloadClaimFence.from(renewed.orElseThrow()))) {
             state.claim = null;
             return Permit.denied();
         }
-        state.claim = renewed.get();
+        recordLeaseProof(state, renewed.orElseThrow(), now);
         return new Permit(true, state.claim);
+    }
+
+    private static boolean claimIoTimedOut(RuntimeException failure) {
+        if (!(failure instanceof TapstateException coded)) return false;
+        if (coded.code() == IoError.WORKLOAD_CLAIM_FENCED) return coded.getCause() instanceof TimeoutException;
+        if (coded.code() != IoError.STORE_UNAVAILABLE || !(coded.args().get("detail") instanceof String detail)) return false;
+        return switch (detail.split(" ", 2)[0]) {
+            case "MongoTimeoutException", "MongoOperationTimeoutException", "MongoExecutionTimeoutException", "MongoSocketReadTimeoutException" -> true;
+            default -> false;
+        };
+    }
+
+    private synchronized void recordLeaseProof(Held state, WorkloadClaim claim, long startedAt) {
+        state.claim = claim;
+        // Mongo computes the TTL after this call starts. Starting the local window earlier is conservative.
+        state.leaseDeadlineNanos = startedAt + TimeUnit.MILLISECONDS.toNanos(ttl.toMillis());
+        state.leaseProofOrder = ++leaseProofSequence;
+        if (state.scope != null && nodeSession == null) state.scopedLease.set(new ScopedLease(claim, state.leaseDeadlineNanos,
+                startedAt + renewIntervalNanos, 0, false, false, null));
     }
 
     private Permit acquire(String pipelineId, Held state, long now) {
         state.contacted = true;
         state.nextContactNanos = now + renewIntervalNanos;
-        ClusterMembership current = membership.committed();
-        if (current == null) {
+        var planned = membership.committed();
+        if (planned == null) return Permit.denied();
+        var grant = requestClaim(pipelineId, state.scope, planned.revision());
+        if (grant.isEmpty()) return Permit.denied();
+        var claim = grant.orElseThrow();
+        if (!canAdopt(claim, planned)) {
+            if (state.scope != null) registerUnadoptedGrant(state.scope, claim);
             return Permit.denied();
         }
-        WorkloadClaimKey key =
-                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+        adoptAcquisition(state, claim, now);
+        return new Permit(true, claim);
+    }
+
+    private Optional<WorkloadClaim> requestClaim(String pipelineId, PipelineIntentScope scope, long revision) {
+        var key = new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
         Optional<WorkloadClaimAttempt> attempt;
         try {
-            attempt = claims.acquire(key, owner, current.revision(), ttl);
+            if (scope == null) attempt = claims.acquire(key, owner, revision, ttl);
+            else if (nodeSession != null) attempt = claims.acquireNodeBackedPipeline(scope, nodeSession, revision);
+            else attempt = claims.acquirePipeline(scope, owner, revision, ttl);
         } catch (RuntimeException unreachable) {
-            return Permit.denied();
+            return Optional.empty();
         }
-        if (attempt.isEmpty() || !attempt.get().acquired() || !attempt.get().claim().owner().equals(owner)) {
-            return Permit.denied();
-        }
-        state.claim = attempt.get().claim();
+        return attempt.filter(WorkloadClaimAttempt::acquired).map(WorkloadClaimAttempt::claim)
+                .filter(claim -> claim.key().equals(key) && claim.owner().equals(owner));
+    }
+
+    private boolean canAdopt(WorkloadClaim claim, ClusterMembership planned) {
+        return !closing && admission.current() && claim.topologyRevision() == planned.revision()
+                && planned.equals(membership.committed()) && membership.businessEligible();
+    }
+
+    private void adoptAcquisition(Held state, WorkloadClaim claim, long now) {
+        state.contacted = true;
+        state.nextContactNanos = now + renewIntervalNanos;
+        recordLeaseProof(state, claim, now);
         state.failureObservedAtNanos = NEVER;
         state.visibilityRevisionAtDetectionWindow = NEVER;
-        if (state.claim.executionGeneration() != state.runExecutionGeneration) {
+        if (claim.executionGeneration() != state.runExecutionGeneration) {
             // The run this claim carries is not the one this member last submitted: somebody else drove the
             // pipeline while this member did not hold it, and replaced that run. What this member planned its
             // own run over says nothing about the run it holds now -- a member that was not in sight when it
             // planned would never be missed from it. Without it, this is the inherited run it is.
             state.runMembers = null;
         }
-        return new Permit(true, state.claim);
     }
 }

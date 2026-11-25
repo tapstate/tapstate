@@ -3,3 +3,4 @@
 # image itself.
 *
 !app/target/app-*-boot.jar
+!NOTICE

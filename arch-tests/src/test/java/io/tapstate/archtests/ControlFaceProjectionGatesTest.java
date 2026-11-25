@@ -2,8 +2,6 @@ package io.tapstate.archtests;
 
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethod;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.Operation;
@@ -41,9 +39,7 @@ class ControlFaceProjectionGatesTest {
 
     @BeforeAll
     static void importFace() {
-        restApi = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate.control.restapi");
+        restApi = ProductionClassImports.packages("io.tapstate.control.restapi");
     }
 
     /** Every operation id an HTTP handler declares it projects. */
@@ -79,6 +75,20 @@ class ControlFaceProjectionGatesTest {
                         ControlOperations.registry().exposedOn(Frontend.REST).stream())
                 .map(Operation::id)
                 .collect(toCollection(TreeSet::new));
+    }
+
+    @Test void storageRoutesMatchTheSharedClientAndCanonicalRegistry() {
+        var ids = io.tapstate.control.client.StorageControlClient.OPERATIONS;
+        assertThat(ids).contains("configuration.export", "storage.setup.activate").hasSize(12);
+        for (var id : ids) {
+            var methods = restApi.stream().flatMap(type -> type.getMethods().stream()).filter(method -> method.isAnnotatedWith(Verb.class)
+                    && method.getAnnotationOfType(Verb.class).value().equals(id)).toList();
+            assertThat(methods).as(id).hasSize(1);
+            var mapping = methods.getFirst().getAnnotationOfType(org.springframework.web.bind.annotation.PostMapping.class);
+            assertThat(mapping.value()).containsExactly(io.tapstate.control.client.StorageControlClient.path(id).substring("/api".length()));
+            for (var face : java.util.List.of(Frontend.CLI, Frontend.REST, Frontend.MCP))
+                assertThat(ControlOperations.registry().resolve(id).exposure()).containsKey(face);
+        }
     }
 
     @Test

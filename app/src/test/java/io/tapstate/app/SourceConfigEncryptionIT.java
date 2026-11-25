@@ -186,7 +186,8 @@ class SourceConfigEncryptionIT {
                 "--tapstate.cloud.cluster-id=shared-source-cluster"));
         else args.add("--tapstate.store.mongo.uri=" + uri);
         StandardEnvironment environment = CloudFixtureEnvironment.isolated();
-        return new SpringApplicationBuilder(SharedConnectorSourceModesIT.Assembly.class).environment(environment)
+        return new SpringApplicationBuilder(SharedConnectorSourceModesIT.Assembly.class)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures).environment(environment)
                 .run(args.toArray(String[]::new));
     }
 

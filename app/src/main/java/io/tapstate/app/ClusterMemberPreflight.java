@@ -3,6 +3,8 @@ package io.tapstate.app;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterIdentity;
 import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
+import java.util.Set;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -58,27 +60,32 @@ final class ClusterMemberPreflight {
                         && cluster.getBootstrapMinMembers() != 2)) {
             throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
         }
-        String clusterId = required(cluster.getId(), BootError.CLUSTER_ID_REQUIRED);
-        try {
-            new ClusterIdentity(clusterId);
-        } catch (IllegalArgumentException invalid) {
-            throw new TapstateException(BootError.CLUSTER_ID_INVALID, Map.of(), invalid);
-        }
+        String clusterId = clusterId(cluster.getId());
         String nodeId = required(cluster.getNodeId(), BootError.NODE_ID_REQUIRED);
-        String advertised = required(control.getAdvertiseUrl(), BootError.CONTROL_ADVERTISE_URL_INVALID);
-        URI controlUrl;
-        try {
-            controlUrl = URI.create(advertised);
-        } catch (IllegalArgumentException invalid) {
-            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), invalid);
+        URI controlUrl = controlUrl(control.getAdvertiseUrl(), true);
+        validateLeaseBudgets(cluster);
+        return new Identity(clusterId, nodeId, controlUrl);
+    }
+
+    /** A single member reuses its durable cluster identity as its only stable node key. */
+    static Identity singleIdentity(ClusterProperties cluster, ClusterIdentityStore identities, ClusterMembershipStore memberships) {
+        if (cluster.getProfile() != ClusterProperties.Profile.SINGLE) throw new IllegalArgumentException("not a single-member deployment");
+        if (identities == null || memberships == null) throw new TapstateException(BootError.COORDINATION_STORE_REQUIRED, Map.of(), null);
+        validateLeaseBudgets(cluster);
+        ClusterIdentity existing = identities.find().orElseThrow(() -> new TapstateException(BootError.CLUSTER_ID_REQUIRED, Map.of(), null));
+        String id = existing.clusterId();
+        if (cluster.getId() != null && !cluster.getId().isBlank() && !id.equals(cluster.getId().trim())) {
+            throw new TapstateException(BootError.CLUSTER_ID_MISMATCH, Map.of("configured", cluster.getId().trim(), "stored", id), null);
         }
-        if (!controlUrl.isAbsolute()
-                || controlUrl.getHost() == null
-                || !reachableFromElsewhere(controlUrl.getHost())
-                || !("http".equalsIgnoreCase(controlUrl.getScheme())
-                        || "https".equalsIgnoreCase(controlUrl.getScheme()))) {
-            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), null);
-        }
+        memberships.read(id).ifPresent(stored -> {
+            if (!id.equals(stored.clusterId()) || !stored.activeNodeIds().equals(Set.of(id))) {
+                throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
+            }
+        });
+        return new Identity(id, id, null);
+    }
+
+    private static void validateLeaseBudgets(ClusterProperties cluster) {
         if (cluster.getNodeSessionTtl() == null || cluster.getNodeSessionTtl().isNegative()
                 || cluster.getNodeSessionTtl().isZero()) {
             throw new TapstateException(BootError.NODE_SESSION_TTL_INVALID, Map.of(), null);
@@ -105,7 +112,34 @@ final class ClusterMemberPreflight {
                 || cluster.getMembershipReconcileInterval().isZero()) {
             throw new TapstateException(BootError.CLUSTER_PROFILE_INVALID, Map.of(), null);
         }
-        return new Identity(clusterId, nodeId, controlUrl);
+    }
+
+    /** Applies the same cluster identity syntax in both standalone and discoverable modes. */
+    static String clusterId(String configured) {
+        String value = required(configured, BootError.CLUSTER_ID_REQUIRED);
+        try {
+            new ClusterIdentity(value);
+            return value;
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(BootError.CLUSTER_ID_INVALID, Map.of(), invalid);
+        }
+    }
+
+    /** Standalone members may advertise loopback; syntax and error codes are shared by both modes. */
+    static URI controlUrl(String configured, boolean remoteAddressRequired) {
+        String advertised = required(configured, BootError.CONTROL_ADVERTISE_URL_INVALID);
+        URI url;
+        try {
+            url = URI.create(advertised);
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), invalid);
+        }
+        if (!url.isAbsolute() || url.getHost() == null
+                || !("http".equalsIgnoreCase(url.getScheme()) || "https".equalsIgnoreCase(url.getScheme()))
+                || (remoteAddressRequired && !reachableFromElsewhere(url.getHost()))) {
+            throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), null);
+        }
+        return url;
     }
 
     private static void validateHeartbeat(HazelcastProperties hazelcast) {
@@ -139,6 +173,20 @@ final class ClusterMemberPreflight {
         if (!attempt.acquired()) {
             throw new TapstateException(BootError.NODE_ID_IN_USE, Map.of("nodeId", identity.nodeId()), null);
         }
+        return new Identity(identity.clusterId(), identity.nodeId(), identity.controlUrl(), attempt.claim());
+    }
+
+    /** Ordinary single-node startup cannot repair a missing configuration identity. */
+    static Identity reserveExisting(Identity identity, ClusterProperties cluster, ClusterIdentityStore identities,
+                                     WorkloadClaimStore claims, String bootId) {
+        if (identities == null || claims == null) throw new TapstateException(BootError.COORDINATION_STORE_REQUIRED, Map.of(), null);
+        ClusterIdentity existing = identities.find().orElseThrow(() -> new TapstateException(BootError.CLUSTER_ID_REQUIRED, Map.of(), null));
+        if (!existing.clusterId().equals(identity.clusterId())) throw new TapstateException(BootError.CLUSTER_ID_MISMATCH,
+                Map.of("configured", identity.clusterId(), "stored", existing.clusterId()), null);
+        WorkloadOwner owner = new WorkloadOwner(identity.nodeId(), bootId);
+        WorkloadClaimAttempt attempt = claims.acquire(new WorkloadClaimKey(identity.clusterId(), WorkloadClaimType.NODE_SESSION, identity.nodeId()),
+                owner, 0, cluster.getNodeSessionTtl());
+        if (!attempt.acquired()) throw new TapstateException(BootError.NODE_ID_IN_USE, Map.of("nodeId", identity.nodeId()), null);
         return new Identity(identity.clusterId(), identity.nodeId(), identity.controlUrl(), attempt.claim());
     }
 

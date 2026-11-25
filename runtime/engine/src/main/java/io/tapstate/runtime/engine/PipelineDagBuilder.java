@@ -3,20 +3,27 @@ package io.tapstate.runtime.engine;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import io.tapstate.core.dsl.aggregate.AggregateDefinition;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.sql.JoinPlan;
+import io.tapstate.runtime.engine.aggregate.AggregateProcessor;
+import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.runtime.engine.join.JoinDag;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.nest.NestDag;
@@ -288,6 +295,12 @@ public final class PipelineDagBuilder {
         return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest ? nest : null;
     }
 
+    /** The aggregate this step declares, or {@code null} where the step is anything else. */
+    private static TransformBody.Aggregate aggregateOf(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Aggregate aggregate
+                ? aggregate : null;
+    }
+
     /**
      * The join this step declares, or {@code null} where the step is anything else. One place answers
      * it so that everything walking a pipeline's transforms agrees on what a join is.
@@ -370,7 +383,7 @@ public final class PipelineDagBuilder {
         Map<Vertex, Integer> inboundOrdinal = new HashMap<>();
         PipelineChains chains = frontier == null ? null : new PipelineChains();
 
-        for (String sourceId : pipeline.sourceIds()) {
+        for (String sourceId : pipeline.sourceBindings()) {
             List<String> sourceKeys = bindings.sourceKeys().apply(sourceId);
             if (sourceKeys == null || sourceKeys.isEmpty()) {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
@@ -404,18 +417,18 @@ public final class PipelineDagBuilder {
                         throw new IllegalStateException("transform step '" + step.id()
                                 + "' is a nest, but no nest binding was supplied to the builder");
                     }
-                    NestTopology topology =
-                            NestTopology.compile(pipeline.id(), step.id(), nest, bindings.nest().tables());
+                    var nestBinding = bindings.nest().forStep(pipeline.id(),step.id());
+                    NestTopology topology = nestBinding.topology(pipeline.id(),step.id(),nest);
                     // Before a vertex is drawn, not after: the paths a tree keeps its state under are
                     // named by the tree, so a job built first and refused afterwards would already have
                     // decided which entries it was about to read - and every one of them would be the
                     // wrong entry, silently, with nothing downstream able to tell.
-                    NestStateLedger.reconcile(bindings.nest().ledger(), pipeline.id(), step.id(),
-                            topology.statePaths());
+                    NestStateLedger.reconcile(nestBinding.ledger(), pipeline.id(), step.id(),
+                            nestBinding.stores().hasTypedPlacements() ? topology.stateIdentityPaths() : topology.statePaths());
                     byKey.put(step.id(), NestDag.attach(dag, topology,
                             step.id(), nest.root().from(), step.id(),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
-                            bindings.nest(),
+                            nestBinding,
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
@@ -461,6 +474,46 @@ public final class PipelineDagBuilder {
                     assembled = true;
                     continue;
                 }
+                if (aggregateOf(step) != null) {
+                    // An aggregate step is one processor for the whole cluster, whatever the width of the
+                    // nodes around it: both of its sides commit under the pipeline's one claim, and a row
+                    // leaving a group has to be applied before the same row arriving in another.
+                    if (bindings.aggregate() == null) {
+                        throw new IllegalStateException("transform step '" + step.id()
+                                + "' is an aggregate, but no aggregate binding was supplied to the builder");
+                    }
+                    if (shape.isNative(step.id())) {
+                        throw new IllegalStateException("aggregate step '" + step.id()
+                                + "' was given a width; it runs as one processor");
+                    }
+                    List<String> upstream = resolveClause(step.from(), bindings);
+                    Map<Integer, List<String>> carried = chains == null ? null : chains.perOrdinal(upstream);
+                    AggregateStepSpec spec = bindings.aggregate().specs().apply(step);
+                    AggregateStores stores = bindings.aggregate().stores();
+                    AggregateDefinition definition = AggregateDefinition.of(upstream, spec);
+                    ReplayFloorFactory aggregateFloor = bindings.aggregate().replayFloor();
+                    AggregateProcessor.Sweep sweep = bindings.aggregate().sweep();
+                    String pipelineId = pipeline.id();
+                    String name = step.id();
+                    SupplierEx<Processor> processors = axes == null
+                            ? () -> new AggregateProcessor(pipelineId, name, spec, definition, stores, null, aggregateFloor, sweep)
+                            : () -> new AggregateProcessor(pipelineId, name, spec, definition, stores,
+                                    new LevelBounds(carried, axes, LevelBounds.HOLDS_NOTHING), aggregateFloor, sweep);
+                    Vertex vertex = dag.newVertex(name,
+                            TotalOne.passingBounds(ProcessorSupplier.of(processors), name, axes, carried));
+                    byKey.put(name, vertex);
+                    drawn.add(name, name);
+                    if (chains != null) {
+                        // The rows it sends are rows of its own, never rows a source read.
+                        chains.assembled(name, upstream);
+                    }
+                    connect(dag, verticesOf(upstream, byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
+                    attachTraceInputs(dag, name, step.from(), bindings, byKey, trace,
+                            outboundOrdinal, inboundOrdinal, shape);
+                    attachTrace(dag, name, vertex, trace, outboundOrdinal, inboundOrdinal, shape);
+                    assembled = true;
+                    continue;
+                }
                 List<String> upstream = resolveClause(step.from(), bindings);
                 Vertex vertex = transformVertex(dag, step, bindings, axes,
                         chains == null ? null : chains.perOrdinal(upstream), shape);
@@ -481,12 +534,13 @@ public final class PipelineDagBuilder {
         // can report.
         List<SinkNode> sinks = sinkNodes(pipeline, bindings);
         Map<String, List<String>> writersByChain = chains == null ? null : writersByChain(sinks, chains, shape);
+        var roster = writersByChain == null ? null : new SinkAckFactory.RunWriters(writersByChain, writersByOutput(sinks, chains, shape));
         boolean startsTheRun = sinkAck != null && writersByChain != null;
         for (SinkNode sink : sinks) {
             verticesOf(sink.upstream(), byKey).forEach(upstream -> drawn.feeds(sink.name(), upstream.getName()));
             if (shape.isNative(sink.name())) {
                 drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,
-                        startsTheRun ? writersByChain : null);
+                        startsTheRun ? roster : null);
                 drawn.add(sink.name(), ROUTE_VERTEX_PREFIX + sink.name());
                 drawn.add(sink.name(), sink.name());
                 startsTheRun = false;
@@ -497,9 +551,9 @@ public final class PipelineDagBuilder {
             boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
             ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
                     assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()),
-                    sink.batch()), sink);
+                    chains == null ? Map.of() : chains.assembledOutputs(sink.upstream()), sink.batch()), sink);
             if (startsTheRun) {
-                supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
+                supplier = WriterRunStart.of(supplier, sinkAck, roster);
                 startsTheRun = false;
             }
             Vertex vertex = dag.newVertex(sink.name(), supplier);
@@ -509,9 +563,10 @@ public final class PipelineDagBuilder {
 
         // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
         // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
-        if (sinkAck != null && chains != null) {
+        boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
+        if (sinkAck != null && chains != null && readsSnapshot) {
             Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
-            for (String sourceId : pipeline.sourceIds()) {
+            for (String sourceId : pipeline.sourceBindings()) {
                 for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
                     List<AwaitedLoad> awaited = gates.get(frontier.chainOf(sourceKey));
                     if (awaited != null) {
@@ -631,7 +686,7 @@ public final class PipelineDagBuilder {
     private static void drawNativeSink(DAG dag, SinkNode sink, SinkAckFactory sinkAck, ChainAxes axes,
             PipelineChains chains, ExecutionShape shape, Map<String, Vertex> byKey,
             Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal,
-            Map<String, List<String>> startsTheRun) {
+            SinkAckFactory.RunWriters startsTheRun) {
         String name = sink.name();
         Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
         int local = shape.localOf(name);
@@ -651,7 +706,8 @@ public final class PipelineDagBuilder {
                         LevelBounds.HOLDS_NOTHING);
         ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
                 sinkAck, () -> SettledFloor.forRoutedWriter(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
-                shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis()),
+                shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis(),
+                chains == null ? Map.of() : chains.assembledOutputs(sink.upstream())),
                 sink);
         if (startsTheRun != null) {
             writers = WriterRunStart.of(writers, sinkAck, startsTheRun);
@@ -736,6 +792,16 @@ public final class PipelineDagBuilder {
         return byChain;
     }
 
+    private static Map<String, Map<String, List<String>>> writersByOutput(List<SinkNode> sinks, PipelineChains chains, ExecutionShape shape) {
+        var outputs = new LinkedHashMap<String, Map<String, List<String>>>();
+        for (var sink : sinks) {
+            var streams = new LinkedHashMap<String, List<String>>(); var writers = writersOf(sink, shape);
+            for (String stream : chains.union(sink.upstream())) streams.put(stream, writers);
+            outputs.put(sink.name(), streams);
+        }
+        return outputs;
+    }
+
     /**
      * Every writer {@code sink} runs: one, at index zero, for a sink running as one processor for the cluster,
      * and as many as it runs across the cluster otherwise, by the index the engine gives each.
@@ -774,7 +840,7 @@ public final class PipelineDagBuilder {
     private static ProcessorMetaSupplier sinkVertex(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAck, ChainAxes axes, boolean assembled, Map<Integer, List<String>> chainsByOrdinal,
-            BatchSpec batch) {
+            Map<String, List<String>> assembledOutputs, BatchSpec batch) {
         if (sinkAck == null) {
             return SinkProcessor.metaSupplier(vertexName, writerFactory, batch.effectiveMaxRecords(),
                     batch.effectiveMaxWaitMillis());
@@ -786,7 +852,7 @@ public final class PipelineDagBuilder {
                 ? null
                 : () -> new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING);
         return SinkProcessor.metaSupplier(vertexName, writerFactory, sinkAck, frontier, edges,
-                batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis());
+                batch.effectiveMaxRecords(), batch.effectiveMaxWaitMillis(), assembledOutputs);
     }
 
     /**

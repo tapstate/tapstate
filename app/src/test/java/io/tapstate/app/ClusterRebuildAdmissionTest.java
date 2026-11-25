@@ -33,6 +33,7 @@ class ClusterRebuildAdmissionTest {
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
     private final ClusterProperties properties = production();
     private final ClusterMembershipGate membership = new ClusterMembershipGate(properties);
+    { membership.observeNodeSession(() -> true); }
     private final AtomicLong nanos = new AtomicLong();
     private final PipelineActuationOwnership ownership = new PipelineActuationOwnership(
             "cluster-a", NODE_A, membership, new ClusterWorkloadClaims(claims, membership), TTL, RENEW,
@@ -454,6 +455,26 @@ class ClusterRebuildAdmissionTest {
     }
 
     @Test
+    void onlyAConfirmedNewLifetimeResetsTheRetainedBudget() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+        var original = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        admission.observeScope(original, java.util.Optional::empty);
+        for (int attempt = 0; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            assertThat(admission.admits("orders")).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        admission.retain(List.of("orders"));
+        var rebuilt = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", 2);
+        admission.observeScope(rebuilt, () -> java.util.Optional.of(new io.tapstate.spi.store.PipelineStateMappings.LogWindow(1, 2)));
+        assertThat(admission.admits("orders")).isFalse();
+        var recreated = new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", 3);
+        admission.observeScope(recreated, () -> java.util.Optional.of(new io.tapstate.spi.store.PipelineStateMappings.LogWindow(3, 3)));
+        assertThat(admission.admits("orders")).isTrue();
+    }
+
+    @Test
     void aPipelineCreatedUnderTheIdOfOneThatSpentItsBudgetGetsABudgetOfItsOwn() {
         committed(7, "node-a", "node-b");
         submitRunUnder(7);
@@ -834,14 +855,18 @@ class ClusterRebuildAdmissionTest {
     /** What the admission logged while {@code scenario} ran. */
     private static List<String> loggedBy(Runnable scenario) {
         Logger logger = (Logger) LoggerFactory.getLogger(ClusterRebuildAdmission.class);
+        var previousLevel = logger.getLevel();
         ListAppender<ILoggingEvent> written = new ListAppender<>();
+        written.setContext(logger.getLoggerContext());
         written.start();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         logger.addAppender(written);
         try {
             scenario.run();
         } finally {
             logger.detachAppender(written);
             written.stop();
+            logger.setLevel(previousLevel);
         }
         return written.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
     }

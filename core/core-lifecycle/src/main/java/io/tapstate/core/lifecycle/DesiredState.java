@@ -58,6 +58,35 @@ public record DesiredState(
     }
 
     /**
+     * Whether this one-shot start is still owed at the checkpoint. Completion can win the next CAS
+     * just after a start was accepted at epoch E; COMPLETED at E+1 did not execute that start. A start
+     * actually consumed at E first writes RUNNING at E+1, so its own completion is at least E+2.
+     */
+    public boolean rebuildOwedAt(CheckpointDoc checkpoint) {
+        if (!reassemble || rebuiltAtStateEpoch == null || checkpoint == null) {
+            return false;
+        }
+        return rebuiltAtStateEpoch == checkpoint.epoch()
+                || StateJson.parse(checkpoint.stateJson()) == PipelineState.COMPLETED
+                && checkpoint.epoch() > 0 && rebuiltAtStateEpoch == checkpoint.epoch() - 1;
+    }
+
+    /**
+     * The intent after accounting for natural completion. A consumed RUNNING intent stays on file,
+     * but does not request another run. A newly accepted start, including one newer than the checkpoint
+     * this reader observed, must still be treated as RUNNING until its own execution has completed.
+     */
+    public PipelineState targetStateAt(CheckpointDoc checkpoint) {
+        if (targetState != PipelineState.RUNNING || checkpoint == null
+                || StateJson.parse(checkpoint.stateJson()) != PipelineState.COMPLETED) {
+            return targetState;
+        }
+        boolean pending = rebuildOwedAt(checkpoint)
+                || reassemble && rebuiltAtStateEpoch != null && rebuiltAtStateEpoch > checkpoint.epoch();
+        return pending ? PipelineState.RUNNING : PipelineState.COMPLETED;
+    }
+
+    /**
      * An intent that builds nothing afresh and knows nothing about what its run was assembled from —
      * every verb but the resume that re-assembles, and every intent stored before those fields existed.
      */

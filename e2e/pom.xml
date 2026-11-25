@@ -22,6 +22,10 @@
   <name>Tapstate :: E2E</name>
   <description>Declarative YAML test-specification envelope + Java executor (test scope only)</description>
 
+  <properties>
+    <tapstate.it.jvmArgs></tapstate.it.jvmArgs>
+  </properties>
+
   <dependencyManagement>
     <dependencies>
       <dependency>
@@ -35,6 +39,19 @@
   </dependencyManagement>
 
   <dependencies>
+    <!-- Native fixture preparation uses the same split-store ports as the assembly root. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-mongo-store</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-store</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- Shared test scaffolding: the Docker gate these suites are held to. A test-jar in test
          scope - nothing from it reaches the shipped artifact. -->
     <dependency>
@@ -326,7 +343,7 @@
                generated classes - blocked on JDK 17+ unless java.lang is opened. The shipped server
                carries the same opening in its launcher; the in-process tier must match it, or a real
                connector's very first init fails here with an ExceptionInInitializerError. -->
-          <argLine>--add-opens java.base/java.lang=ALL-UNNAMED</argLine>
+          <argLine>--add-opens java.base/java.lang=ALL-UNNAMED ${tapstate.it.jvmArgs}</argLine>
           <systemPropertyVariables>
             <!-- Where the reactor puts the service deliverable. The real-process tier drives this file
                  rather than a classpath, which is the whole of its fidelity claim; the app module is
@@ -343,6 +360,7 @@
             <!-- Where this module's output goes, so the witness ledger is written where the release
                  gate reads it rather than wherever the JVM happened to be started. -->
             <tapstate.e2e.build-directory>${project.build.directory}</tapstate.e2e.build-directory>
+            <tapstate.e2e.dummy-example>${project.basedir}/../docs/tutorials/qualifying-dummy-pipelines</tapstate.e2e.dummy-example>
           </systemPropertyVariables>
         </configuration>
         <executions>

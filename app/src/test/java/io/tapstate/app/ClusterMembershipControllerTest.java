@@ -185,7 +185,9 @@ class ClusterMembershipControllerTest {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         properties.setBootstrapMinMembers(3);
-        return new ClusterMembershipGate(properties);
+        var gate = new ClusterMembershipGate(properties);
+        gate.observeNodeSession(() -> true);
+        return gate;
     }
 
     /** A member whose cluster reports whatever the supplied set says, and nothing else. */

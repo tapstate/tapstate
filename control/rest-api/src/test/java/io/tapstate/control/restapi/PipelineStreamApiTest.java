@@ -133,7 +133,7 @@ class PipelineStreamApiTest {
         FakeObservationStore observations = context.getBean(FakeObservationStore.class);
         observations.save(new Observation("pl1", PipelineState.FAILED, Map.of("errorCount", 1L),
                 Map.of(), Map.of(), new ObservationFailure(
-                        "engine.job-failed", Map.of("pipeline", "pl1", "cause", "sink refused the batch"))));
+                        "TS0440008", Map.of("pipeline", "pl1", "cause", "sink refused the batch"))));
 
         FrameSink sink = new FrameSink();
         WebSocket ws = connect("/api/pipelines/pl1/status/watch", readToken(), sink);
@@ -143,7 +143,7 @@ class PipelineStreamApiTest {
             Object failure = frame.get("failure");
             assertThat(failure).isInstanceOf(Map.class);
             Map<?, ?> failureMap = (Map<?, ?>) failure;
-            assertThat(failureMap.get("code")).isEqualTo("engine.job-failed");
+            assertThat(failureMap.get("code")).isEqualTo("TS0440008");
             assertThat(failureMap.get("message")).isNotNull();
             Map<?, ?> params = (Map<?, ?>) failureMap.get("params");
             assertThat(params.get("cause")).isEqualTo("sink refused the batch");
@@ -170,6 +170,23 @@ class PipelineStreamApiTest {
 
             Map<?, ?> second = frames.nextFrame();
             assertThat(messages(second)).containsExactly("converged to RUNNING");
+        } finally {
+            ws.abort();
+        }
+    }
+
+    @Test
+    void followResumesStrictlyAfterTheRequestedCursor() throws Exception {
+        FakeLogSink sink = context.getBean(FakeLogSink.class);
+        sink.append("pl2", new LogLine(1_700_000_000_000L, "INFO", "submitted job"));
+        sink.append("pl2", new LogLine(1_700_000_000_100L, "INFO", "converged to RUNNING"));
+
+        FrameSink frames = new FrameSink();
+        WebSocket ws = connect("/api/pipelines/pl2/logs/follow?after=tail%3A1", readToken(), frames);
+        try {
+            Map<?, ?> resumed = frames.nextFrame();
+            assertThat(messages(resumed)).containsExactly("converged to RUNNING");
+            assertThat(resumed.get("truncated")).isEqualTo(false);
         } finally {
             ws.abort();
         }

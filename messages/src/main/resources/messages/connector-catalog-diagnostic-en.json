@@ -1,0 +1,10 @@
+{
+  "TS0380001": {
+    "message": "Connector '{connector}' is not present in the online catalog.",
+    "solution": "Choose a connector returned by `connector.list`, or register it before requesting its form metadata."
+  },
+  "TS0380002": {
+    "message": "The download target for connector '{connector}' has changed.",
+    "solution": "Review the current version and confirm the new target."
+  }
+}

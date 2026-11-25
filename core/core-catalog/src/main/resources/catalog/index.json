@@ -1,5 +1,5 @@
 {
-  "specSha": "cc13816",
+  "specSha": "ebdb247",
   "capabilitySha": "cc13816",
   "entries": [
     "GitHub",
@@ -23,6 +23,7 @@
     "custom",
     "databend",
     "db2",
+    "db2i",
     "doris",
     "dummy",
     "dws",

@@ -1,11 +1,14 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.core.common.ActuationErrorDefinitions;
 import io.tapstate.control.core.ArtifactDraft;
 import io.tapstate.control.core.PipelinePreviewEvent;
 import io.tapstate.control.core.PipelinePreviewCommand;
 import io.tapstate.control.core.PipelinePreviewSession;
 import io.tapstate.control.core.PipelinePreviewService;
+import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -23,6 +26,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -48,13 +53,15 @@ class PipelinePreviewController {
 
     @Verb("pipeline.preview")
     @PostMapping(value = "/artifacts:preview", consumes = "application/json", produces = "application/x-ndjson")
-    ResponseEntity<StreamingResponseBody> preview(HttpServletRequest request) throws IOException {
+    ResponseEntity<StreamingResponseBody> preview(HttpServletRequest request, HttpServletResponse servletResponse)
+            throws IOException {
         if (request.getContentLengthLong() > MAX_REQUEST_BYTES) {
             throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
         }
         byte[] bytes = readBounded(request.getInputStream(), MAX_REQUEST_BYTES);
         PipelinePreviewCommand command = parse(decodeRequest(bytes, json));
-        PreviewResponse response = new PreviewResponse(json, previews.open(AuthenticatedCaller.subject(), command));
+        PreviewResponse response = new PreviewResponse(json, previews.open(AuthenticatedCaller.subject(), command),
+                servletResponse, ApiExceptionHandler.localeFor(request));
         try {
             WebAsyncUtils.getAsyncManager(request).registerCallableInterceptor(response, response);
             return ResponseEntity.ok()
@@ -77,18 +84,24 @@ class PipelinePreviewController {
             implements StreamingResponseBody, CallableProcessingInterceptor, AutoCloseable {
         private final ObjectMapper json;
         private final PipelinePreviewSession stream;
+        private final HttpServletResponse servletResponse;
+        private final Locale locale;
         private final AtomicBoolean closed = new AtomicBoolean();
 
-        private PreviewResponse(ObjectMapper json, PipelinePreviewSession stream) {
+        private PreviewResponse(ObjectMapper json, PipelinePreviewSession stream, HttpServletResponse servletResponse,
+                                Locale locale) {
             this.json = json;
             this.stream = stream;
+            this.servletResponse = servletResponse;
+            this.locale = locale;
         }
 
         @Override
         public void writeTo(OutputStream output) throws IOException {
             PreviewResponse owner = this;
             try (owner) {
-                writeEvents(json, output, stream);
+                // The framework can suppress output-stream flushes; commit each event through the servlet.
+                writeEvents(json, output, stream, servletResponse::flushBuffer, locale);
             }
         }
 
@@ -203,13 +216,28 @@ class PipelinePreviewController {
     }
 
     static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
+        writeEvents(json, output, stream, Locale.ENGLISH);
+    }
+
+    static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream, Locale locale)
+            throws IOException {
+        writeEvents(json, output, stream, output::flush, locale);
+    }
+
+    @FunctionalInterface
+    private interface EventFlush {
+        void flush() throws IOException;
+    }
+
+    private static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream,
+                                    EventFlush eventFlush, Locale locale) throws IOException {
         SerializationOutputStream serializationOutput = new SerializationOutputStream(output);
         try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {
-                json.writeValue(serializationOutput, event);
+                json.writeValue(serializationOutput, localizeFailure(event, locale));
                 output.write('\n');
-                output.flush();
+                eventFlush.flush();
                 if ("run.completed".equals(event.kind()) || "run.failed".equals(event.kind())) {
                     break;
                 }
@@ -228,6 +256,26 @@ class PipelinePreviewController {
             stream.cancel();
             throw disconnected;
         }
+    }
+
+    private static PipelinePreviewEvent localizeFailure(PipelinePreviewEvent event, Locale locale) {
+        var definition = ActuationErrorDefinitions.PREVIEW_ASSOCIATION_KEY_DROPPED;
+        var payload = event.payload();
+        if (!"run.failed".equals(event.kind()) || !definition.code().equals(payload.get("code"))
+                || !(payload.get("params") instanceof Map<?, ?> rawParameters)) {
+            return event;
+        }
+        Map<String, Object> parameters = new LinkedHashMap<>();
+        for (String name : definition.parameters()) {
+            if (!(rawParameters.get(name) instanceof String value)) {
+                return event;
+            }
+            parameters.put(name, value);
+        }
+        var localized = new LinkedHashMap<>(payload);
+        localized.put("reason", MessageCatalog.bundled().render(definition.code(), parameters, locale).message());
+        return new PipelinePreviewEvent(event.runId(), event.candidateHash(), event.seq(), event.kind(),
+                event.at(), localized);
     }
 
     private static final class SerializationOutputStream extends OutputStream {

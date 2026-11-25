@@ -71,6 +71,7 @@ class GuidedFirstRunIT {
             Pattern.compile("up: preflight failed on " + SOURCE_ID + ": (\\S+) ");
 
     private static ServerHandle server;
+    private static PreparedNativeStore storage;
     private static MongoEndpoints mongo;
     private static EndpointAddress viewStore;
     private static Map<String, Object> mysql;
@@ -85,16 +86,17 @@ class GuidedFirstRunIT {
         RealConnectorGate.require("mysql", "mongodb");
         mysql = SharedMySql.settings(DATABASE);
         seed(mysql, SEEDED_ROWS);
-        server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl(DATABASE));
+        storage = PreparedNativeStore.create(USER, PASSWORD);
+        server = Tiers.IN_PROCESS.launch(storage);
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin(USER, PASSWORD);
+        storage.loginAndAwaitBusiness(control);
         // The connectors a first run needs, registered the way every real-connector witness registers
         // them: the source's own, and the one the server's view store is reached through.
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
         mongo = new MongoEndpoints();
-        // Views land in the "views" database of the server's own replica set, under the view's id.
-        viewStore = EndpointAddress.uri(SharedMongo.replicaSetUrl("views"));
+        // The native installation declares the master database that holds the view.
+        viewStore = EndpointAddress.uri(storage.masterUri());
         home = Files.createDirectories(temporaryRoot.resolve("home"));
         workspace = Files.createDirectories(temporaryRoot.resolve("workspace"));
     }
@@ -106,6 +108,9 @@ class GuidedFirstRunIT {
         }
         if (server != null) {
             server.close();
+        }
+        if (storage != null) {
+            storage.close();
         }
     }
 

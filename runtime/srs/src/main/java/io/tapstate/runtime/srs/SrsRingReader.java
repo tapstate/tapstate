@@ -67,6 +67,9 @@ public final class SrsRingReader {
         this.cursor = startSeq;
     }
 
+    /** The run-local next read position, used only to save an initial arrival before any fill; it is not an ACK. */
+    public long nextReadSequence() { return cursor; }
+
     /**
      * A reader positioned by a {@code start} point resolved against the ring: {@code earliest} at the head
      * (replay everything buffered), {@code latest} just past the tail (only changes appended from now on),
@@ -177,11 +180,7 @@ public final class SrsRingReader {
                 throw reader.gap(ackedSeq, "the confirmed position does not prove this table's recovery cursor");
             }
             if (ackedSeq > bounds.trimmedThrough()) {
-                SrsLogBatch batch = reader.readDurable(ackedSeq, 1);
-                SrsLogRecord record = batch.records().get(ackedSeq);
-                if (record.epoch() != order.epoch() || !Objects.equals(record.srcToken(), confirmed.token())) {
-                    throw reader.gap(ackedSeq, "the confirmed position differs from the retained record's generation or token");
-                }
+                reader.verifyConfirmation(ackedSeq, confirmed);
             }
         }
         return reader;
@@ -189,6 +188,19 @@ public final class SrsRingReader {
 
     private static long nextSequence(long sequence) {
         return Math.addExact(sequence, 1L);
+    }
+
+    private void verifyConfirmation(long sequence, ChainPosition confirmed) {
+        SrsLogBatch batch = log.readBatch(ringName, sequence, 1);
+        // Compaction may retire this confirmed record during the lookup; the unread suffix must remain.
+        requireRetained(cursor, batch.bounds());
+        if (sequence <= batch.bounds().trimmedThrough()) return;
+        SrsLogRecord record = batch.records().get(sequence);
+        if (record == null) throw gap(sequence, "the retained log has no record at the required sequence");
+        if (record.epoch() < 1L) throw gap(sequence, "the retained record has no verified original capture generation");
+        if (record.epoch() != confirmed.order().epoch() || !Objects.equals(record.srcToken(), confirmed.token())) {
+            throw gap(sequence, "the confirmed position differs from the retained record's generation or token");
+        }
     }
 
     private long firstDurableSeqAtOrAfter(StartFrom.At at, String retention, SrsLogBounds bounds) {
@@ -309,40 +321,66 @@ public final class SrsRingReader {
      */
     public int fill(ObjLongConsumer<SrsItem> out, int max) {
         Objects.requireNonNull(out, "out");
+        int emitted = drain((item, sequence) -> {
+            out.accept(item, sequence);
+            cursor++;
+        }, max, ring.tailSequence());
+        if (emitted > 0) onAdvance.accept(cursor - 1);
+        return emitted;
+    }
+
+    int fill(SrsEventModelVerifier verifier, ObjLongConsumer<SrsItem> out, int max) {
+        if (!(verifier instanceof SrsEventModelVerifier.Batch batch)) {
+            return fill((item, sequence) -> {
+                verifier.verify(item, sequence);
+                out.accept(item, sequence);
+            }, max);
+        }
         long tail = ring.tailSequence();
-        long head = log == null || cursor > tail || max < 1 ? 0L : ring.headSequence();
+        if (cursor > tail || max < 1) return 0;
+        var items = new java.util.ArrayList<SrsItem>();
+        int emitted = drain((item, sequence) -> items.add(item), max, tail);
+        batch.verifyBatch(items, cursor);
+        for (SrsItem item : items) {
+            out.accept(item, cursor);
+            cursor++;
+        }
+        onAdvance.accept(cursor - 1);
+        return emitted;
+    }
+
+    private int drain(ObjLongConsumer<SrsItem> out, int max, long tail) {
+        long sequence = cursor;
+        long head = log == null || sequence > tail || max < 1 ? 0L : ring.headSequence();
         int emitted = 0;
-        while (cursor <= tail && emitted < max) {
-            if (log != null && cursor < head) {
-                int size = (int) Math.min((long) max - emitted, Math.min(tail - cursor + 1L,
-                        head - cursor));
-                SrsLogBatch batch = readDurable(cursor, size);
+        while (sequence <= tail && emitted < max) {
+            if (log != null && sequence < head) {
+                int size = (int) Math.min((long) max - emitted, Math.min(tail - sequence + 1L,
+                        head - sequence));
+                SrsLogBatch batch = readDurable(sequence, size);
                 for (int i = 0; i < size; i++) {
-                    out.accept(itemOf(batch.records().get(cursor)), cursor);
-                    cursor++;
+                    out.accept(itemOf(batch.records().get(sequence)), sequence);
+                    sequence++;
                     emitted++;
                 }
             } else {
                 SrsItem item;
                 try {
-                    item = ring.readOne(cursor);
+                    item = ring.readOne(sequence);
                 } catch (StaleSequenceException missing) {
                     if (log == null) {
                         throw missing;
                     }
-                    throw gap(cursor, "the hot ring lost the required record and the durable log could not serve it");
+                    throw gap(sequence, "the hot ring lost the required record and the durable log could not serve it");
                 }
                 if (log != null && (item == null || item.epoch() < 1L)) {
-                    throw gap(cursor, item == null ? "the required ring record is missing"
+                    throw gap(sequence, item == null ? "the required ring record is missing"
                             : "the retained record has no verified original capture generation");
                 }
-                out.accept(item, cursor);
-                cursor++;
+                out.accept(item, sequence);
+                sequence++;
                 emitted++;
             }
-        }
-        if (emitted > 0) {
-            onAdvance.accept(cursor - 1);
         }
         return emitted;
     }

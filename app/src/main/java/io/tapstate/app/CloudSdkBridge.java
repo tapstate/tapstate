@@ -1,13 +1,19 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
+
 import io.tapstate.cloud.sdk.ApiClient;
 import io.tapstate.cloud.sdk.ApiException;
 import io.tapstate.cloud.sdk.api.C2StatusReportApi;
 import io.tapstate.cloud.sdk.client.CloudControlPlaneException;
 import io.tapstate.cloud.sdk.client.CloudControlPlaneSdk;
+import io.tapstate.cloud.sdk.client.ClusterEgressAddress;
+import io.tapstate.cloud.sdk.client.JwtExchangeResult;
 import io.tapstate.cloud.sdk.client.JwtVerificationException;
 import io.tapstate.cloud.sdk.model.StatusReportRequest;
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudClusterEgressAddress;
+import io.tapstate.control.core.CloudClusterEgressAddressProvider;
 import io.tapstate.control.core.CloudCodeExchanger;
 import io.tapstate.control.core.CloudCodeExchangeResult;
 import io.tapstate.control.core.CloudJwtValidator;
@@ -31,7 +37,7 @@ import java.util.Optional;
 
 /** Thin binding to the Cloud-owned SDK; session and status policy remain in Tapstate. */
 final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
-        CloudSessionCallbackVerifier, CloudStatusSender {
+        CloudSessionCallbackVerifier, CloudStatusSender, CloudClusterEgressAddressProvider {
 
     static final String DEPLOYMENT_ORGANIZATION = "sdk-verified-cluster";
     private static final Logger LOG = LoggerFactory.getLogger(CloudSdkBridge.class);
@@ -62,10 +68,11 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             logValidationFailure("code-exchange", "configured-cluster-mismatch");
             throw CloudAuthenticationService.unavailable();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EXCHANGE)) {
             ExchangeResult result = sdk.exchange(exchangeCode);
             return new CloudCodeExchangeResult(result.jwt(), result.context());
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EXCHANGE);
             throw CloudAuthenticationService.unavailable();
         }
     }
@@ -81,7 +88,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             logValidationFailure("claims-validation", "missing-request-audience");
             return Optional.empty();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_VERIFY)) {
             VerifiedClaims claims = sdk.verify(rawJwt);
             String rejected = !text(claims.userId()) ? "missing-user-id"
                     : !text(claims.organizationId()) ? "missing-org-id"
@@ -101,8 +108,9 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             }
             return Optional.of(new CloudLoginIdentity(
                     expectedDeployment, claims.userId(), claims.organizationId(), claims.clusterId(),
-                    claims.jwtId(), scope, claims.expiresAt()));
+                    claims.jwtId(), scope, claims.expiresAt(), claims.userEmail()));
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_VERIFY);
             return Optional.empty();
         } catch (IllegalArgumentException invalid) {
             logValidationFailure("claims-validation", "invalid-verified-claims");
@@ -118,9 +126,10 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 || !settings.clusterId().equals(clusterId)) {
             return false;
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_CALLBACK)) {
             return sdk.verifyCallback(method, timestamp, nonce, data, signature);
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_CALLBACK);
             return false;
         }
     }
@@ -130,10 +139,42 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         if (!settings.clusterId().equals(clusterId)) {
             throw statusUnavailable();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_STATUS)) {
             sdk.report(clusterId, nonce, status, settings.token());
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_STATUS);
             throw statusUnavailable();
+        }
+    }
+
+    @Override
+    public Optional<CloudClusterEgressAddress> currentAddress(String organizationId, String clusterId) {
+        if (!settings.clusterId().equals(clusterId)) {
+            return Optional.empty();
+        }
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS)) {
+            ClusterEgressAddress current = sdk.currentEgressAddress();
+            if (!organizationId.equals(current.organizationId()) || !clusterId.equals(current.clusterId())) {
+                return Optional.empty();
+            }
+            return Optional.of(new CloudClusterEgressAddress(current.organizationId(), current.clusterId(),
+                    optionalText(current.ec2PublicIp()), optionalText(current.egressAddressStatus())));
+        } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS);
+            return Optional.empty();
+        }
+    }
+
+    /** Machine-token-authenticated Cluster context, independent of every user session and display label. */
+    Optional<io.tapstate.core.alerting.AlarmKey.Scope> alertScope() {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS)) {
+            ClusterEgressAddress original = sdk.currentEgressAddress();
+            if (original == null || !settings.clusterId().equals(original.clusterId())
+                    || !text(original.organizationId()) || DEPLOYMENT_ORGANIZATION.equals(original.organizationId())) return Optional.empty();
+            return Optional.of(new io.tapstate.core.alerting.AlarmKey.Scope(original.organizationId(), original.clusterId()));
+        } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS);
+            return Optional.empty();
         }
     }
 
@@ -209,24 +250,66 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         return id == null ? "none" : id;
     }
 
+    ConfigurationInitialization claimConfiguration(String bootId, String hash) {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_CLAIM)) {
+            var result = sdk.claimConfiguration(bootId, hash);
+            if (!settings.clusterId().equals(result.clusterId()) || !hash.equals(result.configurationHash())) throw new ProviderFailure();
+            return result;
+        } catch (ProviderFailure failure) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_CLAIM);
+            throw CloudAuthenticationService.unavailable();
+        }
+    }
+
+    void completeConfiguration(String operationId, String hash) {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_COMPLETE)) {
+            var result = sdk.completeConfiguration(operationId, hash);
+            if (!settings.clusterId().equals(result.clusterId()) || !hash.equals(result.configurationHash())
+                    || !operationId.equals(result.operationId()) || !"COMPLETE".equals(result.phase()) || result.creationGranted()) throw new ProviderFailure();
+        } catch (ProviderFailure failure) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_COMPLETE);
+            throw CloudAuthenticationService.unavailable();
+        }
+    }
+
+    record ConfigurationInitialization(String clusterId, String operationId, String phase, String configurationHash, boolean creationGranted) {
+        ConfigurationInitialization {
+            try {
+                if (!text(clusterId) || operationId == null || !java.util.UUID.fromString(operationId).toString().equals(operationId)
+                        || !List.of("CLAIMED", "COMPLETE").contains(phase) || configurationHash == null || !configurationHash.matches("[0-9a-f]{64}")
+                        || creationGranted && !phase.equals("CLAIMED")) throw new ProviderFailure();
+            } catch (IllegalArgumentException invalid) { throw new ProviderFailure(); }
+        }
+    }
+
     interface SdkRuntime {
         ExchangeResult exchange(String code);
         VerifiedClaims verify(String jwt);
+        ClusterEgressAddress currentEgressAddress();
         boolean verifyCallback(String method, String timestamp, String nonce, String data, String signature);
         void report(String clusterId, String nonce, CloudRuntimeStatus status, String token);
+        default ConfigurationInitialization claimConfiguration(String bootId, String hash) { throw new ProviderFailure(); }
+        default ConfigurationInitialization completeConfiguration(String operationId, String hash) { throw new ProviderFailure(); }
     }
 
     record ExchangeResult(
             String jwt, String organizationId, String clusterId,
-            String organizationName, String clusterName, String region) {
+            String organizationName, String clusterName, String region,
+            String ec2PublicIp, String egressAddressStatus) {
         ExchangeResult(String jwt) {
-            this(jwt, null, null, null, null, null);
+            this(jwt, null, null, null, null, null, null, null);
+        }
+
+        ExchangeResult(String jwt, String organizationId, String clusterId,
+                String organizationName, String clusterName, String region) {
+            this(jwt, organizationId, clusterId, organizationName, clusterName, region, null, null);
         }
 
         ExchangeResult {
             if (!text(jwt)) throw new ProviderFailure();
             boolean noContext = organizationId == null && clusterId == null
-                    && organizationName == null && clusterName == null && region == null;
+                    && organizationName == null && clusterName == null && region == null
+                    && ec2PublicIp == null && egressAddressStatus == null;
             boolean completeContext = text(organizationId) && text(clusterId)
                     && text(organizationName) && text(clusterName) && text(region);
             if (!noContext && !completeContext) throw new ProviderFailure();
@@ -234,12 +317,17 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
         CloudSessionContext context() {
             return organizationId == null ? null
-                    : new CloudSessionContext(organizationId, clusterId, organizationName, clusterName, region);
+                    : new CloudSessionContext(organizationId, clusterId, organizationName, clusterName, region,
+                            ec2PublicIp, egressAddressStatus);
         }
     }
 
     record VerifiedClaims(String userId, String organizationId, String clusterId, String jwtId,
-            Instant expiresAt, String issuer, String audience, List<String> scopes) {
+            Instant expiresAt, String issuer, String audience, List<String> scopes, String userEmail) {
+        VerifiedClaims(String userId, String organizationId, String clusterId, String jwtId,
+                Instant expiresAt, String issuer, String audience, List<String> scopes) {
+            this(userId, organizationId, clusterId, jwtId, expiresAt, issuer, audience, scopes, null);
+        }
         VerifiedClaims {
             Objects.requireNonNull(expiresAt, "expiresAt");
             scopes = scopes == null ? null : List.copyOf(scopes);
@@ -252,11 +340,32 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         }
     }
 
+    static ExchangeResult exchangeResult(JwtExchangeResult exchanged) {
+        String jwt = exchanged.jwt();
+        String organizationId = exchanged.orgId();
+        String clusterId = exchanged.clusterId();
+        String organizationName = exchanged.organizationName();
+        String clusterName = exchanged.clusterName();
+        String region = exchanged.region();
+        if (!text(jwt) || !text(organizationId) || !text(clusterId)
+                || !text(organizationName) || !text(clusterName) || !text(region)) {
+            throw new ProviderFailure();
+        }
+        return new ExchangeResult(jwt, organizationId, clusterId, organizationName, clusterName, region,
+                optionalText(exchanged.ec2PublicIp()), optionalText(exchanged.egressAddressStatus()));
+    }
+
+    private static String optionalText(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
     private static final class TypedSdkRuntime implements SdkRuntime {
         private final CloudControlPlaneSdk sdk;
         private final C2StatusReportApi status;
+        private final CloudRuntimeSettings settings;
 
         TypedSdkRuntime(CloudRuntimeSettings settings) {
+            this.settings = settings;
             sdk = CloudControlPlaneSdk.builder()
                     .baseUrl(settings.baseUrl().toString())
                     .issuer(settings.baseUrl().toString())
@@ -266,19 +375,34 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             status = new C2StatusReportApi(new ApiClient().setBasePath(settings.baseUrl().toString()));
         }
 
+        @Override public ConfigurationInitialization claimConfiguration(String bootId, String hash) {
+            return configuration("claim", Map.of("bootId", bootId, "configurationHash", hash));
+        }
+        @Override public ConfigurationInitialization completeConfiguration(String operationId, String hash) {
+            return configuration("complete", Map.of("operationId", operationId, "configurationHash", hash));
+        }
+        private ConfigurationInitialization configuration(String action, Map<String,String> body) {
+            // Reuse the installed SDK transport and JSON envelope. Unknown writes are never retried or redirected.
+            try (var transport = org.apache.hc.client5.http.impl.classic.HttpClients.custom()
+                    .disableAutomaticRetries().disableRedirectHandling().build()) {
+                var api = new ApiClient(transport).setBasePath(settings.baseUrl().toString()).setConnectTimeout(5000).setReadTimeout(10000);
+                Map<String,Object> response = api.invokeAPI("/v1/api/clusters/" + api.escapeString(settings.clusterId()) + "/configuration-initialization/" + action,
+                        "POST", new java.util.ArrayList<>(), new java.util.ArrayList<>(), null, body,
+                        new java.util.HashMap<>(Map.of("Authorization", "Bearer " + settings.token())), new java.util.HashMap<>(),
+                        new java.util.HashMap<>(), "application/json", "application/json", new String[0],
+                        new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {});
+                if (response == null || !"ok".equals(response.get("code")) || !(response.get("data") instanceof Map<?,?> value)
+                        || !(value.get("clusterId") instanceof String cluster) || !(value.get("operationId") instanceof String operation)
+                        || !(value.get("phase") instanceof String phase) || !(value.get("configurationHash") instanceof String hash)
+                        || !(value.get("creationGranted") instanceof Boolean granted)) throw new ProviderFailure();
+                return new ConfigurationInitialization(cluster, operation, phase, hash, granted);
+            } catch (ApiException | java.io.IOException failure) { throw new ProviderFailure(); }
+        }
+
         @Override
         public ExchangeResult exchange(String code) {
             try {
-                var exchanged = sdk.exchangeForJwt(code);
-                String organizationName = exchanged.organizationName();
-                String clusterName = exchanged.clusterName();
-                String region = exchanged.region();
-                if (!text(exchanged.orgId()) || !text(exchanged.clusterId())
-                        || !text(organizationName) || !text(clusterName) || !text(region)) {
-                    throw new ProviderFailure();
-                }
-                return new ExchangeResult(exchanged.jwt(), exchanged.orgId(), exchanged.clusterId(),
-                        organizationName, clusterName, region);
+                return exchangeResult(sdk.exchangeForJwt(code));
             } catch (CloudControlPlaneException failure) {
                 logExchangeFailure(failure);
                 throw new ProviderFailure();
@@ -291,7 +415,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 var verified = sdk.verifyJwt(jwt);
                 return new VerifiedClaims(
                         verified.userId(), verified.orgId(), verified.clusterId(), verified.jti(),
-                        verified.expiresAt(), verified.issuer(), verified.audience(), verified.scope());
+                        verified.expiresAt(), verified.issuer(), verified.audience(), verified.scope(), optionalText(verified.userEmail()));
             } catch (JwtVerificationException failure) {
                 String kind = failure.getKind();
                 String reason = switch (kind == null ? "" : kind) {
@@ -304,6 +428,27 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             } catch (CloudControlPlaneException failure) {
                 logValidationFailure("jwt-verification", "jwks-provider-unavailable");
                 throw new ProviderFailure();
+            }
+        }
+
+        @Override
+        public ClusterEgressAddress currentEgressAddress() {
+            try {
+                return sdk.currentEgressAddress();
+            } catch (CloudControlPlaneException failure) {
+                logAddressFailure(failure);
+                throw new ProviderFailure();
+            }
+        }
+
+        private static void logAddressFailure(CloudControlPlaneException failure) {
+            String code = failure.getErrorCode();
+            String diagnostic = reportableFailureCode(code) ? code : "unclassified";
+            int status = failure.getHttpStatus();
+            if (status < 0 || status > 599) status = 0;
+            if (LOG.isWarnEnabled()) {
+                LOG.warn("Cloud Cluster address refresh failed [request_id={}, http={}, reason={}]",
+                        requestId(), status, diagnostic);
             }
         }
 

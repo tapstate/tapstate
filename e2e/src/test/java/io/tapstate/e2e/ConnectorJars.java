@@ -46,15 +46,31 @@ final class ConnectorJars {
         }
     }
 
+    /** The same exact artifact selection for adapter-level integration witnesses. */
+    static Path pathFor(String connectorId) {
+        return find(directory(), connectorId);
+    }
+
     /** The bytes of the jar whose file name identifies the connector id. */
     static byte[] bytesFor(String connectorId) {
-        Path directory = directory();
-        Path jar = find(directory, connectorId);
+        Path jar = pathFor(connectorId);
         try {
             return Files.readAllBytes(jar);
         } catch (IOException e) {
             throw new UncheckedIOException("cannot read the " + connectorId + " connector at " + jar, e);
         }
+    }
+
+    /** A native installation's managed Mongo target uses the separately supplied connector input. */
+    static byte[] managedMongoBytes() {
+        String supplied = System.getProperty("tapstate.e2e.managed-mongo-jar");
+        if (supplied == null || supplied.isBlank()) {
+            if (!directoryNamed()) throw new EnvelopeException(
+                    "a managed Mongo target requires tapstate.e2e.managed-mongo-jar or " + DIRECTORY_PROPERTY);
+            return bytesFor("mongodb");
+        }
+        try { return Files.readAllBytes(Path.of(supplied)); }
+        catch (IOException failure) { throw new UncheckedIOException("cannot read the managed Mongo connector at " + supplied, failure); }
     }
 
     private static Path directory() {

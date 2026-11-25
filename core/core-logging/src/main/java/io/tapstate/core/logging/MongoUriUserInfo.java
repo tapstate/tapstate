@@ -24,6 +24,13 @@ public final class MongoUriUserInfo {
         return uri.substring(0, userInfo.start()) + REDACTED + uri.substring(userInfo.end());
     }
 
+    /** Log spans can contain diagnostic at-signs after the authority; preserve that text verbatim. */
+    static String redactAuthority(String text) {
+        UserInfo userInfo = find(text);
+        return userInfo == null ? text
+                : text.substring(0, userInfo.start()) + REDACTED + text.substring(userInfo.end());
+    }
+
     /** Whether a request is carrying the display marker in place of connection credentials. */
     public static boolean isRedactedDisplay(String uri) {
         Objects.requireNonNull(uri, "uri");
@@ -37,6 +44,15 @@ public final class MongoUriUserInfo {
 
     /** Raw userinfo plus password spellings that a connector or driver could put in a log line. */
     public static List<String> secretValues(String uri) {
+        return secretValues(uri, false);
+    }
+
+    /** Diagnostic arguments may contain the username on its own, including its decoded spelling. */
+    public static List<String> diagnosticSecretValues(String uri) {
+        return secretValues(uri, true);
+    }
+
+    private static List<String> secretValues(String uri, boolean includeUsername) {
         Objects.requireNonNull(uri, "uri");
         UserInfo userInfo = find(uri);
         if (userInfo == null) {
@@ -50,18 +66,22 @@ public final class MongoUriUserInfo {
         values.add(raw);
         int separator = raw.indexOf(':');
         if (separator >= 0 && separator + 1 < raw.length()) {
-            String password = raw.substring(separator + 1);
-            values.add(password);
-            try {
-                String decoded = URLDecoder.decode(password.replace("+", "%2B"), StandardCharsets.UTF_8);
-                if (!decoded.equals(password)) {
-                    values.add(decoded);
-                }
-            } catch (IllegalArgumentException invalidEncoding) {
-                // The raw spelling is still registered even if percent escapes are malformed.
-            }
+            addSpellings(values, raw.substring(separator + 1));
         }
-        return List.copyOf(values);
+        if (includeUsername && separator != 0) {
+            addSpellings(values, separator < 0 ? raw : raw.substring(0, separator));
+        }
+        return values.stream().distinct().toList();
+    }
+
+    private static void addSpellings(List<String> values, String raw) {
+        values.add(raw);
+        try {
+            String decoded = URLDecoder.decode(raw.replace("+", "%2B"), StandardCharsets.UTF_8);
+            if (!decoded.equals(raw)) values.add(decoded);
+        } catch (IllegalArgumentException invalidEncoding) {
+            // The raw spelling is still registered even if percent escapes are malformed.
+        }
     }
 
     private static UserInfo find(String uri) {

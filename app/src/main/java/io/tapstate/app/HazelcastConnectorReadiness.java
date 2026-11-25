@@ -52,6 +52,11 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
 
     @Override
     public Set<String> requireEveryMemberCanLoad(String pipelineId, Set<String> connectors) {
+        return requireEveryMemberCanLoad(pipelineId,connectors,Map.of());
+    }
+    @Override public Set<String> requireEveryMemberCanLoad(String pipelineId,Set<String> connectors,Map<String,String> hashes) {
+        var exact=new TreeMap<String,String>();
+        for(String connector:connectors)if(hashes.containsKey(connector))exact.put(connector,hashes.get(connector));
         if (connectors.isEmpty()) {
             return Set.of();
         }
@@ -63,7 +68,7 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
             }
         }
         Map<Member, Future<List<Loaded>>> answers =
-                member.getExecutorService(EXECUTOR).submitToMembers(new LoadConnectors(asked), dataMembers.values());
+                member.getExecutorService(EXECUTOR).submitToMembers(new LoadConnectors(asked,exact), dataMembers.values());
         long deadline = System.nanoTime() + timeout.toNanos();
         Map<String, Map<String, String>> loadedBy = new TreeMap<>();
         Set<String> shared = new TreeSet<>(asked);
@@ -73,6 +78,8 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                 if (loaded.failure() != null) {
                     throw unavailable(pipelineId, memberId, loaded.connector(), loaded.failure());
                 }
+                if(exact.containsKey(loaded.connector()) && !exact.get(loaded.connector()).equals(loaded.contentHash()))
+                    throw unavailable(pipelineId,memberId,loaded.connector(),"the member loaded a different confirmed artifact");
                 loadedBy.computeIfAbsent(loaded.connector(), ignored -> new TreeMap<>())
                         .put(memberId, loaded.contentHash());
                 if (!loaded.shareSafe()) {
@@ -153,10 +160,14 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
         private static final long serialVersionUID = 1L;
 
         private final List<String> connectors;
+        private final Map<String,String> hashes;
         private transient HazelcastInstance member;
 
         LoadConnectors(List<String> connectors) {
-            this.connectors = List.copyOf(connectors);
+            this(connectors,Map.of());
+        }
+        LoadConnectors(List<String> connectors,Map<String,String> hashes) {
+            this.connectors = List.copyOf(connectors);this.hashes=Map.copyOf(hashes);
         }
 
         @Override
@@ -175,7 +186,7 @@ final class HazelcastConnectorReadiness implements ConnectorReadiness {
                     continue;
                 }
                 try {
-                    loaded.add(Loaded.of(provisioner.resolve(connector), connector));
+                    loaded.add(Loaded.of(hashes.containsKey(connector)?provisioner.resolve(connector,hashes.get(connector)):provisioner.resolve(connector), connector));
                 } catch (RuntimeException failed) {
                     loaded.add(Loaded.failed(connector, reasonOf(failed)));
                 }

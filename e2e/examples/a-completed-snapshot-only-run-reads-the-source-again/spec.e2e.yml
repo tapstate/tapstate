@@ -1,0 +1,25 @@
+# A snapshot-only run completes after its target confirms the load. Starting it again reads the
+# source again: there is no CDC tail, and the filter admits only snapshot rows. A row inserted
+# between completed runs therefore cannot arrive without a new snapshot.
+name: a-completed-snapshot-only-run-reads-the-source-again
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 2 }
+steps:
+  - start
+  - await: { count: { tgt_file.orders: 2 } }
+  - await: { state: COMPLETED }
+  - cdc: { src_file.orders: insert 1 }
+  - assert: { count: { tgt_file.orders: 2 } }
+  - start
+  - await: { count: { tgt_file.orders: 3 } }
+  - await: { state: COMPLETED }
+  - cdc: { src_file.orders: insert 1 }
+  - assert: { count: { tgt_file.orders: 3 } }
+  - restart --rerun
+  - await: { count: { tgt_file.orders: 4 } }
+  - await: { state: COMPLETED }

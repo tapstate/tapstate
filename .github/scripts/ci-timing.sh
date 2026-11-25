@@ -154,8 +154,9 @@ def main():
                'preserving every reactor and test-class occurrence; it does not infer uncovered build time.')
     parser.add_argument('workflow', help='workflow file name, for example ci.yml')
     parser.add_argument('--runs', type=int, default=5, help='required number of successful completed runs (default: 5)')
-    parser.add_argument('--event', choices=['push', 'pull_request'])
+    parser.add_argument('--event', choices=['push', 'pull_request', 'workflow_dispatch'])
     parser.add_argument('--branch', help='exact head branch filter')
+    parser.add_argument('--run-id', type=int, help='one exact completed run, including failed/cancelled attempts; no successful-sample filtering')
     parser.add_argument('--repo', help='owner/repository (default: GITHUB_REPOSITORY or gh repo view)')
     parser.add_argument('--job', help='exact job name for step and optional Maven breakdown')
     parser.add_argument('--modules', action='store_true', help='parse Maven logs; requires --job')
@@ -176,16 +177,31 @@ def main():
         filters['branch'] = args.branch
     prefix = f'repos/{repo}/actions'
     runs = []
-    for run in pages(f'{prefix}/workflows/{quote(args.workflow, safe="")}/runs', 'workflow_runs', filters):
-        if run.get('status') != 'completed' or run.get('conclusion') != 'success':
-            continue
+    if args.run_id is not None:
+        if args.run_id < 1:
+            parser.error('--run-id must be positive')
+        run = api(f'{prefix}/runs/{args.run_id}')
+        if run.get('id') != args.run_id or run.get('status') != 'completed':
+            raise ReportError('exact run is missing or not completed')
+        if run.get('path', '').split('@', 1)[0] != '.github/workflows/' + args.workflow:
+            raise ReportError('exact run belongs to another workflow')
         if args.event and run.get('event') != args.event:
-            raise ReportError('API run does not match requested event')
+            raise ReportError('exact run has another event')
         if args.branch and run.get('head_branch') != args.branch:
-            raise ReportError('API run does not match requested branch')
-        runs.append(run)
-        if len(runs) == args.runs:
-            break
+            raise ReportError('exact run has another head branch')
+        runs = [run]
+        args.runs = 1
+    else:
+        for run in pages(f'{prefix}/workflows/{quote(args.workflow, safe="")}/runs', 'workflow_runs', filters):
+            if run.get('status') != 'completed' or run.get('conclusion') != 'success':
+                continue
+            if args.event and run.get('event') != args.event:
+                raise ReportError('API run does not match requested event')
+            if args.branch and run.get('head_branch') != args.branch:
+                raise ReportError('API run does not match requested branch')
+            runs.append(run)
+            if len(runs) == args.runs:
+                break
     if len(runs) != args.runs:
         raise ReportError(f'requested {args.runs} successful runs, found {len(runs)}')
     records, jobs_by_name, steps_by_name = [], defaultdict(list), defaultdict(list)
@@ -197,7 +213,7 @@ def main():
         jobs = list(pages(f'{prefix}/runs/{run_id}/attempts/{attempt}/jobs', 'jobs'))
         if not jobs:
             raise ReportError(f'no jobs for {context}')
-        record = {'id': run_id, 'attempt': attempt, 'head_sha': required(run, 'head_sha', context),
+        record = {'id': run_id, 'attempt': attempt, 'conclusion': run.get('conclusion'), 'head_sha': required(run, 'head_sha', context),
                   'event': required(run, 'event', context), 'branch': run.get('head_branch'),
                   'url': required(run, 'html_url', context), 'created_at': run.get('created_at'),
                   'run_started_at': run.get('run_started_at'), 'jobs': []}

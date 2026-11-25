@@ -14,7 +14,16 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
-                        "system.version",
+                        "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
+                        "validation.start", "validation.progress", "validation.stop", "validation.history",
+                        "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
+                        "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
+                        "retry-settings.get", "retry-settings.replace",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
+                        "system.version", "system.pdk-version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -30,7 +39,7 @@ class ControlOperationsTest {
                         "source.delete",
                         "sample-source.list",
                         "sample-source.install",
-                        "state-store.connect",
+                        "state-store.connect", "state-store.connection-uri",
                         "connection.test",
                         "connection.test-result",
                         "connection.discover-schema",
@@ -39,6 +48,8 @@ class ControlOperationsTest {
                         "connector.list",
                         "connector.get",
                         "connector.icon",
+                        "connector-center.list", "connector-center.refresh", "connector-center.download",
+                        "connector-center.operation", "connector-center.upload",
                         "data-browser.collections",
                         "data-browser.find",
                         "data-browser.stats",
@@ -46,6 +57,7 @@ class ControlOperationsTest {
                         "cluster.context",
                         "pipeline.list",
                         "pipeline.catalog",
+                        "pipeline.delete",
                         "view.list",
                         "pipeline.get",
                         "pipeline.layout.get",
@@ -62,6 +74,7 @@ class ControlOperationsTest {
                         "pipeline-draft.publish",
                         "pipeline-draft.rebase",
                         "pipeline.start",
+                        "pipeline.start-checks",
                         "pipeline.stop",
                         "pipeline.pause",
                         "pipeline.resume",
@@ -69,12 +82,15 @@ class ControlOperationsTest {
                         "pipeline.metrics",
                         "pipeline.snapshot",
                         "pipeline.logs",
+                        "pipeline.log-level",
                         "pipeline.metrics.history",
                         "pipeline.explain",
                         "pipeline.position",
                         "pipeline.set-position",
                         "pipeline.derived-schema",
                         "pipeline.accept-derived-schema",
+                        "pipeline.aggregate-check",
+                        "pipeline.aggregate-repair",
                         "auth.current-user",
                         "user.create",
                         "user.passwd",
@@ -87,6 +103,7 @@ class ControlOperationsTest {
     @Test
     void scopesMatchTheOperationInventory() {
         assertThat(registry.resolve("artifact.apply").scope()).isEqualTo(Scope.WRITE);
+        assertThat(registry.resolve("storage.setup.activate").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("artifact.validate").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("pipeline.preview").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.get").scope()).isEqualTo(Scope.READ);
@@ -119,6 +136,26 @@ class ControlOperationsTest {
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
+        for (String id : List.of("connector-center.list", "connector-center.operation")) {
+            assertThat(registry.resolve(id).scope()).isEqualTo(Scope.READ);
+            assertThat(registry.resolve(id).audited()).isFalse();
+        }
+        for (String id : List.of("connector-center.refresh", "connector-center.download", "connector-center.upload")) {
+            assertThat(registry.resolve(id).scope()).isEqualTo(Scope.ADMIN);
+            assertThat(registry.resolve(id).audited()).isTrue();
+        }
+        for (Operation operation : registry.all()) {
+            Scope cloudScope = switch (operation.id()) {
+                case "connector-center.refresh", "connector-center.download" -> Scope.WRITE;
+                default -> operation.scope();
+            };
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.CLOUD_SESSION))
+                    .as(operation.id()).isEqualTo(cloudScope);
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.HUMAN_JWT))
+                    .as(operation.id()).isEqualTo(operation.scope());
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.MACHINE_TOKEN))
+                    .as(operation.id()).isEqualTo(operation.scope());
+        }
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
@@ -130,16 +167,18 @@ class ControlOperationsTest {
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
         // The layout update replaces editor metadata, while the lifecycle verbs write desired state.
         for (String id : List.of(
-                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
+                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.delete", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
         }
         // The static Pipeline projection, layout read, and observation reads are all
         // read faces; read-scoped, unaudited.
         for (String id : List.of(
                 "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
-                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain")) {
+                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
+                "pipeline.start-checks")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
+        assertThat(registry.resolve("pipeline.log-level").scope()).isEqualTo(Scope.WRITE);
         for (String id : List.of("user.create", "user.passwd", "user.list", "token.create", "token.revoke", "token.list")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.ADMIN);
         }
@@ -149,6 +188,7 @@ class ControlOperationsTest {
     void auditFlagMarksOnlyTheStateMutatingOperations() {
         for (String id :
                 List.of(
+                        "storage.setup.commit", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "configuration.export", "configuration.import.preflight", "configuration.import.commit",
                         "artifact.apply",
                         "artifact.delete",
                         "source.create",
@@ -164,7 +204,9 @@ class ControlOperationsTest {
                         "pipeline.pause",
                         "pipeline.resume",
                         "pipeline.update",
+                        "pipeline.delete",
                         "pipeline.create",
+                        "pipeline.log-level",
                         "user.create",
                         "user.passwd",
                         "token.create",
@@ -172,7 +214,8 @@ class ControlOperationsTest {
             assertThat(registry.resolve(id).audited()).as(id).isTrue();
         }
         for (String id : List.of(
-                "system.version",
+                "storage.status", "storage.test", "storage.setup.status", "storage.recovery.status",
+                        "configuration.import.status", "system.version",
                 "artifact.get",
                 "artifact.list",
                 "artifact.validate",
@@ -202,22 +245,36 @@ class ControlOperationsTest {
                 "pipeline.snapshot",
                 "pipeline.logs",
                 "pipeline.metrics.history",
-                "pipeline.explain")) {
+                "pipeline.explain",
+                "pipeline.start-checks")) {
             assertThat(registry.resolve(id).audited()).as(id).isFalse();
         }
     }
 
     @Test
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
-        // The cluster context is REST-only. The reveal reservation stays unpublished until its
-        // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(66);
+        // The cluster context and Cloud-session provider selection are REST-only. The reveal
+        // reservation stays unpublished until its dedicated authorizer exists.
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(89);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
-                && !"cluster.context".equals(op.id())).allSatisfy(op ->
+                && !"state-store.connection-uri".equals(op.id())
+                && !"system.pdk-version".equals(op.id())
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
+                && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
+                && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")
+                && !op.id().startsWith("connector-center.")).allSatisfy(op ->
+
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
+        assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
+                assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
         assertThat(registry.resolve("cluster.context").exposure())
                 .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
+        assertThat(registry.resolve("ai-provider.select").exposure())
+                .containsEntry(Frontend.REST, Maturity.CURRENT).containsOnlyKeys(Frontend.REST);
+        assertThat(registry.resolve("retry-settings.get").scope()).isEqualTo(Scope.ADMIN);
+        assertThat(registry.resolve("retry-settings.replace").scope()).isEqualTo(Scope.ADMIN);
+        assertThat(registry.resolve("retry-settings.replace").audited()).isTrue();
     }
 
     @Test
@@ -242,13 +299,16 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
-                        "system.version",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
                         "connector.list", "connector.get",
                         "source.draft", "source.list",
                         "connection.test", "connection.test-result",
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
                         "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        // read-scoped, so a caller with no write capability sees why a start would stop
+                        "pipeline.start-checks",
                         "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",
@@ -258,12 +318,24 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
-                        "sample-source.list", "sample-source.install", "state-store.connect",
+                        "system.pdk-version",
+                        "connector-center.list", "connector-center.refresh", "connector-center.download",
+                        "connector-center.operation", "connector-center.upload",
+                        "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
+                        "validation.start", "validation.progress", "validation.stop", "validation.history",
+                        "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
+                        "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.select", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
+                        "retry-settings.get", "retry-settings.replace",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
+                        "sample-source.list", "sample-source.install", "state-store.connect", "state-store.connection-uri",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "cluster.context", "view.list",
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
                         "pipeline.preview",
-                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
+                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog", "pipeline.delete");
     }
 
     /**
@@ -310,4 +382,25 @@ class ControlOperationsTest {
         assertThat(delete.schema()).as("an MCP operation must carry a schema ref").isNotNull();
         assertThat(delete.description()).as("an MCP tool must carry a description").isNotBlank();
     }
+    @Test
+    void directFullValidationKeepsItsWriteAuditAndReadOnlyQueryBoundaries() {
+        for (String id : List.of("validation.save", "validation.start", "validation.stop", "validation.schedule-disable")) {
+            assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
+            assertThat(registry.resolve(id).audited()).as(id).isTrue();
+        }
+        assertThat(registry.resolve("validation.evaluate").scope()).isEqualTo(Scope.WRITE);
+        assertThat(registry.resolve("validation.evaluate").audited()).isFalse();
+        for (String id : List.of("validation.get", "validation.schedule-preview", "validation.progress", "validation.history",
+                "validation.report", "validation.roots", "validation.root")) {
+            assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
+            assertThat(registry.resolve(id).audited()).as(id).isFalse();
+        }
+        for (String id : List.of("validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
+                "validation.start", "validation.progress", "validation.stop", "validation.history", "validation.report",
+                "validation.roots", "validation.root", "validation.schedule-disable")) {
+            assertThat(registry.resolve(id).exposure()).as(id).containsEntry(Frontend.REST, Maturity.CURRENT)
+                    .doesNotContainKey(Frontend.CLI).doesNotContainKey(Frontend.MCP);
+        }
+    }
+
 }

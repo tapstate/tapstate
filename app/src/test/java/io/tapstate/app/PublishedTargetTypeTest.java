@@ -13,7 +13,6 @@ import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -120,6 +119,24 @@ class PublishedTargetTypeTest {
         return byName;
     }
 
+    /**
+     * A soft-delete marker named after the table's key column writes false under that name on every
+     * live row. Keyed on it, a target would upsert every row onto one: the key holds only where the
+     * column still carries the source's own value, and a sink told of a key one column short reports it.
+     */
+    @Test
+    void aKeyColumnTheMapWritesAMarkerOverIsNotTheTargetsKey() {
+        NodeColumns marked = NodeColumns.of(new TransformBody.MapProjection(Map.of(), "o_id"),
+                Map.of("in", atTheSource()), null);
+        NodeColumns passedThrough = NodeColumns.of(new TransformBody.MapProjection(Map.of(), "is_deleted"),
+                Map.of("in", atTheSource()), null);
+
+        assertThat(StoreBackedDagSource.publishedAs(source(), marked, atTheSource()).fields())
+                .noneMatch(TargetField::primaryKey);
+        assertThat(StoreBackedDagSource.publishedAs(source(), passedThrough, atTheSource()).fields())
+                .filteredOn(TargetField::primaryKey).extracting(TargetField::name).containsExactly("o_id");
+    }
+
     @Test
     @DisplayName("a column the pipeline did not retype keeps the word the source declared")
     void anUntouchedColumnKeepsTheSourcesOwnTypeToken() {
@@ -173,14 +190,16 @@ class PublishedTargetTypeTest {
     @Test
     void aComputedDecimalWithTheSameTypeCannotBorrowAnOlderSourcesBounds() {
         TargetTable base = new TargetTable("orders", List.of(
-                new TargetField("amount", "decimal(10,2)", false)));
-        NodeColumns source = shared("amount", "DECIMAL NULL");
-        NodeColumns computed = source.withUnchangedFields(Set.of());
+                new TargetField("amount", "decimal(10,2)", false, TapstateType.DECIMAL)));
+        NodeColumns source = shared("amount", "DECIMAL NULL")
+                .withLegacyDecimalDeclarations(Map.of("amount", "decimal(10,2)"));
+        NodeColumns computed = NodeColumns.of(new TransformBody.MapProjection(Map.of("amount",
+                FieldRule.computed("has(after.amount) ? after.amount : before.amount"))), Map.of("in", source), null);
 
-        assertThat(typesOf(StoreBackedDagSource.publishedAs(base, source, source)))
-                .containsEntry("amount", "decimal(10,2)");
-        assertThat(typesOf(StoreBackedDagSource.publishedAs(base, computed, source)))
-                .containsEntry("amount", null);
+        assertThat(StoreBackedDagSource.publishedAs(base, source, source).fields())
+                .containsExactlyElementsOf(base.fields());
+        assertThat(StoreBackedDagSource.publishedAs(base, computed, source).fields())
+                .containsExactly(new TargetField("amount", null, false, TapstateType.DECIMAL));
     }
 
     /**

@@ -65,10 +65,10 @@ class DataBrowserUnsupportedBackendIT {
             mysql.start();
             seed(mysql);
 
-            try (ServerHandle server =
-                    InProcessServer.start(SharedMongo.replicaSetUrl("e2e_unsupported_backend"))) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = InProcessServer.startPrepared(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.apply(Map.of("src_mysql.tap.yml", sourceYaml(mysql)));
 
@@ -90,7 +90,7 @@ class DataBrowserUnsupportedBackendIT {
                 ControlPlane.Refusal refused = control.findExpectingRefusal(SOURCE_ID, TABLE, Map.of());
                 assertThat(refused.code())
                         .as("the code a row read of a backend this face cannot ask in is refused with")
-                        .isEqualTo("data-browser.connector-not-browsable");
+                        .isEqualTo("TS0390004");
             }
         }
     }

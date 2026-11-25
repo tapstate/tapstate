@@ -19,11 +19,24 @@
     never on an adapter.</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The resource model the DAG builder reads to compile a pipeline into a Jet job; core ring,
          zero third-party (rule R4: core + spi only). -->
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-model</artifactId>
+      <version>${revision}</version>
+    </dependency>
+    <!-- The aggregate-function library and the rollup fold a nest renders its rollup fields with;
+         core ring. The engine reaches it only through core-dsl's own types, never the expression
+         language behind it (rule R4). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-dsl</artifactId>
       <version>${revision}</version>
     </dependency>
 

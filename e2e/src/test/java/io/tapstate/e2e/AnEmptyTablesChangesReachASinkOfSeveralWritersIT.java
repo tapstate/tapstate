@@ -10,7 +10,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -47,10 +46,10 @@ class AnEmptyTablesChangesReachASinkOfSeveralWritersIT {
         FileEndpoints files = new FileEndpoints();
         files.seed(sourceAddress, TABLE, List.of());
 
-        String store = SharedMongo.replicaSetUrl("empty_table_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(workspace(source, target));

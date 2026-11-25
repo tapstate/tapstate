@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.ConnectorCatalogErrorDefinitions;
+import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.control.client.ControlResponse;
 import io.tapstate.control.client.HttpControlClient;
@@ -42,6 +44,10 @@ import java.util.function.Supplier;
  * render outcomes without try/catch.
  */
 final class HttpControlPlaneClient implements ControlPlaneClient {
+    @Override public io.tapstate.control.client.ControlResponse storageOperation(URI baseUrl, String credential, String operation, Map<String,Object> input) {
+        return io.tapstate.control.client.StorageControlClient.execute(sharedClient, baseUrl, credential, operation, input);
+    }
+
 
     /**
      * The probe / connect budget: short enough that an unreachable seed does not stall the connect walk,
@@ -61,6 +67,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     private final Duration probeTimeout;
     private final Duration heavyTimeout;
     private final RequestBudget connectionBudget;
+    private final Duration streamPingInterval;
+    private final Duration streamPongTimeout;
     private HttpClient httpClient;
     private final HttpControlClient sharedClient;
 
@@ -78,6 +86,19 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget) {
+        this(probeTimeout, heavyTimeout, connectionBudget, Duration.ofSeconds(5), Duration.ofSeconds(15));
+    }
+
+    HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, Duration pingInterval, Duration pongTimeout) {
+        this(probeTimeout, heavyTimeout, RequestBudget.HEAVY, pingInterval, pongTimeout);
+    }
+
+    private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget,
+            Duration pingInterval, Duration pongTimeout) {
+        if (pingInterval.isNegative() || pingInterval.isZero() || pongTimeout.isNegative() || pongTimeout.isZero())
+            throw new IllegalArgumentException("stream liveness budgets must be positive");
+        this.streamPingInterval = pingInterval;
+        this.streamPongTimeout = pongTimeout;
         this.probeTimeout = probeTimeout;
         this.heavyTimeout = heavyTimeout;
         this.connectionBudget = connectionBudget;
@@ -489,7 +510,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential)
+            HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential, heavyTimeout)
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts), StandardCharsets.UTF_8))
                     .build();
@@ -537,7 +558,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     public DeleteOutcome delete(URI baseUrl, String credential, String id, String expectedContentHash) {
         try {
             HttpRequest.Builder builder = authed(
-                    baseUrl, "/api/artifacts/" + urlSegment(id), credential);
+                    baseUrl, "/api/artifacts/" + urlSegment(id), credential, heavyTimeout);
             // Send no If-Match at all rather than an empty one when the caller supplied no precondition:
             // the server tells "you sent none" (428) apart from "yours is stale" (412), and an empty
             // header would turn the first into the second.
@@ -655,8 +676,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         ? new ConnectionTestOutcome.Unreachable()
                         : new ConnectionTestOutcome.Tested(report);
             }
-            Rejection r = rejection(response.body(), "The server refused the connection test.");
-            return new ConnectionTestOutcome.Rejected(r.code(), r.message());
+            Rejection r = rejection(response.body(), "The server refused the connection test.", true);
+            return new ConnectionTestOutcome.Rejected(r.code(), r.message(), r.params(), r.diagnostic());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new ConnectionTestOutcome.Unreachable();
@@ -687,8 +708,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             if (status == 404) {
                 return new ConnectionTestResultOutcome.Absent();
             }
-            Rejection r = rejection(response.body(), "The server refused the read.");
-            return new ConnectionTestResultOutcome.Rejected(r.code(), r.message());
+            Rejection r = rejection(response.body(), "The server refused the read.", true);
+            return new ConnectionTestResultOutcome.Rejected(r.code(), r.message(), r.params(), r.diagnostic());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new ConnectionTestResultOutcome.Unreachable();
@@ -784,6 +805,58 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         } catch (IOException | RuntimeException e) {
             return new ConnectorRegisterOutcome.Unreachable();
         }
+    }
+
+    @Override
+    public java.util.Optional<ConnectorRegisterOutcome> downloadConnector(URI baseUrl, String credential, String id) {
+        if (!id.matches("[A-Za-z0-9][A-Za-z0-9_.-]*")) return java.util.Optional.empty();
+        try {
+            var request = authed(baseUrl, "/api/connector-center/" + id + ":download", credential)
+                    .POST(HttpRequest.BodyPublishers.noBody()).build();
+            var response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 200 && response.statusCode() != 202) {
+                var rejected = rejection(response.body(), "The server refused the connector download.");
+                if (response.statusCode() == 404
+                        && !ConnectorCatalogErrorDefinitions.NOT_FOUND.code().equals(rejected.code())
+                        && !"connector.not-found".equals(rejected.code()))
+                    return java.util.Optional.empty();
+                return java.util.Optional.of(new ConnectorRegisterOutcome.Rejected(rejected.code(), rejected.message()));
+            }
+            if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> accepted)
+                    || !(accepted.get("operationId") instanceof String operation)
+                    || !operation.matches("[a-f0-9-]{36}")) {
+                return java.util.Optional.of(new ConnectorRegisterOutcome.Unreachable());
+            }
+            return java.util.Optional.of(awaitConnectorDownload(baseUrl, credential, operation));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return java.util.Optional.of(new ConnectorRegisterOutcome.Unreachable());
+        } catch (HttpTimeoutException timeout) {
+            return java.util.Optional.of(new ConnectorRegisterOutcome.TimedOut());
+        } catch (IOException | IllegalArgumentException unavailable) {
+            return java.util.Optional.of(new ConnectorRegisterOutcome.Unreachable());
+        }
+    }
+
+    private ConnectorRegisterOutcome awaitConnectorDownload(URI baseUrl, String credential, String operation)
+            throws IOException, InterruptedException {
+        String path = "/api/connector-center/operations/" + operation;
+        long limit = System.nanoTime() + java.time.Duration.ofMinutes(5).toNanos();
+        while (System.nanoTime() < limit) {
+            var response = send(authed(baseUrl, path, credential).GET().build(),
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 200 || !(JsonReader.parse(response.body()) instanceof Map<?, ?> value))
+                return new ConnectorRegisterOutcome.Unreachable();
+            if ("INSTALLED".equals(value.get("state")) && value.get("connectorId") instanceof String connector
+                    && value.get("sha256") instanceof String hash) {
+                return new ConnectorRegisterOutcome.Registered(new RegisteredConnector(connector, hash,
+                        stringOrNull(value.get("pdkApiVersion")), Boolean.TRUE.equals(value.get("newlyRegistered"))));
+            }
+            if ("FAILED".equals(value.get("state")) && value.get("errorCode") instanceof String error)
+                return new ConnectorRegisterOutcome.Rejected(error, "The connector download or installation failed.");
+            Thread.sleep(500);
+        }
+        return new ConnectorRegisterOutcome.TimedOut();
     }
 
     @Override
@@ -1078,7 +1151,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                             && c.get("status") instanceof String status) {
                         checks.add(new ConnectionReport.Check(name, status,
                                 stringOrNull(c.get("message")), stringOrNull(c.get("reason")),
-                                stringOrNull(c.get("solution")), stringOrNull(c.get("connectorErrorCode"))));
+                                stringOrNull(c.get("solution")), stringOrNull(c.get("connectorErrorCode")),
+                                DiagnosticProjection.read(c.get("diagnostic"))));
                     }
                 }
             }
@@ -1124,6 +1198,113 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         } catch (IOException | RuntimeException e) {
             return new LifecycleOutcome.Unreachable();
         }
+    }
+
+    @Override
+    public StartAttempt start(URI baseUrl, String credential, String pipelineId, List<StartDecision> decisions,
+            String ifMatch) {
+        try {
+            HttpRequest.Builder builder = authed(baseUrl, "/api/pipelines/" + pipelineId + ":start", credential,
+                    heavyTimeout);
+            if (decisions != null && !decisions.isEmpty()) {
+                List<Map<String, Object>> answers = new ArrayList<>();
+                for (StartDecision decision : decisions) {
+                    Map<String, Object> answer = new LinkedHashMap<>();
+                    answer.put("finding", decision.finding());
+                    answer.put("action", decision.action());
+                    answers.add(answer);
+                }
+                builder = builder.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers
+                        .ofString(JsonOut.compact(Map.of("decisions", answers)), StandardCharsets.UTF_8));
+            } else {
+                builder = builder.POST(HttpRequest.BodyPublishers.noBody());
+            }
+            if (ifMatch != null) {
+                builder = builder.header("If-Match", "\"" + ifMatch + "\"");
+            }
+            HttpResponse<String> response =
+                    send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            Object json = parseOrNull(response.body());
+            if (response.statusCode() == 200) {
+                LifecycleOutcome.Accepted accepted = desiredState(response.body());
+                if (accepted == null || !(json instanceof Map<?, ?> body)) {
+                    return new StartAttempt.Unreachable(true);
+                }
+                return new StartAttempt.Started(accepted.pipelineId(), accepted.targetState(), accepted.revision(),
+                        StartChecks.parse(body.get("startChecks")), maps(body.get("decisionsApplied")),
+                        maps(body.get("staleDecisions")), stringKeyed(body));
+            }
+            Rejection r = rejection(response.body(), "The server refused the start.");
+            if (json instanceof Map<?, ?> body) {
+                StartChecks checks = StartChecks.parse(body.get("startChecks"));
+                if (checks != null) {
+                    return new StartAttempt.Stopped(r.code(), r.params(), r.message(), checks);
+                }
+                return new StartAttempt.Rejected(r.code(), r.params(), r.message(), maps(body.get("decisionsApplied")));
+            }
+            return new StartAttempt.Rejected(r.code(), r.params(), r.message(), List.of());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new StartAttempt.Unreachable(true);
+        } catch (java.net.ConnectException | HttpConnectTimeoutException notConnected) {
+            // No connection was made, so nothing was sent: another member may be asked instead.
+            return new StartAttempt.Unreachable(false);
+        } catch (IOException | RuntimeException e) {
+            return new StartAttempt.Unreachable(true);
+        }
+    }
+
+    @Override
+    public StartChecksOutcome startChecks(URI baseUrl, String credential, String pipelineId, String intent) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + "/start-checks?intent="
+                    + URLEncoder.encode(intent, StandardCharsets.UTF_8), credential, heavyTimeout).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                StartChecks checks = StartChecks.parse(parseOrNull(response.body()));
+                return checks == null ? new StartChecksOutcome.Unreachable() : new StartChecksOutcome.Found(checks);
+            }
+            Rejection r = rejection(response.body(), "The server refused to read the start checks.");
+            // A server released before start checks has no such resource at all: its 404 carries no code of
+            // ours, which is what tells it apart from a pipeline this server does not have.
+            if (response.statusCode() == 404 && !r.code().startsWith("lifecycle.")
+                    && !io.tapstate.core.common.LifecycleErrorDefinitions.UNKNOWN_PIPELINE.code().equals(r.code())) {
+                return new StartChecksOutcome.NotSupported();
+            }
+            return new StartChecksOutcome.Rejected(r.code(), r.params(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new StartChecksOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new StartChecksOutcome.Unreachable();
+        }
+    }
+
+    private static Object parseOrNull(String body) {
+        try {
+            return body == null || body.isBlank() ? null : JsonReader.parse(body);
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+    }
+
+    private static List<Map<String, Object>> maps(Object value) {
+        List<Map<String, Object>> maps = new ArrayList<>();
+        if (value instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> map) {
+                    maps.add(stringKeyed(map));
+                }
+            }
+        }
+        return maps;
+    }
+
+    private static Map<String, Object> stringKeyed(Map<?, ?> map) {
+        Map<String, Object> keyed = new LinkedHashMap<>();
+        map.forEach((key, value) -> keyed.put(String.valueOf(key), value));
+        return keyed;
     }
 
     /** The new desired state decoded from a 200 body, or {@code null} unless it carries all three string fields. */
@@ -1401,9 +1582,69 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (map.get("plan") != null && plan == null || awaitingRebalance == null) {
             return null;
         }
+        List<ExplainOutcome.Rollup> rollups = explanationRollups(map.get("rollups"));
+        if (rollups == null) {
+            return null;
+        }
+        List<ExplainOutcome.Aggregate> aggregates = explanationAggregates(map.get("aggregates"));
+        if (aggregates == null) {
+            return null;
+        }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups, aggregates);
+    }
+
+    /** The aggregate steps an explanation lists; absent is none, and anything malformed is no answer. */
+    private static List<ExplainOutcome.Aggregate> explanationAggregates(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<ExplainOutcome.Aggregate> aggregates = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> a) || !(a.get("step") instanceof String step)
+                    || !(a.get("entriesPerRow") instanceof Number perRow)) {
+                return null;
+            }
+            List<String> kept = a.get("keptInputFields") == null ? List.of() : strings(a.get("keptInputFields"));
+            if (kept == null) {
+                return null;
+            }
+            aggregates.add(new ExplainOutcome.Aggregate(step, perRow.intValue(), kept,
+                    a.get("inputRows") instanceof Number rows ? rows.longValue() : null,
+                    a.get("estimatedEntries") instanceof Number estimated ? estimated.longValue() : null,
+                    a.get("storedEntries") instanceof Number stored ? stored.longValue() : null));
+        }
+        return aggregates;
+    }
+
+    /** The rollup fields an explanation lists; absent is none, and anything malformed is no answer. */
+    private static List<ExplainOutcome.Rollup> explanationRollups(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<ExplainOutcome.Rollup> rollups = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> r)) {
+                return null;
+            }
+            List<String> references = r.get("references") == null ? List.of() : strings(r.get("references"));
+            if (!(r.get("step") instanceof String step) || !(r.get("level") instanceof String level)
+                    || !(r.get("embed") instanceof String embed) || !(r.get("field") instanceof String field)
+                    || !(r.get("function") instanceof String function) || references == null) {
+                return null;
+            }
+            rollups.add(new ExplainOutcome.Rollup(step, level, embed, field, function,
+                    r.get("argument") instanceof String argument ? argument : null,
+                    r.get("filter") instanceof String filter ? filter : null, references));
+        }
+        return rollups;
     }
 
     private static ExplainOutcome.Plan explanationPlan(Object raw) {
@@ -1639,7 +1880,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * when that field is absent. A malformed failure block is a contract error, not a healthy pipeline.
      */
     private static StatusOutcome statusFound(String body) {
-        if (JsonReader.parse(body) instanceof Map<?, ?> m
+        Object parsed = JsonReader.parse(body);
+        if (parsed instanceof Map<?, ?> pending && pending.get("pipelineId") instanceof String
+                && pending.get("state") == null && pending.get("observedState") == null
+                && (pending.containsKey("displayState") || pending.containsKey("desiredState"))) {
+            return new StatusOutcome.NoObservation();
+        }
+        if (parsed instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
             boolean aggregate = m.containsKey("observedState")
@@ -1668,7 +1915,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // The message is the server's rendering of that code; when it is absent the code still names
             // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
             String message = failure.get("message") instanceof String rendered ? rendered : code;
-            return new StatusOutcome.Found(id, state, code, message, ageMillis);
+            var params = new LinkedHashMap<String, Object>();
+            if (failure.get("params") instanceof Map<?, ?> supplied) {
+                supplied.forEach((key, value) -> { if (key instanceof String name) params.put(name, value); });
+            }
+            return new StatusOutcome.Found(id, state, code, message, ageMillis, params,
+                    io.tapstate.core.common.RuntimeDiagnosticProjection.read(failure.get("diagnostic")));
         }
         return null;
     }
@@ -1862,6 +2114,68 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return steps;
     }
 
+    @Override
+    public AggregateCheckOutcome aggregateCheck(URI baseUrl, String credential, String pipelineId, String step,
+            boolean repair, Map<String, String> group, String after) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (group != null) {
+            body.put("group", group);
+        }
+        if (after != null) {
+            body.put("after", after);
+        }
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + "/aggregates/" + encode(step)
+                            + (repair ? ":repair" : ":check"), credential)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonOut.compact(body), StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                AggregateCheckOutcome.Found found = aggregateReport(response.body());
+                return found == null ? new AggregateCheckOutcome.Unreachable() : found;
+            }
+            Rejection r = rejection(response.body(), repair ? "The server refused the repair." : "The server refused the check.");
+            return new AggregateCheckOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new AggregateCheckOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new AggregateCheckOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The step's answer decoded from a 200 body, or {@code null} when the body is not the object this
+     * contract promises. A group's key value that is JSON null stays a null: it is the null of that
+     * column, not a missing answer.
+     */
+    static AggregateCheckOutcome.Found aggregateReport(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> report) || !(report.get("groups") instanceof Number groups)
+                || !(report.get("findings") instanceof List<?> listed)) {
+            return null;
+        }
+        List<AggregateCheckOutcome.Finding> findings = new ArrayList<>();
+        for (Object entry : listed) {
+            if (!(entry instanceof Map<?, ?> finding) || !(finding.get("group") instanceof Map<?, ?> named)
+                    || !(finding.get("verdict") instanceof String verdict)) {
+                return null;
+            }
+            Map<String, String> group = new LinkedHashMap<>();
+            named.forEach((name, value) -> group.put(String.valueOf(name), value == null ? null : String.valueOf(value)));
+            List<String> fields = new ArrayList<>();
+            if (finding.get("fields") instanceof List<?> names) {
+                names.forEach(name -> fields.add(String.valueOf(name)));
+            }
+            findings.add(new AggregateCheckOutcome.Finding(group, verdict, fields, string(finding.get("code")),
+                    string(finding.get("field"))));
+        }
+        return new AggregateCheckOutcome.Found(groups.intValue(), findings, string(report.get("next")),
+                report.get("conflicts") instanceof Number conflicts ? conflicts.longValue() : 0,
+                report.get("withheld") instanceof Number withheld ? withheld.longValue() : 0);
+    }
+
     /** A JSON cell as a string, or null where it is absent - which is what an absent side means here. */
     private static String string(Object value) {
         return value instanceof String s ? s : null;
@@ -1869,9 +2183,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public LogsOutcome logs(URI baseUrl, String credential, String pipelineId) {
+        return logs(baseUrl, credential, pipelineId, null);
+    }
+
+    @Override
+    public LogsOutcome logs(URI baseUrl, String credential, String pipelineId, RemoteLogCursor after) {
         try {
+            String suffix = after == null ? "" : "?after=" + encode(after.token());
             HttpRequest request =
-                    authed(baseUrl, "/api/pipelines/" + pipelineId + "/logs", credential).GET().build();
+                    authed(baseUrl, "/api/pipelines/" + pipelineId + "/logs" + suffix, credential).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -1898,12 +2218,59 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         && line.get("timestampMillis") instanceof Number ts
                         && line.get("level") instanceof String level
                         && line.get("message") instanceof String message) {
-                    parsed.add(new RemoteLogLine(ts.longValue(), level, message));
+                    parsed.add(new RemoteLogLine(ts.longValue(), level, message, io.tapstate.core.common.RuntimeDiagnosticProjection.read(line.get("diagnostic"))));
                 }
             }
-            return new LogsOutcome.Found(id, parsed);
+            RemoteLogCursor cursor = null;
+            if (m.get("nextCursor") instanceof Map<?, ?> next
+                    && next.get("generation") instanceof String generation
+                    && next.get("sequence") instanceof Number sequence) {
+                cursor = new RemoteLogCursor(generation, sequence.longValue());
+            }
+            boolean truncated = m.get("truncated") instanceof Boolean value && value;
+            return new LogsOutcome.Found(id, parsed, cursor, truncated);
         }
         return null;
+    }
+
+    @Override
+    public PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId, String level) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":log-level", credential)
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonOut.write(Map.of("level", level)), StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200 && JsonReader.parse(response.body()) instanceof String changed) {
+                return new PipelineLogLevelOutcome.Changed(changed);
+            }
+            Rejection rejection = rejection(response.body(), "The server refused the log level change.");
+            return new PipelineLogLevelOutcome.Rejected(rejection.code(), rejection.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new PipelineLogLevelOutcome.Unreachable();
+        } catch (IOException | RuntimeException unavailable) {
+            return new PipelineLogLevelOutcome.Unreachable();
+        }
+    }
+
+    @Override
+    public PipelineLogLevelOutcome logLevel(URI baseUrl, String credential, String pipelineId) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + ":log-level", credential)
+                    .GET()
+                    .build();
+            HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200 && JsonReader.parse(response.body()) instanceof String current) {
+                return new PipelineLogLevelOutcome.Current(current);
+            }
+            Rejection rejection = rejection(response.body(), "The server refused the log level read.");
+            return new PipelineLogLevelOutcome.Rejected(rejection.code(), rejection.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new PipelineLogLevelOutcome.Unreachable();
+        } catch (IOException | RuntimeException unavailable) {
+            return new PipelineLogLevelOutcome.Unreachable();
+        }
     }
 
     // --- streaming reads over a websocket (status --watch / logs --follow) -----------------------
@@ -1920,7 +2287,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return stream(wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/status/watch"), credential, stop, frame -> {
             StatusOutcome decoded = statusFound(frame);
             if (decoded instanceof StatusOutcome.Found found) {
-                sink.state(found.pipelineId(), found.state(), found.failureCode(), found.failureMessage());
+                sink.state(found);
             }
         });
     }
@@ -1928,10 +2295,24 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public String followLogs(URI baseUrl, String credential, String pipelineId,
             LogStream sink, BooleanSupplier stop) {
-        return stream(wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/logs/follow"), credential, stop, frame -> {
+        return followLogs(baseUrl, credential, pipelineId, null, sink, stop);
+    }
+
+    @Override
+    public String followLogs(URI baseUrl, String credential, String pipelineId, RemoteLogCursor after,
+            LogStream sink, BooleanSupplier stop) {
+        AtomicReference<RemoteLogCursor> cursor = new AtomicReference<>(after);
+        return stream(() -> {
+            RemoteLogCursor latest = cursor.get();
+            String suffix = latest == null ? "" : "?after=" + encode(latest.token());
+            return wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/logs/follow" + suffix);
+        }, credential, stop, frame -> {
             LogsOutcome.Found found = logsFound(frame);
-            if (found != null && !found.lines().isEmpty()) {
-                sink.lines(found.pipelineId(), found.lines());
+            if (found != null && (!found.lines().isEmpty() || found.truncated())) {
+                if (found.nextCursor() != null) {
+                    cursor.set(found.nextCursor());
+                }
+                sink.page(found);
             }
         });
     }
@@ -1996,24 +2377,30 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * though, so that every caller gets it without having to remember to.
      */
     private String stream(URI wsUri, String credential, BooleanSupplier stop, Consumer<String> onFrame) {
+        return stream(() -> wsUri, credential, stop, onFrame);
+    }
+
+    /** Resolves the endpoint once so a cursor can be included when opening the stream. */
+    private String stream(Supplier<URI> wsUri, String credential, BooleanSupplier stop, Consumer<String> onFrame) {
         if (stop.getAsBoolean()) {
             return null;
         }
         CountDownLatch closed = new CountDownLatch(1);
         AtomicReference<String> refusal = new AtomicReference<>();
+        var liveness = new StreamLiveness(streamPingInterval, streamPongTimeout, closed);
         WebSocket ws;
         try {
             ws = client().newWebSocketBuilder()
                     .header("Authorization", "Bearer " + credential)
-                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                    .buildAsync(wsUri.get(), new StreamListener(onFrame, closed, refusal, liveness))
+
                     .join();
         } catch (RuntimeException handshakeFailed) {
-            // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
-            // RuntimeException); either way this node is not serving the stream right now.
+            // Member selection belongs to the caller; do not retry the same address here.
             sleepUnlessStopped(RECONNECT_BACKOFF, stop);
             return null;
         }
-        awaitClosedOrStop(closed, stop);
+        awaitClosedOrStop(closed, stop, ws, liveness);
         ws.abort();
         if (refusal.get() != null) {
             return refusal.get();
@@ -2042,9 +2429,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     /** Waits until the connection closes or {@code stop} is signalled, whichever comes first. */
-    private static void awaitClosedOrStop(CountDownLatch closed, BooleanSupplier stop) {
+    private static void awaitClosedOrStop(CountDownLatch closed, BooleanSupplier stop, WebSocket socket, StreamLiveness liveness) {
         try {
             while (!stop.getAsBoolean()) {
+                liveness.tick(socket, System.nanoTime());
                 if (closed.await(STOP_POLL.toMillis(), TimeUnit.MILLISECONDS)) {
                     return;
                 }
@@ -2079,11 +2467,20 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         private final CountDownLatch closed;
         private final AtomicReference<String> refusal;
         private final StringBuilder partial = new StringBuilder();
+        private final StreamLiveness liveness;
 
-        StreamListener(Consumer<String> onFrame, CountDownLatch closed, AtomicReference<String> refusal) {
+        StreamListener(Consumer<String> onFrame, CountDownLatch closed, AtomicReference<String> refusal, StreamLiveness liveness) {
             this.onFrame = onFrame;
             this.closed = closed;
             this.refusal = refusal;
+            this.liveness = liveness;
+        }
+
+        @Override
+        public CompletionStage<?> onPong(WebSocket socket, java.nio.ByteBuffer payload) {
+            liveness.pong(payload, System.nanoTime());
+            socket.request(1);
+            return null;
         }
 
         @Override
@@ -2357,7 +2754,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     /** A parsed coded refusal: the server's code and message, or a fixed generic message if not coded. */
-    private record Rejection(String code, String message, Map<String, Object> params) {
+    private record Rejection(
+            String code, String message, Map<String, Object> params, Map<String, Object> diagnostic) {
     }
 
     /**
@@ -2366,6 +2764,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * (e.g. a container 500 page) is still a refusal, never a crash and never leaked raw to the user.
      */
     private static Rejection rejection(String body, String genericMessage) {
+        return rejection(body, genericMessage, false);
+    }
+
+    private static Rejection rejection(String body, String genericMessage, boolean readDiagnostic) {
         try {
             if (JsonReader.parse(body) instanceof Map<?, ?> map && map.get("code") instanceof String code) {
                 String message = map.get("message") instanceof String m ? m : code;
@@ -2375,12 +2777,14 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 if (map.get("params") instanceof Map<?, ?> raw) {
                     raw.forEach((key, value) -> params.put(String.valueOf(key), value));
                 }
-                return new Rejection(code, message, Collections.unmodifiableMap(params));
+                Map<String, Object> diagnostic = readDiagnostic
+                        ? DiagnosticProjection.read(map.get("diagnostic")) : Map.of();
+                return new Rejection(code, message, Collections.unmodifiableMap(params), diagnostic);
             }
         } catch (RuntimeException malformed) {
             // fall through: a non-coded / unparseable error body is still a refusal, not a crash
         }
-        return new Rejection("", genericMessage, Map.of());
+        return new Rejection("", genericMessage, Map.of(), Map.of());
     }
 
     private static RemoteCreatedToken createdToken(Object body) {

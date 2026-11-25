@@ -43,9 +43,9 @@ class WatchRefusesNonTtyIT {
 
     @Test
     void aWatchWhoseOutputIsAPipeRefusesAndNamesBothAlternatives() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_watch_nontty"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
                     "watch", NAMESPACE);
@@ -59,7 +59,7 @@ class WatchRefusesNonTtyIT {
             // it has no contract. This is also what separates the refusal from the one the read would
             // have produced -- an implementation that got as far as asking fails here reporting a
             // data-browser code instead, which is exactly the mutation this case exists to catch.
-            assertThat(run.stderr()).contains("cli.watch-needs-a-terminal");
+            assertThat(run.stderr()).contains("TS0330025");
             // Both alternatives, because a reader who reached for this verb wants one of them: a stream
             // that pipes, or a look that ends. A refusal naming neither leaves them nothing to type.
             assertThat(run.stderr()).contains("tail").contains("find");

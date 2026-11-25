@@ -1,15 +1,18 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClients;
 import io.tapstate.testsupport.DockerGate;
+import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -27,13 +30,203 @@ class BoundedPipelinePreviewIT {
         DockerGate.require();
     }
 
+    @Test
+    void aPlainMapKeyRenameCompletesADefaultSyncPreview(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,company_name\norder-1,Northwind\norder-2,Contoso\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: preview_pipeline
+                    source: preview_source
+                    settings: { read_mode: snapshot_and_cdc }
+                    transforms:
+                      - id: renamed_orders
+                        from: [ orders ]
+                        type: map
+                        fields:
+                          ORDER_ID: $id
+                          company: $company_name
+                    serve:
+                      from: renamed_orders
+                      sync:
+                        - { id: preview_sync, source: preview_target }
+                    """;
+            List<Map<String, Object>> events = control.preview(PIPELINE_ID, "preview_sync", 1,
+                    SAMPLE_ID + "-plain-rename", List.of(
+                            new ControlPlane.PreviewDraft("source.tap.yml", """
+                                    version: tapstate/v1
+                                    kind: source
+                                    id: preview_source
+                                    connector: e2e_file
+                                    config: { uri: "%s" }
+                                    mode: cdc
+                                    tables: [ orders ]
+                                    """.formatted(source)),
+                            new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline),
+                            new ControlPlane.PreviewDraft("target.tap.yml",
+                                    targetYaml(source.resolve("preview-target")))));
+
+            assertThat(events).extracting(event -> event.get("kind"))
+                    .as("default sync preview events: %s", events)
+                    .startsWith("run.accepted", "compile.completed", "sample.completed")
+                    .endsWith("result.completed", "run.completed");
+            assertThat(((Number) payload(events, "sample.completed").get("rootRows")).intValue()).isEqualTo(1);
+            assertThat(documents(payload(events, "result.completed")))
+                    .isEqualTo(List.of(Map.of("ORDER_ID", "order-1", "company", "Northwind")));
+            assertThat(control.artifactIds()).doesNotContain(SOURCE_ID, PIPELINE_ID, "preview_target");
+            assertThat(source.resolve("preview-target")).doesNotExist();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"join", "nest"})
+    void aMapAfterAStatefulStepMaterializesOnItsRenamedKey(String operator, @TempDir Path directory)
+            throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,customer_id,amount\norder-1,customer-1,12\n");
+            Files.writeString(source.resolve("customers.csv"), "id,name\ncustomer-1,Northwind\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+
+            String assembly = operator.equals("join") ? """
+                  - id: assembled_orders
+                    type: join
+                    from: { o: orders, c: customers }
+                    engine: builtin
+                    sql: |
+                      SELECT o.id AS id, o.customer_id AS customer_id, o.amount AS amount
+                      FROM o JOIN c ON o.customer_id = c.id
+                """ : """
+                  - id: assembled_orders
+                    type: nest
+                    from: { o: orders, c: customers }
+                    root:
+                      from: o
+                      key: [ id ]
+                      embed:
+                        - { from: c, on: { id: customer_id }, as: object, path: customer }
+                """;
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: preview_pipeline
+                    source: preview_source
+                    transforms:
+                    """ + assembly + """
+                      - id: projected_orders
+                        type: map
+                        from: assembled_orders
+                        fields:
+                          order_key: $id
+                          customer_id: false
+                          customer: false
+                          tag: x
+                          amount: "=int(after.amount)"
+                    serve:
+                      from: projected_orders
+                      sync: [{ id: preview_sync, source: preview_target }]
+                    """;
+            List<Map<String, Object>> events = control.preview(PIPELINE_ID, "preview_sync", 1,
+                    SAMPLE_ID + "-projected-" + operator, List.of(
+                            new ControlPlane.PreviewDraft("source.tap.yml", """
+                                    version: tapstate/v1
+                                    kind: source
+                                    id: preview_source
+                                    connector: e2e_file
+                                    config: { uri: "%s" }
+                                    mode: cdc
+                                    tables: [ orders, customers ]
+                                    """.formatted(source)),
+                            new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline),
+                            new ControlPlane.PreviewDraft("target.tap.yml",
+                                    targetYaml(source.resolve("preview-target")))));
+
+            assertThat(events).extracting(event -> event.get("kind"))
+                    .as("%s preview events: %s", operator, events)
+                    .endsWith("result.completed", "run.completed");
+            assertThat(documents(payload(events, "result.completed")))
+                    .isEqualTo(List.of(Map.of("order_key", "order-1", "tag", "x", "amount", 12L)));
+        }
+    }
+
+    @Test
+    void previewDoesNotReadUnrelatedTransformDefinitions(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
+                var observer = MongoClients.create(storage.configurationUri())) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectories(directory.resolve("source"));
+            Files.writeString(source.resolve("orders.csv"), "id,customer_id,company_name,amount\n"
+                    + "order-1,customer-1,Northwind,12\n"
+                    + "order-2,customer-2,Contoso,7\n"
+                    + "order-3,customer-3,Fabrikam,9\n");
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            var drafts = new java.util.LinkedHashMap<String, String>();
+            drafts.put("preview_source.tap.yml", sourceYaml(source).replace(
+                    "tables: [ orders, customers, orders_archive, order_items, item_labels ]", "tables: [ orders ]"));
+            List<String> unrelatedIds = List.of("unrelated_one", "unrelated_two", "unrelated_three");
+            for (String id : unrelatedIds) {
+                drafts.put(id + ".tap.yml", """
+                        version: tapstate/v1
+                        kind: transform
+                        id: %s
+                        type: filter
+                        expr: "true"
+                        """.formatted(id));
+            }
+            control.apply(drafts);
+
+            var database = observer.getDatabase(storage.configurationDatabase());
+            database.runCommand(new Document("profile", 1)
+                    .append("filter", new Document("command.find", "transform_definitions")));
+            try {
+                assertThat(database.getCollection("transform_definitions")
+                        .find(new Document("_id", unrelatedIds.getFirst())).first()).isNotNull();
+                var unrelatedLookup = new Document("command.find", "transform_definitions")
+                        .append("command.filter._id", new Document("$in", unrelatedIds));
+                var profile = database.getCollection("system.profile");
+                long before = profile.countDocuments(unrelatedLookup);
+                assertThat(before).as("the profiler records an exact unrelated-definition lookup").isEqualTo(1);
+
+                List<Map<String, Object>> events = control.preview(PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID,
+                        List.of(new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml())));
+
+                assertThat(events).extracting(event -> event.get("kind"))
+                        .endsWith("result.completed", "run.completed");
+                List<?> documents = documents(payload(events, "result.completed"));
+                assertThat(documents).hasSize(2);
+                assertDocument(documents.get(0), "order-1", "Northwind", 24);
+                assertDocument(documents.get(1), "order-2", "Contoso", 14);
+                assertThat(profile.countDocuments(unrelatedLookup))
+                        .as("preview reads its dependency closure without looking up unrelated definitions")
+                        .isEqualTo(before);
+            } finally {
+                database.runCommand(new Document("profile", 0));
+            }
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void runsTheUnsavedCandidateWithABoundedSourceSampleOnBothTiers(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri(tier))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 
@@ -59,121 +252,11 @@ class BoundedPipelinePreviewIT {
             Map<String, Object> settings = Map.of("uri", source.toString());
             control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, settings);
 
-            List<ControlPlane.PreviewDraft> drafts = List.of(
-                    new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
-                    new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml()));
-            List<Map<String, Object>> events = control.preview(
-                    PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
-
-            assertThat(events).extracting(event -> event.get("kind"))
-                    .as("preview events including terminal failure payload: %s", events)
-                    .startsWith("run.accepted", "compile.completed", "sample.completed")
-                    .endsWith("result.completed", "run.completed");
-            List<Long> sequences = events.stream()
-                    .map(event -> ((Number) event.get("seq")).longValue())
-                    .toList();
-            assertThat(sequences)
-                    .containsExactlyElementsOf(java.util.stream.LongStream.range(0, events.size()).boxed().toList());
-            assertThat(events).extracting(event -> event.get("runId"))
-                    .containsOnly(events.getFirst().get("runId"));
-            assertThat(events).extracting(event -> event.get("candidateHash"))
-                    .containsOnly(events.getFirst().get("candidateHash"));
-
-            Map<String, Object> sample = payload(events, "sample.completed");
-            assertThat(sample).containsEntry("complete", true).containsEntry("rootTruncated", true);
-            assertThat(((Number) sample.get("rootRows")).intValue()).isEqualTo(2);
-            assertThat(((Number) sample.get("queryCount")).intValue()).isEqualTo(1);
-
-            Map<String, Object> result = payload(events, "result.completed");
-            assertThat(result).containsEntry("format", "logical-json").containsEntry("complete", true);
-            assertThat(((Number) result.get("rowCount")).intValue()).isEqualTo(2);
-            assertThat(result.get("documents")).isInstanceOf(List.class);
-            List<?> documents = (List<?>) result.get("documents");
-            assertThat(documents).hasSize(2);
-            assertDocument(documents.get(0), "order-1", "Northwind", 24);
-            assertDocument(documents.get(1), "order-2", "Contoso", 14);
-
-            List<Map<String, Object>> cached = control.preview(PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
-            assertThat(payload(cached, "sample.completed")).containsEntry("cacheHit", true);
-            assertThat(payload(cached, "result.completed").get("documents")).isEqualTo(documents);
-
-            List<ControlPlane.PreviewDraft> javascriptDrafts = List.of(
-                    new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
-                    new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", javascriptPipelineYaml()));
-            List<Map<String, Object>> javascriptEvents = control.preview(
-                    PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID + "-javascript", javascriptDrafts);
-            Map<String, Object> javascriptResult = payload(javascriptEvents, "result.completed");
-            assertThat(javascriptResult).containsEntry("format", "logical-json");
-            assertThat(javascriptResult.get("documents")).isInstanceOf(List.class);
-            List<?> javascriptDocuments = (List<?>) javascriptResult.get("documents");
-            assertThat(javascriptDocuments).hasSize(2);
-            assertDocument(javascriptDocuments.get(0), "order-1", "Northwind", 24);
-            assertDocument(javascriptDocuments.get(1), "order-2", "Contoso", 14);
-
-            Map<String, Object> filtered = result(control, source, filterPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-filter", false);
-            assertThat(filtered).containsEntry("complete", true);
-            assertThat(((Number) filtered.get("rowCount")).intValue()).isEqualTo(1);
-            assertThat(values(documents(filtered), "id"))
-                    .containsExactly("order-1");
-
-            Map<String, Object> allFiltered = result(control, source, emptyFilterPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-filter-empty", false);
-            assertThat(allFiltered).containsEntry("complete", true);
-            assertThat(((Number) allFiltered.get("rowCount")).intValue()).isZero();
-            assertThat(documents(allFiltered)).isEmpty();
-
-            Map<String, Object> union = result(control, source, unionPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-union", false);
-            assertThat(union).containsEntry("complete", true);
-            assertThat(((Number) union.get("rowCount")).intValue()).isEqualTo(4);
-            assertThat(values(documents(union), "id"))
-                    .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
-            List<Map<String, Object>> boundedUnion = control.preview(PIPELINE_ID, OUTPUT_ID, 2,
-                    SAMPLE_ID + "-union-bounded", List.of(
-                            new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
-                            new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", unionPipelineYaml())));
-            Map<String, Object> unionSample = payload(boundedUnion, "sample.completed");
-            assertThat(((Number) unionSample.get("rootRows")).intValue()).isEqualTo(2);
-            assertThat(unionSample).containsEntry("rootTruncated", true);
-            List<String> unionRootKeys = ((List<?>) unionSample.get("rootSourceKeys")).stream()
-                    .map(String::valueOf)
-                    .toList();
-            assertThat(unionRootKeys).hasSize(2)
-                    .containsExactlyElementsOf(unionRootKeys.stream().sorted().toList());
-
-            Map<String, Object> joined = result(control, source, joinPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-join", false);
-            assertThat(joined).containsEntry("complete", true);
-            assertThat(((Number) joined.get("rowCount")).intValue()).isEqualTo(3);
-            Map<?, ?> joinedOrder = documentBy(documents(joined), "order_id", "order-1");
-            assertThat(joinedOrder.get("customer_name")).isEqualTo("Northwind Ltd");
-
-            Map<String, Object> nested = result(control, source, nestedPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-nest", false);
-            assertThat(nested).containsEntry("complete", true);
-            assertThat(((Number) nested.get("rowCount")).intValue()).isEqualTo(3);
-            Map<?, ?> firstOrder = documentBy(documents(nested), "id", "order-1");
-            List<?> items = (List<?>) firstOrder.get("items");
-            assertThat(items).hasSize(2);
-            Map<?, ?> firstItem = documentBy(items, "id", "item-1");
-            assertThat(values((List<?>) firstItem.get("labels"), "label"))
-                    .containsExactlyInAnyOrder("fragile", "gift");
-            Map<?, ?> secondItem = documentBy(items, "id", "item-2");
-            assertThat((List<?>) secondItem.get("labels")).isEmpty();
-            assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
-
-            Map<String, Object> unwound = result(control, source, unwindPipelineYaml(), "preview_sync",
-                    SAMPLE_ID + "-unwind", true);
-            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true);
-            assertThat(((Number) unwound.get("rowCount")).intValue()).isEqualTo(6);
-            assertThat(values(documents(unwound), "item_index").stream()
-                    .map(Number.class::cast)
-                    .map(Number::intValue)
-                    .toList())
-                    .containsExactly(0, 1, 0, 1, 0, 1);
-            assertThat(values(documents(unwound), "items"))
-                    .contains("first-item", "second-item");
+            assertSampleAndCache(control, source);
+            assertJavascriptAndFilters(control, source);
+            assertUnionSample(control, source);
+            assertJoinedAndNested(control, source);
+            assertUnwindSample(control, source);
 
             assertThat(control.artifactIds())
                     .as("preview compiles drafts without applying them to the artifact store")
@@ -182,6 +265,231 @@ class BoundedPipelinePreviewIT {
                     .as("preview replaces the target sink and never creates a target directory")
                     .isFalse();
         }
+    }
+
+    @Test
+    void reportsDroppedCompositeAssociationKeysThroughThePreviewApi(@TempDir Path directory) throws Exception {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
+                    Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            Path source = Files.createDirectory(directory.resolve("source"));
+            Files.writeString(source.resolve("bmsql_oorder.csv"), """
+                    o_id,o_w_id,o_d_id,o_c_id
+                    order-1,w1,d2,c3
+                    """);
+            Files.writeString(source.resolve("bmsql_customer.csv"), """
+                    customer_id,c_w_id,c_d_id,c_id,c_name,c_credit
+                    row-1,w1,d2,c3,Matched,500
+                    row-2,w9,d2,c3,Other warehouse,20
+                    """);
+            control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+
+            for (String field : List.of("c_w_id", "c_d_id", "c_id")) {
+                List<Map<String, Object>> rejected = previewCompositeAssociation(control, source,
+                        "c_credit: false, " + field + ": false", "en");
+                assertThat(rejected).extracting(event -> event.get("kind"))
+                        .as("invalid candidate events: %s", rejected)
+                        .containsExactly("run.accepted", "compile.completed", "run.failed");
+                assertThat(payload(rejected, "run.failed"))
+                        .containsEntry("code", "TS0360036")
+                        .containsEntry("params", Map.of("relation", "customer", "field", field,
+                                "transform", "customer__pre", "droppedField", field));
+            }
+
+            String dropped = "c_credit: false, c_d_id: false";
+            var simplified = payload(previewCompositeAssociation(control, source, dropped, "zh-CN"), "run.failed");
+            var traditional = payload(previewCompositeAssociation(control, source, dropped, "zh-TW"), "run.failed");
+            var expected = Map.of("relation", "customer", "field", "c_d_id",
+                    "transform", "customer__pre", "droppedField", "c_d_id");
+            assertThat(simplified).containsEntry("code", "TS0360036").containsEntry("params", expected);
+            assertThat(traditional).containsEntry("code", "TS0360036").containsEntry("params", expected);
+            assertThat((String) simplified.get("reason")).contains("\u5173\u8054\u952e", "c_d_id");
+            assertThat((String) traditional.get("reason")).contains("\u95dc\u806f\u9375", "c_d_id");
+
+            List<Map<String, Object>> restored = previewCompositeAssociation(control, source, "c_credit: false", null);
+            assertThat(restored).extracting(event -> event.get("kind"))
+                    .as("restored candidate events: %s", restored)
+                    .endsWith("result.completed", "run.completed");
+            Map<?, ?> order = documentBy(documents(payload(restored, "result.completed")), "o_id", "order-1");
+            assertThat(order.get("c_name")).isEqualTo("Matched");
+            assertThat(order.containsKey("c_credit")).isFalse();
+        }
+    }
+
+    private static List<Map<String, Object>> previewCompositeAssociation(
+            ControlPlane control, Path source, String fields, String language) {
+        String sourceDraft = """
+                version: tapstate/v1
+                kind: source
+                id: preview_source
+                connector: e2e_file
+                config: { uri: "%s" }
+                mode: cdc
+                tables: [ bmsql_oorder, bmsql_customer ]
+                """.formatted(source);
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                transforms:
+                  - id: customer__pre
+                    from: [ bmsql_customer ]
+                    type: map
+                    fields: { %s }
+                  - id: order_tree
+                    type: nest
+                    from: { root: bmsql_oorder, customer: customer__pre }
+                    root:
+                      from: root
+                      key: [ o_id ]
+                      embed:
+                        - from: customer
+                          on: { c_w_id: o_w_id, c_d_id: o_d_id, c_id: o_c_id }
+                          key: [ c_w_id, c_d_id, c_id ]
+                          as: flat
+                view:
+                  id: preview_view
+                  from: order_tree
+                  primary_key: o_id
+                """.formatted(fields);
+        return control.preview(PIPELINE_ID, OUTPUT_ID, 1, SAMPLE_ID + "-composite",
+                List.of(new ControlPlane.PreviewDraft("source.tap.yml", sourceDraft),
+                        new ControlPlane.PreviewDraft("pipeline.tap.yml", pipeline)), language);
+    }
+
+    private static void assertSampleAndCache(ControlPlane control, Path source) throws Exception {
+        List<ControlPlane.PreviewDraft> drafts = List.of(
+                new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml()));
+        List<Map<String, Object>> events = control.preview(
+                PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
+
+        assertThat(events).extracting(event -> event.get("kind"))
+                .as("preview events including terminal failure payload: %s", events)
+                .startsWith("run.accepted", "compile.completed", "sample.completed")
+                .endsWith("result.completed", "run.completed");
+        List<Long> sequences = events.stream()
+                .map(event -> ((Number) event.get("seq")).longValue())
+                .toList();
+        assertThat(sequences)
+                .containsExactlyElementsOf(java.util.stream.LongStream.range(0, events.size()).boxed().toList());
+        assertThat(events).extracting(event -> event.get("runId"))
+                .containsOnly(events.getFirst().get("runId"));
+        assertThat(events).extracting(event -> event.get("candidateHash"))
+                .containsOnly(events.getFirst().get("candidateHash"));
+
+        Map<String, Object> sample = payload(events, "sample.completed");
+        assertThat(sample).containsEntry("complete", true).containsEntry("rootTruncated", true);
+        assertThat(((Number) sample.get("rootRows")).intValue()).isEqualTo(2);
+        assertThat(((Number) sample.get("queryCount")).intValue()).isEqualTo(1);
+
+        Map<String, Object> result = payload(events, "result.completed");
+        assertThat(result).containsEntry("format", "logical-json").containsEntry("complete", true);
+        assertThat(((Number) result.get("rowCount")).intValue()).isEqualTo(2);
+        assertThat(result.get("documents")).isInstanceOf(List.class);
+        List<?> documents = (List<?>) result.get("documents");
+        assertThat(documents).hasSize(2);
+        assertDocument(documents.get(0), "order-1", "Northwind", 24);
+        assertDocument(documents.get(1), "order-2", "Contoso", 14);
+
+        List<Map<String, Object>> cached = control.preview(PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
+        assertThat(payload(cached, "sample.completed")).containsEntry("cacheHit", true);
+        assertThat(payload(cached, "result.completed").get("documents")).isEqualTo(documents);
+
+    }
+
+    private static void assertJavascriptAndFilters(ControlPlane control, Path source) throws Exception {
+        List<ControlPlane.PreviewDraft> javascriptDrafts = List.of(
+                new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", javascriptPipelineYaml()));
+        List<Map<String, Object>> javascriptEvents = control.preview(
+                PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID + "-javascript", javascriptDrafts);
+        Map<String, Object> javascriptResult = payload(javascriptEvents, "result.completed");
+        assertThat(javascriptResult).containsEntry("format", "logical-json");
+        assertThat(javascriptResult.get("documents")).isInstanceOf(List.class);
+        List<?> javascriptDocuments = (List<?>) javascriptResult.get("documents");
+        assertThat(javascriptDocuments).hasSize(2);
+        assertDocument(javascriptDocuments.get(0), "order-1", "Northwind", 24);
+        assertDocument(javascriptDocuments.get(1), "order-2", "Contoso", 14);
+
+        Map<String, Object> filtered = result(control, source, filterPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-filter", false);
+        assertThat(filtered).containsEntry("complete", true);
+        assertThat(((Number) filtered.get("rowCount")).intValue()).isEqualTo(1);
+        assertThat(values(documents(filtered), "id"))
+                .containsExactly("order-1");
+
+        Map<String, Object> allFiltered = result(control, source, emptyFilterPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-filter-empty", false);
+        assertThat(allFiltered).containsEntry("complete", true);
+        assertThat(((Number) allFiltered.get("rowCount")).intValue()).isZero();
+        assertThat(documents(allFiltered)).isEmpty();
+
+    }
+
+    private static void assertUnionSample(ControlPlane control, Path source) throws Exception {
+        Map<String, Object> union = result(control, source, unionPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-union", false);
+        assertThat(union).containsEntry("complete", true);
+        assertThat(((Number) union.get("rowCount")).intValue()).isEqualTo(4);
+        assertThat(values(documents(union), "id"))
+                .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
+        List<Map<String, Object>> boundedUnion = control.preview(PIPELINE_ID, OUTPUT_ID, 2,
+                SAMPLE_ID + "-union-bounded", List.of(
+                        new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                        new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", unionPipelineYaml())));
+        Map<String, Object> unionSample = payload(boundedUnion, "sample.completed");
+        assertThat(((Number) unionSample.get("rootRows")).intValue()).isEqualTo(2);
+        assertThat(unionSample).containsEntry("rootTruncated", true);
+        List<String> unionRootKeys = ((List<?>) unionSample.get("rootSourceKeys")).stream()
+                .map(String::valueOf)
+                .toList();
+        assertThat(unionRootKeys).hasSize(2)
+                .containsExactlyElementsOf(unionRootKeys.stream().sorted().toList());
+
+    }
+
+    private static void assertJoinedAndNested(ControlPlane control, Path source) throws Exception {
+        Map<String, Object> joined = result(control, source, joinPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-join", false);
+        assertThat(joined).containsEntry("complete", true);
+        assertThat(((Number) joined.get("rowCount")).intValue()).isEqualTo(3);
+        Map<?, ?> joinedOrder = documentBy(documents(joined), "order_id", "order-1");
+        assertThat(joinedOrder.get("customer_name")).isEqualTo("Northwind Ltd");
+
+        Map<String, Object> nested = result(control, source, nestedPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-nest", false);
+        assertThat(nested).containsEntry("complete", true);
+        assertThat(((Number) nested.get("rowCount")).intValue()).isEqualTo(3);
+        Map<?, ?> firstOrder = documentBy(documents(nested), "id", "order-1");
+        List<?> items = (List<?>) firstOrder.get("items");
+        assertThat(items).hasSize(2);
+        Map<?, ?> firstItem = documentBy(items, "id", "item-1");
+        assertThat(values((List<?>) firstItem.get("labels"), "label"))
+                .containsExactlyInAnyOrder("fragile", "gift");
+        Map<?, ?> secondItem = documentBy(items, "id", "item-2");
+        assertThat((List<?>) secondItem.get("labels")).isEmpty();
+        assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
+
+    }
+
+    private static void assertUnwindSample(ControlPlane control, Path source) throws Exception {
+        Map<String, Object> unwound = result(control, source, unwindPipelineYaml(), "preview_sync",
+                SAMPLE_ID + "-unwind", true, true);
+        assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true)
+                .containsEntry("logicalDocuments", unwound.get("documents"));
+        assertThat(((Number) unwound.get("rowCount")).intValue()).isEqualTo(6);
+        assertThat(values(documents(unwound), "item_index").stream()
+                .map(Number.class::cast)
+                .map(Number::intValue)
+                .toList())
+                .containsExactly(0, 1, 0, 1, 0, 1);
+        assertThat(values(documents(unwound), "items"))
+                .contains("first-item", "second-item");
+
     }
 
     private static void assertDocument(Object value, String id, String company, int doubledAmount) {
@@ -209,6 +517,12 @@ class BoundedPipelinePreviewIT {
     private static Map<String, Object> result(
             ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
             boolean includeTarget) {
+        return result(control, directory, pipelineYaml, outputId, sampleId, includeTarget, false);
+    }
+
+    private static Map<String, Object> result(
+            ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
+            boolean includeTarget, boolean expectIdentity) {
         List<ControlPlane.PreviewDraft> drafts = new java.util.ArrayList<>();
         drafts.add(new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(directory)));
         drafts.add(new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml));
@@ -217,9 +531,17 @@ class BoundedPipelinePreviewIT {
                     "preview_target.tap.yml", targetYaml(directory.resolve("preview-target"))));
         }
         List<Map<String, Object>> events = control.preview(PIPELINE_ID, outputId, 100, sampleId, drafts);
+        Object[] prefix = expectIdentity
+                ? new String[] {"run.accepted", "compile.completed", "identity.completed", "sample.completed"}
+                : new String[] {"run.accepted", "compile.completed", "sample.completed"};
         assertThat(events).extracting(event -> event.get("kind"))
-                .startsWith("run.accepted", "compile.completed", "sample.completed")
-                .endsWith("result.completed", "run.completed");
+                .startsWith(prefix).endsWith("result.completed", "run.completed");
+        if (expectIdentity) {
+            List<?> targets = (List<?>) payload(events, "identity.completed").get("targets");
+            assertThat(targets).hasSize(1);
+            assertThat(targets.getFirst()).asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
+                    .containsEntry("status", "not-required").containsEntry("generatedFields", List.of());
+        }
         return payload(events, "result.completed");
     }
 
@@ -437,7 +759,4 @@ class BoundedPipelinePreviewIT {
                 """;
     }
 
-    private static String storeUri(Tiers tier) {
-        return SharedMongo.replicaSetUrl("bounded_preview_" + tier.name().toLowerCase(Locale.ROOT));
-    }
 }

@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -30,10 +29,9 @@ class SavedSourceSchemaRefreshIT {
     @EnumSource(Tiers.class)
     void aRedactedSavedSourceStillDiscoversWithItsPersistedPassword(Tiers tier, @TempDir Path directory) {
         writeTable(directory);
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(
-                "saved_source_schema_refresh_" + tier.name().toLowerCase(Locale.ROOT)))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     read(E2eConnectorJar.buildInto(directory)));
             control.apply(Map.of("src_saved.tap.yml", sourceYaml(directory)));

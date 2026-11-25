@@ -14,4 +14,9 @@ interface StatusStream {
      * the very frame that reports it dead, not only from a separate poll.
      */
     void state(String pipelineId, String state, String failureCode, String failureMessage);
+
+    /** Retains the complete frame for consumers that render captured runtime details. */
+    default void state(StatusOutcome.Found found) {
+        state(found.pipelineId(), found.state(), found.failureCode(), found.failureMessage());
+    }
 }

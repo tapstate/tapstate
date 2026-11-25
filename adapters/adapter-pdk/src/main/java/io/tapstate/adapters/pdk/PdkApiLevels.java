@@ -25,16 +25,63 @@ public final class PdkApiLevels {
      * Append-only: an existing base version keeps its level (renumbering would silently re-judge every
      * connector). {@code 2.0.5} / {@code 2.0.7} / {@code 2.0.8} are one level because they are API-
      * equivalent under PDK's {@code 2.0.x} backward-compatibility line. The audited
-     * {@code 2.0.9} PDK API artifact contains the same class bytes as the baseline.
+     * {@code 2.0.9} PDK API artifact contains the same class bytes as the baseline. In the audited
+     * {@code 2.0.6} artifact every public and protected member is also present in the baseline, which
+     * only adds the alter-table-TTL function, so a connector declaring it links against the baseline.
+     * The 2.0.11-20261019.093332-6 PDK API has the same 174 class bytes as the old 2.0.8
+     * baseline, but its entity companion adds 25 classes and changes 16 from 2.0.9. Level 2
+     * includes that expanded entity/codec contract; API-jar equality alone does not imply level 1.
+     * The host therefore supplies the matching 2.0.11 entity and 2.11 runner/common line.
      */
     private static final Map<String, Integer> LEVELS = Map.of(
             "2.0.5", 1,
+            "2.0.6", 1,
             "2.0.7", 1,
             "2.0.8", 1,
-            "2.0.9", 1);
+            "2.0.9", 1,
+            "2.0.11", 2);
+
+    /** The release generation normalizes the API version aliases used by Maven publications. */
+    public static java.util.OptionalInt generation(String version) {
+        if (version == null) return java.util.OptionalInt.empty();
+        var matcher = java.util.regex.Pattern.compile("2\\.(?:0\\.)?([0-9]+)").matcher(baseVersion(version));
+        if (!matcher.matches()) return java.util.OptionalInt.empty();
+        try {
+            return java.util.OptionalInt.of(Integer.parseInt(matcher.group(1)));
+        } catch (NumberFormatException invalid) {
+            return java.util.OptionalInt.empty();
+        }
+    }
+
+    /** Both the packaged host generation and its known ABI must cover the artifact. */
+    public static boolean allows(String host, String required) {
+        var hostGeneration = generation(host);
+        var artifactGeneration = generation(required);
+        if (hostGeneration.isEmpty() || artifactGeneration.isEmpty()
+                || artifactGeneration.getAsInt() > hostGeneration.getAsInt()) return false;
+        var hostLevel = levelOf("2.0." + hostGeneration.getAsInt());
+        var artifactLevel = levelOf("2.0." + artifactGeneration.getAsInt());
+        return hostLevel.isPresent() && artifactLevel.isPresent() && artifactLevel.getAsInt() <= hostLevel.getAsInt();
+    }
+
+    public static int compareArtifactVersions(String left, String right) {
+        String[] a = baseVersion(left).split("\\.");
+        String[] b = baseVersion(right).split("\\.");
+        boolean numericLeft = baseVersion(left).matches("[0-9]+(?:\\.[0-9]+)*+");
+        boolean numericRight = baseVersion(right).matches("[0-9]+(?:\\.[0-9]+)*+");
+        if (numericLeft != numericRight) return Boolean.compare(numericLeft, numericRight);
+        if (!numericLeft) return left.compareTo(right);
+        for (int i = 0; i < Math.max(a.length, b.length); i++) {
+            var x = new java.math.BigInteger(i < a.length ? a[i] : "0");
+            var y = new java.math.BigInteger(i < b.length ? b[i] : "0");
+            int order = x.compareTo(y);
+            if (order != 0) return order;
+        }
+        return Boolean.compare(!left.contains("-SNAPSHOT"), !right.contains("-SNAPSHOT"));
+    }
 
     /** The frozen baseline the bridge compiles and runs against. */
-    private static final String ENGINE_VERSION = "2.0.8";
+    private static final String ENGINE_VERSION = "2.0.11";
 
     /** The level this bridge provides — the level of the baseline it is built against. */
     public static final int ENGINE_LEVEL = level(ENGINE_VERSION);
@@ -57,7 +104,9 @@ public final class PdkApiLevels {
      * registry gap the load path turns into a coded refusal, never a bare crash on operator data.
      */
     public static OptionalInt levelOf(String version) {
-        Integer level = LEVELS.get(baseVersion(version));
+        var releaseGeneration = generation(version);
+        if (releaseGeneration.isEmpty()) return OptionalInt.empty();
+        Integer level = LEVELS.get("2.0." + releaseGeneration.getAsInt());
         return level == null ? OptionalInt.empty() : OptionalInt.of(level);
     }
 

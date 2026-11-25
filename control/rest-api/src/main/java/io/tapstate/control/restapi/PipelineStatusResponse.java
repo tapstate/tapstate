@@ -3,7 +3,7 @@ package io.tapstate.control.restapi;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineStatus;
-import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.control.core.ConnectorUsageQuery;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
 
@@ -11,12 +11,13 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.TreeMap;
 
 /**
  * The wire shape of a Pipeline status read. {@code state}, failure, and observation time describe runtime
- * facts; before the first runtime observation, state is {@code NEW} and {@code observedState} is absent.
+ * facts. A current, fenced engine job can supply state before monitoring publishes; observation fields
+ * remain absent until an observation exists. An unproved transition does not invent a runtime state.
  * {@code desiredState} and {@code displayState} separately describe lifecycle intent and its UI projection.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -24,70 +25,95 @@ record PipelineStatusResponse(
         String pipelineId,
         PipelineState state,
         PipelineCatalogItem.UiState displayState,
-        Failure failure,
+        ApiError failure,
         Instant observedAt,
         Long observedAgeMillis,
         PipelineState desiredState,
         PipelineState observedState,
         boolean hasArtifact,
         ExecutionPlanResponse plan,
-        List<String> awaitingRebalance) {
-
-    /**
-     * A coded failure as a client reads it: the canonical code string, its named arguments sorted for a stable
-     * machine contract, and the message rendered through the shared catalog.
-     */
-    record Failure(String code, Map<String, Object> params, String message) {
-    }
+        List<String> awaitingRebalance,
+        ApiError intentReadFailure,
+        List<ConnectorUsageQuery.Version> connectorVersions) {
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
-        return of(status, catalog, Clock.systemUTC());
+        return of(status, catalog, Clock.systemUTC(), Locale.ENGLISH);
     }
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
+        return of(status, catalog, clock, Locale.ENGLISH);
+    }
+
+    static PipelineStatusResponse of(
+            PipelineStatus status, MessageCatalog catalog, Clock clock, Locale locale) {
         Instant observedAt = status.observedAt();
-        return new PipelineStatusResponse(status.pipelineId(),
-                status.state(), PipelineCatalogItem.UiState.valueOf(status.state().name()),
-                failure(status.failure(), catalog), observedAt,
+        return new PipelineStatusResponse(status.pipelineId(), status.state(), null,
+                ApiError.from(status.failure(), catalog, locale), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                null, status.state(), true, ExecutionPlanResponse.of(status.plan()),
-                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance());
+                null, status.observedState(), false, ExecutionPlanResponse.of(status.plan()),
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null, null);
     }
 
     static PipelineStatusResponse of(
             PipelineCatalogItem item, MessageCatalog catalog, PipelineStatus runtime) {
+        return of(item, catalog, runtime, Locale.ENGLISH);
+    }
+
+    static PipelineStatusResponse of(
+            PipelineCatalogItem item, MessageCatalog catalog, PipelineStatus runtime, Locale locale) {
         PipelineCatalogItem.Status status = item.status();
         Instant observedAt = runtime.observedAt();
         return new PipelineStatusResponse(item.id(), runtime.state(), status.displayState(),
-                failure(runtime.failure(), catalog),
+                ApiError.from(runtime.failure(), catalog, locale),
                 observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
-                status.desiredState(), runtime.state(), item.hasArtifact(),
+                status.desiredState(), runtime.observedState(), item.hasArtifact(),
                 ExecutionPlanResponse.of(runtime.plan()),
-                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
+                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(),
+                ApiError.from(status.intentReadFailure(), catalog, locale), null);
     }
 
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
-        return of(item, catalog, Clock.systemUTC());
+        return of(item, catalog, Clock.systemUTC(), Locale.ENGLISH);
     }
 
     /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
-        PipelineCatalogItem.Status status = item.status();
-        PipelineState state = status.observedState() == null ? PipelineState.NEW : status.observedState();
-        Instant observedAt = status.observedAt();
-        return new PipelineStatusResponse(item.id(), state, status.displayState(),
-                failure(status.failure(), catalog), observedAt, observedAt == null ? null
-                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                status.desiredState(), status.observedState(), item.hasArtifact(), null, null);
+        return of(item, catalog, clock, Locale.ENGLISH);
     }
 
-    private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
-        if (failure == null) {
-            return null;
+    static PipelineStatusResponse of(
+            PipelineCatalogItem item, MessageCatalog catalog, Clock clock, Locale locale) {
+        PipelineCatalogItem.Status status = item.status();
+        PipelineState state = status.observedState();
+        if (state == null && status.state() != null) {
+            state = switch (status.state()) {
+                case NEW, RUNNING, PAUSED, STOPPED, COMPLETED, FAILED -> PipelineState.valueOf(status.state().name());
+                default -> null;
+            };
         }
-        Map<String, Object> params = new TreeMap<>(failure.params());
-        return new Failure(failure.code(), params, catalog.render(failure.code(), params).message());
+        if (state == null && item.hasArtifact() && !knownTransition(status.displayState())) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", item.id(), "field", "checkpoint"), null);
+        }
+        Instant observedAt = status.observedAt();
+        return new PipelineStatusResponse(item.id(), state, status.displayState(),
+                ApiError.from(status.failure(), catalog, locale), observedAt, observedAt == null ? null
+                        : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
+                status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
+                ApiError.from(status.intentReadFailure(), catalog, locale), null);
+    }
+
+    PipelineStatusResponse withConnectorVersions(List<ConnectorUsageQuery.Version> versions) {
+        return new PipelineStatusResponse(pipelineId, state, displayState, failure, observedAt, observedAgeMillis,
+                desiredState, observedState, hasArtifact, plan, awaitingRebalance, intentReadFailure, List.copyOf(versions));
+    }
+
+    private static boolean knownTransition(PipelineCatalogItem.UiState state) {
+        return state != null && switch (state) {
+            case STARTING, STOPPING, PAUSING, RESUMING, RECOVERY_REQUIRED -> true;
+            default -> false;
+        };
     }
 }

@@ -32,7 +32,7 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 /**
  * The pipeline observation read side: the three store-backed read faces (status / metrics / snapshot)
  * each project the latest published observation for a pipeline, and a read of a pipeline that has
- * published no observation is a coded {@code monitor.no-observation} diagnostic — never a bare crash,
+ * published no observation is a coded {@code TS0400001} diagnostic — never a bare crash,
  * so the same read serves a frontend with no stderr/exit channel.
  */
 class PipelineObservationQueryServiceTest {
@@ -125,6 +125,38 @@ class PipelineObservationQueryServiceTest {
         });
     }
 
+    @Test
+    void aProvedReadDiagnosisNeverRewritesTheStoredStateTimeOrMeasurements() {
+        var original = runningWithFacts();
+        var store = storeWith(original);
+        var diagnosis = new ObservationFailure("TS0440009", Map.of("pipeline", "orders_sync"));
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var query = new PipelineObservationQueryService(artifactsWith("orders_sync"), store,
+                ExecutionPlans.NONE, List::of, (pipeline, observed) -> { calls.incrementAndGet(); return Optional.of(diagnosis); });
+        var status = query.lifecycleStatus("orders_sync");
+        assertThat(status.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(status.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(status.failure()).isEqualTo(diagnosis);
+        assertThat(status.observedAt()).isEqualTo(TAKEN);
+        assertThat(query.metrics("orders_sync").metrics()).isEqualTo(original.metrics());
+        assertThat(store.read("orders_sync")).contains(original);
+        assertThat(calls).hasValue(1);
+        var item = new PipelineCatalogItem("orders_sync", "orders_sync", null, null, null, null, null, true,
+                new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.FAILED, PipelineCatalogItem.UiState.FAILED,
+                        PipelineState.RUNNING, PipelineState.RUNNING, diagnosis, TAKEN));
+        assertThat(query.findStatusWithPlan(item).orElseThrow()).isEqualTo(status);
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
+    void terminalAndUnobservedPipelinesCannotBeDiagnosedAsAnotherRun() {
+        var stopped = new Observation("orders_sync", PipelineState.STOPPED, Map.of(), Map.of());
+        var query = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(stopped),
+                ExecutionPlans.NONE, List::of, (pipeline, observed) -> { throw new AssertionError("no active observed run"); });
+        assertThat(query.status("orders_sync").state()).isEqualTo(PipelineState.STOPPED);
+        assertThat(query.findStatus("missing")).isEmpty();
+    }
+
     private static Observation running() {
         return new Observation("orders_sync", PipelineState.RUNNING,
                 Map.of("recordCount", 5L), Map.of("orders", new TableSnapshot(10L, 20L, 50)));
@@ -148,6 +180,49 @@ class PipelineObservationQueryServiceTest {
     }
 
     @Test
+    void completedBoundedLoadSurvivesPlanCleanupButNotAReplacementExecution() {
+        var now = java.time.Instant.parse("2026-10-28T09:00:00Z");
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), now);
+        var current = new HashMap<String, io.tapstate.core.lifecycle.ExecutionPlan>();
+        current.put("p", plan);
+        var load = new io.tapstate.core.lifecycle.InitialLoad(
+                io.tapstate.core.lifecycle.InitialLoad.executionKey(plan), now, "snapshot_only", Map.of(
+                        "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(
+                                io.tapstate.core.lifecycle.InitialLoad.Stage.LANDED, 3L, null)));
+        var store = storeWith(new Observation("p", PipelineState.COMPLETED, Map.of(), Map.of(), Map.of(),
+                null, now, List.of(), load));
+        var service = new PipelineObservationQueryService(artifactsWith("p"), store,
+                ids -> Map.copyOf(current), List::of, java.time.Clock.fixed(now, java.time.ZoneOffset.UTC));
+        assertThat(service.snapshot("p").initialLoad()).isEqualTo(load);
+        current.clear();
+        assertThat(service.snapshot("p").phase()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.COMPLETED);
+        current.put("p", new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 3L, 3L, List.of(), List.of(), now));
+        assertThat(service.snapshot("p").initialLoad()).isNull();
+    }
+
+    @Test
+    void initialLoadIsAvailableOnlyForAFreshMatchingExecution() {
+        var now = java.time.Instant.parse("2026-10-28T09:00:00Z");
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), now);
+        var load = new io.tapstate.core.lifecycle.InitialLoad(
+                io.tapstate.core.lifecycle.InitialLoad.executionKey(plan), now, "snapshot_and_cdc", Map.of(
+                        "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(
+                                io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 3L, null)));
+        var store = storeWith(new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, now, List.of(), load));
+        var service = new PipelineObservationQueryService(artifactsWith("p"), store,
+                ids -> Map.of("p", plan), List::of, java.time.Clock.fixed(now, java.time.ZoneOffset.UTC));
+        assertThat(service.snapshot("p").initialLoad()).isEqualTo(load);
+        assertThat(service.snapshot("p").phase()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.SNAPSHOTTING);
+        var replacement = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 4L, 3L, List.of(), List.of(), now);
+        assertThat(new PipelineObservationQueryService(artifactsWith("p"), store, ids -> Map.of("p", replacement),
+                List::of, java.time.Clock.fixed(now, java.time.ZoneOffset.UTC)).snapshot("p").initialLoad()).isNull();
+        assertThat(new PipelineObservationQueryService(artifactsWith("p"), store, ids -> Map.of("p", plan),
+                List::of, java.time.Clock.fixed(now.plusSeconds(30), java.time.ZoneOffset.UTC))
+                .snapshot("p").initialLoad()).isNull();
+    }
+
+    @Test
     void statusProjectsThePublishedState() {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()));
 
@@ -162,7 +237,7 @@ class PipelineObservationQueryServiceTest {
         // FAILED on its own tells the user something broke but not what: the reason is published with the
         // state, so the status face answers it from the store rather than sending the user to the logs.
         Observation dead = new Observation("orders_sync", PipelineState.FAILED, Map.of("errorCount", 1L),
-                Map.of(), Map.of(), new ObservationFailure("engine.job-failed",
+                Map.of(), Map.of(), new ObservationFailure("TS0440008",
                         Map.of("pipeline", "orders_sync", "cause", "sink refused the batch")));
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(dead));
 
@@ -170,7 +245,7 @@ class PipelineObservationQueryServiceTest {
 
         assertThat(status.state()).isEqualTo(PipelineState.FAILED);
         assertThat(status.failure()).isNotNull();
-        assertThat(status.failure().code()).isEqualTo("engine.job-failed");
+        assertThat(status.failure().code()).isEqualTo("TS0440008");
         assertThat(status.failure().params()).containsEntry("cause", "sink refused the batch");
     }
 

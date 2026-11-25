@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -53,6 +55,25 @@ class DataBrowserServiceTest {
             null, null, null, null);
 
     @Test
+    void targetProbeTreatsOnlyTheTypedMissingCollectionAsEmpty() {
+        var browser = service(store(VIEWS), config -> List.of());
+        var probe = new DataBrowserTargetProbe(browser);
+        assertThatThrownBy(() -> browser.find("views", "absent", null, null, 1))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isSameAs(DataBrowserError.UNKNOWN_COLLECTION);
+                    assertThat(failure.code().code()).isEqualTo("TS0390001");
+                });
+        assertThat(probe.rows("views", "absent")).isEqualTo(TargetProbe.TargetRows.EMPTY);
+        assertThat(probe.rows(VIEWS, "absent")).isEqualTo(TargetProbe.TargetRows.EMPTY);
+        assertThatThrownBy(() -> probe.rows("missing-source", "absent"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isSameAs(SourceError.NOT_FOUND));
+        var defect = new IllegalStateException("listing invariant");
+        var broken = new DataBrowserTargetProbe(service(store(VIEWS), config -> { throw defect; }));
+        assertThatThrownBy(() -> broken.rows("views", "absent")).isSameAs(defect);
+    }
+
+    @Test
     void listsThroughTheProbeOnTheSourcesOwnConnection() {
         AtomicReference<ConnectionConfig> driven = new AtomicReference<>();
         DataBrowserService service = service(store(VIEWS), config -> {
@@ -66,6 +87,55 @@ class DataBrowserServiceTest {
         assertThat(driven.get().id()).isEqualTo("views");
         assertThat(driven.get().connectorId()).isEqualTo("mongodb");
         assertThat(driven.get().settings()).containsEntry("database", "shop");
+    }
+
+    @Test
+    void collectionDescriptionsResolveOnlyViewCandidatesAfterBrowsingTheDirectory() {
+        var parser = new DslParser();
+        var pipeline = parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: unrelated_pipeline
+                source: [views]
+                """);
+        var view = parser.parse("""
+                version: tapstate/v1
+                kind: view
+                id: order_view
+                metadata: {description: Orders by customer}
+                primary_key: id
+                storage: {warm: {collection: orders}}
+                """);
+        var lookups = new ArrayList<String>();
+        var browser = service(store(lookups::add, VIEWS, pipeline, view), config -> List.of("orders", "raw"));
+
+        assertThat(browser.collections("views")).containsExactly(
+                new DataBrowserCollection("orders", DataBrowserCollection.VIEW, null, "Orders by customer"),
+                new DataBrowserCollection("raw", null, null, null));
+        assertThat(lookups).containsExactly("views", "order_view");
+    }
+
+    @Test
+    void catalogStatsShareOneListingAndReadEachTargetCollectionOncePerRequest() {
+        var artifacts = store(VIEWS);
+        var listings = new java.util.concurrent.atomic.AtomicInteger();
+        var stats = new ArrayList<String>();
+        var browser = new DataBrowserService(artifacts, new EmptySchemaStore(),
+                config -> { listings.incrementAndGet(); return List.of("orders", "customers"); },
+                (config, collection) -> { stats.add(collection); return new DataBrowserTableInfo(2L, 10L, 5L); },
+                (config, query) -> NOTHING, NO_FOLLOWS);
+        var request = browser.catalogStats(artifacts::get);
+
+        assertThat(request.apply("views", "orders")).isPresent();
+        assertThat(request.apply("views", "orders")).isPresent();
+        assertThat(request.apply("views", "customers")).isPresent();
+        assertThat(request.apply("views", "absent")).isEmpty();
+        assertThat(listings.get()).isOne();
+        assertThat(stats).containsExactly("orders", "customers");
+
+        assertThat(browser.catalogStats(artifacts::get).apply("views", "orders")).isPresent();
+        assertThat(listings.get()).isEqualTo(2);
+        assertThat(stats).containsExactly("orders", "customers", "orders");
     }
 
     @Test
@@ -101,7 +171,7 @@ class DataBrowserServiceTest {
                 new DataBrowserSortOrder("price\\usd", DataBrowserSortOrder.Direction.ASC), 10))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test
@@ -111,7 +181,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.collections("absent"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("source.not-found");
+                .isEqualTo("TS0220001");
     }
 
     @Test
@@ -125,7 +195,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.collections("orders"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("source.not-found");
+                .isEqualTo("TS0220001");
     }
 
     @Test
@@ -136,7 +206,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.unknown-collection");
+                    assertThat(coded.code().code()).isEqualTo("TS0390001");
                     assertThat(coded.args())
                             .containsEntry("source", "views")
                             .containsEntry("collection", "absent");
@@ -342,7 +412,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.unorderable-field");
+                    assertThat(coded.code().code()).isEqualTo("TS0390003");
                     assertThat(coded.args())
                             .as("named as the reader wrote it -- told about `price.usd` they would go "
                                     + "looking for a different column")
@@ -428,7 +498,7 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.invalid-limit");
+                    assertThat(coded.code().code()).isEqualTo("TS0390002");
                     assertThat(coded.args()).containsEntry("limit", "201").containsEntry("max", "200");
                 });
         assertThat(driven.get()).isNull();
@@ -456,7 +526,7 @@ class DataBrowserServiceTest {
             assertThatThrownBy(() -> service.find("views", "order_state", null, null, unreadable))
                     .isInstanceOf(TapstateException.class)
                     .extracting(failure -> ((TapstateException) failure).code().code())
-                    .isEqualTo("data-browser.invalid-limit");
+                    .isEqualTo("TS0390002");
         }
     }
 
@@ -506,12 +576,13 @@ class DataBrowserServiceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(failure -> {
                     TapstateException coded = (TapstateException) failure;
-                    assertThat(coded.code().code()).isEqualTo("data-browser.connector-not-browsable");
+                    assertThat(coded.code().code()).isEqualTo("TS0390004");
                     // Both parameters carry their weight: one says which source cannot be read, the
                     // other says what can, which is the only thing a reader can act on.
                     assertThat(coded.args())
                             .containsEntry("connector", "mysql")
-                            .containsEntry("browsable", "mongodb, mongodb-atlas");
+                            .containsEntry("browsable",
+                                    "aliyun-db-mongodb, mongodb, mongodb-atlas, tencent-db-mongodb");
                 });
         assertThat(read.get()).as("a read that was refused must not have been sent").isNull();
         assertThat(listed.get()).as("nor cost a round trip to find out").isNull();
@@ -527,7 +598,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.tail("rows_in_sql", "orders", null, change -> { }))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("data-browser.connector-not-browsable");
+                .isEqualTo("TS0390004");
     }
 
     @Test
@@ -585,6 +656,10 @@ class DataBrowserServiceTest {
     }
 
     private static ArtifactStore store(Resource... stored) {
+        return store(ignored -> {}, stored);
+    }
+
+    private static ArtifactStore store(Consumer<String> lookup, Resource... stored) {
         Map<String, Resource> byId = new LinkedHashMap<>();
         for (Resource resource : stored) {
             byId.put(resource.id(), resource);
@@ -597,6 +672,7 @@ class DataBrowserServiceTest {
 
             @Override
             public Optional<Resource> get(String id) {
+                lookup.accept(id);
                 return Optional.ofNullable(byId.get(id));
             }
 

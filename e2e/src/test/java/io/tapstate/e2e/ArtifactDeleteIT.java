@@ -11,7 +11,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -58,8 +57,8 @@ class ArtifactDeleteIT {
     @EnumSource(Tiers.class)
     void everyKindCanBeRemovedAndTheRemovalIsRealRatherThanATombstone(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri("artifact_delete", tier))) {
-            ControlPlane control = connected(server, directory);
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
+            ControlPlane control = connected(server, storage, directory);
 
             // Each kind arrives in the smallest batch that is a closure: a pipeline names its source, so the
             // two travel together; the reusable definitions stand alone.
@@ -104,16 +103,12 @@ class ArtifactDeleteIT {
         }
     }
 
-    private static ControlPlane connected(ServerHandle server, Path directory) throws Exception {
+    private static ControlPlane connected(ServerHandle server, PreparedNativeStore storage, Path directory) throws Exception {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector(
                 E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
         return control;
-    }
-
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
     }
 
     /** A pipeline and the source it names: references resolve within one submitted batch, so they travel as one. */

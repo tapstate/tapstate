@@ -131,6 +131,37 @@ class CloudStateStoreSetupApiTest {
     }
 
     @Test
+    void onlyTheCloudWriterCanReadTheCurrentlyBoundDestinationUri() {
+        String writer = enter("write-code");
+        connect(writer, HttpStatus.OK);
+        reveal(writer, "atlas-store", HttpStatus.NOT_FOUND);
+        org.mockito.Mockito.doReturn(Optional.of("atlas-store")).when(artifacts()).managedDefaultSourceId();
+        reveal(null, "atlas-store", HttpStatus.UNAUTHORIZED);
+        reveal(enter("read-code"), "atlas-store", HttpStatus.FORBIDDEN);
+        reveal(writer, "another-source", HttpStatus.NOT_FOUND);
+        reveal(writer, "atlas-store", HttpStatus.OK);
+        assertThat(context.getBean(Audits.class).records)
+                .anyMatch(record -> record.operationId().equals("state-store.connection-uri")
+                        && record.principal().equals("store-writer"));
+    }
+
+    private void reveal(String cookie, String id, HttpStatus expected) {
+        var request = client.post().uri("/api/state-store/{id}/connection-uri", id)
+                .header(HttpHeaders.ORIGIN, origin);
+        if (cookie != null) request.header(HttpHeaders.COOKIE, cookie);
+        request.exchange((input, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(expected);
+            if (expected == HttpStatus.OK) {
+                assertThat(response.getHeaders().getCacheControl()).contains("no-store");
+                assertThat(response.bodyTo(Map.class)).isEqualTo(Map.of("uri", SETTINGS.get("uri")));
+            } else {
+                assertThat(response.bodyTo(String.class)).doesNotContain(PASSWORD);
+            }
+            return null;
+        });
+    }
+
+    @Test
     void readersAndAnonymousCallersCannotProbeOrCreateAStore() {
         connect(enter("read-code"), HttpStatus.FORBIDDEN);
         connect(null, HttpStatus.UNAUTHORIZED);
@@ -143,7 +174,7 @@ class CloudStateStoreSetupApiTest {
         String cookie = enter("write-code");
         client.get().uri("/api/tokens").header(HttpHeaders.COOKIE, cookie).exchange((request, response) -> {
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-            assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("control.forbidden");
+            assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("TS0210004");
             return null;
         });
         verifyNoInteractions(context.getBean(TokenAdminService.class));
@@ -158,7 +189,7 @@ class CloudStateStoreSetupApiTest {
                         "metadata", Map.of("labels", Map.of("store", "true")), "config", SETTINGS))
                 .exchange((request, response) -> {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-                    assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("control.malformed-request");
+                    assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("TS0210001");
                     return null;
                 });
         assertThat(artifacts().list()).isEmpty();
@@ -238,7 +269,7 @@ class CloudStateStoreSetupApiTest {
         @Bean AuthenticationMode mode() { return AuthenticationMode.CLOUD; }
         @Bean OperationRegistry registry() { return ControlOperations.registry(); }
         @Bean Clock clock() { return Clock.fixed(NOW, ZoneOffset.UTC); }
-        @Bean InMemoryArtifactStore artifacts() { return new InMemoryArtifactStore(); }
+        @Bean InMemoryArtifactStore artifacts() { return org.mockito.Mockito.spy(new InMemoryArtifactStore()); }
         @Bean Audits audits() { return new Audits(); }
         @Bean AuditGate auditGate(Audits audits, Clock clock) { return new AuditGate(audits.records::add, clock); }
         @Bean SchemaStore schemas() { return mock(SchemaStore.class); }
@@ -257,7 +288,8 @@ class CloudStateStoreSetupApiTest {
         @Bean Results results() { return new Results(); }
         @Bean Probe probe() { return new Probe(); }
         @Bean ConnectionTestService connections(Probe probe, Results results, AuditGate audit) {
-            return new ConnectionTestService(probe, results, audit);
+            return new ConnectionTestService(probe, results, audit, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
         @Bean TokenAdminService tokenAdministration() { return mock(TokenAdminService.class); }
         @Bean CloudAuthenticationService authentication(Clock clock) {

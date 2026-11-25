@@ -22,6 +22,7 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
 
 import java.time.Instant;
+import java.util.function.BooleanSupplier;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -87,8 +88,19 @@ final class FactsMetricProducer implements MetricProducer {
     }
 
     private final Instant started;
-    private final CardinalityBudget.Folder folder = CardinalityBudget.folder();
+    private static final class PipelineFold {
+        private CardinalityBudget.Folder folder = CardinalityBudget.folder();
+    }
+    private final Map<String, PipelineFold> folds = new HashMap<>();
     private final Map<String, Offered> latest = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicReference<List<MetricFact>> runtimeFacts=
+            new java.util.concurrent.atomic.AtomicReference<>(List.of());
+    void offerRuntime(Instant observedAt,List<MetricFact> facts) {
+        if(facts.size()>64 || facts.stream().anyMatch(f->!f.name().startsWith("tapstate.alerting.") || f.type()!=MetricType.GAUGE
+                || f.points().size()!=1 || !f.points().getFirst().attributes().isEmpty() || !f.points().getFirst().observedAt().equals(observedAt)))
+            throw new IllegalArgumentException("outside bounded runtime metrics contract");
+        runtimeFacts.set(List.copyOf(facts));
+    }
 
     /** Per instrument, the attribute sets that hold a series of their own past the export limit, in first-seen order. */
     private final Map<String, Set<Map<String, String>>> named = new HashMap<>();
@@ -99,26 +111,37 @@ final class FactsMetricProducer implements MetricProducer {
 
     /** Holds {@code facts} as the latest of {@code pipelineId}, folded to the budget on the way in. */
     void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
+        offerIfCurrent(pipelineId, state, observedAt, facts, () -> true);
+    }
+
+    void offerIfCurrent(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts,
+            BooleanSupplier current) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(facts, "facts");
-        List<MetricFact> folded = new ArrayList<>(facts.size());
-        // The folder remembers which values it named; one offer at a time keeps that memory whole.
-        synchronized (folder) {
-            for (MetricFact fact : facts) {
-                folded.add(folder.fold(fact));
+        PipelineFold pipeline;
+        synchronized (folds) {
+            pipeline = folds.computeIfAbsent(pipelineId, ignored -> new PipelineFold());
+        }
+        synchronized (pipeline) {
+            if (!current.getAsBoolean()) return;
+            var candidate = pipeline.folder.copy();
+            List<MetricFact> folded = new ArrayList<>(facts.size());
+            for (var fact : facts) folded.add(candidate.fold(fact));
+            if (!current.getAsBoolean()) return;
+            synchronized (folds) {
+                if (folds.get(pipelineId) != pipeline) return;
+                pipeline.folder = candidate;
+                latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
             }
         }
-        latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
     }
 
     /** Drops what is held for every pipeline outside {@code pipelineIds}; their series stop with the next collection. */
     void forgetPipelinesOutside(Collection<String> pipelineIds) {
         Set<String> kept = Set.copyOf(pipelineIds);
-        latest.keySet().retainAll(kept);
-        // The per-pipeline fold remembers which values of each open dimension it named, and that memory
-        // has the same expiry as the names below: it belongs to a pipeline, and the pipeline is gone.
-        synchronized (folder) {
-            folder.forgetPipelinesOutside(kept);
+        synchronized (folds) {
+            latest.keySet().retainAll(kept);
+            folds.keySet().retainAll(kept);
         }
         // The names go with the pipelines they were held for. A name is a promise to a chart: this series
         // will not begin folding while the data behind it has not changed. A pipeline that is gone has
@@ -152,6 +175,7 @@ final class FactsMetricProducer implements MetricProducer {
                         .points.addAll(fact.points());
             }
         }
+        for(var fact:runtimeFacts.get())byInstrument.computeIfAbsent(fact.name(),name->new Series(fact.type(),fact.unit())).points.addAll(fact.points());
         List<MetricData> out = new ArrayList<>();
         byInstrument.forEach((name, series) ->
                 out.add(metric(resource, name, series.type, series.unit, backstop(name, series.type, series.points))));

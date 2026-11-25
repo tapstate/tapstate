@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class DecimalIsRefusedAtApplyIT {
 
     private static final String PIPELINE_ID = "decimal_pipeline";
-    private static final String TYPE_UNSUPPORTED = "dsl.row-expression-type-unsupported";
+    private static final String TYPE_UNSUPPORTED = "TS0010021";
 
     @BeforeAll
     static void requireDockerAndRealConnectors() {
@@ -63,8 +63,8 @@ class DecimalIsRefusedAtApplyIT {
             NumericSource.seed(mysql);
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
-            try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl("decimal_refused_" + suffix))) {
-                ControlPlane control = NumericSource.connected(server);
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
+                ControlPlane control = NumericSource.connected(server, storage);
                 Map<String, Object> config = NumericSource.config(mysql);
 
                 // Discovered first: the schema this refusal is entitled to consult has to be there, or

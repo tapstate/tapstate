@@ -481,7 +481,7 @@
       },
       "required": true,
       "default": null,
-      "secret": false,
+      "secret": true,
       "options": [],
       "visibleWhen": {
         "controllingField": "krb5",
@@ -696,7 +696,7 @@
   ],
   "provenance": {
     "specPath": "connectors/kafka-enhanced-connector/src/main/resources/spec_kafka_enhanced.json",
-    "specContentHash": "216470726861d3dc",
+    "specContentHash": "dcc29407209f6d76",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

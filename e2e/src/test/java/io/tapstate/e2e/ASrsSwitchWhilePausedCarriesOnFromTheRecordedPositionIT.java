@@ -5,10 +5,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
-import io.tapstate.runtime.srs.CaptureError;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 
@@ -17,6 +18,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -44,9 +48,8 @@ import java.util.Set;
  *   <li>The cursor the held run recorded on the shared capture, read just before the resume and again after
  *       the refusal, and compared whole. A refusal that reset part of it would still pass a check that it is
  *       there.</li>
- *   <li>The pipeline's recorded intent: still to run, and not to clear its state on the way. A refusal that
- *       turned itself into a stop that clears would take the cursor with it, but possibly only after the
- *       cursor had been read.</li>
+ *   <li>The pipeline's recorded intent: the refused resume leaves the original pause in place and
+ *       does not ask to clear the pipeline's state.</li>
  *   <li>The target. A change made while the pipeline ran reaches it first, so this pipeline is seen carrying
  *       changes when it runs. A delete and an insert are then made at the source while it is held. After the
  *       refusal the deleted document is still in the target and the inserted one is not: nothing ran before
@@ -88,22 +91,22 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void turningTheBufferOffWhileHeldIsRefusedAndKeepsWhatTheHeldRunRecorded(Tiers tier) {
+    void turningTheBufferOffWhileHeldIsRefusedAndKeepsWhatTheHeldRunRecorded(Tiers tier) throws Exception {
         String suffix = "srs_switch_paused_" + tier.name().toLowerCase(Locale.ROOT);
         String database = suffix + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
         String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
-        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
-                MongoClient store = MongoClients.create(new ConnectionString(storeUri));
-                StoreDocuments documents = StoreDocuments.at(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
+                MongoClient store = MongoClients.create(storage.configurationUri());
+                StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri());
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+                ServerHandle server = tier.launch(storage)) {
 
             seed(source, database);
-            ControlPlane control = start(server, suffix, sourceUri, targetUri);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri);
 
             awaitCount(mongo, target, "the full load of the seeded documents");
             // A change while it is running and buffering, so the held run has confirmed something past its
@@ -133,23 +136,22 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
                     .as("the cursor the held run recorded on the shared capture, read before the resume")
                     .isNotNull();
 
-            control.lifecycle(suffix, LifecycleVerb.RESUME);
-            awaitState(control, suffix, PipelineState.FAILED);
-
-            assertThat(control.failureCode(suffix))
-                    .as("the refusal names a record that cannot prove a safe start")
-                    .contains(CaptureError.RECOVERY_PROGRESS_UNPROVEN.code());
+            Document heldIntent = intent(store, storage.configurationUri(), suffix);
+            assertThat(heldIntent).isNotNull();
+            var resume = HttpClient.newHttpClient().send(HttpRequest.newBuilder(server.baseUrl().resolve(
+                            "/api/pipelines/" + suffix + ":" + LifecycleVerb.RESUME.id()))
+                    .timeout(Duration.ofSeconds(10)).header("Authorization", "Bearer " + control.credential())
+                    .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(resume.statusCode()).as("resume refusal: %s", resume.body()).isEqualTo(500);
+            var refusal = (Map<?, ?>) JsonReader.parse(resume.body());
+            assertThat(refusal.get("code")).isEqualTo(IoError.PIPELINE_CAPTURE_IDENTITY_UNPROVEN.code());
+            assertThat(control.state(suffix)).contains(PipelineState.PAUSED);
             assertThat(documents.consumerOffset(chain, consumer))
                     .as("the refusal leaves the held run's cursor exactly as it was")
                     .isEqualTo(recorded);
-            Document intent = intent(store, storeUri, suffix);
-            assertThat(intent).as("the pipeline's recorded intent").isNotNull();
-            assertThat(intent.getString("targetState"))
-                    .as("the intent is still to run")
-                    .isEqualTo(PipelineState.RUNNING.name());
-            assertThat(intent.getBoolean("purgeState"))
-                    .as("and not to clear the pipeline's state")
-                    .isFalse();
+            assertThat(intent(store, storage.configurationUri(), suffix))
+                    .as("the refusal leaves the held intent and revision intact")
+                    .isEqualTo(heldIntent);
             assertThat(namesOf(mongo, target, DELETED_WHILE_PAUSED))
                     .as("the document deleted while held is still in the target: no run carried the delete")
                     .containsExactly("order-" + DELETED_WHILE_PAUSED);
@@ -161,9 +163,9 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
 
     /** Everything up to and including the start. The pipeline begins with the buffer on. */
     private static ControlPlane start(
-            ServerHandle server, String pipelineId, String sourceUri, String targetUri) {
+            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
         control.apply(workspace(pipelineId, sourceUri, targetUri, true));
@@ -248,7 +250,7 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
      */
     private static Document intent(MongoClient store, String storeUri, String pipelineId) {
         return store.getDatabase(new ConnectionString(storeUri).getDatabase())
-                .getCollection(MongoStorePort.PIPELINE_DESIRED)
+                .getCollection(SystemCollections.PIPELINE_INTENTS.collectionName())
                 .find(new Document("_id", pipelineId))
                 .first();
     }

@@ -18,6 +18,16 @@ class TokenRecordTest {
     private static final Instant NOW = Instant.parse("2026-07-08T00:00:00Z");
 
     @Test
+    void authenticationBindingTracksTheVerifiedRecordRatherThanOnlyItsReusableId() {
+        TokenRecord original = new TokenRecord("token", "ADMIN", "original-hash", false, NOW);
+        assertThat(original.authenticationBinding()).matches("[a-f0-9]{64}");
+        assertThat(new TokenRecord("token", "ADMIN", "original-hash", false, NOW).authenticationBinding()).isEqualTo(original.authenticationBinding());
+        assertThat(new TokenRecord("token", "ADMIN", "replacement-hash", false, NOW).authenticationBinding()).isNotEqualTo(original.authenticationBinding());
+        assertThat(new TokenRecord("token", "ADMIN", "original-hash", false, NOW.plusNanos(1)).authenticationBinding()).isNotEqualTo(original.authenticationBinding());
+        assertThat(new TokenRecord("token", "READ", "original-hash", false, NOW).authenticationBinding()).isNotEqualTo(original.authenticationBinding());
+    }
+
+    @Test
     void carriesItsFields() {
         TokenRecord record = new TokenRecord("tok-1", "WRITE", "hash-abc", false, NOW);
 

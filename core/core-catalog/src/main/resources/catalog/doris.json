@@ -315,7 +315,7 @@
   ],
   "provenance": {
     "specPath": "connectors/doris-connector/src/main/resources/spec_doris.json",
-    "specContentHash": "4bd1d1d8636cc7b6",
+    "specContentHash": "f2c35e4cce1fe447",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

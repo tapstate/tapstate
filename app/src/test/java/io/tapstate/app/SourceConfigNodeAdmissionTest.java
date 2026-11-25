@@ -8,6 +8,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.spi.store.ClusterIdentity;
 import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -27,11 +29,11 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Proves keyring admission and exact lease cleanup before member construction, without creating a member. */
+/** Configuration key sessions cannot gate admission; startup failure releases only its original node claim. */
 class SourceConfigNodeAdmissionTest {
 
     @Test
-    void aRejectedCurrentEpochReleasesOnlyItsExactNodeSessionBeforeMemberConstruction() {
+    void aConfigurationKeySessionCannotStopAdmissionAndStartupFailureOnlyReleasesTheOriginalNodeClaim() {
         InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
         List<String> order = new ArrayList<>();
         ClusterProperties cluster = new ClusterProperties();
@@ -53,29 +55,22 @@ class SourceConfigNodeAdmissionTest {
         var membersBefore = new HashSet<>(Hazelcast.getAllHazelcastInstances());
 
         assertThatThrownBy(() -> attemptMember(properties, cluster, control, claims, keyring))
-                .isSameAs(keyring.refusal)
-                .isInstanceOfSatisfying(TapstateException.class,
-                        failure -> assertThat(failure.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY));
+                .isSameAs(properties.beforeConstruction);
 
-        assertThat(order).containsExactly("reserve-identity", "acknowledge-current-epoch", "release-exact-ack");
-        assertThat(keyring.candidate).isNotNull();
-        assertThat(keyring.candidate.key()).isEqualTo(new WorkloadClaimKey(cluster.getId(),
-                WorkloadClaimType.NODE_SESSION, cluster.getNodeId()));
-        assertThat(keyring.candidate.owner().nodeId()).isEqualTo(cluster.getNodeId());
-        assertThat(keyring.candidate.owner().bootId()).isNotBlank();
-        assertThat(keyring.ackTtl).isEqualTo(cluster.getNodeSessionTtl());
-        var released = claims.read(keyring.candidate.key()).orElseThrow();
+        assertThat(order).containsExactly("reserve-identity", "member-configuration");
+        assertThat(keyring.candidate).isNull(); assertThat(keyring.ackTtl).isNull();
+        var released = claims.read(new WorkloadClaimKey(cluster.getId(), WorkloadClaimType.NODE_SESSION, cluster.getNodeId())).orElseThrow();
         assertThat(released.leased()).isFalse();
-        assertThat(released.claim().owner()).isEqualTo(keyring.candidate.owner());
-        assertThat(released.claim().claimGeneration()).isEqualTo(keyring.candidate.claimGeneration());
-        assertThat(released.claim().executionGeneration()).isEqualTo(keyring.candidate.executionGeneration());
+        assertThat(released.claim().owner().nodeId()).isEqualTo(cluster.getNodeId());
+        assertThat(released.claim().owner().bootId()).isNotBlank();
+        assertThat(released.claim().claimGeneration()).isOne();
         assertThat(claims.read(other.key()).orElseThrow().leased()).isTrue();
         assertThat(keyring.pendingAcks).containsExactly(other);
         assertThat(Hazelcast.getAllHazelcastInstances()).containsExactlyInAnyOrderElementsOf(membersBefore);
     }
 
     @Test
-    void theExistingSingleProfileReachesConfigurationWithoutAcquiringOrAcknowledgingANodeSession() {
+    void aSingleProfileReservesItsOriginalNodeAndNeverAcknowledgesTheConfigurationKey() {
         InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
         List<String> order = new ArrayList<>();
         BeforeMemberProperties properties = new BeforeMemberProperties(order);
@@ -86,7 +81,9 @@ class SourceConfigNodeAdmissionTest {
         assertThatThrownBy(() -> attemptMember(properties, cluster, new ControlEndpointProperties(), claims, keyring))
                 .isSameAs(properties.beforeConstruction);
 
-        assertThat(order).containsExactly("member-configuration");
+        assertThat(order).containsExactly("read-existing-identity", "read-existing-identity", "member-configuration");
+        var released = claims.read(new WorkloadClaimKey("single-existing-cluster", WorkloadClaimType.NODE_SESSION, "single-existing-cluster")).orElseThrow();
+        assertThat(released.leased()).isFalse(); assertThat(released.claim().owner().bootId()).isNotBlank();
         assertThat(keyring.candidate).isNull();
         assertThat(keyring.pendingAcks).isEmpty();
         assertThat(Hazelcast.getAllHazelcastInstances()).containsExactlyInAnyOrderElementsOf(membersBefore);
@@ -96,9 +93,12 @@ class SourceConfigNodeAdmissionTest {
             ControlEndpointProperties control, WorkloadClaimStore claims, SourceConfigKeyringSession keyring) {
         DefaultListableBeanFactory beans = new DefaultListableBeanFactory();
         ClusterIdentityStore identities = new ClusterIdentityStore() {
-            private ClusterIdentity identity;
+            private ClusterIdentity identity = cluster.getProfile() == ClusterProperties.Profile.SINGLE ? new ClusterIdentity("single-existing-cluster") : null;
 
-            @Override public Optional<ClusterIdentity> find() { return Optional.ofNullable(identity); }
+            @Override public Optional<ClusterIdentity> find() {
+                if (cluster.getProfile() == ClusterProperties.Profile.SINGLE) ((BeforeMemberProperties) properties).order.add("read-existing-identity");
+                return Optional.ofNullable(identity);
+            }
 
             @Override public ClusterIdentity createIfAbsent(ClusterIdentity proposed) {
                 ((BeforeMemberProperties) properties).order.add("reserve-identity");
@@ -109,12 +109,15 @@ class SourceConfigNodeAdmissionTest {
         beans.registerSingleton("clusterIdentity", identities);
         beans.registerSingleton("workloadClaims", claims);
         beans.registerSingleton("sourceConfigKeyring", keyring);
+        ClusterMembershipStore memberships = org.mockito.Mockito.mock(ClusterMembershipStore.class);
+        org.mockito.Mockito.when(memberships.read("single-existing-cluster")).thenReturn(Optional.empty());
+        beans.registerSingleton("memberships", memberships);
         HazelcastInstance member = null;
         try {
             member = new HazelcastConfiguration().hazelcastMember(properties, cluster, control,
                     null, null, null, null, NestSettings.defaults(), null, null, null,
                     beans.getBeanProvider(ClusterIdentityStore.class), beans.getBeanProvider(WorkloadClaimStore.class),
-                    beans.getBeanProvider(SourceConfigKeyringSession.class), new ClusterMembershipGate(cluster));
+                    new ClusterMembershipGate(cluster), BootId.fresh(), beans.getBeanProvider(StorePort.class), beans.getBeanProvider(ClusterMembershipStore.class));
             throw new AssertionError("The admission test must stop before constructing a member");
         } finally {
             if (member != null) member.shutdown();
@@ -131,7 +134,7 @@ class SourceConfigNodeAdmissionTest {
 
         @Override String getClusterName() {
             // Preflight never reads this property; memberConfig does so before invoking the real factory.
-            // Removing or moving the acknowledgement crosses this boundary and fails without binding sockets.
+            // A failure here must clean the reserved node claim without binding any sockets.
             order.add("member-configuration");
             throw beforeConstruction;
         }

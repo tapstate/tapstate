@@ -27,8 +27,8 @@ target: https://tapstate.dev/docs/quickstart-online
 > stack is `curl -sSL https://install.tapstate.dev/demo | sh`. This page is the same
 > flow by hand, for when you want to see each verb.
 
-What you'll do: bring up a Docker Compose stack — databases, the server, and the
-first-admin bootstrap all seeded and started together — then drive two sources through
+You will start the databases and server with Docker Compose, choose the first
+administrator credentials, and drive two sources through
 one pipeline from the CLI, so that rows from two different database engines are assembled
 into a single object and kept fresh: snapshot first, then live change-data-capture (CDC).
 
@@ -83,11 +83,26 @@ published server image runs as a non-root user and is not prepared for this mode
 `rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
 production use, where the native mode is the one to run.
 
+Db2 for i (IBM i, formerly AS/400) is accepted as a source-only **preview** under the id
+`db2i`, outside the certified table: no release lane reads a live IBM i system. Snapshot, journal
+capture of inserts, updates and deletes, and continuation across a server restart were verified
+by hand against IBM i 7.4.
+Db2 for i is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2i` connection is refused on-prem as well as in
+the cloud profile. Reads take a snapshot through the IBM Toolbox for Java JDBC driver and then
+capture inserts, updates and deletes from the journal named by `journalLibraryName` and
+`journalName`; every captured table must be journaled to it. The connection user needs `*USE`
+authority on the data library and its files, on that journal and its attached receiver, and on
+the `DSPJRN` command; `SELECT` on the `QSYS2` catalog views `SYSSCHEMAS`, `SYSTABLES`,
+`SYSCOLUMNS`, `SYSKEYCST`, `SYSINDEXES`, `OBJECT_PRIVILEGES`, `JOURNAL_INFO` and
+`JOURNAL_RECEIVER_INFO`; and `EXECUTE` on `QSYS2.DISPLAY_JOURNAL`. Change capture carries
+neither large-object values nor DDL changes; a snapshot reads large objects in full.
+
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
 and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
-and 16 across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 18 connector ids: the Db2 and
+Db2 for i previews, and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
 live-verified individually. The Atlas connector was verified with snapshot and change-stream
 reads, restart continuation, and target writes against a real Atlas deployment in both cloud
@@ -98,7 +113,7 @@ Other managed variants of Oracle, SQL Server and Db2 are outside the default acc
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
 acceptance does not certify the added connectors. The setting is empty by default and
-is not configured in release or quickstart artifacts. A `connector.not-official` refusal
+is not configured in release or quickstart artifacts. A `TS0060008` refusal
 reports the server's actual accepted set, including any additional ids configured there.
 Registration through an upload and registration through the seed directory use the same
 acceptance check.
@@ -109,14 +124,23 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle, SQL Server and Db2 connector jars are published as separate assets on the floating
-`connectors-preview` release. They remain outside versioned Tapstate releases and are not
-downloaded by the three-database quickstart unless you explicitly run `register oracle`,
-`register sqlserver` or `register db2`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+Oracle, SQL Server and Db2 connector jars are published as separate assets on the
+floating `connectors-preview` release. They remain outside versioned Tapstate releases and are
+not downloaded by the three-database quickstart unless you explicitly run `register oracle`,
+`register sqlserver` or `register db2`.
+
+The Db2 for i asset is scheduled for publication after this connector change is merged.
+Until `db2i-connector.jar` appears on that release, register an available local JAR with
+`tapstate register /path/to/db2i-connector.jar`. After publication, `tapstate register db2i`
+downloads and verifies the pinned asset automatically.
+
+The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
 the MIT License; the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
-IBM's International Program License Agreement. Those dependency terms govern only the bundled drivers and do not change
-Tapstate's Apache-2.0 license. The Oracle, SQL Server and Db2 implementations are paid connector
+IBM's International Program License Agreement; the Db2 for i jar bundles IBM Toolbox for Java
+(JTOpen) 21.0.5 under the IBM Public License 1.0, with the complete license text in
+`license.html` at the JAR root. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle, SQL Server, Db2 and Db2 for i implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
@@ -141,13 +165,14 @@ schema configuration before starting.
 ## Existing rows in the target
 
 A target collection is created from the source model when it is absent. Existing
-target rows are governed by `on_full_load` on each `serve.sync` element:
+target rows are governed by `on_full_load` on each `serve.sync` element and on each
+view:
 
 | Policy | Before a new full load |
 |---|---|
 | `append` (default) | Keep existing rows and use the configured `write_mode`. |
 | `clear` | Clear existing rows before writing the new full load. |
-| `fail` | Refuse to start writing if the target collection is not empty. |
+| `fail` | Refuse the start if the target already holds rows. |
 
 For example, a sync to the `warehouse` connection can request a clean full load:
 
@@ -159,11 +184,68 @@ serve:
       on_full_load: clear
 ```
 
+A view takes the same two settings as a sync element, with the same values, meanings
+and defaults: `write_mode` (`upsert`, or `append`) and `on_full_load`. Both may be
+written on an inline view or on a `kind: view` definition; a `use:` reference takes
+neither. With `write_mode: append` a delete at the source removes nothing. On MongoDB,
+the target keeps its key index, so an update still replaces the document under its
+key: each key ends up holding one document, its latest, and a deleted row's last one
+stays.
+
+```yaml
+view:
+  id: order_state
+  from: orders
+  primary_key: id
+  on_full_load: clear
+```
+
 An empty or newly created collection is allowed with `fail`. Resume, failure recovery,
-and `cdc_only` runs never clear the target, even when `clear` is declared.
-`restart --rerun` resets the pipeline's progress and starts a new full load; it
-still follows `on_full_load`, so use `clear` explicitly when existing target rows
-should be removed. A failed clear stops the pipeline before it writes rows.
+`cdc_only` runs, and a pipeline a restarted server carries on never clear the target,
+even when `clear` is declared. A failed clear stops the pipeline before it writes rows.
+
+### A start checks the targets first
+
+Before a start writes anything, it looks at every target its new full load would
+write into. A new full load copies what the source holds now, so a row deleted at the
+source while the pipeline was stopped with its state cleared is in neither the source
+nor the load: kept in a target that is not cleared, it stays there, and nothing else
+would say so. So when a target already holds rows and its policy is `append`, the start
+stops and asks, naming the target and how many rows it holds:
+
+- **`clear`** clears the target before the full load, and records `on_full_load: clear`
+  on the element that writes it. That changes the pipeline's definition on the server;
+  your workspace file still says `append`, so applying it again sets it back, and the
+  next new full load asks again.
+- **`keep`** keeps the rows and starts anyway.
+
+When one write element owns several targets, `clear` changes the policy for all of them;
+its preview names every affected target. Their answers must agree: mixing `clear` and
+`keep` for the same element is refused before the definition or start intent is written.
+
+A non-empty target the server can read, set to `fail`, refuses the start outright before anything is written. A target
+set to `clear`, or an empty one, is not asked about. A target whose rows the server
+cannot read gets a warning and does not stop the start. An element that comes from a
+shared `kind: serve` or `kind: view` definition is only offered `keep`; change the
+shared definition to clear it.
+
+At a terminal, `tapstate start` shows the question and waits for an answer; Enter
+cancels and leaves the pipeline as it is. Where nobody can answer, the start is
+refused with the commands that answer it. In a script:
+
+```sh
+tapstate start orders_sync --checks-only               # what a start would ask; exits 0 when nothing
+tapstate start orders_sync --decide target-not-empty=keep
+tapstate start orders_sync -y                          # answer every question by going ahead as configured
+```
+
+`--decide <check>=<answer>` answers every question one check asks;
+`--decide <check>/<subject>=<answer>` answers one, by the key the start checks print.
+`-o json` prints the report the start was stopped with and never asks.
+`restart --rerun` asks everything, the clearing included, before it stops anything,
+so cancelling leaves the pipeline running untouched. `up --yes` answers every question
+by going ahead as configured. What the checks are and how a new one is added is in
+[Start checks](start-checks/).
 
 ## The one-command demo
 
@@ -195,8 +277,8 @@ online verbs the script drives, or to point the pipeline at your own databases.
 ## Prerequisites
 
 - **Docker** with the **Compose v2** plugin (`docker compose version`). The stack is
-  a single-node local demo: databases, server, and first-admin bootstrap come up
-  together, on the loopback interface only.
+  a single-node local demo with the server published on loopback only.
+- **jq**, used by the installer to read setup responses and encode credentials.
 - **The system version named in the release notes** — a macOS version on a Mac, a glibc
   version on Linux. A recommendation, not a gate; see the note at the top of this page.
 - **JDK 21** (`java -version`) — only for the dev overlay below, which builds the
@@ -215,7 +297,7 @@ export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
 ```
 
 Everything below runs from here — this is where the compose file lives, so
-`docker compose …` finds it, and the jars and workspace you create sit alongside it.
+`docker compose …` finds it, and the demo workspace sits alongside it.
 
 `docker-compose.yml` on its own names the published server image and never builds,
 because that is the file a user downloads into an empty directory where there is no
@@ -244,37 +326,24 @@ it again.
 > **Preview.** With the development override in play, the server image is built
 > locally on first run from a repackaged jar, so build that jar once:
 > ```sh
-> ( cd ../.. && mvn -pl app -am -DskipTests package )    # -> app/target/app-<version>-boot.jar
+> ( cd ../.. && mvn -pl app -am -DskipTests package )
+> python3 ../cloud/stage-published-connectors.py --boot-jar ../../app/target/app-*-boot.jar \
+>   --profile onprem --stage-dir "$PWD/.onprem-seeds"
+> export TAPSTATE_ONPREM_CONNECTORS_CONTEXT="$PWD/.onprem-seeds"
 > ```
 > Drop the override once the image is published and this becomes a plain pull.
 
-Start everything:
+Run the Quickstart from this directory to initialize the demo and choose the
+administrator credentials:
 
 ```sh
-docker compose up -d
+TAPSTATE_QUICKSTART_BASE_URL="file://$(cd ../.. && pwd)" sh ./quickstart.sh
 ```
 
-That brings up four services:
-
-- **MongoDB** as a single-member replica set (Tapstate's state store needs one),
-  initiated automatically by its healthcheck.
-- **MySQL** seeded with a demo `orders` table of five rows, with row-based binary
-  logging on so CDC has a binlog to tail.
-- the **server** (`--role=all`), published on **`127.0.0.1:8080`** only — an
-  unauthenticated first run must not be reachable from other machines.
-- a one-shot **bootstrap** that creates the first admin over the server's loopback,
-  then exits.
-
-The first admin defaults to **`admin` / `admin`**, which is fine for this
-loopback-only demo. To set your own password, copy `.env.example` to `.env` and edit
-`TAPSTATE_ADMIN_PASSWORD` before bringing the stack up.
-
-Wait for the server to report healthy (first run also builds the image, so allow up
-to a minute):
-
-```sh
-docker compose ps          # the "server" row should read "healthy"
-```
+The script starts MongoDB, MySQL, PostgreSQL and Tapstate. It configures CONFIG,
+CACHE and views in the bundled MongoDB replica set, then uses the administrator
+credentials to run the demo pipeline. The remaining steps show the CLI commands
+the script runs and can be used to inspect the demo or try it with other sources.
 
 ### The server's address
 
@@ -294,6 +363,29 @@ If 8080 is taken on your machine, move it in one place and use your port above:
 
 Two places cannot read a shell variable and so spell the address out: what you type at the
 REPL prompt, and the MCP JSON configuration. Substitute your port there by hand.
+
+### On-prem browser authentication
+
+For browser access, serve the workbench and API from the same HTTPS origin and set
+`TAPSTATE_BROWSER_AUTH_PUBLIC_ORIGINS` to the allowed public origins, separated by commas.
+For example, use `https://workbench.example.com` or `https://workbench.example.com:8443`.
+The allow-list is required for HTTPS browser authentication; unrelated Host aliases are refused.
+
+When a reverse proxy terminates HTTPS, set `TAPSTATE_BROWSER_AUTH_TRUSTED_PROXIES` to the
+comma-separated exact IP addresses of its immediate connections to Tapstate. The proxy must
+replace `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` with its own values,
+and direct access to the upstream listener must be restricted. Leave this setting empty when
+there is no trusted proxy.
+
+Plain HTTP browser authentication is disabled by default. For isolated local development only,
+`TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK=true` permits loopback HTTP. This mode puts a
+long-lived session credential in an HTTP-only cookie on the loopback hostname. Cookies are not
+scoped by port: another local service on that hostname can receive and replay the credential.
+Enable it only when every local service and browser profile using that hostname is trusted, and
+sign out when finished. Use HTTPS and a dedicated hostname for normal deployments.
+
+The browser keeps the short-lived access token in memory. Signing out revokes the session used
+for future exchanges; an access token already issued can remain valid until its expiry.
 
 ## 3. Get the CLI
 
@@ -319,40 +411,14 @@ independent of Spring. Do not expose `cli/target/tapstate` directly when MCP is
 needed: a global symlink must point at the bundle's `bin/tapstate`, or the launcher
 cannot find the sidecar.
 
-## 4. Get the connector jars
+## 4. Check the connectors in the image
 
-This walkthrough needs a MySQL, a PostgreSQL and a MongoDB connector. Prebuilt jars are
-published as release assets — download them next to the compose file:
+The matching OP image includes MongoDB, MySQL, and PostgreSQL. MongoDB is available
+during storage initialization. After signing in, run `connectors` in the CLI and
+check that all three are registered before applying the demo sources.
 
-```sh
-base=https://github.com/tapstate/tapstate/releases/download/connectors-preview
-curl -fL -O "$base/mysql-connector.jar"
-curl -fL -O "$base/postgres-connector.jar"
-curl -fL -O "$base/mongodb-connector.jar"
-```
-
-These three jars are published so this walkthrough runs without building the connector
-repositories first. The download list is the demo's selection; the full accepted set and
-certification directions are described in [Connector support boundary](#connector-support-boundary).
-The jars are shaded and carry their own drivers on an isolated loader;
-`mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
-FOSS Exception (see [`NOTICE`](../NOTICE)).
-
-The same release carries Oracle, SQL Server, Db2, MongoDB Atlas, and the unverified AWS RDS MySQL preview
-for explicit registration. From an authenticated CLI session, give `register` the published
-connector id instead of a local path:
-
-```console
-tapstate(admin@127.0.0.1:8080)> register oracle
-tapstate(admin@127.0.0.1:8080)> register sqlserver
-tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
-tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
-tapstate(admin@127.0.0.1:8080)> register db2
-```
-
-The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
-the connected server. Set `TAPSTATE_CONNECTORS_URL` to an HTTPS mirror when GitHub Releases
-is not reachable.
+For additional connectors, use the server's Connector Center to install an
+available version. On OP you can also upload a supported local JAR.
 
 ## 5. Author the resources
 
@@ -505,9 +571,6 @@ bound local to /.../work
 tapstate(offline:work)> auth login admin
 Password:                       # the admin password from step 2 (not echoed)
 signed in as admin (read, write, admin)
-tapstate(admin@127.0.0.1:8080)> register ../mysql-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../postgres-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../mongodb-connector.jar
 tapstate(admin@127.0.0.1:8080)> apply source/orders_db.tap.yml
 tapstate(admin@127.0.0.1:8080)> apply source/fulfillment_db.tap.yml
 tapstate(admin@127.0.0.1:8080)> discover-schema orders_db
@@ -557,7 +620,7 @@ while a machine token is selected.
 
 - **`register`** uploads a connector jar to the server (content-addressed and
   idempotent; re-registering the same jar is a no-op). An exact published connector id,
-  such as `oracle` or `sqlserver`, is downloaded from `connectors-preview` first. Local
+  such as `oracle` or `sqlserver`, uses the runtime's Maven download center. Local
   paths resolve against the workspace root — `work/` here — which is why the jars beside
   it are reached as `../mysql-connector.jar`. An absolute path works too, as does naming
   a directory: `register ..` uploads every `*.jar` under it as one batch. An existing
@@ -586,13 +649,10 @@ the same workflow. The sidecar is a foreground stdio process. It does not contai
 model, start a Tapstate Server, or access the state store directly; every tool call
 uses the Server's authenticated HTTP control API.
 
-Register connector jars and create a revocable machine token from an authenticated
+Create a revocable machine token from an authenticated
 CLI session first:
 
 ```console
-tapstate(admin@127.0.0.1:8080)> register ../mysql-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../postgres-connector.jar
-tapstate(admin@127.0.0.1:8080)> register ../mongodb-connector.jar
 tapstate(admin@127.0.0.1:8080)> token create --scope write
 created <token-id> WRITE
 token <one-time-token>
@@ -672,13 +732,14 @@ pagination, REST and MCP forms, and the difference between an empty retained win
 
 - The read faces lag the write verbs: they report observed state, which converges to
   what you asked for rather than changing with the command. Immediately after `start`,
-  CLI `status` and `metrics` may report `monitor.no-observation` until the first runtime
-  observation. REST `GET /api/pipelines/{id}/status` returns `state: "NEW"` and omits
-  `observedState` during that window; `desiredState` carries the requested target. After
+  CLI `status` and `metrics` may report `TS0400001` until the first runtime
+  observation. During startup, REST `GET /api/pipelines/{id}/status` can show
+  `desiredState: "RUNNING"` and `displayState: "STARTING"` while omitting `state` and
+  `observedState` until runtime state is available. After
   `stop`, the observed state can still be `RUNNING` until another observation arrives,
   even though the intent is `STOPPED`. `status --watch` streams observed state changes
   only; a known unobserved pipeline or saved draft keeps the watch open without frames,
-  while an unknown id closes with `lifecycle.unknown-pipeline`. Use `--watch`, or retry
+  while an unknown id closes with `TS0280005`. Use `--watch`, or retry
   after another observation arrives.
 - Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
   per second per direction, measured between two readings of the pipeline's own observation time —
@@ -720,8 +781,11 @@ pagination, REST and MCP forms, and the difference between an empty retained win
 - **The position it reports is `targetAckedPosition`: how far the target has confirmed writes.**
   When a connector supplies a Java-serialized token, `metrics` summarizes how many tables have
   an acknowledged position and how many distinct positions they share; it cannot infer a source
-  coordinate or lag from those opaque bytes. The REST metrics response retains the raw token for
-  machine use. This is not how far the source could be read to or how far the pipeline has processed.
+  coordinate or lag from those opaque bytes. The REST metrics response returns an
+  `opaque-v1:<sha256>` fingerprint for equality comparisons. The updated CLI shows a short
+  fingerprint with either server version. An older CLI may print the full fingerprint verbatim.
+  To read or write a resume point, use `/api/pipelines/{id}/position`.
+  This is not how far the source could be read to or how far the pipeline has processed.
   Those two are printed by name as `not collected`, because a position that is simply missing reads
   the same as one this product has no concept of — and only one of those is an answer. A target that
   has stopped accepting writes freezes this position while the other two would still be moving, so
@@ -857,7 +921,7 @@ docker compose down -v     # stops every service and drops the named volumes
 
 `down -v` discards the store, so a re-run re-registers the connectors from scratch.
 The pulled/built images remain — remove them with `docker image rm <image>` if you
-want the machine back exactly as it was. The jars, `work/`, and `.env` you created
+want the machine back exactly as it was. The generated `work/` directory
 here are just files; delete them as usual.
 
 ## Upgrading to a newer release
@@ -893,6 +957,9 @@ starting one that the store already calls running is refused.
 Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. Check
 `./tapstate --version` afterwards: it is the CLI's own version, and it should be the
 one you just installed.
+
+The downloaded demo is tied to its pinned release. Do not reuse an older demo's database volumes
+for a fresh three-layer installation.
 
 ## Alternative: build and run the server from source
 
@@ -935,32 +1002,16 @@ the server and databases are hosted changes.
    fact, and the seed file's `REPLICA IDENTITY FULL` is what lets a deleted shipment leave
    the array it was in (see the note in [step 5](#5-author-the-resources)).
 
-3. **Start the server** on the host with JDK 21, pointing it at your Mongo:
+3. **Initialize and start the server** with the three-layer installation in this checkout.
+   Use the [OP installation procedure](storage/README.md#install-op-and-create-its-first-administrator),
+   including its owner-only directory, three connection tests and saved binding. A built JAR uses
+   `--add-opens java.base/java.lang=ALL-UNNAMED`; the distribution launcher supplies it.
+   Keep your normal port/TLS and packaged connector seed settings.
 
-   ```sh
-   mkdir -p ./plugins       # a writable cache the server unpacks registered connectors into
-   java -jar app/target/app-<version>-boot.jar --role=all \
-     --tapstate.store.mongo.uri="mongodb://127.0.0.1:27017/tapstate?replicaSet=rs0" \
-     --tapstate.store.mongo.operator-state-database=tapstate_nest \
-     --tapstate.connectors.plugins-dir=./plugins
-   ```
-
-   It listens on port **8080**. If that port is taken, set `SERVER_PORT` to another one
-   before starting it, and point the rest of this section at the same value:
-
-   ```sh
-   export TAPSTATE_URL=http://127.0.0.1:8080     # match SERVER_PORT if you set one
-   ```
-
-   A Hazelcast `--add-opens` warning at startup is harmless.
-
-4. **First admin.** There is no bootstrap sidecar here, so create the first user with
-   a one-time, localhost-only `curl` (a `204 No Content` means success):
-
-   ```sh
-   curl -X POST "$TAPSTATE_URL/auth/bootstrap" \
-     -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}'
-   ```
+4. **Restart and create the first administrator.** After the setup page requests a restart,
+   restart with the same installation directory and issue `installation --authorize`. Create
+   the first account on the dedicated management channel, then sign in at the ordinary service
+   address. A public `/auth/bootstrap` request cannot replace that procedure.
 
 5. **Resources.** Use the same three resources as [step 5](#5-author-the-resources),
    with one change: the server now runs on the host, not in the compose network, so
@@ -969,13 +1020,13 @@ the server and databases are hosted changes.
    `config: { host: 127.0.0.1, port: 5432, … }` in `fulfillment_db`. Both of them, not one:
    a source left pointing at a compose service name resolves to nothing from the host, and
    the pipeline names every source it reads. The pipeline itself needs no change — the
-   managed store it materializes into is addressed by the server, through the store settings you
-   passed in step 3, not by a resource here. The operator-state database defaults to `tapstate_nest`;
-   changing its setting selects another database and does not copy the old state.
+   default target is the system-owned `views` Source created by storage setup. Its Application data
+   database is the one you selected, while operator state uses the separate bound Durable cache.
+   Changing a URI or database name is not a state migration.
 
 6. **Online verbs, observe, CDC** are identical to steps 6–8, except you reach the
    databases with your own client (`docker exec tapstate-mysql …` /
-   `docker exec tapstate-mongo mongosh "mongodb://127.0.0.1:27017/views" …`)
+   `docker exec tapstate-mongo mongosh "mongodb://127.0.0.1:27017/tapstate_views" …`)
    rather than `docker compose exec`.
 
 Tear down with `docker rm -f tapstate-mysql tapstate-postgres tapstate-mongo` and `Ctrl-C` in the
@@ -1000,10 +1051,17 @@ This runtime is a preview. Known constraints in this slice:
   unconfirmed work and requires the connector's source history to remain available.
 - **At-least-once delivery.** Retries and restarts can deliver records again;
   idempotent upserts absorb overlap, but there is no exactly-once guarantee.
+- **A new full load cannot see what the source deleted meanwhile.** After a stop that
+  clears the pipeline's state, the next run copies what the source holds then, and a
+  row deleted at the source in between is not in the copy: a target that is not
+  cleared keeps it. The start asks before that happens (see
+  [A start checks the targets first](#a-start-checks-the-targets-first)), but only for
+  targets whose rows the server can read; for any other target it warns and goes ahead.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
-- **No CLI bootstrap verb.** The compose stack creates the first admin for you; on
-  the from-source path it is the `curl` above.
+- **Installation and application commands are separate.** The demo automates storage and
+  administrator setup. A manually started server uses the `installation` owner command and
+  dedicated management channel.
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,
   `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.
@@ -1011,8 +1069,11 @@ This runtime is a preview. Known constraints in this slice:
 ### Restart recovery
 
 A single-member process restart with the same MongoDB data re-adopts pipelines
-recorded as running. Keep the store volume and operator-state database: recovery
-positions and state are part of that data. Completed finite runs stay completed;
+recorded as running when its original storage and recovery state are complete. In a three-layer
+installation, retain Configuration and Durable cache, including any additional Nest cache databases:
+recovery positions and state are part of that data. For missing cache state, use the
+[explicit storage recovery procedure](storage/README.md#recover-a-wholly-lost-durable-cache); it leaves
+affected Pipelines stopped until each full rebuild is confirmed. Completed finite runs stay completed;
 failed runs require an explicit recovery action.
 
 All supported database sources use the connector capture path. The runtime passes
@@ -1023,10 +1084,10 @@ is no blanket guarantee of recovery after that history expires.
 | Read mode | Recovery of a running pipeline after a single-member restart |
 | --- | --- |
 | `snapshot_and_cdc` (default) | Skip tables whose initial load this pipeline's sinks already confirmed. Read each unconfirmed table again from the beginning, keeping its recorded snapshot generation and original pre-snapshot CDC position, then resume changes from the recorded position. There is no durable cursor within an unfinished table's snapshot. |
-| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `capture.recovery-progress-unproven` and the pipeline becomes `FAILED`. |
+| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `TS0350005` and the pipeline becomes `FAILED`. |
 | `snapshot_only` | Read the selected data again for an interrupted active load. There is no CDC recovery chain or durable snapshot row cursor. |
 
-For `capture.recovery-progress-unproven`, keep the retained state for diagnosis.
+For `TS0350005`, keep the retained state for diagnosis.
 Perform a full reload, or explicitly accept a new CDC-only baseline and the missing
 interval. The runtime does not clear retained state automatically.
 

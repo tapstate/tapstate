@@ -19,7 +19,7 @@ public final class EventJsonValues {
     }
 
     public static Object normalize(Object value) {
-        return normalize(value, 0);
+        return normalize(value, 0, "$");
     }
 
     /** Measures the compact JSON UTF-8 representation, stopping once the supplied limit is exceeded. */
@@ -28,55 +28,54 @@ public final class EventJsonValues {
             throw new IllegalArgumentException("limit must not be negative");
         }
         Meter meter = new Meter(limit);
-        measure(value, meter, 0);
+        measure(value, meter, 0, "$");
         return meter.size;
     }
 
-    private static Object normalize(Object value, int depth) {
+    private static Object normalize(Object value, int depth, String path) {
         if (depth > MAX_DEPTH) {
             throw new IllegalArgumentException("event value exceeds the maximum JSON nesting depth");
         }
         return switch (value) {
             case null -> null;
-            case ConvertedValue converted -> normalize(converted.value(), depth + 1);
+            case ConvertedValue converted -> normalize(converted.value(), depth + 1, path);
             case Bytes bytes -> Map.of(
                     "$binary", Base64.getEncoder().encodeToString(bytes.value()),
                     "$tag", bytes.tag());
-            case Map<?, ?> map -> normalizeMap(map, depth);
+            case Map<?, ?> map -> normalizeMap(map, depth, path);
             case Collection<?> collection -> {
                 ArrayList<Object> result = new ArrayList<>(collection.size());
+                int index = 0;
                 for (Object item : collection) {
-                    result.add(normalize(item, depth + 1));
+                    result.add(normalize(item, depth + 1, path + "/" + index++));
                 }
                 yield result;
             }
             default -> value != null && value.getClass().isArray()
-                    ? normalizeArray(value, depth)
+                    ? normalizeArray(value, depth, path)
                     : JsonValues.normalize(value);
         };
     }
 
-    private static Map<String, Object> normalizeMap(Map<?, ?> source, int depth) {
+    private static Map<String, Object> normalizeMap(Map<?, ?> source, int depth, String path) {
         Map<String, Object> result = new LinkedHashMap<>(source.size());
         source.forEach((key, value) -> {
-            if (!(key instanceof String field)) {
-                throw new IllegalArgumentException("event object field names must be strings");
-            }
-            result.put(field, normalize(value, depth + 1));
+            String field = RowMapKeys.requireString(key, path);
+            result.put(field, normalize(value, depth + 1, RowMapKeys.childPath(path, field)));
         });
         return result;
     }
 
-    private static Object normalizeArray(Object source, int depth) {
+    private static Object normalizeArray(Object source, int depth, String path) {
         int length = Array.getLength(source);
         ArrayList<Object> result = new ArrayList<>(length);
         for (int index = 0; index < length; index++) {
-            result.add(normalize(Array.get(source, index), depth + 1));
+            result.add(normalize(Array.get(source, index), depth + 1, path + "/" + index));
         }
         return result;
     }
 
-    private static void measure(Object value, Meter meter, int depth) {
+    private static void measure(Object value, Meter meter, int depth, String path) {
         if (meter.exceeded()) {
             return;
         }
@@ -85,7 +84,7 @@ public final class EventJsonValues {
         }
         switch (value) {
             case null -> meter.add(4);
-            case ConvertedValue converted -> measure(converted.value(), meter, depth + 1);
+            case ConvertedValue converted -> measure(converted.value(), meter, depth + 1, path);
             case Bytes bytes -> {
                 meter.add(22L + 4L * ((bytes.value().length + 2L) / 3L)
                         + JsonValues.encodedSize(bytes.tag(), Long.MAX_VALUE));
@@ -97,21 +96,20 @@ public final class EventJsonValues {
                     if (meter.exceeded()) {
                         return;
                     }
-                    if (!(entry.getKey() instanceof String field)) {
-                        throw new IllegalArgumentException("event object field names must be strings");
-                    }
+                    String field = RowMapKeys.requireString(entry.getKey(), path);
                     if (!first) {
                         meter.add(1);
                     }
                     first = false;
                     meter.add(JsonValues.encodedSize(field, meter.remaining()));
                     meter.add(1);
-                    measure(entry.getValue(), meter, depth + 1);
+                    measure(entry.getValue(), meter, depth + 1, RowMapKeys.childPath(path, field));
                 }
             }
             case Collection<?> collection -> {
                 meter.add(2);
                 boolean first = true;
+                int index = 0;
                 for (Object item : collection) {
                     if (meter.exceeded()) {
                         return;
@@ -120,7 +118,7 @@ public final class EventJsonValues {
                         meter.add(1);
                     }
                     first = false;
-                    measure(item, meter, depth + 1);
+                    measure(item, meter, depth + 1, path + "/" + index++);
                 }
             }
             default -> {
@@ -131,7 +129,7 @@ public final class EventJsonValues {
                         if (index > 0) {
                             meter.add(1);
                         }
-                        measure(Array.get(value, index), meter, depth + 1);
+                        measure(Array.get(value, index), meter, depth + 1, path + "/" + index);
                     }
                 } else if (value instanceof Date || value instanceof java.time.temporal.TemporalAccessor) {
                     meter.add(JsonValues.encodedSize(value, meter.remaining()));

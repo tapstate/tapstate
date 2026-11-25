@@ -314,5 +314,15 @@ refuses "--report-only needs somewhere to write it" "--list-open" \
 
 expect "an unknown bump is a usage error"          sideways 2 "--bump"
 
+# The post-publication scan must carry the frozen range into the final documentation request.
+if python3 "$here/docs-refresh-shallow-test.py" \
+    DocumentationRefreshShallowTest.test_satellite_refresh_carries_followups_from_shallow_release_checkout; then
+  printf '  ok    %s\n' "satellite refresh retains followups from a shallow checkout"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n' "satellite refresh retains followups from a shallow checkout"
+  failed=$((failed + 1))
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

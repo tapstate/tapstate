@@ -1,5 +1,7 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.event.RowMapKeys;
+
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -32,6 +34,7 @@ public final class SrsWriteGate {
      */
     public OptionalLong append(SrsItem item, long minConsumerReadSeq) {
         Objects.requireNonNull(item, "item");
+        validate(item);
         if (!hasHeadroom(ring.tailSequence(), ring.capacity(), minConsumerReadSeq)) {
             return OptionalLong.empty();
         }
@@ -49,6 +52,7 @@ public final class SrsWriteGate {
         if (items.isEmpty()) {
             return OptionalLong.empty();
         }
+        items.forEach(SrsWriteGate::validate);
         if (!hasHeadroom(ring.tailSequence(), ring.capacity(), minConsumerReadSeq, items.size())) {
             return OptionalLong.empty();
         }
@@ -58,6 +62,12 @@ public final class SrsWriteGate {
     /** The ring's capacity -- the largest run that can ever be admitted at once. */
     public long capacity() {
         return ring.capacity();
+    }
+
+    private static void validate(SrsItem item) {
+        Objects.requireNonNull(item, "item");
+        RowMapKeys.validate(item.before(), "$/before");
+        RowMapKeys.validate(item.after(), "$/after");
     }
 
     /**

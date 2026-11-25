@@ -70,9 +70,9 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
                     "INSERT INTO orders VALUES (1, 'order-1'), (3, 'order-3')",
                     "INSERT INTO order_items VALUES (11, 1, 'sku-11'), (12, 1, 'sku-12'), (21, 2, 'sku-21'),"
                             + " (22, 2, 'sku-22')");
-            String store = SharedMongo.replicaSetUrl("e2e_interleaved_nest_cluster_w" + width);
             String target = SharedMongo.replicaSetUrl("e2e_interleaved_nest_target_w" + width);
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-interleaved-nest-w" + width);
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 RealProcessServer third = threeMembers(cluster);
                 try {
@@ -154,21 +154,14 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
                     // customer 3 with the load and its order after it.
                     "INSERT INTO customers VALUES (1, 'ada'), (3, 'cy')",
                     "INSERT INTO orders VALUES (100, 1, 1), (200, 2, 2)");
-            String store = SharedMongo.replicaSetUrl("e2e_interleaved_join_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-interleaved-join");
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 RealProcessServer third = threeMembers(cluster);
                 try {
                     ControlPlane control = cluster.first();
                     Map<String, Object> config = mysqlConfig(mysql);
                     Map<String, String> resources = sources(config, "orders", "customers");
-                    resources.put("views.tap.yml", """
-                            version: tapstate/v1
-                            kind: source
-                            id: views
-                            connector: mongodb
-                            config: { uri: "%s" }
-                            """.formatted(store));
                     resources.put(pipeline + ".tap.yml", """
                             version: tapstate/v1
                             kind: pipeline
@@ -191,7 +184,7 @@ class JoinAndNestConvergeAcrossSourceInterleavingsIT {
                             """.formatted(pipeline));
                     start(control, config, resources, pipeline, "src_orders", "src_customers");
                     requireTheWidth(control, pipeline, "widen", 3);
-                    EndpointAddress rows = EndpointAddress.uri(store);
+                    EndpointAddress rows = EndpointAddress.uri(storage.masterUri());
 
                     Map<Long, String> expected = new TreeMap<>(Map.of(100L, "ada"));
                     awaitRows(control, mongo, rows, pipeline, expected);

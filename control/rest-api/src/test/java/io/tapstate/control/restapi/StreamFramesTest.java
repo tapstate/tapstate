@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelineLogs;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.logging.LogCursor;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.messages.MessageCatalog;
 import org.junit.jupiter.api.Test;
@@ -34,16 +35,34 @@ class StreamFramesTest {
         // A watcher must be able to tell why a pipeline died from the same frame that reports it dead --
         // otherwise the one frame that matters is reasonless and no later frame repeats it (the state
         // does not change again on its own).
-        ObservationFailure failure = new ObservationFailure("engine.job-failed",
+        ObservationFailure failure = new ObservationFailure("TS0440008",
                 Map.of("pipeline", "orders", "cause", "sink refused the batch"));
         String frame = StreamFrames.status(new PipelineStatus("orders", PipelineState.FAILED, failure), CATALOG);
 
         assertThat(frame).contains("\"pipelineId\":\"orders\"");
         assertThat(frame).contains("\"state\":\"FAILED\"");
         assertThat(frame).contains("\"failure\":{");
-        assertThat(frame).contains("\"code\":\"engine.job-failed\"");
+        assertThat(frame).contains("\"code\":\"TS0440008\"");
         assertThat(frame).contains("\"cause\":\"sink refused the batch\"");
         assertThat(frame).contains("\"message\":");
+    }
+
+    @Test
+    void statusFrameKeepsTheSameCapturedDetailsAndSolutionAsThePolledFailure() {
+        var diagnostic = Map.<String, Object>of("message", "captured owner",
+                "cause", Map.of("message", "safe cause", "stackTrace", "safe frame"));
+        var failure = new ObservationFailure("TS0060027",
+                Map.of("connector", "demo", "detail", "safe detail"), diagnostic);
+        var polled = ApiError.from(failure, CATALOG, java.util.Locale.ENGLISH);
+        var parsed = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(
+                StreamFrames.status(new PipelineStatus("orders", PipelineState.FAILED, failure), CATALOG));
+        var streamed = (Map<?, ?>) parsed.get("failure");
+        assertThat(streamed.get("code")).isEqualTo(polled.code());
+        assertThat(streamed.get("params")).isEqualTo(polled.params());
+        assertThat(streamed.get("message")).isEqualTo(polled.message());
+        assertThat(polled.solution()).isNotBlank();
+        assertThat(streamed.get("solution")).isEqualTo(polled.solution());
+        assertThat(streamed.get("diagnostic")).isEqualTo(diagnostic).isEqualTo(polled.diagnostic());
     }
 
     @Test
@@ -55,11 +74,22 @@ class StreamFramesTest {
     @Test
     void logsFrameCarriesTheIdAndLinesLikeTheReadFace() {
         PipelineLogs logs = new PipelineLogs("orders", List.of(
-                new LogLine(1_700_000_000_000L, "INFO", "submitted job")));
+                new LogLine(1_700_000_000_000L, "INFO", "submitted job")),
+                new LogCursor("generation", 7), false);
         String frame = StreamFrames.logs(logs);
         assertThat(frame).isEqualTo(
                 "{\"pipelineId\":\"orders\",\"lines\":[{\"timestampMillis\":1700000000000,"
-                        + "\"level\":\"INFO\",\"message\":\"submitted job\"}]}");
+                        + "\"level\":\"INFO\",\"message\":\"submitted job\"}],\"nextCursor\":{"
+                        + "\"generation\":\"generation\",\"sequence\":7},\"truncated\":false}");
+    }
+
+    @Test
+    void logsFrameKeepsTheCapturedDiagnostic() {
+        var diagnostic = java.util.Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        var frame = StreamFrames.logs(new PipelineLogs("p", List.of(new LogLine(1L, "WARN", "safe failure", diagnostic))));
+        var parsed = (java.util.Map<?, ?>) io.tapstate.core.common.JsonReader.parse(frame);
+        var line = (java.util.Map<?, ?>) ((List<?>) parsed.get("lines")).getFirst();
+        assertThat(line.get("diagnostic")).isEqualTo(diagnostic);
     }
 
     @Test
@@ -73,6 +103,6 @@ class StreamFramesTest {
     @Test
     void logsFrameOfNoLinesCarriesAnEmptyArray() {
         String frame = StreamFrames.logs(new PipelineLogs("p", List.of()));
-        assertThat(frame).isEqualTo("{\"pipelineId\":\"p\",\"lines\":[]}");
+        assertThat(frame).isEqualTo("{\"pipelineId\":\"p\",\"lines\":[],\"truncated\":false}");
     }
 }

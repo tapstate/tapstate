@@ -54,9 +54,9 @@ class SourceSchemaScopeIT {
         writeTable("orders", "id,amount\n1,12\n");
         writeTable("payments", "id,status\n1,paid\n");
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_source_schema_scope"))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(connectorJar));
             control.apply(Map.of("src_file.tap.yml", source()));
             control.discoverSchema(

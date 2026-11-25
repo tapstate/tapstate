@@ -14,6 +14,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.StandardWatchEventKinds;
+import java.util.concurrent.TimeUnit;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -37,13 +40,14 @@ public final class ObservedMongoConnector implements TapConnector {
     @Override
     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         delegate.registerCapabilities(functions, codecs);
-        Path witness;
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream("mongo-write-witness-path.txt")) {
-            if (in == null) throw new AssertionError("missing write witness path");
-            witness = Path.of(new String(in.readAllBytes(), StandardCharsets.UTF_8));
-        } catch (java.io.IOException failure) {
-            throw new AssertionError("cannot read write witness path", failure);
+        Path latency = witnessPath("mongo-latency-witness-path.txt");
+        if (latency != null) {
+            functions.supportWriteRecord(LatencyWitness.target(latency, functions.getWriteRecordFunction()));
+            functions.supportStreamRead(LatencyWitness.source(latency, functions.getStreamReadFunction()));
+            return;
         }
+        Path witness = witnessPath("mongo-write-witness-path.txt");
+        if (witness == null) throw new AssertionError("missing write witness path");
         var original = functions.getWriteRecordFunction();
         if (original == null) throw new AssertionError("real Mongo connector registered no writer");
         functions.supportWriteRecord(WriteTableWitness.record(witness, original));
@@ -54,11 +58,38 @@ public final class ObservedMongoConnector implements TapConnector {
                 String start = "START " + offset;
                 appendTailObservation(tail, start);
                 try {
+                    // An opt-in fixture barrier pins cursor selection before source backlog forwarding.
+                    awaitTailRelease(witness.resolveSibling(witness.getFileName() + ".hold-tail"));
                     stream.streamRead(context, tables, offset, size, consumer);
                 } finally {
                     appendTailObservation(tail, "END");
                 }
             });
+        }
+    }
+
+    private Path witnessPath(String resource) {
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream(resource)) {
+            return in == null ? null : Path.of(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        } catch (IOException failure) {
+            throw new AssertionError("cannot read witness path", failure);
+        }
+    }
+
+    private static void awaitTailRelease(Path hold) throws IOException, InterruptedException {
+        if (!Files.exists(hold)) return;
+        try (var changes = hold.getFileSystem().newWatchService()) {
+            hold.toAbsolutePath().getParent().register(changes, StandardWatchEventKinds.ENTRY_DELETE);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+            while (Files.exists(hold)) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new AssertionError("tail fixture barrier was not released");
+                var changed = changes.poll(remaining, TimeUnit.NANOSECONDS);
+                if (changed != null) {
+                    changed.pollEvents();
+                    if (!changed.reset() && Files.exists(hold)) throw new AssertionError("tail fixture directory disappeared");
+                }
+            }
         }
     }
 

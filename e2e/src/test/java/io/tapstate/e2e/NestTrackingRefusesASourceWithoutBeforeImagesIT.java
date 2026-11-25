@@ -64,7 +64,7 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
     private static final String PIPELINE_ID = "blind_tracking";
 
     /** The connector's own diagnosis, which is the part worth carrying all the way to the read faces. */
-    private static final String EXPECTED_CODE = "connector.capture-failed";
+    private static final String EXPECTED_CODE = "TS0060024";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
@@ -94,13 +94,12 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("blind_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("blind_target_" + suffix);
 
             // No reader for the target: the run never reaches it, and that is the point being pinned.
-            try (ServerHandle server = tier.launch(storeUri)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -124,6 +123,7 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
                                 + "changes, rather than let the documents diverge.%n  metrics: %s",
                                 control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.errorCount(pipelineId).filter(count -> count > 0).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);

@@ -53,6 +53,22 @@ public interface SrsLogStore {
         return new SrsLogBounds(largestSequence(ring), -1L);
     }
 
+    /** A same-snapshot batch for ordinary, already published rings; an empty result requests the exact path. */
+    default Optional<Map<String, SrsLogBounds>> publishedBounds(String chain, java.util.Set<String> rings) {
+        return Optional.empty();
+    }
+
+    /**
+     * Supplies only numbering metadata while the ring infrastructure initializes or migrates a ring.
+     * An adapter may inspect a quarantined ring's original, verified control receipt and existing
+     * bounds here without granting access to its records. Missing or untrusted quarantine metadata
+     * must fail rather than inventing an empty ring or redirecting to a replacement namespace.
+     * Ordinary reads, writes and retention still enforce their own original access checks.
+     */
+    default SrsLogBounds ringInitializationBounds(String ring) {
+        return bounds(ring);
+    }
+
     /**
      * Reads at most {@code maxSize} consecutive sequence positions beginning at {@code firstSeq}, returning
      * each record under its actual sequence key. Missing positions stay missing so a caller can diagnose a
@@ -85,4 +101,15 @@ public interface SrsLogStore {
      * store applies the resolved one.
      */
     void trim(String ring, long throughSeq);
+
+    /**
+     * Retires the caller's resolved confirmed prefix under the original CAPTURE claim. Implementations
+     * without durable claim proof refuse; they must not silently use the unclaimed entry point.
+     * Split model-aware storage also limits the cut to every current table consumer's confirmed floor
+     * in the same CACHE transaction. A newly attached or lagging consumer can reduce the cut to no work;
+     * the durable bounds, rather than return from this method, state the prefix actually retired.
+     */
+    default void trim(String ring, long throughSeq, WorkloadClaimFence originalCaptureFence) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
 }

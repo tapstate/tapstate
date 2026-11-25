@@ -42,7 +42,8 @@ setup:
     src: { kind: postgres }
     store: { kind: mongo }
   connectors: [postgres, mongodb]
-  apply: [src_point_orders.tap.yml, src_point_customers.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_point_orders.tap.yml, src_point_customers.tap.yml, pipeline.tap.yml]
   discover: [src_point_orders, src_point_customers]
 pipeline: pipeline.tap.yml
 seed:
@@ -59,5 +60,5 @@ steps:
   - await: { doc: { views.point_state: { where: { id: 1 }, expect: { customer.id: 100, customer.name: ada } } } }
   - cdc: { src_point_orders.point_orders: { update: { where: { id: 1 }, set: { cust_ref: 200 } } } }
   - await: { state: FAILED }
-  - assert: { failure_code: nest.reference-tracking-requires-before-image }
+  - await: { failure_code: TS0490027 }
   - assert: { count: { views.point_state: 1 } }

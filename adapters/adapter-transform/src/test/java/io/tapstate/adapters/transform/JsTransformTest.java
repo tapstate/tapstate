@@ -310,7 +310,7 @@ class JsTransformTest {
         assertThatThrownBy(() -> js("function filter(r) { return true; }"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("transform.script-no-process"));
+                        .isEqualTo("TS0450004"));
     }
 
     @Test
@@ -319,7 +319,7 @@ class JsTransformTest {
         assertThatThrownBy(() -> js("function process(r, ctx) { return "))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("transform.script-compile-failed"));
+                        .isEqualTo("TS0450002"));
     }
 
     @Test
@@ -332,7 +332,7 @@ class JsTransformTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException e = (TapstateException) thrown;
-                    assertThat(e.code().code()).isEqualTo("transform.script-failed");
+                    assertThat(e.code().code()).isEqualTo("TS0450005");
                     assertThat(String.valueOf(e.args().get("detail"))).contains("boom");
                 });
     }
@@ -346,7 +346,7 @@ class JsTransformTest {
         assertThatThrownBy(() -> js.transform(row))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("transform.script-output-invalid"));
+                        .isEqualTo("TS0450006"));
     }
 
     @Test
@@ -360,7 +360,7 @@ class JsTransformTest {
         assertThatThrownBy(() -> js.transform(row))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("transform.script-output-invalid"));
+                        .isEqualTo("TS0450006"));
     }
 
     @Test
@@ -372,7 +372,7 @@ class JsTransformTest {
         assertThatThrownBy(() -> js.transform(row))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("transform.script-output-invalid"));
+                        .isEqualTo("TS0450006"));
     }
 
     @Test

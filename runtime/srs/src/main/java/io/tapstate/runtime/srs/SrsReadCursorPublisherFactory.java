@@ -5,6 +5,7 @@ import io.tapstate.core.event.ChainPosition;
 
 import java.io.Serializable;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.function.LongConsumer;
 
 /**
@@ -39,8 +40,23 @@ public interface SrsReadCursorPublisherFactory extends Serializable {
         return Optional.empty();
     }
 
+    /** Scoped consumers resolve exact model validation on the executing member before projection. */
+    default SrsEventModelVerifier modelVerifier(HazelcastInstance member, String ringName) {
+        return SrsEventModelVerifier.NONE;
+    }
+
+    /** Native model-bound consumers cannot fall back to a volatile ring when their durable log is unbound. */
+    default boolean requiresDurableLog() { return false; }
+
     /** The table's confirmed cursor or explicit arrival marker, excluding mere read progress. */
     default java.util.OptionalLong recoverySequence(HazelcastInstance member) {
         return java.util.OptionalLong.empty();
     }
+
+    /** Reads both startup coordinates from one progress observation when the store supports it. */
+    default RecoveryProgress recoveryProgress(HazelcastInstance member) {
+        return new RecoveryProgress(recoverySequence(member), confirmedPosition(member));
+    }
+
+    record RecoveryProgress(OptionalLong sequence, Optional<ChainPosition> confirmed) {}
 }

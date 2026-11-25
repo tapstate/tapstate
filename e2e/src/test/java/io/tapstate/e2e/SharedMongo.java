@@ -15,7 +15,7 @@ import org.testcontainers.utility.DockerImageName;
  */
 final class SharedMongo {
 
-    private static final DockerImageName IMAGE = DockerImageName.parse("mongo:7.0");
+    private static final DockerImageName IMAGE = DockerImageName.parse(System.getProperty("tapstate.e2e.mongo-image", "mongo:7.0"));
 
     /** Kept as its own constant rather than reached for across modules: this module depends on neither. */
     static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
@@ -64,6 +64,19 @@ final class SharedMongo {
         if (container == null) {
             DockerGate.require();
             MongoDBContainer starting = new MongoDBContainer(IMAGE);
+            io.tapstate.testsupport.ContainerLabels.configure(starting);
+            String owner = System.getProperty("tapstate.e2e.resource-owner");
+            if (owner != null && !owner.isBlank()) {
+                starting.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
+                        "io.tapstate.e2e.resource-owner"), owner);
+            }
+            if (Boolean.getBoolean("tapstate.e2e.mongo-tmpfs")) {
+                starting.withTmpFs(java.util.Map.of("/data/db", "rw,size=1g", "/data/configdb", "rw,size=16m"));
+                var command = new java.util.ArrayList<>(java.util.Arrays.asList(starting.getCommandParts()));
+                command.addAll(java.util.List.of("--wiredTigerCacheSizeGB", "0.25", "--oplogSize", "16"));
+                starting.withCommand(command.toArray(String[]::new));
+                starting.withCreateContainerCmdModifier(cmd -> cmd.getHostConfig().withMemory(1L << 30).withNanoCPUs(1_000_000_000L));
+            }
             starting.start();
             container = starting;
         }

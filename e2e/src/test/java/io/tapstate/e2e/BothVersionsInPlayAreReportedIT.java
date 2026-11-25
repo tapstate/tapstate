@@ -48,9 +48,9 @@ class BothVersionsInPlayAreReportedIT {
 
     @Test
     void theServerLineCarriesWhatTheServerItselfAnswered() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_version"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             // Read straight from the server first, so what the CLI prints is checked against a second,
             // independent reader of the same endpoint rather than against a constant this test holds.
@@ -90,16 +90,15 @@ class BothVersionsInPlayAreReportedIT {
             // The control group for the mismatch advisory. A matched pair is the case that a comparison
             // written to warn unconditionally still passes every mismatch test it has, and fails only
             // here.
-            assertThat(run.stderr()).doesNotContain("cli.version-mismatch");
+            assertThat(run.stderr()).doesNotContain("TS0330060");
         }
     }
 
     @Test
     void aConnectedStopRefusalNamesTheServersVersion(@TempDir Path home) {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("e2e_cli_diagnostic_version"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             String reportedByTheServer = control.version();
             assertThat(reportedByTheServer).isNotBlank();
 
@@ -108,7 +107,7 @@ class BothVersionsInPlayAreReportedIT {
                     "stop", "ship_clear");
 
             assertThat(run.exitCode()).isEqualTo(1);
-            assertThat(run.stderr()).contains("error: cli.confirmation-needs-a-terminal")
+            assertThat(run.stderr()).contains("error: TS0330026")
                     .endsWith(", server " + reportedByTheServer + ")" + System.lineSeparator());
         }
     }

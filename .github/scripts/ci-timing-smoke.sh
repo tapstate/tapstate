@@ -51,6 +51,15 @@ if '/workflows/' in path:
         print('invalid JSON')
         sys.exit(0)
     print(json.dumps(dict(total_count=0 if mode == 'empty' else 2, workflow_runs=data)))
+elif path in ['repos/example/project/actions/runs/1', 'repos/example/project/actions/runs/2']:
+    data = run(int(path.rsplit('/', 1)[1]))
+    data['path'] = '.github/workflows/ci.yml'
+    if mode == 'exact-failed': data['conclusion'] = 'failure'
+    if mode == 'exact-dispatch': data['event'] = 'workflow_dispatch'
+    if mode == 'exact-unfinished': data['status'] = 'in_progress'
+    if mode == 'exact-other-workflow': data['path'] = '.github/workflows/release.yml'
+    if mode == 'exact-other-branch': data['head_branch'] = 'different'
+    print(json.dumps(data))
 elif '/attempts/' in path:
     i = int(path.split('/runs/')[1].split('/')[0])
     attempt = 2 if i == 1 else 1
@@ -136,5 +145,16 @@ check(result.returncode == 0 and json.loads(result.stdout)['runs'][0]['modules']
 result = call(argv=base[:-1])
 check(result.returncode == 0 and 'Workflow wall' in result.stdout and '1234.567' in result.stdout,
       'human-readable timings preserve useful precision')
+exact = [os.environ['TIMING_GATE'], 'ci.yml', '--repo', 'example/project', '--run-id', '2',
+         '--event', 'push', '--branch', 'main', '--json']
+result = call('exact-failed', exact)
+check(result.returncode == 0 and json.loads(result.stdout)['runs'][0]['conclusion'] == 'failure',
+      'exact failed run is retained and identified, not filtered into a successful sample')
+result = call('exact-dispatch', [*exact[:8], '--event', 'workflow_dispatch', '--json'])
+check(result.returncode == 0 and json.loads(result.stdout)['runs'][0]['event'] == 'workflow_dispatch',
+      'dispatch remains its actual event and cannot masquerade as PR')
+for mode in ['exact-unfinished', 'exact-other-workflow', 'exact-other-branch', 'exact-dispatch']:
+    result = call(mode, exact)
+    check(result.returncode != 0 and not result.stdout, mode + ' cannot become a comparable complete sample')
 print(f'ci-timing smoke: {passed} assertions passed')
 PY

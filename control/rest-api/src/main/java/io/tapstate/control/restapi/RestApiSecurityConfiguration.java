@@ -5,22 +5,30 @@ import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.DispatcherType;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
+import org.springframework.security.config.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.annotation.web.configurers.HeadersConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AuthenticationFilter;
 import org.springframework.security.web.context.SecurityContextHolderFilter;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatcher;
 import org.springframework.security.web.util.matcher.NegatedRequestMatcher;
+import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.handler.HandlerMappingIntrospector;
+import org.springframework.web.servlet.handler.MappedInterceptor;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
@@ -36,6 +44,17 @@ import java.util.List;
 class RestApiSecurityConfiguration {
 
     @Bean
+    MappedInterceptor authorizedOptionsDispatch() {
+        return new MappedInterceptor(new String[]{"/api/**"}, new HandlerInterceptor() {
+            @Override
+            public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+                OperationRequestMappingHandlerMapping.requireAuthorizedDispatch(request, handler);
+                return true;
+            }
+        });
+    }
+
+    @Bean
     ApiSecurityErrorWriter apiSecurityErrorWriter(MessageCatalog catalog, ObjectMapper json) {
         return new ApiSecurityErrorWriter(catalog, json);
     }
@@ -43,6 +62,30 @@ class RestApiSecurityConfiguration {
     @Bean
     AuthenticationManager tapstateAuthenticationManager(CredentialAuthenticator credentials) {
         return new ProviderManager(List.of(new TapstateCredentialAuthenticationProvider(credentials)));
+    }
+
+    @Bean @Order(0)
+    SecurityFilterChain installationSecurityFilterChain(HttpSecurity http, ObjectProvider<InstallationHttpAccess> installations,
+            ApiSecurityErrorWriter errors) throws Exception {
+        http.securityMatcher(request -> {
+                    var installation = installations.getIfAvailable();
+                    return installation != null && installation.isManagementRequest(request);
+                })
+                .csrf(AbstractHttpConfigurer::disable).formLogin(AbstractHttpConfigurer::disable)
+                .httpBasic(AbstractHttpConfigurer::disable).logout(AbstractHttpConfigurer::disable)
+                .requestCache(AbstractHttpConfigurer::disable)
+                .sessionManagement(sessions -> sessions.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .addFilterAfter(new org.springframework.web.filter.OncePerRequestFilter() {
+                    @Override protected void doFilterInternal(jakarta.servlet.http.HttpServletRequest request,
+                            jakarta.servlet.http.HttpServletResponse response, jakarta.servlet.FilterChain chain)
+                            throws jakarta.servlet.ServletException, java.io.IOException {
+                        try { installations.getObject().requireManagementRequest(request); }
+                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(request, response, refused.code(), refused.args()); return; }
+                        chain.doFilter(request, response);
+                    }
+                }, SecurityContextHolderFilter.class)
+                .authorizeHttpRequests(authorize -> authorize.anyRequest().permitAll());
+        return http.build();
     }
 
     @Bean
@@ -60,6 +103,7 @@ class RestApiSecurityConfiguration {
 
         http
                 .securityMatcher(PathPatternRequestMatcher.pathPattern("/api/**"))
+                .headers(RestApiSecurityConfiguration::writeApiHeadersEagerly)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -74,17 +118,39 @@ class RestApiSecurityConfiguration {
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         // WebSocket upgrades retain their own handshake gate because they are not MVC verbs.
                         .requestMatchers(
-                                "/api/pipelines/*/status/watch",
-                                "/api/pipelines/*/logs/follow",
-                                "/api/data-browser/*/*/tail")
+                                PipelineStreamConfiguration.STATUS_WATCH_PATH,
+                                PipelineStreamConfiguration.LOGS_FOLLOW_PATH,
+                                DataBrowserStreamConfiguration.TAIL_PATH)
                         .permitAll()
                         .anyRequest().access(authorization));
         return http.build();
     }
 
+    static void writeApiHeadersEagerly(HeadersConfigurer<HttpSecurity> headers) {
+        // Set headers before an asynchronous response can begin streaming on another thread.
+        headers.withObjectPostProcessor(new ObjectPostProcessor<HeaderWriterFilter>() {
+            @Override
+            public <O extends HeaderWriterFilter> O postProcess(O filter) {
+                filter.setShouldWriteHeadersEagerly(true);
+                return filter;
+            }
+        });
+    }
+
+    @Bean
+    PublicStaticResource publicStaticResource(PathMatchingResourcePatternResolver publicImageResolver) {
+        return PublicStaticResource.create(publicImageResolver);
+    }
+
+    @Bean
+    PathMatchingResourcePatternResolver publicImageResolver() {
+        return new PathMatchingResourcePatternResolver(PublicStaticResource.class.getClassLoader());
+    }
+
     @Bean
     @Order(2)
-    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors) throws Exception {
+    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors,
+            PublicStaticResource images) {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
@@ -97,12 +163,19 @@ class RestApiSecurityConfiguration {
                 .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(entryPoint))
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
-                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
+                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, AuthWire.BROWSER_LOGIN_PATH,
+                                AuthWire.BROWSER_SESSION_PATH, AuthWire.BROWSER_LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
                                 CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
-                                "/index.html", "/assets/**", "/error").permitAll()
+                                "/auth/storage-entry", "/index.html", "/assets/**", "/favicon.ico", "/tapstate-mark.svg",
+                                "/tapstate-mark-light.svg", "/error").permitAll()
+                        .requestMatchers(images::matches).permitAll()
                         .requestMatchers(SpaNavigationRequest::matches).permitAll()
                         .anyRequest().denyAll());
-        return http.build();
+        try {
+            return http.build();
+        } catch (Exception failure) {
+            throw new IllegalStateException("Unable to build the root security filter chain", failure);
+        }
     }
 
     private static AuthenticationFilter bearerFilter(

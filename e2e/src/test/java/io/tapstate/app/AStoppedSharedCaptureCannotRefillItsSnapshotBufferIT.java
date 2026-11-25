@@ -108,7 +108,8 @@ class AStoppedSharedCaptureCannotRefillItsSnapshotBufferIT {
                     Await.until("the shared neighbour to deliver its full snapshot", BOUND,
                             () -> target.size() == 3, () -> "rows=" + target + ", job=" + job.getStatus());
                     assertThat(target).extracting(row -> row.after().get("id")).containsExactly(1L, 2L, 3L);
-                    assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+                    Await.until("the bounded neighbour to complete", BOUND,
+                            () -> job.getStatus() == JobStatus.COMPLETED, () -> String.valueOf(job.getStatus()));
                     assertThat(captures.captureFailure("q")).isEmpty();
                     assertThat(buffer.drain("p", ring))
                             .as("the stopped owner's completed load cannot resurrect its released queue").isEmpty();

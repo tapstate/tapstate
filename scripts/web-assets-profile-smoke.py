@@ -137,6 +137,7 @@ pathlib.Path(os.environ["WEB_PROFILE_SMOKE_TRACE"]).write_text(json.dumps({
     "arguments": sys.argv[1:], "consoleUrl": os.environ.get("VITE_CLOUD_CONSOLE_URL"),
     "otherVite": os.environ.get("VITE_OTHER_UNTRUSTED_INPUT"), "cwd": str(root),
     "gitDirectory": os.environ.get("GIT_DIR"), "gitWorkTree": os.environ.get("GIT_WORK_TREE"),
+    "localDevelopment": os.environ.get("TAPSTATE_LOCAL_DEVELOPMENT"),
 }))
 if os.environ.get("WEB_PROFILE_SMOKE_FAIL"):
     sys.exit(23)
@@ -146,6 +147,8 @@ if dist.exists():
 (dist / "assets").mkdir(parents=True)
 (dist / "index.html").write_text("<!doctype html><title>Tapstate</title>\\n")
 (dist / "assets" / "app.js").write_text('console.log("opaque fixture")\\n')
+if os.environ.get("WEB_PROFILE_SMOKE_PRODUCER"):
+    (dist / "tapstate-web-build.json").write_text(os.environ["WEB_PROFILE_SMOKE_PRODUCER"])
 if os.environ.get("WEB_PROFILE_SMOKE_MUTATE_SOURCE"):
     (root / "package.json").write_text("{}\\n")
 ''', encoding="utf-8")
@@ -282,6 +285,54 @@ if os.environ.get("WEB_PROFILE_SMOKE_MUTATE_SOURCE"):
         self.assertIn("web.profile=cloud\n", properties)
         self.assertIn("cloud.console.url=" + CONSOLE_URL + "\n", properties)
         self.assertFalse((self.output / "static" / PROFILE.BUILD_MARKER).exists())
+
+    def test_local_producer_cannot_enter_release_even_with_a_matching_attestation(self) -> None:
+        self.built()
+        (self.dist / "tapstate-web-build.json").write_text(json.dumps({
+            "schemaVersion": 1, "profile": "op", "purpose": "local-development",
+        }), encoding="utf-8")
+        digest = hashlib.sha256(PROFILE.files_manifest(self.dist)).hexdigest()
+        self.marker().write_text(json.dumps(PROFILE.marker_metadata(self.revision, "onprem", None, digest)), encoding="utf-8")
+        self.rejected(self.stage("--web-profile", "onprem"), "local-development")
+
+    def test_release_build_drops_ambient_local_purpose_and_accepts_ordinary_producer(self) -> None:
+        self.environment["TAPSTATE_LOCAL_DEVELOPMENT"] = "true"
+        self.environment["WEB_PROFILE_SMOKE_PRODUCER"] = json.dumps({
+            "schemaVersion": 1, "profile": "op", "purpose": "release",
+        })
+        self.built()
+        trace = json.loads(self.trace.read_text(encoding="utf-8"))
+        self.assertEqual(trace["localDevelopment"], "false")
+        result = self.stage("--web-profile", "onprem")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_current_cloud_producer_retains_its_exact_https_release_url(self) -> None:
+        self.environment["WEB_PROFILE_SMOKE_PRODUCER"] = json.dumps({
+            "schemaVersion": 1, "profile": "cloud", "purpose": "release", "cloudConsoleUrl": CONSOLE_URL,
+        })
+        self.built("cloud", CONSOLE_URL)
+        result = self.stage("--web-profile", "cloud", "--cloud-console-url", CONSOLE_URL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cloud.console.url=" + CONSOLE_URL,
+                      (self.output / "META-INF/tapstate-web.properties").read_text(encoding="utf-8"))
+
+    def test_local_cloud_producer_is_refused_before_release_attestation(self) -> None:
+        self.environment["WEB_PROFILE_SMOKE_PRODUCER"] = json.dumps({
+            "schemaVersion": 1, "profile": "cloud", "purpose": "local-development", "cloudConsoleUrl": CONSOLE_URL,
+        })
+        result = self.build("cloud", CONSOLE_URL)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("local-development", result.stderr)
+        self.assertFalse(self.marker().exists())
+
+    def test_release_producer_cannot_hide_an_http_console_url(self) -> None:
+        self.environment["WEB_PROFILE_SMOKE_PRODUCER"] = json.dumps({
+            "schemaVersion": 1, "profile": "cloud", "purpose": "release", "cloudConsoleUrl": "http://localhost:39175/",
+        })
+        result = self.build("cloud", CONSOLE_URL)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTPS", result.stderr)
+        self.assertFalse(self.marker().exists())
 
     def test_a_bundle_without_build_attestation_is_rejected(self) -> None:
         self.rejected(self.stage("--web-profile", "onprem"), "no valid Web build attestation")

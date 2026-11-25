@@ -36,9 +36,10 @@ public final class OfficialConnectors {
      * Supported ids that belong to no verified database kind: a server accepts them at registration,
      * but no release lane exercises their database against a live instance, so they are previews
      * rather than certified support. Kept apart from the kinds so that accepting a connector and
-     * promising its database is verified stay two separate decisions.
+     * promising its database is verified stay two separate decisions. Dummy is for internal
+     * performance diagnostics.
      */
-    public static final List<String> PREVIEW_IDS = List.of("db2");
+    public static final List<String> PREVIEW_IDS = List.of("db2", "db2i", "dummy");
 
     /** The supported ids, in the order a message naming them should read: the kinds', then previews. */
     public static final List<String> IDS = Stream.concat(
@@ -51,10 +52,10 @@ public final class OfficialConnectors {
      * <p>Being listed here is a support boundary, not a statement about the connector: its jar may well
      * implement writes. The same sink rule applies when catalog rows are derived and when previously
      * stored rows are read, so an earlier release's row cannot restore the write role after an upgrade.
-     * The server's target check and the API listings read the sink off the row, so none of them needs
-     * to know this list exists.
+     * API listings read the sink off the row. The server also checks this policy by id so missing
+     * catalog metadata cannot accidentally admit an official source-only connector as a private sink.
      */
-    public static final List<String> SOURCE_ONLY_IDS = List.of("db2");
+    public static final List<String> SOURCE_ONLY_IDS = List.of("db2", "db2i");
 
     private static Map<String, List<String>> databaseKinds() {
         Map<String, List<String>> kinds = new LinkedHashMap<>();

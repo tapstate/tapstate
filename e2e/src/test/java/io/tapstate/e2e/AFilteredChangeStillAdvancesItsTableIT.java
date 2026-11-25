@@ -13,7 +13,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -42,10 +41,10 @@ class AFilteredChangeStillAdvancesItsTableIT {
         FileEndpoints.replaceTable(source.resolve("orders.csv"), "id,priority\n1,keep\n");
         FileEndpoints.replaceTable(source.resolve("activity.csv"), "id,priority\n1,keep\n");
         Path delegate = E2eConnectorJar.buildInto(Files.createDirectory(directory.resolve("connector")));
-        String store = SharedMongo.replicaSetUrl("filtered_tail_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, CdcRecoveryFixture.connectorJar(delegate));
             Map<String, String> resources = workspace(source, target);
             control.apply(Map.of(SOURCE + ".tap.yml", resources.get(SOURCE + ".tap.yml")));
@@ -82,9 +81,9 @@ class AFilteredChangeStillAdvancesItsTableIT {
                                 && tableSequence(offset, "activity") >= 3;
                     }, () -> String.valueOf(documents.consumerOffset(chain, consumer)));
             assertThat(rowCount(target, "orders")).as("the dropped order never becomes a target row").isEqualTo(2);
-            assertThat(sequence(control.resumePoint(PIPELINE).get("token")))
-                    .as("the resume point passes the dropped change without another passing order")
-                    .isGreaterThanOrEqualTo(2);
+            Await.until("the resume point passes the dropped change without another passing order",
+                    Duration.ofSeconds(30), () -> sequence(control.resumePoint(PIPELINE).get("token")) >= 2,
+                    () -> String.valueOf(control.resumePoint(PIPELINE)));
             assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
         }
     }
@@ -94,12 +93,14 @@ class AFilteredChangeStillAdvancesItsTableIT {
     }
 
     private static long sequence(Document position) {
-        return position == null ? -1L : sequence(position.getString("sinkAckedSrcpos"));
+        return position == null ? -1L : sequence(position.getString("token"));
     }
 
     private static long tableSequence(Document offset, String table) {
-        Document byTable = offset == null ? null : offset.get("sinkAckedByTable", Document.class);
-        return byTable == null ? -1L : sequence(byTable.get(table, Document.class));
+        if (offset == null) return -1L;
+        return offset.get("progress", Document.class).getList("sinkAckedByTable", Document.class).stream()
+                .filter(row -> table.equals(row.getString("table")))
+                .mapToLong(row -> sequence(row.get("position", Document.class))).findFirst().orElse(-1L);
     }
 
     private static long sequence(String token) {

@@ -1,0 +1,6 @@
+{
+  "TS0370001": {
+    "message": "This member cannot read who is in the cluster right now.",
+    "solution": "Its engine cannot answer for the cluster yet, which is what a member looks like while it is starting, while it is stopping, while the cluster is putting itself back together after a partition healed, and while it settles after another member has left. Ask another member, or read again in a moment."
+  }
+}

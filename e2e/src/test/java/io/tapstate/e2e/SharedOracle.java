@@ -89,21 +89,45 @@ final class SharedOracle {
                 .withStartupTimeout(STARTUP_BUDGET);
         long began = System.nanoTime();
         starting.start();
+        System.err.printf("oracle-fixture-probe container-ready id=%s epoch-ms=%d%n",
+                starting.getContainerId(), System.currentTimeMillis());
         try {
-            // Supplemental logging waits for in-flight transactions after the database reopens.
+            // Keep the application PDB closed during database-wide logging changes. Opening it first
+            // lets unrelated PDB transaction recovery hold the supplemental-logging statement after
+            // the controlled ROOT transaction has already finished. Reopen it before provisioning.
+            // Supplemental logging still waits for in-flight ROOT transactions.
             // Give that wait the same bounded budget as container startup.
             // SQL*Plus does not echo redirected input, so mark statements before executing them.
             var result = starting.execInContainer("bash", "-c", """
                     timeout %d sqlplus -s / as sysdba <<'SQL'
                     WHENEVER SQLERROR EXIT SQL.SQLCODE
+                    HOST date -u '+oracle-fixture-probe main-stage=shutdown epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT SHUTDOWN IMMEDIATE;
                     SHUTDOWN IMMEDIATE;
+                    HOST date -u '+oracle-fixture-probe main-stage=startup-mount epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT STARTUP MOUNT;
                     STARTUP MOUNT;
+                    HOST date -u '+oracle-fixture-probe main-stage=archivelog epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT ALTER DATABASE ARCHIVELOG;
                     ALTER DATABASE ARCHIVELOG;
+                    HOST date -u '+oracle-fixture-probe main-stage=database-open epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT ALTER DATABASE OPEN;
                     ALTER DATABASE OPEN;
+                    HOST date -u '+oracle-fixture-probe main-stage=pdb-close epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
+                    PROMPT ALTER PLUGGABLE DATABASE FREEPDB1 CLOSE IMMEDIATE;
+                    BEGIN
+                      EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE FREEPDB1 CLOSE IMMEDIATE';
+                    EXCEPTION WHEN OTHERS THEN
+                      IF SQLCODE != -65020 THEN RAISE; END IF;
+                    END;
+                    /
+                    HOST date -u '+oracle-fixture-probe main-stage=supplemental epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
+                    PROMPT Enabling minimal supplemental logging;
+                    ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+                    HOST date -u '+oracle-fixture-probe main-stage=force-logging epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
+                    PROMPT ALTER DATABASE FORCE LOGGING;
+                    ALTER DATABASE FORCE LOGGING;
+                    HOST date -u '+oracle-fixture-probe main-stage=pdb-open epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT ALTER PLUGGABLE DATABASE FREEPDB1 OPEN;
                     BEGIN
                       EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE FREEPDB1 OPEN';
@@ -111,19 +135,24 @@ final class SharedOracle {
                       IF SQLCODE != -65019 THEN RAISE; END IF;
                     END;
                     /
-                    PROMPT Enabling minimal supplemental logging;
-                    ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
-                    PROMPT ALTER DATABASE FORCE LOGGING;
-                    ALTER DATABASE FORCE LOGGING;
+                    HOST date -u '+oracle-fixture-probe main-stage=create-user epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT CREATE USER C##TAPSTATE;
                     CREATE USER C##TAPSTATE IDENTIFIED BY "Tapstate_Test_42" CONTAINER=ALL;
+                    HOST date -u '+oracle-fixture-probe main-stage=grant epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT GRANT DBA, LOGMINING TO C##TAPSTATE CONTAINER=ALL;
                     GRANT DBA, LOGMINING TO C##TAPSTATE CONTAINER=ALL;
+                    HOST date -u '+oracle-fixture-probe main-stage=register epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT ALTER SYSTEM REGISTER;
                     ALTER SYSTEM REGISTER;
                     EXIT;
                     SQL
                     status=$?
+                    printf '\nOracle bounded diagnostic stage journal:\n'
+                    for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log; do
+                      [ -f "$journal" ] || continue
+                      printf '\nOracle diagnostic journal: %%s\n' "$journal"
+                      head -c 65536 "$journal" || true
+                    done
                     if [ "$status" -ne 0 ]; then
                       printf '\\nSQL*Plus exit code: %%s\\n' "$status"
                       timeout 10 bash -c '
@@ -139,6 +168,8 @@ final class SharedOracle {
                     fi
                     exit "$status"
                     """.formatted(STARTUP_BUDGET.toSeconds()));
+            System.err.printf("oracle-fixture-probe capture-sql-exit=%d stdout=%n%s%n stderr=%n%s%n",
+                    result.getExitCode(), result.getStdout(), result.getStderr());
             if (result.getExitCode() != 0) {
                 throw new EnvelopeException("cannot enable Oracle change capture: " + result.getStdout() + result.getStderr());
             }
@@ -162,6 +193,33 @@ final class SharedOracle {
     /** Retains live initialization state before a failed fixture is stopped. */
     private static boolean captureInitializationState(OracleContainer server, Exception failure) {
         var capture = new FutureTask<>(() -> server.execInContainer("bash", "-c", """
+                for probe_log in /tmp/tapstate-initialization-stage.log /tmp/tapstate-initialization.log /tmp/tapstate-transaction.log; do
+                  if [ -f "$probe_log" ]; then
+                    printf '\\nOracle test probe log (last 120 lines): %s\\n' "$probe_log"
+                    tail -n 120 "$probe_log"
+                  fi
+                done
+                for probe_pid_file in /tmp/tapstate-main-sqlplus.pid /tmp/tapstate-transaction.pid; do
+                  if [ -f "$probe_pid_file" ]; then
+                    probe_pid=$(cat "$probe_pid_file")
+                    case "$probe_pid" in
+                      ''|*[!0-9]*) printf 'Invalid Oracle test probe PID: %s\\n' "$probe_pid_file" ;;
+                      *)
+                        printf 'Oracle test probe process: %s PID=%s\\n' "$probe_pid_file" "$probe_pid"
+                        if kill -0 "$probe_pid" 2>/dev/null; then
+                          awk '/^(Name|State|PPid):/ { print }' "/proc/$probe_pid/status"
+                        else
+                          printf 'Oracle test probe process has exited.\\n'
+                        fi
+                        ;;
+                    esac
+                  fi
+                done
+                for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log; do
+                  [ -f "$journal" ] || continue
+                  printf '\nOracle diagnostic journal before cleanup: %s\n' "$journal"
+                  head -c 65536 "$journal" || true
+                done
                 oracle_state_output=$(mktemp) || exit $?
                 timeout --kill-after=2 10 sqlplus -s / as sysdba > "$oracle_state_output" 2>&1 <<'SQL'
                 WHENEVER SQLERROR CONTINUE NONE

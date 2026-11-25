@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.common.TapstateException;
@@ -25,6 +26,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * What key a join's output is written under.
@@ -51,6 +54,121 @@ class JoinOutputTargetTest {
         assertThat(targets).containsOnlyKeys("widen");
         assertThat(keyOf(targets.get("widen"))).containsExactly("order_id");
         assertThat(namesOf(targets.get("widen"))).containsExactly("order_id", "customer_name");
+    }
+
+    @Test
+    void aMapAfterJoinPublishesItsProjectedFieldsAndKeyToTheSyncTarget() {
+        String pipeline = JOIN_PIPELINE.replace("serve:\n  from: widen\n", """
+                  - id: project
+                    type: map
+                    from: widen
+                    fields: { order_key: $order_id, customer_name: false, tag: x }
+                serve:
+                  from: project
+                """);
+
+        Map<String, TargetTable> targets = bind(pipeline);
+
+        assertThat(targets).containsOnlyKeys("widen");
+        assertThat(targets.get("widen").fields()).extracting(TargetField::name, TargetField::primaryKey)
+                .containsExactlyInAnyOrder(tuple("order_key", true), tuple("tag", false));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "amount, =after.amount",
+            "total, =after.amount",
+            "total, =before.amount",
+            "total, $amount"
+    })
+    void aMapCopyOfAJoinedDecimalKeepsItsLegacyDeclaration(String output, String rule) {
+        String join = pipeline("SELECT o.id AS order_id, o.price AS amount, c.name AS customer_name");
+        String projected = join.replace("serve:\n  from: widen\n", """
+                  - id: project
+                    type: map
+                    from: widen
+                    fields: { %s: '%s' }
+                serve:
+                  from: project
+                """.formatted(output, rule));
+        for (String pipeline : List.of(join, projected)) {
+            String column = pipeline.equals(join) ? "amount" : output;
+            assertThat(bindJoinedDecimal(pipeline).fields())
+                    .contains(new TargetField(column, "decimal(10,2)", false, TapstateType.DECIMAL));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "[widen, project] | false | decimal(10,2)",
+            "[project, widen] | false | decimal(10,2)",
+            "[widen, project] | $amount | decimal(10,2)",
+            "[widen, project] | $other_amount |",
+            "[widen, project] | $undeclared_amount |"
+    })
+    void aServedJoinedDecimalKeepsItsDeclarationWhenAllCarryingBranchesAgree(
+            String branches, String rule, String declaration) {
+        String pipeline = pipeline("SELECT o.id AS order_id, o.price AS amount, "
+                + "o.other_price AS other_amount, o.undeclared_price AS undeclared_amount")
+                .replace("serve:\n  from: widen\n", """
+                          - id: project
+                            type: map
+                            from: widen
+                            fields: { amount: %s }
+                        serve:
+                          from: %s
+                        """.formatted(rule, branches));
+
+        assertThat(bindJoinedDecimal(pipeline).fields())
+                .contains(new TargetField("amount", declaration, false, TapstateType.DECIMAL));
+    }
+
+    @Test
+    void aComputedFieldAfterJoinReplacesTheJoinedColumnsType() {
+        String pipeline = JOIN_PIPELINE.replace("serve:\n  from: widen\n", """
+                  - id: project
+                    type: map
+                    from: widen
+                    fields: { customer_name: "=size(after.customer_name)" }
+                serve:
+                  from: project
+                """);
+        InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
+        discovered(store, "orders_src", "orders", List.of("id"),
+                new SourceField("id", "bigint", TapstateType.INT64), field("customer_ref", "bigint"));
+        discovered(store, "customers_src", "customers", List.of("id"),
+                field("id", "bigint"), field("cust_ref", "bigint"),
+                new SourceField("name", "varchar", TapstateType.STRING));
+        Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
+
+        assertThat(captured.get("mongodb").get("widen").fields()).containsExactly(
+                new TargetField("order_id", "bigint", true, TapstateType.INT64),
+                new TargetField("customer_name", null, false, TapstateType.INT64));
+    }
+
+    @Test
+    void aMapAfterJoinCannotPublishAnIncompleteOrReplacedFactKey() {
+        for (String rule : List.of("false", "'=after.region + \"-copy\"'")) {
+            String pipeline = COMPOSITE_KEY_PIPELINE.replace("serve:\n  from: widen\n", """
+                      - id: project
+                        type: map
+                        from: widen
+                        fields: { order_key: $order_id, region: %s }
+                    serve:
+                      from: project
+                    """.formatted(rule));
+            assertThatThrownBy(() -> bind(pipeline, List.of("id", "region")))
+                    .isInstanceOfSatisfying(TapstateException.class, failure ->
+                            assertThat(failure.code()).isEqualTo(ActuationError.SYNC_OUTPUT_IDENTITY_UNRESOLVED));
+
+            TargetTable appended = bind(pipeline.replace("source: orders_dest }", "source: orders_dest, write_mode: append }"),
+                    List.of("id", "region")).get("widen");
+            assertThat(namesOf(appended)).contains("order_key");
+            assertThat(appended.fields()).noneMatch(TargetField::primaryKey);
+            assertThat(appended.indexes()).noneMatch(TargetIndex::unique);
+        }
     }
 
     @Test
@@ -117,7 +235,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(UNKEYED_PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /**
@@ -132,7 +250,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(EXPRESSION_KEY_PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /** A composite fact key has to be published whole; publishing half of it identifies nothing. */
@@ -144,7 +262,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(HALF_COMPOSITE_KEY_PIPELINE, List.of("region", "id")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /**
@@ -194,7 +312,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(unkeyedInto("upsert")))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     /** The same, with the mode left out entirely - which is how the upsert default is written. */
@@ -203,7 +321,7 @@ class JoinOutputTargetTest {
         assertThatThrownBy(() -> bind(UNKEYED_PIPELINE))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-output-key-not-published"));
+                        .isEqualTo("TS0360015"));
     }
 
     // ---- fixtures ----------------------------------------------------------------------
@@ -335,18 +453,34 @@ class JoinOutputTargetTest {
         return captured.getOrDefault("mongodb", Map.of());
     }
 
+    private static TargetTable bindJoinedDecimal(String pipeline) {
+        InMemoryStorePort store = validated(ORDERS_SRC, CUSTOMERS_SRC, TARGET, pipeline);
+        discovered(store, "orders_src", "orders", List.of("id"),
+                new SourceField("id", "bigint", TapstateType.INT64), field("customer_ref", "bigint"),
+                new SourceField("price", "decimal(10,2)", TapstateType.DECIMAL),
+                new SourceField("other_price", "decimal(12,3)", TapstateType.DECIMAL),
+                new SourceField("undeclared_price", null, TapstateType.DECIMAL));
+        discovered(store, "customers_src", "customers", List.of("id"),
+                field("id", "bigint"), field("cust_ref", "bigint"), field("name", "varchar"));
+        Map<String, Map<String, TargetTable>> captured = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturing(captured)).dagFor("wide");
+
+        return captured.get("mongodb").get("widen");
+    }
+
     private static StoreBackedDagSource.SinkWriterBinder capturing(
             Map<String, Map<String, TargetTable>> into) {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     Map<String, TargetTable> targets, PipelineNode node) {
                 into.put(connectorId, targets);

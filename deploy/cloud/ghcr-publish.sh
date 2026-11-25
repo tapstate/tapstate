@@ -6,23 +6,31 @@ fail() { printf 'Cloud GHCR publication refused: %s\n' "$1" >&2; exit 1; }
 mode="${1:-}"
 case "$mode" in
     publish|publish-dev) ;;
-    *) fail 'usage: ghcr-publish.sh <publish|publish-dev> --archive FILE --version VERSION --expected-digest SHA256' ;;
+    *) fail 'usage: ghcr-publish.sh <publish|publish-dev> --archive FILE --version VERSION --expected-digest SHA256 [--dev-source-sha SHA]' ;;
 esac
 shift
-archive='' version='' expected_digest=''
+archive='' version='' expected_digest='' dev_source_sha=''
 while [[ $# -gt 0 ]]; do
     [[ $# -ge 2 ]] || fail 'a publish argument is missing its value'
     case "$1" in
         --archive) archive="$2" ;;
         --version) version="$2" ;;
         --expected-digest) expected_digest="$2" ;;
+        --dev-source-sha) dev_source_sha="$2" ;;
         *) fail 'unknown publish argument' ;;
     esac
     shift 2
 done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'a numeric release version is required; floating tags are forbidden'
 tag="$version"
-if [[ "$mode" == publish-dev ]]; then tag="$version-dev"; fi
+if [[ -n "$dev_source_sha" ]]; then
+    [[ "$mode" == publish-dev ]] || fail 'a dev source SHA is valid only for publish-dev'
+    [[ "$dev_source_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'a dev source SHA must be a full lowercase commit SHA'
+fi
+if [[ "$mode" == publish-dev ]]; then
+    tag="$version-dev"
+    if [[ -n "$dev_source_sha" ]]; then tag+="-${dev_source_sha:0:12}"; fi
+fi
 [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'expected OCI digest is missing or invalid'
 [[ -f "$archive" ]] || fail 'verified OCI archive is missing'
 workflow_identity=false

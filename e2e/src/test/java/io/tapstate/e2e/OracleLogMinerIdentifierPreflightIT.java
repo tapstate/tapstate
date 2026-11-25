@@ -14,7 +14,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,7 +34,7 @@ class OracleLogMinerIdentifierPreflightIT {
     private static final String TARGET = "tgt_file";
     private static final String TABLE = "orders";
     private static final String LONG_SCHEMA = "S".repeat(63);
-    private static final String FAILURE_CODE = "connector.logminer-identifier-too-long";
+    private static final String FAILURE_CODE = "TS0060019";
     private static final Duration TIMEOUT = Duration.ofSeconds(90);
 
     @BeforeAll
@@ -53,11 +52,10 @@ class OracleLogMinerIdentifierPreflightIT {
         Files.createDirectories(target);
         FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,seq\n1,1\n");
 
-        try (ServerHandle server = tier.launch(
-                SharedMongo.replicaSetUrl(
-                        "oracle_logminer_preflight_" + tier.name().toLowerCase(Locale.ROOT)))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(ORACLE, read(E2eConnectorJar.buildInto(directory, ORACLE)));
             control.registerConnector(
                     E2eConnectorJar.CONNECTOR_ID, read(E2eConnectorJar.buildInto(directory)));
@@ -70,16 +68,20 @@ class OracleLogMinerIdentifierPreflightIT {
             control.discoverSchema(SOURCE, ORACLE, sourceSettings(source));
 
             control.lifecycle(PIPELINE, LifecycleVerb.START);
-            Await.until("the unsupported LogMiner configuration to settle", TIMEOUT,
-                    () -> control.state(PIPELINE)
-                            .filter(state -> state == PipelineState.FAILED
-                                    || state == PipelineState.RUNNING)
-                            .isPresent(),
-                    () -> "state=" + control.state(PIPELINE)
-                            + ", failure=" + control.failureCode(PIPELINE));
+            Await.until("the LogMiner refusal to appear in pipeline status", TIMEOUT, () -> {
+                var status = control.pipelineStatus(PIPELINE);
+                var observedState = status.get("observedState");
+                assertThat(observedState).as("observed state before the LogMiner refusal")
+                        .isNotEqualTo(PipelineState.RUNNING.name());
+                var failure = status.get("failure");
+                // The FAILED checkpoint can be visible before the coded observation is published.
+                if (failure == null) return false;
+                assertThat(failure).as("published failure").isInstanceOf(Map.class);
+                assertThat(((Map<?, ?>) failure).get("code")).as("published failure code")
+                        .isEqualTo(FAILURE_CODE);
+                return PipelineState.FAILED.name().equals(observedState);
+            }, () -> control.pipelineStatus(PIPELINE).toString());
 
-            assertThat(control.state(PIPELINE)).contains(PipelineState.FAILED);
-            assertThat(control.failureCode(PIPELINE)).contains(FAILURE_CODE);
             assertThat(new FileEndpoints().count(EndpointAddress.uri(target.toString()), TABLE))
                     .as("changes delivered before the LogMiner identifier refusal")
                     .isZero();

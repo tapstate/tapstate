@@ -1,10 +1,9 @@
 package io.tapstate.e2e;
 
-import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.SrsConsumerId;
@@ -15,6 +14,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -47,13 +48,13 @@ class ASinkCheckpointBelongsToTheRunThatWroteItIT {
         Path source = Files.createDirectories(directory.resolve("src"));
         Path target = Files.createDirectories(directory.resolve("tgt"));
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
-        String storeUri = SharedMongo.replicaSetUrl("e2e_sink_checkpoint_fence");
-        ConnectionString connection = new ConnectionString(storeUri);
 
         try (FileEndpoints files = new FileEndpoints();
-                MongoClient reader = MongoClients.create(connection);
-                TwoMemberCluster cluster = TwoMemberCluster.start(storeUri, "e2e-sink-checkpoint-fence")) {
-            MongoDatabase database = reader.getDatabase(connection.getDatabase());
+                PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage);
+                MongoClient reader = MongoClients.create(storage.cacheUri());
+                TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
+            MongoDatabase database = reader.getDatabase(storage.cacheDatabase());
             EndpointAddress sourceAddress = EndpointAddress.uri(source.toString());
             EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
             files.seed(sourceAddress, TABLE, SeedRows.generated(3));
@@ -68,22 +69,17 @@ class ASinkCheckpointBelongsToTheRunThatWroteItIT {
             control.apply(resources);
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitState(control, PipelineState.RUNNING);
-            Await.until("the first run's rows and checkpoint to land", DELIVERY,
-                    () -> files.count(targetAddress, TABLE) == 3 && hasCheckpoint(database),
-                    () -> "target rows=" + files.count(targetAddress, TABLE) + ", consumer=" + consumer(database));
-            Document firstFence = assertFenceMatchesCurrentRun(database, control.clusterId());
-
+            Document firstCursor = awaitCheckpoint(documents, files, targetAddress, 3, null, -1, null);
+            Document firstFence = assertFenceMatchesCurrentRun(documents, database, control.clusterId(), firstCursor);
+            String chain = firstCursor.get("_id", Document.class).getString("chain");
             control.stop(PIPELINE, false);
             awaitState(control, PipelineState.STOPPED);
+            long retainedEnd = documents.largestSequence(chain, TABLE);
             files.insert(sourceAddress, TABLE, SeedRows.generated(4).subList(3, 4));
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitState(control, PipelineState.RUNNING);
-            Await.until("the replacement run's change and checkpoint to land", DELIVERY,
-                    () -> files.count(targetAddress, TABLE) == 4
-                            && consumer(database) != null
-                            && !firstFence.equals(consumer(database).get("sinkAckFence")),
-                    () -> "target rows=" + files.count(targetAddress, TABLE) + ", consumer=" + consumer(database));
-            Document replacementFence = assertFenceMatchesCurrentRun(database, control.clusterId());
+            Document replacementCursor = awaitCheckpoint(documents, files, targetAddress, 4, chain, retainedEnd, firstFence);
+            Document replacementFence = assertFenceMatchesCurrentRun(documents, database, control.clusterId(), replacementCursor);
             assertThat(replacementFence.getLong("executionGeneration"))
                     .as("a replacement execution cannot retain the old run's durable sink fence")
                     .isGreaterThan(firstFence.getLong("executionGeneration"));
@@ -96,26 +92,86 @@ class ASinkCheckpointBelongsToTheRunThatWroteItIT {
                 () -> String.valueOf(control.state(PIPELINE)));
     }
 
-    private static boolean hasCheckpoint(MongoDatabase database) {
-        Document consumer = consumer(database);
-        return consumer != null && consumer.containsKey("sinkAckedEpoch") && consumer.containsKey("sinkAckedSeq");
+    private static Document awaitCheckpoint(NativeSrsDocuments documents, FileEndpoints files,
+            EndpointAddress target, long expectedRows, String originalChain, long priorRingEnd, Document priorFence) {
+        var boundary = new AtomicReference<AckBoundary>();
+        var proof = new AtomicReference<Document>();
+        Await.until("the rows and current writers' durable checkpoint to land", DELIVERY, () -> {
+            if (files.count(target, TABLE) != expectedRows) return false;
+            Document cursor = consumer(documents);
+            if (cursor == null || writerFence(cursor) == null
+                    || cursor.get("progress", Document.class).get("sinkAcked") == null
+                    || priorFence != null && priorFence.equals(writerFence(cursor))) return false;
+            String chain = cursor.get("_id", Document.class).getString("chain");
+            if (originalChain != null && !originalChain.equals(chain)) return false;
+            if (boundary.get() == null) {
+                long epoch = documents.chain(chain).getLong("epoch");
+                long sequence = documents.largestSequence(chain, TABLE);
+                if (sequence <= priorRingEnd || documents.chain(chain).getLong("epoch") != epoch) return false;
+                boundary.set(new AckBoundary(chain, epoch, sequence));
+            }
+            if (!currentWritersConfirmed(cursor, boundary.get())) return false;
+            proof.set(cursor);
+            return true;
+        }, () -> "target rows=" + files.count(target, TABLE) + ", boundary=" + boundary.get()
+                + ", consumer=" + consumer(documents));
+        return proof.get();
     }
 
-    private static Document consumer(MongoDatabase database) {
-        return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                .find(new Document("pipelineId", SrsConsumerId.of(PIPELINE, SOURCE).value())).first();
+    private static Document consumer(NativeSrsDocuments documents) {
+        Document member = documents.pipelineMembership(PIPELINE, SOURCE);
+        if (member == null) return null;
+        String chain = member.get("_id", Document.class).getString("chain");
+        Document cursor = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
+        if (cursor == null || !member.get("stateGeneration").equals(cursor.get("stateGeneration"))
+                || !member.get("revision").equals(cursor.get("membershipRevision"))) return null;
+        return cursor;
     }
 
-    private static Document assertFenceMatchesCurrentRun(MongoDatabase database, String clusterId) {
-        Document consumer = consumer(database);
+    private static Document writerFence(Document consumer) {
+        Document run = consumer.get("writerRun", Document.class);
+        return run == null ? null : run.get("commandFence", Document.class);
+    }
+
+    private record AckBoundary(String chain, long epoch, long sequence) {}
+
+    /** A new roster is insufficient: every current writer must durably cover the fixed new row boundary. */
+    private static boolean currentWritersConfirmed(Document cursor, AckBoundary boundary) {
+        if (!boundary.chain().equals(cursor.get("_id", Document.class).getString("chain"))) return false;
+        Document run = cursor.get("writerRun", Document.class);
+        List<String> expected = run.getList("expected", Document.class).stream()
+                .filter(table -> TABLE.equals(table.getString("table")))
+                .flatMap(table -> table.getList("writers", String.class).stream()).toList();
+        List<Document> progress = run.getList("progress", Document.class).stream()
+                .filter(table -> TABLE.equals(table.getString("table")))
+                .flatMap(table -> table.getList("writers", Document.class).stream()).toList();
+        if (expected.isEmpty() || progress.size() != expected.size()
+                || !new java.util.HashSet<>(expected).equals(progress.stream()
+                        .map(writer -> writer.getString("writer")).collect(java.util.stream.Collectors.toSet()))) return false;
+        for (Document writer : progress) {
+            Document through = writer.get("durableThrough", Document.class);
+            if (through == null || through.getLong("epoch") != boundary.epoch()
+                    || through.getLong("sequence") < boundary.sequence()) return false;
+        }
+        return cursor.getList("ringDoneThrough", Document.class).stream()
+                .anyMatch(table -> TABLE.equals(table.getString("table"))
+                        && table.getLong("sequence") >= boundary.sequence());
+    }
+
+    private static Document assertFenceMatchesCurrentRun(NativeSrsDocuments documents, MongoDatabase database, String clusterId, Document consumer) {
         assertThat(consumer).isNotNull();
-        Document fence = consumer.get("sinkAckFence", Document.class);
+        Document fence = writerFence(consumer);
         assertThat(fence).as("the sink's actual durable checkpoint carries its admitted run identity").isNotNull();
-        Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+        Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)
                 .find(new Document("_id.clusterId", clusterId)
                         .append("_id.resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
                         .append("_id.resourceId", PIPELINE)).first();
         assertThat(claim).isNotNull();
+        var scope = documents.scope();
+        assertThat(claim.get("pipelineScope", Document.class))
+                .isEqualTo(new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion())
+                        .append("cacheIncarnation", scope.cacheIncarnation()).append("pipelineId", PIPELINE)
+                        .append("stateGeneration", consumer.getLong("stateGeneration")));
         assertThat(fence).containsEntry("clusterId", clusterId)
                 .containsEntry("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
                 .containsEntry("resourceId", PIPELINE);

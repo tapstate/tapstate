@@ -86,6 +86,23 @@ class AHandOverInFlightKeepsTheFrontierBelowItTest {
     }
 
     @Test
+    void aPolicyHandOverDoesNotHoldAnUnrelatedCustomerChain() throws Exception {
+        AssemblerProcessor processor = assembler();
+        givenAPolicyWithAClaimUnder("C1", processor);
+        feed(processor, FROM_POLICIES, departureOfP1From("C1"));
+        assertThat(boundsAfter(processor, FAR_ABOVE))
+                .as("the policy subtree is still parked when the other chain advances")
+                .containsExactly(FrontierOrders.pack(POLICIES, at(MOVED_AT)) - 1);
+
+        long customerBound = FrontierOrders.pack(CUSTOMERS, at(900));
+        processor.tryProcessWatermark(ROOT_ROWS, new Watermark(customerBound, AXES.axisOf(CUSTOMERS)));
+
+        assertThat(boundsIn(drained()))
+                .as("a policy-only hold has no customer position to withhold")
+                .containsExactly(customerBound);
+    }
+
+    @Test
     void theBoundGoesPastOnceTheDocumentThatWasOwedItHasTakenIt() throws Exception {
         AssemblerProcessor processor = assembler();
         givenAPolicyWithAClaimUnder("C1", processor);

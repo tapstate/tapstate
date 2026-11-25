@@ -259,7 +259,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     .isInstanceOf(TapstateException.class)
                     .satisfies(e -> {
                         TapstateException refused = (TapstateException) e;
-                        assertThat(refused.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(refused.code().code()).isEqualTo("TS0350010");
                         assertThat(refused.args()).containsEntry("value", binlogCoordinate);
                     });
         }
@@ -791,7 +791,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
                 .isInstanceOfSatisfying(TapstateException.class, exception -> {
-                    assertThat(exception.code().code()).isEqualTo("capture.event-table-not-selected");
+                    assertThat(exception.code().code()).isEqualTo("TS0350012");
                     assertThat(exception.args()).containsEntry("table", "customers");
                 });
         assertThat(coordinator.isCapturing("p")).isFalse();
@@ -848,6 +848,15 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(buffer.snapshotState("p", ring).declared()).as("declared before the job is assembled").isTrue();
         assertThat(buffer.snapshotState("p", ring).handedOver()).isFalse();
         assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+        var at = java.time.Instant.now();
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+        assertThat(port.atRest.await(10, TimeUnit.SECONDS)).isTrue();
+        var live = coordinator.initialLoad("p", plan, at);
+        assertThat(live.tables().get("orders").rowsRead()).isEqualTo(1L);
+        assertThat(live.tables()).containsKey("orders");
+        assertThat(live.tables().get("orders").stage())
+                .isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.READING);
+        assertThat(live.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.SNAPSHOTTING);
 
         rest.countDown();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
@@ -1025,6 +1034,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     private static final class HeldSource implements CapturePort {
         private final int rows;
         private final CountDownLatch rest;
+        private final CountDownLatch atRest = new CountDownLatch(1);
         volatile boolean closed;
 
         HeldSource(int rows, CountDownLatch rest) {
@@ -1063,6 +1073,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         }
 
         private void awaitRest() {
+            atRest.countDown();
             try {
                 while (!rest.await(20, TimeUnit.MILLISECONDS)) {
                     if (closed) {
@@ -1114,6 +1125,15 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .containsOnly(entry("orders", new TableSnapshot(500L, null, null)));
         // A total without what it accumulates from cannot be read, so the load says when it opened.
         assertThat(coordinator.snapshotProgress("p").start()).isPresent();
+        var at = java.time.Instant.now();
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+        var display = coordinator.initialLoad("p", plan, at);
+        assertThat(display.tables().get("orders").stage())
+                .isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDING);
+        assertThat(display.tables().get("orders").rowsTotalEstimate()).isNull();
+        var replacement = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 3L, 3L, List.of(), List.of(), at);
+        assertThat(coordinator.initialLoad("p", replacement, at)).isNull();
+
     }
 
     @Test
@@ -1240,6 +1260,16 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             verify(source, times(1)).snapshot(org.mockito.ArgumentMatchers.argThat(
                     config -> config.streams().equals(List.of("orders"))));
+            store.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(SrsConsumerId.of("p", "orders_src").value()));
+            assertThat(replacement.snapshotProgress("p").byTable()).isEmpty();
+            var at = java.time.Instant.now();
+            var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+            var load = replacement.initialLoad("p", plan, at);
+            assertThat(load.tables().get("orders").stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDED);
+            assertThat(load.tables().get("orders").rowsRead()).isNull();
+            assertThat(load.landedTables()).isEqualTo(1);
+            assertThat(load.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.MIXED);
+
         } finally {
             releaseSecondRead.countDown();
             replacement.stopCapture("p", false);
@@ -1659,7 +1689,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
                 .isInstanceOfSatisfying(TapstateException.class, refused -> assertThat(refused.code().code())
-                        .isEqualTo("actuation.source-schema-not-discovered"));
+                        .isEqualTo("TS0360004"));
         assertThat(opened).isEmpty();
         assertThat(coordinator.isCapturing("p")).isFalse();
     }
@@ -1839,6 +1869,29 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.stopCapture("p", false);
 
         assertThat(coordinator.loadDelivered("p")).isTrue();
+    }
+
+    @Test void captureUsesTheModelSnapshotChosenBeforeALaterDiscoveryExpandsTheSelection() {
+        var source = new SourceResource("orders_src",null,"mysql",Map.of("host","h"),SourceMode.CDC,
+                List.of(TableRef.regex(".*")),null,null);
+        var artifacts = new InMemoryArtifactStore(); artifacts.save(source); artifacts.save(pipeline("p","orders_src"));
+        var store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel(source.id(),"mysql",1,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of())))));
+        var snapshot = ReadOnlyArtifactSnapshot.capture(artifacts); var models = SourceModelSnapshot.capture("p",List.of(source),store.schemas());
+        store.schemas().save(new DiscoveredSourceModel(source.id(),"mysql",2,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of()),
+                new SourceTable("new_orders",List.of(),List.of(),List.of())))));
+        var srs = new SrsCoordinator(store.meta()); var opened = new AtomicReference<CaptureRunSpec>();
+        CaptureStarter starter = (spec,passthrough) -> {
+            opened.set(spec); var chain = spec.miningChainId();
+            srs.provisionSource(spec.sourceId(),chain,spec.config().streams(),spec.retention()); srs.attachConsumer(chain,spec.consumerId());
+            return new CaptureRun(Optional.of(chain),false,0L,Optional.empty(),Optional.of(() -> {}),new CaptureHealth());
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store,starter,srs,new SnapshotBuffer());
+        assertThatThrownBy(() -> coordinator.startCapture("foreign",snapshot,models)).isInstanceOf(TapstateException.class); assertThat(opened.get()).isNull();
+        coordinator.startCapture("p",snapshot,models);
+        assertThat(opened.get().config().streams()).containsExactly("orders");
+        assertThat(store.schemas().get(source.id()).orElseThrow().model().tables()).hasSize(2);
+        coordinator.stopCapture("p",false);
     }
 
     // ---- fixtures --------------------------------------------------------------------------------

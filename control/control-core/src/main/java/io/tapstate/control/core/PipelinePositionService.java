@@ -40,14 +40,26 @@ public final class PipelinePositionService {
     private final ArtifactStore artifacts;
     private final LivePipelines live;
     private final AuditGate auditGate;
+    private final WriteBack nativeWriteBack;
+
+    @FunctionalInterface
+    public interface WriteBack {
+        /** Reads and fixes the original command before audit; the returned action performs the write. */
+        Runnable prepare(String pipelineId, PipelinePosition current, Map<String, String> moves);
+    }
 
     public PipelinePositionService(PipelineChains chains, SrsMetaStore meta, ArtifactStore artifacts,
             LivePipelines live, AuditGate auditGate) {
+        this(chains, meta, artifacts, live, auditGate, null);
+    }
+    public PipelinePositionService(PipelineChains chains, SrsMetaStore meta, ArtifactStore artifacts,
+            LivePipelines live, AuditGate auditGate, WriteBack nativeWriteBack) {
         this.chains = Objects.requireNonNull(chains, "chains");
         this.meta = Objects.requireNonNull(meta, "meta");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.live = Objects.requireNonNull(live, "live");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
+        this.nativeWriteBack = nativeWriteBack;
     }
 
     /**
@@ -57,6 +69,7 @@ public final class PipelinePositionService {
      */
     public PipelinePosition read(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        Runnable current=chains.readingGuard(pipelineId);
         List<PipelinePosition.Chain> reported = new ArrayList<>();
         List<PipelineChains.Chain> sources = chains.of(pipelineId);
         for (PipelineChains.Chain chain : sources) {
@@ -64,7 +77,7 @@ public final class PipelinePositionService {
                     .map(PipelineChains.Chain::sourceId).distinct().limit(2).count() == 1;
             reported.add(report(pipelineId, chain, soleSource));
         }
-        return new PipelinePosition(pipelineId, reported);
+        current.run();return new PipelinePosition(pipelineId, reported);
     }
 
     /**
@@ -87,7 +100,11 @@ public final class PipelinePositionService {
             refuseEditsOutsideTheResumePoint(asked, stored);
             String token = asked.resumeFrom() == null ? null : asked.resumeFrom().token();
             if (token != null && !token.equals(tokenOf(stored.resumeFrom()))) {
-                moves.put(stored.chainId(), token);
+                String previous = moves.putIfAbsent(stored.chainId(), token);
+                if (previous != null && !previous.equals(token)) {
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "conflicting resume positions for chain " + stored.chainId()), null);
+                }
             }
         }
         if (moves.isEmpty()) {
@@ -97,9 +114,11 @@ public final class PipelinePositionService {
         for (String chainId : moves.keySet()) {
             refuseWhileAnyReaderIsUp(chainId, current);
         }
+        Runnable nativeAction = nativeWriteBack == null ? null : nativeWriteBack.prepare(pipelineId, current, Map.copyOf(moves));
         return auditGate.dispatch(
                 ControlOperations.PIPELINE_SET_POSITION, new AuditContext(caller, pipelineId), () -> {
-                    moves.forEach((chainId, token) -> {
+                    if (nativeAction != null) nativeAction.run();
+                    else moves.forEach((chainId, token) -> {
                         releaseTheAcksThatWouldOutrankIt(chainId);
                         meta.rewindSourceReadOffset(chainId, token);
                     });
@@ -141,11 +160,13 @@ public final class PipelinePositionService {
     /** The stored chain the request names, or a coded refusal naming the ones this pipeline does read. */
     private static PipelinePosition.Chain matching(
             PipelinePosition current, PipelinePosition.Chain asked, String pipelineId) {
+        PipelinePosition.Chain first = null;
         for (PipelinePosition.Chain chain : current.chains()) {
-            if (chain.chainId().equals(asked.chainId())) {
-                return chain;
-            }
+            if (!chain.chainId().equals(asked.chainId())) continue;
+            if (asked.sourceId() == null || asked.sourceId().equals(chain.sourceId())) return chain;
+            if (first == null) first = chain;
         }
+        if (first != null) return first; // The existing field check reports a changed sourceId.
         throw new TapstateException(PositionError.CHAIN_NOT_READ, Map.of(
                 "chain", String.valueOf(asked.chainId()),
                 "pipeline", pipelineId,
@@ -239,7 +260,7 @@ public final class PipelinePositionService {
 
     /** One chain's reading: where it resumes, when that was written, this pipeline's ack, and who shares it. */
     private PipelinePosition.Chain report(String pipelineId, PipelineChains.Chain chain, boolean soleSource) {
-        Optional<SrsMeta> record = meta.read(chain.chainId());
+        Optional<SrsMeta> record = chains.canReadPositions(pipelineId,chain)?meta.read(chain.chainId()):Optional.empty();
         String consumer = SrsConsumerId.of(pipelineId, chain.sourceId()).value();
         Optional<ConsumerOffset> mine = record.flatMap(found -> found.consumerOffset(consumer)
                 .or(() -> soleSource ? found.consumerOffset(pipelineId) : Optional.empty()));

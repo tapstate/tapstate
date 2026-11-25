@@ -1,0 +1,1100 @@
+package io.tapstate.app;
+
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
+
+import io.tapstate.adapters.mongostore.*;
+import io.tapstate.control.core.*;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.spi.store.*;
+import java.time.Clock;
+import java.util.*;
+import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/** CONFIG-first production ownership. Reads cannot turn an unavailable existing installation into a new one. */
+final class StorageRoot implements AutoCloseable {
+    private static final Logger LOG = LoggerFactory.getLogger(StorageRoot.class);
+    enum Phase { CONFIGURATION_REQUIRED, CONFIGURATION_UNAVAILABLE, SETUP_REQUIRED, CACHE_UNAVAILABLE, AUTH_READY, BUSINESS_READY }
+    private final CloudRuntimeSettings cloud;
+    // Publishes an owner identity; the runtime synchronizes its own mutable lifecycle.
+    @SuppressWarnings("java:S3077")
+    private volatile StorageRuntime runtime;
+    // Publishes an authentication owner whose operations retain their own guards.
+    @SuppressWarnings("java:S3077")
+    private volatile StorageAuthentication authentication;
+    // Publishes a replacement immutable endpoint snapshot.
+    @SuppressWarnings("java:S3077")
+    private volatile Optional<StorageBinding.Connection> endpoint;
+    private final java.util.function.Supplier<MongoConfigurationDomain> configurationLoader;
+    private final Function<MongoConfigurationDomain, StorageRuntime> runtimes;
+    private final Function<MongoConfigurationDomain, StorageAuthentication> authentications;
+    private final CloudConfigurationInitialization initialization;
+    private final byte[] authenticationKey;
+    private volatile Phase phase;
+    private volatile boolean closed;
+    private volatile boolean closeRequested;
+    private final ShutdownAwait shutdown = new ShutdownAwait();
+    private final AdmissionDrain replacements = new AdmissionDrain();
+    private final Set<AutoCloseable> unpublished = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Object authenticationContinuationLock = new Object();
+    private java.util.concurrent.ExecutorService authenticationWorker;
+    private java.util.concurrent.CompletableFuture<Void> pendingAuthentication;
+    private FirstCacheCreation attemptedCreation;
+    private Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> retainedAssembly;
+    private java.util.function.Supplier<StorageSetupService.DefaultTarget> retainedTarget;
+    // Publishes the immutable operation identity for read-only activation projections.
+    @SuppressWarnings("java:S3077")
+    private volatile StorageBindingCommit setupInvocation;
+    private java.util.concurrent.ExecutorService recoveryWorker;
+    private final Object activationLock = new Object();
+    private java.util.concurrent.ExecutorService activationWorker;
+    private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pendingActivation = new java.util.concurrent.atomic.AtomicReference<>();
+    private record InstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete,
+            java.util.function.BooleanSupplier deliveryPending, Runnable deliver) {}
+    private final java.util.concurrent.atomic.AtomicReference<InstallationCompletion> installationCompletion = new java.util.concurrent.atomic.AtomicReference<>();
+    private volatile boolean installationCompletionRegistered;
+    private volatile boolean installationReadinessPublished;
+    private volatile boolean activationStoragePrepared;
+    private boolean initialSourceTestPending;
+    private volatile boolean activationFailed;
+    private volatile boolean recoveryQueued;
+    private volatile boolean recoveryFailed;
+    private record RecoveryFailure(StorageRecoveryCommands.Plan operation, TapstateException cause) {}
+    // Publishes the completed recovery failure identity without mutating its contents.
+    @SuppressWarnings("java:S3077")
+    private volatile RecoveryFailure recoveryFailure;
+    private final Runnable installationActive;
+    private final StorageInitializationProgress initializationProgress;
+    private volatile boolean configurationQuotaExceeded;
+
+    StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
+            MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey) {
+        this(mongo, cloud, bridge, boot, history, secrets, clock, signingKey, () -> {});
+    }
+    StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
+            MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey, Runnable installationActive) {
+        this.installationActive = Objects.requireNonNull(installationActive);
+        initializationProgress = new StorageInitializationProgress(clock);
+        this.cloud = Objects.requireNonNull(cloud);
+        String uri = cloud.metadataUri(mongo.getUri());
+        StorageBinding.Connection selectedEndpoint = null;
+        MongoConnectionSettings selectedSettings = null;
+        phase = Phase.CONFIGURATION_REQUIRED;
+        if (mongo.isEnabled() && uri != null && !uri.isBlank()) {
+            try {
+                selectedEndpoint = new StorageBinding.Connection(
+                        // Platform CONFIG retains its supplied driver/authentication policy. Only the
+                        // customer's CACHE and MASTER inputs use the restricted Atlas setup policy.
+                        StorageBinding.Connection.Kind.MONGODB,
+                        uri, MongoDatabaseNames.fromUri(uri), readCa(mongo.getTlsCaFile()));
+                selectedSettings = new MongoConnectionSettings(uri, mongo.getTlsCaFile(), mongo.getServerSelectionTimeout(), boot.value());
+            } catch (TapstateException unavailable) {
+                phase = Phase.CONFIGURATION_UNAVAILABLE;
+            }
+        }
+        endpoint = Optional.ofNullable(selectedEndpoint);
+        var settings = selectedSettings;
+        initialization = settings != null && cloud.cloud() ? new CloudConfigurationInitialization(settings, cloud, bridge, boot) : null;
+        configurationLoader = settings == null ? null : initialization != null ? initialization::open : () -> MongoConfigurationDomain.openExisting(settings);
+        authenticationKey = signingKey.clone();
+        authentications = configuration -> new StorageAuthentication(configuration, cloud, bridge, secrets, clock, authenticationKey);
+        runtimes = original -> new StorageRuntime(original, binding -> {
+            if (original == null) throw StorageRuntime.unavailable();
+            var preparation = original.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
+            var target = original.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
+            if (!(target.config().get("uri") instanceof String masterUri)) throw StorageRuntime.unavailable();
+            var databases = new OperatorDatabaseBinding(preparation.businessScope(), binding.cache().database(),
+                    original.databaseName(), MongoDatabaseNames.fromUri(masterUri));
+            return MongoCacheDomain.connect(binding.cache(), mongo.getServerSelectionTimeout(), boot.value(), history.getRetention(), databases);
+        }, this::requireOpen);
+        runtime = runtimes.apply(null); authentication = authentications.apply(null);
+        loadConfiguration();
+    }
+
+    /** Explicit Cloud entry can retry initial CONFIG IO using the same process-owned creation invocation. */
+    private void loadConfiguration() {
+        if(!replacements.enter())throw StorageRuntime.unavailable();
+        try {synchronized(this){loadConfigurationOwned();}}finally{replacements.leave();}
+    }
+    private void loadConfigurationOwned() {
+        requireOpen();
+        if (configurationLoader == null || runtime.configuration().isPresent()) return;
+        MongoConfigurationDomain candidate = null;
+        try {
+            candidate = configurationLoader.get();
+            var nextRuntime = retainUnpublished(runtimes.apply(candidate));
+            var nextAuthentication = retainUnpublished(authentications.apply(candidate));
+            authentication.close(); runtime.close();
+            requireOpen();
+            runtime = nextRuntime; authentication = nextAuthentication; phase = Phase.SETUP_REQUIRED;
+            unpublished.remove(nextRuntime);unpublished.remove(nextAuthentication);
+            configurationQuotaExceeded = false;
+        } catch (RuntimeException | Error failure) {
+            closeUnpublished(failure);
+            if (candidate != null) try { candidate.close(); }
+            catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
+            if (!(failure instanceof TapstateException coded)) throw failure;
+            // Generic reachability and refusal to replay may obscure the first failure; a new
+            // specific diagnosis supersedes it even while configuration remains unavailable.
+            boolean secondaryRefusal = coded.code() == ControlError.STORAGE_UNAVAILABLE || coded.code() == IoError.STORE_UNAVAILABLE
+                    || coded.code() == StoreError.INITIALIZATION_REFUSED;
+            configurationQuotaExceeded = quota(coded) || configurationQuotaExceeded && secondaryRefusal;
+            phase = Phase.CONFIGURATION_UNAVAILABLE;
+        }
+    }
+
+    private static boolean quota(TapstateException failure) {
+        return failure.code() == IoError.STORE_QUOTA_EXCEEDED || failure.code() == ControlError.STORAGE_QUOTA_EXCEEDED;
+    }
+
+    private TapstateException initializationDiagnostic(TapstateException failure) {
+        if (quota(failure) || (configurationQuotaExceeded || originalInitializationQuota())
+                && (failure.code() == ControlError.STORAGE_UNAVAILABLE || failure.code() == IoError.STORE_UNAVAILABLE
+                    || failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.CACHE_BUSINESS_FENCED))
+            return new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
+        return failure;
+    }
+
+    /** Later CACHE authorities cannot inherit evidence from the original bootstrap operation. */
+    private boolean originalInitializationQuota() {
+        if (!initializationProgress.quotaExceeded()) return false;
+        return runtime.boundForObservation().map(original -> {
+            var authority = original.preparation().authScope();
+            return authority.bindingVersion() == 1 && authority.authGeneration() == 1
+                    && initializationProgress.snapshot(original.binding().setup()).isPresent();
+        }).orElse(true);
+    }
+
+    Optional<CredentialAuthentication> authenticateCredentials(String presented) {
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ENTRY)) {
+            if(!replacements.enter())throw StorageRuntime.unavailable();
+            try{return authenticateCredentialsOwned(presented);}finally{replacements.leave();}
+        }
+    }
+    private Optional<CredentialAuthentication> authenticateCredentialsOwned(String presented) {
+        requireOpen();
+        try { return authentication.credentials().authenticateContext(presented); }
+        catch (TapstateException failure) { throw initializationDiagnostic(failure); }
+    }
+
+    Phase phase() { requireOpen(); return phase; }
+    StorageRuntime runtime() { requireOpen(); return runtime; }
+    Optional<org.springframework.boot.availability.ApplicationAvailability> businessAvailability() {
+        StorageRuntime current = runtime;
+        if (closed || current == null) return Optional.empty();
+        var business = current.businessForLiveness().orElse(null);
+        return business instanceof NativeBusinessContext nativeBusiness ? nativeBusiness.availability() : Optional.empty();
+    }
+    StorageAuthentication authentication() { requireOpen(); return authentication; }
+    StorageInitializationProgress initializationProgress() { return initializationProgress; }
+    Optional<TapstateException> recoveryFailure() {
+        var current = recoveryFailure; return current == null ? Optional.empty() : Optional.of(current.cause());
+    }
+    Optional<StorageBinding.Connection> configurationEndpoint() {
+        requireOpen(); return runtime.configuration().isPresent() ? endpoint : Optional.empty();
+    }
+    void requireActive() { requireOpen(); }
+    StorageBinding.Mode mode() { return cloud.cloud() ? StorageBinding.Mode.CLOUD : StorageBinding.Mode.OP; }
+
+    StorageSetupService.Status coordinateSetup(java.util.function.Supplier<StorageSetupService.Status> action) {
+        return lifecycle(action);
+    }
+    <T> T coordinateInstallation(java.util.function.Supplier<T> action) { return lifecycle(action); }
+    private <T>T lifecycle(java.util.function.Supplier<T> action){
+        if(!replacements.enter())throw StorageRuntime.unavailable();
+        try{synchronized(this){requireOpen();return action.get();}}finally{replacements.leave();}
+    }
+    synchronized boolean originalSetupCreationAvailable() {
+        return setupInvocation != null && setupInvocation.firstCreation().isPresent()
+                && attemptedCreation != setupInvocation.firstCreation().orElseThrow();
+    }
+
+    synchronized void retainInitialAssembly(Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        retainedAssembly = Objects.requireNonNull(assembly);
+    }
+
+    boolean initialActivationPending() { var current = pendingActivation.get(); return current != null && !current.isDone(); }
+    boolean initialActivationCanRetry() {
+        return activationStoragePrepared || originalSetupCreationAvailable()
+                || installationCompletionPending() && runtime.businessStarted();
+    }
+    void retainInstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete,
+            java.util.function.BooleanSupplier deliveryPending, Runnable deliver) {
+        synchronized (activationLock) {
+            requireOpen();
+            if (cloud.cloud() || !installationCompletion.compareAndSet(null,
+                    new InstallationCompletion(Objects.requireNonNull(pending), Objects.requireNonNull(complete),
+                            Objects.requireNonNull(deliveryPending), Objects.requireNonNull(deliver))))
+                throw new IllegalStateException("installation completion already registered");
+            installationCompletionRegistered = true;
+        }
+    }
+    private boolean installationCompletionPending() {
+        if (!installationCompletionRegistered) return false;
+        var completion = installationCompletion.get();
+        return completion.pending().getAsBoolean() || completion.deliveryPending().getAsBoolean();
+    }
+    private boolean installationFilesPending() {
+        return installationCompletionRegistered && installationCompletion.get().pending().getAsBoolean();
+    }
+    boolean completedInstallationActivationAllowed() {
+        requireOpen();
+        if (runtime.cleanupRequired()) return false;
+        var configuration = runtime.requireConfiguration();
+        var preparation = configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
+        if (preparation.authScope().mode() != StorageBinding.Mode.OP) return false;
+        if (runtime.businessStarted()) {
+            if (!installationFilesPending()) return false;
+            requirePublishedBusinessOwner(null);
+        } else if (preparation.authScope().authGeneration() != 1) return false;
+        OnPremInstallation.requireActivationPreparation(configuration, preparation);
+        return true;
+    }
+
+    private StorageRuntime.Bound requirePublishedBusinessOwner(StorageBindingCommit expected) {
+        requireOpen();
+        var selected = runtime;
+        if (selected.cleanupRequired()) throw StorageRuntime.unavailable();
+        var original = selected.boundForObservation().orElseThrow(StorageRuntime::unavailable);
+        var binding = original.binding(); var preparation = original.preparation();
+        if (expected != null && (!expected.binding().equals(binding) || !expected.preparation().equals(preparation)))
+            throw StorageRuntime.unavailable();
+        var configuration = selected.requireConfiguration();
+        if (!configuration.bindings().load().filter(binding::equals).isPresent()
+                || !configuration.bindings().cachePreparation().filter(preparation::equals).isPresent())
+            throw StorageRuntime.unavailable();
+        original.verifyAuthentication(); original.verifyBusiness();
+        if (cloud.cloud()) authentication.managed(); else authentication.local();
+        if (runtime != selected || selected.boundForObservation().orElseThrow(StorageRuntime::unavailable) != original)
+            throw StorageRuntime.unavailable();
+        return original;
+    }
+
+    private void completeInstallationIfReady(StorageBindingCommit expected) {
+        lifecycle(()->{completeInstallationOwned(expected);return null;});
+    }
+    private void completeInstallationOwned(StorageBindingCommit expected) {
+        if (!installationCompletionPending() || !runtime.businessStarted()) return;
+        var original = requirePublishedBusinessOwner(expected); var scope = original.binding().setup();
+        phase = Phase.BUSINESS_READY;
+        var completion = installationCompletion.get();
+        if (!installationReadinessPublished) {
+            initializationProgress.begin(scope, 2, true);
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+            initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            try {
+                completion.complete().run();
+                initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+                installationReadinessPublished = true;
+            } catch (RuntimeException | Error failure) {
+                activationFailed = true; initializationProgress.failed(scope, failure); throw failure;
+            }
+        }
+        if (completion.deliveryPending().getAsBoolean()) completion.deliver().run();
+        activationFailed = false;
+    }
+
+    private void completeRetainedInstallation() {
+        try { completeInstallationIfReady(null); }
+        catch (TapstateException unavailable) {
+            LOG.warn("Retained installation completion failed [{}]", unavailable.code().code());
+        }
+    }
+
+    /** One original setup handoff; HTTP callers and their capabilities do not own its lifetime. */
+    void handoffActivation(StorageBindingCommit committed, Runnable continuation) {
+        handoffPreparedActivation(committed, () -> continuation);
+    }
+
+    /** Publishes Cloud authentication before returning; only business startup remains asynchronous. */
+    void handoffCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        lifecycle(() -> {
+            handoffPreparedActivation(committed, () -> {
+                var original = continueCloudSetup(committed, target, assembly, false);
+                return () -> lifecycle(() -> { startInitialBusiness(original, assembly, true); return null; });
+            });
+            return null;
+        });
+    }
+
+    private void handoffPreparedActivation(StorageBindingCommit committed, java.util.function.Supplier<Runnable> preparation) {
+        synchronized (activationLock) {
+            requireOpen();
+            if (runtime.cleanupRequired() || committed.binding().bindingVersion() != 1) throw StorageRuntime.unavailable();
+            if (setupInvocation != null && (!setupInvocation.binding().equals(committed.binding())
+                    || !setupInvocation.preparation().equals(committed.preparation()))) throw StorageRuntime.unavailable();
+            setupInvocation = committed;
+            if (phase == Phase.BUSINESS_READY && runtime.businessStarted() && !installationCompletionPending()
+                    || initialActivationPending()) return;
+            activationFailed = false;
+            Runnable continuation;
+            try { continuation = preparation.get(); }
+            catch (RuntimeException | Error failure) { activationFailed = true; throw failure; }
+            if (activationWorker == null) activationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                var thread = new Thread(task, "tapstate-initial-cache-activation"); thread.setDaemon(true); return thread;
+            });
+            var completion = new java.util.concurrent.CompletableFuture<Void>();
+            pendingActivation.set(completion);
+            try {
+                activationWorker.execute(() -> {
+                    try {
+                        if (installationCompletionPending() && runtime.business().isPresent()) {
+                            if (!runtime.businessStarted()) throw StorageRuntime.unavailable();
+                        } else continuation.run();
+                        completeInstallationIfReady(committed);
+                        completion.complete(null);
+                    }
+                    catch (RuntimeException | Error failure) {
+                        activationFailed = true;
+                        if (!installationReadinessPublished) initializationProgress.failed(committed.binding().setup(), failure);
+                        completion.completeExceptionally(failure);
+                        LOG.error("Initial CACHE activation failed [{}]", failure instanceof TapstateException coded
+                                ? coded.code().code() : failure.getClass().getName());
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException closing) {
+                completion.completeExceptionally(StorageRuntime.unavailable()); throw StorageRuntime.unavailable();
+            }
+        }
+    }
+
+    /** Transfers the original installer-owned CONFIG client; the installer retains no second runtime. */
+    void installOnPremConfiguration(MongoConfigurationDomain candidate, StorageBinding.Connection connection) {
+        if(!replacements.enter())throw StorageRuntime.unavailable();
+        try {synchronized(this){installOnPremConfigurationOwned(candidate,connection);}}
+        finally{replacements.leave();}
+    }
+    private void installOnPremConfigurationOwned(MongoConfigurationDomain candidate, StorageBinding.Connection connection) {
+        requireOpen();
+        if (cloud.cloud() || runtime.configuration().isPresent() || runtime.cleanupRequired()) throw StorageRuntime.unavailable();
+        try {
+            var nextRuntime = retainUnpublished(runtimes.apply(candidate));
+            var nextAuthentication = retainUnpublished(authentications.apply(candidate));
+            authentication.close(); runtime.close();requireOpen();
+            endpoint = Optional.of(connection); runtime = nextRuntime; authentication = nextAuthentication; phase = Phase.SETUP_REQUIRED;
+            unpublished.remove(nextRuntime);unpublished.remove(nextAuthentication);
+        }catch(RuntimeException|Error failure){closeUnpublished(failure);throw failure;}
+    }
+    private <T extends AutoCloseable>T retainUnpublished(T owner){unpublished.add(owner);return owner;}
+    private void closeUnpublished(Throwable primary){
+        for(var owner:List.copyOf(unpublished))try{owner.close();unpublished.remove(owner);}
+        catch(Exception|Error cleanup){if(primary!=cleanup)primary.addSuppressed(cleanup);}
+    }
+
+    /** Continues only the original committed setup. No request owns or closes the retained CACHE client. */
+    void continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        lifecycle(()->{continueCloudSetup(committed, target, assembly, true);return null;});
+    }
+    private StorageRuntime.Bound continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly, boolean startBusiness) {
+        requireOpen();
+        if (!cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.CLOUD || runtime.cleanupRequired())
+            throw StorageRuntime.unavailable();
+        var scope = committed.binding().setup();
+        initializationProgress.begin(scope, 1, true);
+        initializationProgress.started(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+        try {
+            var original = prepareInitialSetup(committed, target);
+            authentication.install(original); phase = Phase.AUTH_READY;
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+            if (startBusiness) startInitialBusiness(original, assembly, true);
+            return original;
+        } catch (RuntimeException | Error failure) {
+            initializationProgress.failed(scope, failure);
+            throw failure;
+        }
+    }
+
+    private void startInitialBusiness(StorageRuntime.Bound original,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        startInitialBusiness(original, assembly, false);
+    }
+    private void startInitialBusiness(StorageRuntime.Bound original,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly, boolean awaitInitialReadiness) {
+        var authority = original.preparation().authScope();
+        boolean tracked = authority.authGeneration() == 1;
+        var scope = tracked ? original.binding().setup() : null;
+        if (tracked) {
+            initializationProgress.begin(scope, 2, true);
+            initializationProgress.started(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+        }
+        try {
+            if (awaitInitialReadiness || initialSourceTestPending) runtime.startInitialBusiness(original, assembly);
+            else runtime.startBusiness(original, assembly);
+            if (tracked) {
+                initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+                initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            }
+            phase = Phase.BUSINESS_READY;
+            if (tracked && !installationFilesPending())
+                initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            if (initialSourceTestPending) {
+                initialSourceTestPending = false;
+                try { runtime.businessForLiveness().orElseThrow(StorageRuntime::unavailable).afterInitialReady(); }
+                catch (RuntimeException | Error dispatchFailure) {
+                    LOG.error("Default Source test handoff unavailable [{}]", dispatchFailure.getClass().getName());
+                }
+            }
+        } catch (RuntimeException | Error failure) {
+            if (tracked) initializationProgress.failed(scope, failure);
+            throw failure;
+        }
+    }
+
+    /** OP activates its original CACHE, authentication and business in the current process. */
+    void continueOnPremSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
+        lifecycle(()->{continueOnPremSetupOwned(committed,target);return null;});
+    }
+    private void continueOnPremSetupOwned(StorageBindingCommit committed,StorageSetupService.DefaultTarget target) {
+        requireOpen();
+        if (cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.OP || runtime.cleanupRequired()) throw StorageRuntime.unavailable();
+        var scope = committed.binding().setup();
+        initializationProgress.begin(scope, 1, true);
+        initializationProgress.started(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+        try {
+            var original = prepareInitialSetup(committed, target);
+            authentication.install(original); phase = Phase.AUTH_READY;
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+            startInitialBusiness(original, Objects.requireNonNull(retainedAssembly, "initial business assembly"), true);
+        } catch (RuntimeException | Error failure) {
+            initializationProgress.failed(scope, failure); throw failure;
+        }
+    }
+
+    private StorageRuntime.Bound prepareInitialSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
+        setupInvocation = committed;
+        var original = runtime.loadBound().orElseThrow(StorageRuntime::unavailable);
+        Runnable active = () -> {
+            requireOpen(); original.requireActive();
+            if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original
+                    || !original.binding().equals(committed.binding()) || !original.preparation().equals(committed.preparation())
+                    || !runtime.requireConfiguration().bindings().load().orElseThrow(StorageRuntime::unavailable).equals(committed.binding())
+                    || !runtime.requireConfiguration().bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable).equals(committed.preparation()))
+                throw StorageRuntime.unavailable();
+            if (committed.binding().mode() == StorageBinding.Mode.OP)
+                OnPremInstallation.requireActivationPreparation(runtime.requireConfiguration(), committed.preparation());
+            else runtime.requireConfiguration().requireOriginalInitialPreparation(committed.preparation());
+        };
+        active.run();
+        var configuration = runtime.requireConfiguration();
+        if (configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) {
+            if (committed.preparation().authScope().authGeneration() > 1) throw StorageRuntime.unavailable();
+            initialSourceTestPending = initialSourceTestPending || committed.firstCreation().isPresent();
+            phase = Phase.SETUP_REQUIRED;
+            // Reload the saved encrypted definition and its trust material; a probe's live client is never adopted.
+            var source = configuration.artifacts().get(committed.binding().defaultSourceId())
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
+            if (!(source.config().get("uri") instanceof String uri)
+                    || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())
+                    || cloud.cloud() && !source.connector().equals("mongodb-atlas"))
+                throw StorageRuntime.unavailable();
+            var master = new StorageBinding.Connection(source.connector().equals("mongodb-atlas")
+                    ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB, uri, MongoDatabaseNames.fromUri(uri),
+                    source.config().get(StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca ? ca : null);
+            active.run();
+            if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) {
+                attemptedCreation = committed.firstCreation().orElseThrow();
+                original.cache().prepareFirstAuth(attemptedCreation);
+            } else original.cache().resumeInitialAuth(committed.preparation(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
+            original.verifyAuthentication();
+            configuration.prepareInitialValidationSchema(committed.preparation(), original.cache(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
+            original.verifyBusiness(); active.run();
+            activationStoragePrepared = true;
+            var currentSetup = configuration.setupStates().load().scope();
+            if (!currentSetup.clusterId().equals(committed.binding().setup().clusterId())
+                    || !currentSetup.installationId().equals(committed.binding().setup().installationId())
+                    || !currentSetup.operationId().equals(committed.binding().setup().operationId())) throw StorageRuntime.unavailable();
+            configuration.bindings().guardedBy(active).complete(currentSetup);
+        }
+        active.run();
+        // Completed OP recovery already prepared validation under its original recovery operation.
+        if (cloud.cloud() || configuration.recoveryCommands().current(committed.preparation().authScope()).isEmpty()) {
+            configuration.prepareInitialValidationSchema(committed.preparation(), original.cache(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
+        }
+        original.verifyBusiness(); active.run();
+        return original;
+    }
+
+    /** Explicit startup/operation continuation only. Status reads never connect or initialize a cache. */
+    void loadExisting(Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        loadExisting(assembly, null);
+    }
+    void loadExisting(Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly,
+            java.util.function.Supplier<StorageSetupService.DefaultTarget> target) {
+        lifecycle(()->{loadExistingOwned(assembly,target);return null;});
+    }
+    private void loadExistingOwned(Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly,
+            java.util.function.Supplier<StorageSetupService.DefaultTarget> target) {
+        requireOpen();
+        retainedAssembly = Objects.requireNonNull(assembly);
+        retainedTarget = target;
+        if (runtime.configuration().isEmpty()) return;
+        try {
+            var original = runtime.loadBound();
+            if (original.isEmpty()) { phase = Phase.SETUP_REQUIRED; return; }
+            if (cloud.cloud() && runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) {
+                continueIncompleteCloud(); return;
+            }
+            phase = Phase.CACHE_UNAVAILABLE;
+            try { authentication.install(original.orElseThrow()); }
+            catch (TapstateException unavailable) { restoreAuthentication(); }
+            original = runtime.current(); phase = Phase.AUTH_READY;
+            wakeRecovery();
+            if (runtime.requireConfiguration().setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE) {
+                var retained = original.orElseThrow();
+                retained.cache().prepareRetainedAggregateState(retained.preparation().businessScope(), retained::requireActive);
+                startInitialBusiness(retained, assembly);
+                wakeRecovery();
+            }
+        } catch (TapstateException unavailable) {
+            if (unavailable.code() == BootError.NODE_ID_IN_USE) throw unavailable;
+            LOG.warn("Retained storage startup failed [{}]", unavailable.code().code());
+            if (phase != Phase.AUTH_READY) phase = Phase.CACHE_UNAVAILABLE;
+        }
+        completeRetainedInstallation();
+    }
+
+    LocalAuthenticationContext localAuthentication() {
+        return authenticationContext((owner, budget) -> owner.local(budget));
+    }
+
+    ManagedAuthenticationContext managedAuthentication() {
+        return authenticationContext((owner, budget) -> owner.managed(budget));
+    }
+
+    /** Valid sessions never join business startup; a missing owner waits only within this request's allowance. */
+    private <T> T authenticationContext(java.util.function.BiFunction<StorageAuthentication, MongoReadBudget, T> select) {
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.CONTEXT_SELECT)) {
+            requireOpen();
+            long deadline = System.nanoTime() + StorageAuthentication.AUTHORIZATION_READ_BUDGET.toNanos();
+            var budget = new MongoReadBudget(StorageAuthentication.AUTHORIZATION_READ_BUDGET);
+            T result;
+            try { result = selectAuthentication(select, budget); }
+            catch (TapstateException unavailable) {
+                if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE && !quota(unavailable)) throw unavailable;
+                var pending = continueAuthentication();
+                try (var waiting = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.CONTINUATION_WAIT)) { pending.get(Math.max(0, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt(); throw StorageRuntime.unavailable();
+                } catch (java.util.concurrent.TimeoutException timeout) { throw initializationDiagnostic(StorageRuntime.unavailable()); }
+                catch (java.util.concurrent.ExecutionException failed) {
+                    if (failed.getCause() instanceof TapstateException coded) throw initializationDiagnostic(coded);
+                    if (failed.getCause() instanceof RuntimeException failure) throw failure;
+                    if (failed.getCause() instanceof Error failure) throw failure;
+                    throw new IllegalStateException("authentication continuation failed", failed.getCause());
+                }
+                try { result = selectAuthentication(select, budget); }
+                catch (TapstateException failure) { throw initializationDiagnostic(failure); }
+            }
+            if (System.nanoTime() >= deadline) throw StorageRuntime.unavailable();
+            continueAuthentication();
+            return result;
+        }
+    }
+
+    private <T> T selectAuthentication(java.util.function.BiFunction<StorageAuthentication, MongoReadBudget, T> select,
+            MongoReadBudget budget) {
+        if(!replacements.enter())throw StorageRuntime.unavailable();
+        try{return selectAuthenticationOwned(select,budget);}finally{replacements.leave();}
+    }
+    private <T> T selectAuthenticationOwned(java.util.function.BiFunction<StorageAuthentication,MongoReadBudget,T> select,MongoReadBudget budget) {
+        requireOpen();
+        StorageAuthentication original = authentication;
+        T result = select.apply(original, budget);
+        requireOpen();
+        if (authentication != original) throw StorageRuntime.unavailable();
+        return result;
+    }
+
+    private java.util.concurrent.CompletableFuture<Void> continueAuthentication() {
+        synchronized (authenticationContinuationLock) {
+            requireOpen();
+            if (pendingAuthentication != null) return pendingAuthentication;
+            var pending = new java.util.concurrent.CompletableFuture<Void>();
+            pendingAuthentication = pending;
+            if (authenticationWorker == null) authenticationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                var worker = new Thread(task, "storage-authentication-continuation"); worker.setDaemon(true); return worker;
+            });
+            authenticationWorker.execute(() -> {
+                try {
+                    synchronized (StorageRoot.this) {
+                        requireOpen();
+                        if (cloud.cloud() && runtime.configuration().isEmpty()) loadConfiguration();
+                        if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
+                        if (cloud.cloud() && runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE)
+                            continueIncompleteCloud(false);
+                        try {
+                            if (cloud.cloud()) authentication.managed(); else authentication.local();
+                        } catch (TapstateException unavailable) {
+                            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
+                            restoreAuthentication();
+                        }
+                        requireOpen();
+                        // Complete before starting business while retaining one coalesced continuation through its cleanup.
+                        pending.complete(null);
+                        resumeRetainedBusiness(); wakeRecovery();
+                    }
+                } catch (RuntimeException | Error failure) {
+                    pending.completeExceptionally(failure);
+                    if (!(failure instanceof TapstateException)) throw failure;
+                } finally {
+                    synchronized (authenticationContinuationLock) {
+                        if (pendingAuthentication == pending) pendingAuthentication = null;
+                    }
+                }
+            });
+            return pending;
+        }
+    }
+
+    private void continueIncompleteCloud() {
+        continueIncompleteCloud(true);
+    }
+    private void continueIncompleteCloud(boolean startBusiness) {
+        phase = Phase.SETUP_REQUIRED;
+        if (retainedAssembly == null) return;
+        var bound = runtime.loadBound();
+        if (bound.isEmpty()) return;
+        var original = bound.orElseThrow();
+        if (original.preparation().authScope().authGeneration() == 1 && retainedTarget != null) {
+            var committed = setupInvocation != null && setupInvocation.binding().equals(original.binding())
+                    && setupInvocation.preparation().equals(original.preparation()) ? setupInvocation
+                    : new StorageBindingCommit(original.binding(), original.preparation(), Optional.empty());
+            try { continueCloudSetup(committed, retainedTarget.get(), retainedAssembly, startBusiness); return; }
+            catch (TapstateException unavailable) { /* The original invocation is retained; never manufacture another. */ }
+            if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) return;
+        }
+        try {
+            var restored = runtime.restoreAuthentication();
+            if (restored.preparation().authScope().authGeneration() > 1) {
+                if (restored != original) authentication.invalidateFormal();
+                authentication.install(restored); phase = Phase.AUTH_READY; wakeRecovery();
+            }
+        } catch (TapstateException unavailable) { phase = Phase.CACHE_UNAVAILABLE; }
+    }
+
+    StorageRecoveryService recoveryService(Clock clock) {
+        requireOpen();
+        var configuration = runtime.requireConfiguration();
+        return new StorageRecoveryService(configuration.recoveryCommands(), new StorageRecoveryService.Inspector() {
+            @Override public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {
+                if(selection.extent()==StorageRecoveryCommands.Extent.SHARED_SRS)return sharedRecovery(scope).inspect(selection);
+                synchronized (StorageRoot.this) { return recoveryManifest(scope, selection, true); }
+            }
+            @Override public void requirePlanningCurrent(CacheAuthScope scope,StorageRecoveryCommands.Manifest manifest) {
+                if(manifest.selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS)sharedRecovery(scope).requirePlanningCurrent(manifest);
+                else requireCurrent(scope,manifest);
+            }
+            @Override public StorageRecoveryCommands.Plan prepared(StorageRecoveryCommands.Plan original,Runnable active) {
+                return original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS
+                        ?sharedRecovery(original.originalScope()).prepared(original,active):original;
+            }
+            @Override public Optional<java.util.function.Supplier<StorageRecoveryCommands.Plan>> replanning(StorageRecoveryCommands.Plan original,Runnable active) {
+                return original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS
+                        ?sharedRecovery(original.originalScope()).replanning(original,active):Optional.empty();
+            }
+            @Override public void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest manifest) {
+                if(manifest.selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS){sharedRecovery(scope).requireFinalized(manifest);return;}
+                synchronized (StorageRoot.this) {
+                    var actual = manifest.selection().extent()==StorageRecoveryCommands.Extent.PIPELINE
+                            ? pipelineRecovery(scope).inspectCurrent(manifest.selection()).manifest():recoveryManifest(scope, manifest.selection(), true);
+                    if (!actual.definitionHashes().equals(manifest.definitionHashes()) || !actual.dependencyHash().equals(manifest.dependencyHash()))
+                        throw StorageRuntime.unavailable();
+                }
+            }
+            @Override public StorageRecoveryService.Presentation present(StorageRecoveryCommands.Plan original) {
+                requireOpen();
+                if (original.manifest().selection().extent() == StorageRecoveryCommands.Extent.CLUSTER)
+                    return new StorageRecoveryService.Presentation(runtime.boundForObservation()
+                            .map(bound -> bound.preparation().authScope().equals(original.originalScope())).orElse(false), List.of(), recoveryFailureCode(original));
+                if (runtime.businessForLiveness().isEmpty()) {
+                    requireOpen();
+                    if (original.manifest().selection().extent() == StorageRecoveryCommands.Extent.PIPELINE)
+                        return new StorageRecoveryService.Presentation(false, List.of(), recoveryFailureCode(original));
+                    throw StorageRuntime.unavailable();
+                }
+                synchronized(StorageRoot.this) {
+                    String failure = recoveryFailureCode(original);
+                    if(original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS)
+                        return new StorageRecoveryService.Presentation(sharedRecovery(original.originalScope()).isCurrent(original),List.of(),failure);
+                    if(original.manifest().selection().extent()!=StorageRecoveryCommands.Extent.PIPELINE)
+                        return new StorageRecoveryService.Presentation(runtime.current().map(bound -> bound.preparation().authScope().equals(original.originalScope())).orElse(false),List.of(),failure);
+                    try {
+                        var nativeRecovery=pipelineRecovery(original.originalScope());
+                        if(failure==null)failure=nativeRecovery.failureCode(original);
+                        var inspected=nativeRecovery.inspectCurrent(original.manifest().selection());
+                        boolean current=inspected.manifest().definitionHashes().equals(original.manifest().definitionHashes())
+                                && inspected.manifest().dependencyHash().equals(original.manifest().dependencyHash());
+                        return new StorageRecoveryService.Presentation(current,current?inspected.targets().stream().map(target ->
+                                new StorageRecoveryService.TargetPolicy(target.node(),target.source(),target.policy().name())).toList():List.of(),failure);
+                    } catch(TapstateException unavailable) {return new StorageRecoveryService.Presentation(false,List.of(),failure);}
+                }
+            }
+            @Override public void verifyExternal(CacheAuthScope scope,StorageRecoveryCommands.Manifest manifest) {
+                if(manifest.selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS){sharedRecovery(scope).verifyExternal(manifest,() -> {});return;}
+                synchronized(StorageRoot.this) {
+                    if(manifest.selection().extent()!=StorageRecoveryCommands.Extent.PIPELINE)return;
+                    var actual=pipelineRecovery(scope).verifyExternal(manifest.selection()).manifest();
+                    if(!actual.definitionHashes().equals(manifest.definitionHashes()) || !actual.dependencyHash().equals(manifest.dependencyHash()))throw StorageRuntime.unavailable();
+                }
+            }
+        }, new AuditGate(configuration.audit(), clock), this::scheduleRecovery);
+    }
+
+    private String recoveryFailureCode(StorageRecoveryCommands.Plan original) {
+        var failed = recoveryFailure;
+        return failed != null && failed.operation().operationId().equals(original.operationId())
+                && failed.operation().originalScope().equals(original.originalScope())
+                && failed.operation().controlRevision() == original.controlRevision()
+                && original.phase() != StorageRecoveryCommands.Phase.COMPLETE ? failed.cause().code().code() : null;
+    }
+
+    private StorageRuntime.Bound requireRecoveryOwner(CacheAuthScope scope) {
+        requireOpen();
+        if (runtime.cleanupRequired() || retainedTarget == null || retainedAssembly == null) throw StorageRuntime.unavailable();
+        var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
+        original.requireActive();
+        if (!original.preparation().authScope().equals(scope)) throw StorageRuntime.unavailable();
+        runtime.requireConfiguration().requireAuthenticationPublished(original.preparation());
+        original.verifyAuthentication(); return original;
+    }
+
+    private NativePipelineRecovery pipelineRecovery(CacheAuthScope scope) {
+        requireRecoveryOwner(scope);
+        if(!(runtime.business().orElseThrow(StorageRuntime::unavailable) instanceof NativeBusinessContext nativeBusiness))throw StorageRuntime.unavailable();
+        return nativeBusiness.pipelineRecovery();
+    }
+
+    private synchronized NativeSharedSrsRecovery sharedRecovery(CacheAuthScope scope) {
+        return sharedBusiness(scope).sharedRecovery();
+    }
+
+    private synchronized NativeBusinessContext sharedBusiness(CacheAuthScope scope) {
+        requireRecoveryOwner(scope);
+        if(!(runtime.business().orElseThrow(StorageRuntime::unavailable) instanceof NativeBusinessContext nativeBusiness))throw StorageRuntime.unavailable();
+        return nativeBusiness;
+    }
+
+    private StorageRecoveryCommands.Manifest recoveryManifest(CacheAuthScope scope, StorageRecoveryCommands.Selection selection, boolean authOnly) {
+        if(selection.extent()==StorageRecoveryCommands.Extent.PIPELINE)return pipelineRecovery(scope).inspect(selection).manifest();
+        if (runtime.requireConfiguration().setupStates().load().phase()!=StorageSetupStateStore.Phase.COMPLETE)
+            return initialManifest(scope,selection,authOnly);
+        var original=requireRecoveryOwner(scope);
+        if (selection.extent()!=StorageRecoveryCommands.Extent.CLUSTER || runtime.business().isPresent()) throw StorageRuntime.unavailable();
+        if (authOnly) original.cache().verifyAuthenticationOnly(scope);
+        var configuration=runtime.requireConfiguration();
+        var changes=configuration.cacheRecoveries().inspectCluster(scope);
+        var hashes=new TreeMap<String,String>();
+        for(var resource:configuration.artifacts().list()) hashes.put(resource.id(),io.tapstate.core.model.canonical.CanonicalHash.of(resource));
+        var affected=changes.stream().map(change -> change.targetScope().pipelineId()).collect(java.util.stream.Collectors.toSet());
+        return new StorageRecoveryCommands.Manifest(selection,affected,hashes,CacheRecoveryStore.clusterDependencyHash(scope,changes),configuration.configurationRevision());
+    }
+
+    private StorageRecoveryCommands.Manifest initialManifest(CacheAuthScope scope, StorageRecoveryCommands.Selection selection, boolean authOnly) {
+        var original = requireRecoveryOwner(scope);
+        if (selection.extent() != StorageRecoveryCommands.Extent.CLUSTER || runtime.business().isPresent()) throw StorageRuntime.unavailable();
+        var configuration = runtime.requireConfiguration();
+        var source = configuration.initialCloudRecoverySource(scope);
+        if (authOnly) original.cache().verifyAuthenticationOnly(scope);
+        var master = master(source);
+        var connector = retainedTarget.get().identity(master);
+        String dependency = io.tapstate.core.model.canonical.CanonicalHash.ofText(io.tapstate.core.common.JsonWriter.write(List.of(
+                "initial-cloud-binding", original.binding().setup().installationId(), original.binding().setup().operationId(),
+                scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), scope.authGeneration(), connector.artifactHash(), connector.specHash())));
+        return new StorageRecoveryCommands.Manifest(selection, Set.of(), Map.of(source.id(), io.tapstate.core.model.canonical.CanonicalHash.of(source)),
+                dependency, configuration.configurationRevision());
+    }
+
+    private void wakeRecovery() {
+        if (runtime.cleanupRequired() || runtime.current().isEmpty()) return;
+        var scope = runtime.current().orElseThrow().preparation().authScope();
+        runtime.requireConfiguration().recoveryCommands().current(scope).filter(plan -> plan.originalScope().equals(scope)
+                && (scope.authGeneration()>=2 || plan.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS))
+                .ifPresent(plan -> scheduleRecovery(plan,false));
+    }
+
+    private synchronized void scheduleRecovery(StorageRecoveryCommands.Plan original) {scheduleRecovery(original,true);}
+    private void scheduleRecovery(StorageRecoveryCommands.Plan original,boolean explicitContinuation) {
+        lifecycle(()->{scheduleRecoveryOwned(original,explicitContinuation);return null;});
+    }
+    private void scheduleRecoveryOwned(StorageRecoveryCommands.Plan original,boolean explicitContinuation) {
+        requireOpen();
+        boolean pipeline=original.manifest().selection().extent()==StorageRecoveryCommands.Extent.PIPELINE;
+        boolean shared=original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS;
+        if(shared && runtime.business().isEmpty())return;
+        if(pipeline && original.phase()==StorageRecoveryCommands.Phase.RUNNING && !explicitContinuation)return;
+        if (original.phase()==StorageRecoveryCommands.Phase.COMPLETE) {
+            requireRecoveryOwner(original.originalScope());
+            if(runtime.requireConfiguration().recoveryCommands().find(original.originalScope(),original.operationId()).filter(original::equals).isEmpty())
+                throw StorageRuntime.unavailable();
+            if(!shared)resumeRetainedBusiness();return;
+        }
+        if (original.phase() != StorageRecoveryCommands.Phase.CONFIRMED && original.phase() != StorageRecoveryCommands.Phase.RUNNING) return;
+        requireRecoveryOwner(original.originalScope());
+        if (recoveryQueued) return;
+        long acceptedRevision=pipeline?pipelineRecovery(original.originalScope()).acceptedIntentRevision(original):-1;
+        NativeBusinessContext sharedRuntime=shared?sharedBusiness(original.originalScope()):null;
+        if (recoveryWorker == null) recoveryWorker = java.util.concurrent.Executors.newSingleThreadExecutor(
+                Thread.ofPlatform().daemon(true).name("cache-recovery").factory());
+        recoveryQueued = true; recoveryFailed = false; recoveryFailure = null;
+        recoveryWorker.execute(() -> {
+            if(shared) {
+                try {
+                    sharedRuntime.awaitAvailability();
+                    NativeSharedSrsRecovery recovery;
+                    synchronized(StorageRoot.this) {
+                        if(sharedBusiness(original.originalScope())!=sharedRuntime)throw StorageRuntime.unavailable();
+                        recovery=sharedRuntime.sharedRecovery();
+                    }
+                    recovery.run(original);
+                }
+                catch(TapstateException unavailable){synchronized(StorageRoot.this){recoveryFailure=new RecoveryFailure(original,unavailable);}}
+                finally {synchronized(StorageRoot.this){recoveryQueued=false;}}
+                return;
+            }
+            synchronized (StorageRoot.this) {
+                try {
+                    if(pipeline)pipelineRecovery(original.originalScope()).start(original,explicitContinuation,acceptedRevision);
+                    else if(runtime.requireConfiguration().setupStates().load().phase()==StorageSetupStateStore.Phase.COMPLETE && !isInitialRecovery(original)) runStoppedRecovery(original);
+                    else runInitialRecovery(original);
+                }
+                catch (TapstateException unavailable) { recoveryFailure = new RecoveryFailure(original, unavailable);recoveryFailed=!pipeline; }
+                finally { recoveryQueued = false; }
+            }
+        });
+    }
+
+    private boolean isInitialRecovery(StorageRecoveryCommands.Plan original) {
+        if (!cloud.cloud() || original.manifest().selection().extent()!=StorageRecoveryCommands.Extent.CLUSTER
+                || !original.manifest().affectedPipelineIds().isEmpty())return false;
+        try {
+            var expected=initialManifest(original.originalScope(),original.manifest().selection(),false);
+            return expected.definitionHashes().equals(original.manifest().definitionHashes()) && expected.dependencyHash().equals(original.manifest().dependencyHash());
+        } catch(TapstateException unavailable) {return false;}
+    }
+
+    /** Confirmation includes operator isolation of all old members and external in-flight writes. */
+    private void runStoppedRecovery(StorageRecoveryCommands.Plan requested) {
+        var original=requireRecoveryOwner(requested.originalScope());var configuration=runtime.requireConfiguration();
+        var commands=configuration.recoveryCommands();
+        var current=commands.find(requested.originalScope(),requested.operationId()).orElseThrow(StorageRuntime::unavailable);
+        if(current.phase()==StorageRecoveryCommands.Phase.COMPLETE){resumeRetainedBusiness();return;}
+        if(current.manifest().selection().extent()!=StorageRecoveryCommands.Extent.CLUSTER)throw StorageRuntime.unavailable();
+        var inspected=recoveryManifest(current.originalScope(),current.manifest().selection(),current.phase()==StorageRecoveryCommands.Phase.CONFIRMED);
+        if(!inspected.definitionHashes().equals(current.manifest().definitionHashes()) || !inspected.dependencyHash().equals(current.manifest().dependencyHash()))
+            throw StorageRuntime.unavailable();
+        Runnable local=() -> {
+            requireOpen();original.requireActive();
+            if(runtime.current().orElseThrow(StorageRuntime::unavailable)!=original || runtime.cleanupRequired() || runtime.business().isPresent())
+                throw StorageRuntime.unavailable();
+        };
+        local.run();configuration.cacheRecoveries().guardedBy(local).stageCluster(current);
+        var running=commands.find(current.originalScope(),current.operationId()).orElseThrow(StorageRuntime::unavailable);
+        configuration.prepareStoppedRecovery(original.cache(),running,local);
+        original.verifyBusiness();local.run();
+        runtime.startRecoveredBusiness(original,retainedAssembly,running,() -> commands.guardedBy(local).complete(running));
+        phase=Phase.BUSINESS_READY;
+        completeRetainedInstallation();
+    }
+
+    private void runInitialRecovery(StorageRecoveryCommands.Plan requested) {
+        var original = requireRecoveryOwner(requested.originalScope());
+        var configuration = runtime.requireConfiguration();
+        var commands = configuration.recoveryCommands();
+        var current = commands.find(requested.originalScope(), requested.operationId()).orElseThrow(StorageRuntime::unavailable);
+        if (current.phase() == StorageRecoveryCommands.Phase.COMPLETE) return;
+        var inspected = initialManifest(current.originalScope(), current.manifest().selection(), current.phase() == StorageRecoveryCommands.Phase.CONFIRMED);
+        if (!inspected.definitionHashes().equals(current.manifest().definitionHashes())
+                || !inspected.dependencyHash().equals(current.manifest().dependencyHash())) throw StorageRuntime.unavailable();
+        var source = configuration.initialCloudRecoverySource(current.originalScope());
+        var target = retainedTarget.get(); var master = master(source);
+        target.test(master, source, target.identity(master));
+        var running = current.phase() == StorageRecoveryCommands.Phase.CONFIRMED ? commands.start(current) : current;
+        Runnable active = () -> {
+            requireOpen(); original.requireActive();
+            if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original || runtime.cleanupRequired()
+                    || !commands.find(running.originalScope(), running.operationId()).filter(running::equals).isPresent()) throw StorageRuntime.unavailable();
+            configuration.requireAuthenticationPublished(original.preparation());
+        };
+        configuration.prepareInitialCloudRecovery(original.cache(), running, active);
+        original.verifyBusiness(); active.run();
+        target.test(master, source, target.identity(master)); active.run();
+        configuration.bindings().guardedBy(active).complete(original.binding().setup());
+        runtime.startRecoveredBusiness(original, retainedAssembly, running, () -> commands.complete(running));
+        phase = Phase.BUSINESS_READY;
+        completeRetainedInstallation();
+    }
+
+    private static StorageBinding.Connection master(SourceResource source) {
+        if (!(source.config().get("uri") instanceof String uri)) throw StorageRuntime.unavailable();
+        return new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, uri, MongoDatabaseNames.fromUri(uri),
+                source.config().get(StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca ? ca : null);
+    }
+
+    private void resumeRetainedBusiness() {
+        if (runtime.cleanupRequired()) return;
+        if (runtime.business().isPresent()) {
+            if (phase != Phase.BUSINESS_READY && runtime.businessStarted()) {
+                requirePublishedBusinessOwner(null); phase = Phase.BUSINESS_READY;
+            }
+            completeRetainedInstallation(); return;
+        }
+        if (retainedAssembly == null) return;
+        if (runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) return;
+        try {
+            var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
+            startInitialBusiness(original, retainedAssembly);
+            recoveryFailed=false;recoveryFailure=null;
+        } catch (TapstateException unavailable) {
+            // Formal login remains usable while a missing or failed business domain stays gated.
+            phase = Phase.AUTH_READY;
+            return;
+        }
+        completeRetainedInstallation();
+    }
+
+    private void restoreAuthentication() {
+        phase = Phase.CACHE_UNAVAILABLE;
+        authentication.invalidateFormal();
+        try {
+            var restored = runtime.restoreAuthentication();
+            authentication.install(restored); phase = runtime.businessStarted() ? Phase.BUSINESS_READY : Phase.AUTH_READY;
+        } catch (TapstateException unavailable) {
+            throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), unavailable);
+        }
+    }
+
+    StorageControlDispatcher.Snapshot snapshot(StorageControlAccess caller, Runnable active) {
+        requireOpen(); active.run();
+        var result = snapshotProjection(caller);
+        active.run(); return result;
+    }
+
+    /** Read-only payload for the dispatcher's enclosing original-credential checks. */
+    StorageControlDispatcher.Snapshot snapshotProjection(StorageControlAccess caller) {
+        requireOpen();
+        // No intermediate value leaves the enclosing credential boundary.
+        var configuration = runtime.requireConfiguration(); var status = configuration.setupStates().load();
+        var preparation = configuration.bindings().cachePreparation();
+        boolean admitted = phase == Phase.BUSINESS_READY && runtime.businessStarted();
+        var health = new EnumMap<StorageSetupService.Layer,StorageControlDispatcher.Health>(StorageSetupService.Layer.class);
+        health.put(StorageSetupService.Layer.CONFIG, StorageControlDispatcher.Health.AVAILABLE);
+        health.put(StorageSetupService.Layer.CACHE, switch (phase) {
+            case BUSINESS_READY -> admitted ? StorageControlDispatcher.Health.AVAILABLE : StorageControlDispatcher.Health.AUTH_READY;
+            case AUTH_READY -> StorageControlDispatcher.Health.AUTH_READY;
+            case CACHE_UNAVAILABLE -> StorageControlDispatcher.Health.UNAVAILABLE;
+            default -> StorageControlDispatcher.Health.UNKNOWN;
+        });
+        var masterVerification = admitted && runtime.business().orElse(null) instanceof NativeBusinessContext businessOwner
+                ? businessOwner.applicationDataVerification() : DefaultSourceVerification.Verification.unknown();
+        health.put(StorageSetupService.Layer.MASTER, switch (masterVerification.status()) {
+            case PASSED -> StorageControlDispatcher.Health.AVAILABLE;
+            case FAILED -> StorageControlDispatcher.Health.UNAVAILABLE;
+            default -> StorageControlDispatcher.Health.UNKNOWN;
+        });
+        var business = switch (phase) {
+            case BUSINESS_READY -> admitted ? StorageControlDispatcher.BusinessPhase.READY : StorageControlDispatcher.BusinessPhase.AUTH_READY;
+            case AUTH_READY -> StorageControlDispatcher.BusinessPhase.AUTH_READY;
+            case SETUP_REQUIRED -> StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED;
+            default -> StorageControlDispatcher.BusinessPhase.UNAVAILABLE;
+        };
+        if (status.phase() == StorageSetupStateStore.Phase.STORAGE_BOUND)
+            business = activationFailed ? StorageControlDispatcher.BusinessPhase.UNAVAILABLE : StorageControlDispatcher.BusinessPhase.PREPARING;
+        var activation = setupInvocation;
+        if (activationFailed && !admitted && activation != null
+                && activation.binding().setup().operationId().equals(status.scope().operationId())
+                && preparation.filter(activation.preparation()::equals).isPresent())
+            business = StorageControlDispatcher.BusinessPhase.UNAVAILABLE;
+        if (runtime.cleanupRequired()) business = StorageControlDispatcher.BusinessPhase.CLEANUP_REQUIRED;
+        boolean awaitingRebuild = !admitted && preparation.map(value -> value.authScope().authGeneration() > 1).orElse(false)
+                && phase == Phase.AUTH_READY;
+        if (awaitingRebuild) business = recoveryQueued ? StorageControlDispatcher.BusinessPhase.RECOVERING
+                : StorageControlDispatcher.BusinessPhase.AWAITING_REBUILD_CONFIRMATION;
+        var failure = recoveryFailure;
+        if (recoveryFailed && failure!=null && preparation.filter(value -> value.authScope().equals(failure.operation().originalScope())).isPresent())
+            business = StorageControlDispatcher.BusinessPhase.UNAVAILABLE;
+        if (runtime.cleanupRequired()) business = StorageControlDispatcher.BusinessPhase.CLEANUP_REQUIRED;
+        boolean formalRecovery = preparation.map(value -> value.authScope().authGeneration() > 1).orElse(false);
+        boolean recoveryAvailable=formalRecovery || admitted;
+        var pending = recoveryAvailable ? configuration.recoveryCommands().current(preparation.orElseThrow().authScope())
+                : Optional.<StorageRecoveryCommands.Plan>empty();
+        var actions = new ArrayList<>(List.of("storage.status", "storage.setup.status"));
+        if (admitted && caller.canTestConnections() && masterVerification.status() != DefaultSourceVerification.Status.CHECKING
+                && (!(runtime.businessForLiveness().orElse(null) instanceof NativeBusinessContext nativeOwner) || nativeOwner.canTestDefaultSource()))
+            actions.add("connection.test");
+        if (caller.cacheScope().isPresent()) {
+            actions.addAll(List.of("configuration.export", "configuration.import.status"));
+            if (admitted) actions.addAll(List.of("configuration.import.preflight", "configuration.import.commit"));
+        }
+        if (!runtime.cleanupRequired()) {
+            if (recoveryAvailable) {
+                actions.add("storage.recovery.status");
+                if (status.phase() == StorageSetupStateStore.Phase.COMPLETE || mode() == StorageBinding.Mode.CLOUD) {
+                    actions.add("storage.recovery.plan");
+                    if (pending.filter(plan -> plan.originalScope().equals(preparation.orElseThrow().authScope())).isPresent())
+                        actions.add("storage.recovery.confirm");
+                }
+            } else if (!admitted && status.bindingVersion() > 0 && !initialActivationPending()) {
+                actions.add("storage.setup.activate");
+            } else if (mode() == StorageBinding.Mode.CLOUD && status.bindingVersion() == 0) {
+                actions.add("storage.test"); actions.add("storage.setup.commit");
+            }
+        }
+        long revision = configuration.configurationRevision();
+        requireOpen();
+        return new StorageControlDispatcher.Snapshot(mode(), status.scope().clusterId(), pending.map(StorageRecoveryCommands.Plan::operationId)
+                .orElseGet(() -> awaitingRebuild ? preparation.orElseThrow().operationId() : status.scope().operationId()),
+                status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),
+                revision, status.phase().name(), business, health,
+                actions, false, masterVerification,
+                cloud.cloud() && !formalRecovery && pending.isEmpty()
+                        ? initializationProgress.snapshot(status.scope()).orElse(null) : null);
+    }
+
+    private void requireOpen() { if (closeRequested || closed) throw StorageRuntime.unavailable(); installationActive.run(); }
+    private static String readCa(String path) {
+        if (path == null || path.isBlank()) return null;
+        try { return java.nio.file.Files.readString(java.nio.file.Path.of(path)); }
+        catch (java.io.IOException invalid) { throw StorageRuntime.unavailable(); }
+    }
+    @Override public void close() {
+        long deadline = ShutdownAwait.deadline();
+        closeRequested = true;
+        replacements.stop();
+        synchronized (authenticationContinuationLock) {
+            if (pendingAuthentication != null) pendingAuthentication.completeExceptionally(StorageRuntime.unavailable());
+            if (authenticationWorker != null) authenticationWorker.shutdown();
+        }
+        synchronized (activationLock) {
+            var activation = pendingActivation.get();
+            if (activation != null) activation.completeExceptionally(StorageRuntime.unavailable());
+            if (activationWorker != null) activationWorker.shutdown();
+        }
+        shutdown.complete(deadline, () -> {
+            replacements.await(deadline);
+            if (recoveryWorker != null) recoveryWorker.shutdown();
+            if (authenticationWorker != null) ShutdownAwait.executor(authenticationWorker, deadline);
+            if (activationWorker != null) ShutdownAwait.executor(activationWorker, deadline);
+            if (recoveryWorker != null) ShutdownAwait.executor(recoveryWorker, deadline);
+            if (initialization != null) initialization.close();
+            var cleanup=StorageRuntime.unavailable();closeUnpublished(cleanup);
+            if(!unpublished.isEmpty())throw cleanup;
+            authentication.close();runtime.close(deadline);
+            closed = true;java.util.Arrays.fill(authenticationKey, (byte)0);
+        });
+    }
+}

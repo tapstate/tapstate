@@ -24,4 +24,8 @@ interface ConnectorReadiness {
      * could not, and why.
      */
     Set<String> requireEveryMemberCanLoad(String pipelineId, Set<String> connectors);
+    default Set<String> requireEveryMemberCanLoad(String pipelineId,Set<String> connectors,java.util.Map<String,String> hashes) {
+        if(!hashes.isEmpty())throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+        return requireEveryMemberCanLoad(pipelineId,connectors);
+    }
 }

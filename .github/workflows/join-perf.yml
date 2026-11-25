@@ -10,17 +10,7 @@
 # holds almost none of it, and the two are orders of magnitude apart - so a number with no tier beside it
 # says nothing, and a lane that ran one tier would be reporting on a third of the product.
 #
-# Three triggers, and each is there for a reason the others do not cover:
-#
-#   - schedule, so slow decay is seen. A number measured daily and thrown away is not a trend, and
-#     nothing else here would notice an operator getting five percent worse a month for a year.
-#   - workflow_dispatch, so a release can start this lane on the commit it is about to ship, and so
-#     anyone can ask for it by hand.
-#   - pull_request, path-gated. This one is easy to mistake for redundancy with the ordinary build and
-#     is not: a workflow file that has never been on the default branch cannot be started any other way.
-#     A schedule fires only on the default branch, and a dispatch needs the workflow registered there
-#     first - so on the change that introduces this lane, this trigger is the only thing that can
-#     demonstrate the lane runs at all, rather than being asserted to run once it merges.
+# Release and Nightly call this workflow on an explicit commit. Join changes also run it in PR CI.
 #
 # The measured rows are kept as an artifact and read back from the previous run, which is the whole of
 # what makes this a trend rather than a daily reading. The comparison prints; it does not fail. What
@@ -29,10 +19,14 @@
 name: join performance
 
 on:
-  workflow_dispatch:
-  schedule:
-    # Off the hour: scheduled runs queue, and the top of an hour is where everyone else's are.
-    - cron: "40 18 * * *"
+  workflow_call:
+    inputs:
+      source-sha:
+        required: true
+        type: string
+      trend-workflow:
+        required: true
+        type: string
   pull_request:
     branches:
       - main
@@ -41,13 +35,13 @@ on:
       - "runtime/engine/src/test/java/io/tapstate/runtime/engine/join/**"
       - "runtime/engine/src/test/resources/join-performance.golden"
       - ".github/workflows/join-perf.yml"
-
-concurrency:
-  group: join-perf-${{ github.ref }}
-  cancel-in-progress: true
+      - ".github/scripts/join-perf.sh"
 
 jobs:
   join-perf:
+    concurrency:
+      group: join-perf-${{ github.workflow }}-${{ inputs.source-sha && github.run_id || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -55,24 +49,28 @@ jobs:
       actions: read # read the previous run's artifact, for the trend
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha || github.sha }}
+
+      - name: Restore the verified Join dependency cache
+        id: join-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: join-maven-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/pom.xml', '.mvn/**', '.github/scripts/join-perf.sh', '.github/scripts/setup-ci-maven.sh', '.github/workflows/join-perf.yml') }}
+          restore-keys: join-maven-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-          cache: maven
+          cache: ${{ steps.join-cache.outputs.cache-matched-key == '' && 'maven' || '' }}
+
+      - name: Set up pinned Maven
+        run: bash .github/scripts/setup-ci-maven.sh
 
       - name: every scenario, on every tier
-        run: |
-          set -o pipefail
-          # -Dtest= reaches every module -am builds, and surefire fails the first upstream one
-          # that holds no such test. The flag below is the one that governs that, and it does not
-          # weaken the lane: a run that measured nothing is caught by the row count in the next
-          # step, which is stricter than surefire could be about it.
-          mvn -B -pl runtime/engine -am test -Dtest=JoinPerformanceGateTest \
-              -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true \
-              -Djoinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5 \
-              -Djoinperf.tiers=hot,mixed,cold 2>&1 | tee run.log
+        run: bash .github/scripts/join-perf.sh
 
       - name: the rows this run measured
         # Extracted rather than scraped later: a lane that finished green having measured nothing is
@@ -83,8 +81,8 @@ jobs:
           rows=$(grep -c '^joinperf	' join-perf.tsv || true)
           echo "measured $rows row(s)"
           # One header line plus eleven scenarios on each of three tiers.
-          if [ "$rows" -lt 34 ]; then
-            echo "::error::the lane produced $rows row(s) where 34 were expected - it ran a subset, or it did not run"
+          if [ "$rows" -ne 34 ]; then
+            echo "::error::the lane produced $rows row(s) where 34 were expected - the measurements do not match the full matrix"
             exit 1
           fi
           cat join-perf.tsv >> "$GITHUB_STEP_SUMMARY"
@@ -95,6 +93,13 @@ jobs:
           path: join-perf.tsv
           retention-days: 90
 
+      - name: Save dependencies verified by the offline Join matrix
+        if: steps.join-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ steps.join-cache.outputs.cache-primary-key }}
+
       - name: what moved since the last run of this lane
         # Informational on purpose. The threshold lives in the test, where the recorded numbers are;
         # a second judgement here would be a second place to argue with, and the two would drift.
@@ -104,11 +109,12 @@ jobs:
         # those to a tenth - so the reader is handed thirty-three changed lines and no way to see which
         # one moved for a reason. What a slow decay looks like is one ratio climbing a few percent a
         # month, and it is only visible next to the number it used to be.
-        if: github.event_name != 'pull_request'
+        if: inputs.trend-workflow != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          TREND_WORKFLOW: ${{ inputs.trend-workflow }}
         run: |
-          previous="$(gh run list --workflow join-perf.yml --branch "${GITHUB_REF_NAME}" \
+          previous="$(gh run list --workflow "$TREND_WORKFLOW" --branch "${GITHUB_REF_NAME}" \
               --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
           if [ -z "$previous" ]; then
             echo "no earlier successful run of this lane on ${GITHUB_REF_NAME} - this is the baseline."

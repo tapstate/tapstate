@@ -30,8 +30,8 @@ import java.io.Serializable;
 public interface SinkAck extends Serializable {
 
     /**
-     * Advances {@code chain}'s durable watermark to {@code position}. The caller only ever advances, never
-     * lowers, so the store persists what it is given.
+     * Reports that the target has confirmed progress through {@code position}. An implementation may buffer
+     * the report, and a caller that requires durability uses {@link #flush(boolean)} with {@code true}.
      */
     void advance(String chain, ChainPosition position);
 
@@ -59,6 +59,12 @@ public interface SinkAck extends Serializable {
         bounded(chain, through);
     }
 
+    /** Offers any due progress and checks prior failures, or waits for the final confirmed prefix to commit. */
+    default void flush(boolean complete) { }
+
+    /** Saves pending progress on shutdown while the original writer is still authorized. */
+    default void flushOnClose() { }
+
     /**
      * This ack, reporting as the writer {@code writerId}. Where several writers land one pipeline's changes,
      * how far the pipeline has landed a chain is the lowest of what each has landed, so each has to report as
@@ -67,4 +73,7 @@ public interface SinkAck extends Serializable {
     default SinkAck forWriter(String writerId) {
         return this;
     }
+    /** Local metadata receipt after this actual writer's initialization; not a commit or source ACK. */
+    default void started(long jobId, long executionId) {}
+    default void started(long jobId, long executionId, WorkloadClaimFence fence) { started(jobId, executionId); }
 }

@@ -120,6 +120,44 @@ class PdkSinkWriterCancellationTest {
         }
     }
 
+    @Test void closeDoesNotReportRetirementWhileAnInterruptedTargetCallStillRuns(@TempDir Path directory) throws Throwable {
+        var entered=new CountDownLatch(1);var interrupted=new CountDownLatch(1);var release=new CountDownLatch(1);var exited=new CountDownLatch(1);
+        var closer=Executors.newFixedThreadPool(2);
+        PdkSinkWriter writer=writer(directory,(context,events,table,result) -> {
+            entered.countDown();
+            try {
+                while(release.getCount()!=0)try {release.await();}catch(InterruptedException stopping){interrupted.countDown();}
+                result.accept(new WriteListResult<>(1L,0L,0L));
+            } finally {exited.countDown();}
+        },() -> {});
+        try {
+            writer.write(batch(1));assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+            var closing=closer.submit(writer::close);assertThat(interrupted.await(5,TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> closing.get(200,TimeUnit.MILLISECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+            var retry=closer.submit(writer::close);
+            assertThatThrownBy(() -> retry.get(200,TimeUnit.MILLISECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+            release.countDown();closing.get(5,TimeUnit.SECONDS);retry.get(5,TimeUnit.SECONDS);assertThat(exited.getCount()).isZero();
+        } finally {release.countDown();writer.close();closer.shutdownNow();}
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void aCompletionCallbackCanCloseItsWriterWithoutWaitingForItself(boolean concurrentClose,@TempDir Path directory) throws Throwable {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var interrupted=new CountDownLatch(1);
+        var closer=Executors.newSingleThreadExecutor(task -> {var thread=new Thread(task,"fixture-close");thread.setDaemon(true);return thread;});
+        var writer=writer(directory,(context,events,table,result) -> {
+            entered.countDown();
+            while(release.getCount()!=0)try {release.await();}catch(InterruptedException stopping){interrupted.countDown();}
+            result.accept(new WriteListResult<>(1L,0L,0L));
+        },() -> {});
+        try {
+            var stage=writer.write(batch(1));assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+            var closed=stage.handle((result,failure) -> {writer.close();return null;}).toCompletableFuture();
+            var external=concurrentClose?closer.submit(writer::close):null;
+            if(concurrentClose)assertThat(interrupted.await(5,TimeUnit.SECONDS)).isTrue();
+            release.countDown();closed.get(2,TimeUnit.SECONDS);if(external!=null)external.get(2,TimeUnit.SECONDS);writer.close();
+        } finally {release.countDown();closer.shutdownNow();}
+    }
+
     private static void await(CountDownLatch signal, String failure) {
         try {
             if (!signal.await(5, TimeUnit.SECONDS)) {

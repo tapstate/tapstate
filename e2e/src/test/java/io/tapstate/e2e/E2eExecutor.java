@@ -131,6 +131,7 @@ public final class E2eExecutor {
      */
     private void provision(Setup setup) {
         setup.connectors().forEach(binding::registerConnector);
+        if (setup.managedTarget() != null) binding.readResources(List.of(setup.managedTarget()));
         if (!setup.apply().isEmpty()) {
             // Read, do not apply. What the resources declare is needed before the product is told
             // anything: the seed dials the source's own address, and a discovery is asked for with the
@@ -169,6 +170,7 @@ public final class E2eExecutor {
     private void execute(Step step, String pipelineId) {
         switch (step) {
             case Step.Lifecycle lifecycle -> binding.drive(pipelineId, lifecycle.verb());
+            case Step.StartRefused refused -> binding.startRefused(pipelineId, refused.code());
             case Step.StreamLifecycle stream -> {
                 binding.driveStream(stream.sourceId(), stream.verb());
                 switch (stream.verb()) {

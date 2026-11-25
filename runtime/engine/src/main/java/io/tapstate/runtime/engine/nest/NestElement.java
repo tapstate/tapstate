@@ -23,16 +23,15 @@ import java.util.Objects;
  * <p>{@code fields} absent means the change removes the element rather than putting a row there; the
  * one accessor {@link #deletion()} is how that is asked, so no second flag can disagree with it.
  *
- * <p>The positions are not decoration. An element held for a parent that has not arrived has been
- * consumed and not emitted, so the durable frontier must not be allowed past it - and a bound can only
- * be reported for a position that is still here to be read. An element held without its position would
- * let the frontier claim coverage of a change that has not reached a sink, which after a restart is a
- * change that can neither be replayed nor found.
+ * <p>The positions remain attached while a change waits or is handed onward. A durable waiting copy
+ * lets the frontier pass only after its write returns. Releasing it retains a recoverable handoff until
+ * downstream coverage is confirmed; losing both copies would leave nothing to replay or load.
  *
  * <p>The source's own time for the change is deliberately absent. Nothing here may be decided by it: a
  * source clock can jump, repeat and run backwards, and two sources have two clocks, so ordering by it
  * would silently reorder data — {@code order} is the only thing anything is decided by. A wait here is
- * ended by a parent turning up or by that parent being known gone, never by a clock reaching some time.
+ * ended by a parent turning up; an ordinary missing-parent wait has no clock deadline. Separate
+ * relocation ownership and abandonment rules remain independent of that wait.
  *
  * <p>The maps are copied on the way in, so a change cannot be altered from under the state holding it.
  * {@link Serializable} because a waiting bucket outlives a single run. An order is never null: a null

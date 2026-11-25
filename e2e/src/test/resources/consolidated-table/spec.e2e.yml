@@ -1,9 +1,10 @@
 # The two physical tables have disjoint keys and independent snapshot and change progress.
 name: the-same-table-from-two-sources-reaches-one-view
 setup:
-  connectors: [e2e_file]
-  apply: [src_left.tap.yml, src_right.tap.yml, views.tap.yml, pipeline.tap.yml]
+  connectors: [e2e_file, mongodb]
+  apply: [src_left.tap.yml, src_right.tap.yml, pipeline.tap.yml]
   discover: [src_left, src_right]
+  managed_target: views.tap.yml
 pipeline: pipeline.tap.yml
 seed:
   src_left.orders:
@@ -13,14 +14,14 @@ seed:
 steps:
   - start
   - await: { count: { views.orders_all: 4 } }
-  - assert: { doc: { views.orders_all: { where: { id: 1 }, expect: { seq: 1 } } } }
-  - assert: { doc: { views.orders_all: { where: { id: 101 }, expect: { seq: 101 } } } }
+  - assert: { doc: { views.orders_all: { where: { id: "1" }, expect: { seq: "1" } } } }
+  - assert: { doc: { views.orders_all: { where: { id: "101" }, expect: { seq: "101" } } } }
   - cdc: { src_left.orders: { insert: { values: [ { id: 3, seq: 3 } ] } } }
   - cdc: { src_right.orders: { insert: { values: [ { id: 103, seq: 103 } ] } } }
   - await: { count: { views.orders_all: 6 } }
-  - assert: { doc: { views.orders_all: { where: { id: 3 }, expect: { seq: 3 } } } }
-  - assert: { doc: { views.orders_all: { where: { id: 103 }, expect: { seq: 103 } } } }
+  - assert: { doc: { views.orders_all: { where: { id: "3" }, expect: { seq: "3" } } } }
+  - assert: { doc: { views.orders_all: { where: { id: "103" }, expect: { seq: "103" } } } }
   - restart
   - await: { count: { views.orders_all: 6 } }
-  - await: { doc: { views.orders_all: { where: { id: 1 }, expect: { seq: 1 } } } }
-  - await: { doc: { views.orders_all: { where: { id: 101 }, expect: { seq: 101 } } } }
+  - await: { doc: { views.orders_all: { where: { id: "1" }, expect: { seq: "1" } } } }
+  - await: { doc: { views.orders_all: { where: { id: "101" }, expect: { seq: "101" } } } }

@@ -32,9 +32,10 @@ import java.util.function.Supplier;
  * <p>A capture that writes through is told only a write-through checkpoint. An offset on its chain that is not
  * one was bounded by something else, and a capture running in this mode does not resume from it.
  *
- * <p>A tail is told its starting position the moment it is followed, and after that on a schedule of its own:
- * every interval its chain is read once, and the position is handed over when it differs from the one handed
- * last. A subscription applies it on its source's own delivery thread, so handing it over here only records it.
+ * <p>A tail is told its starting position the moment it is followed unless its startup receipt has no
+ * checkpoint for the current epoch. Every interval its chain is read once, and the position is handed over
+ * when it differs from the one handed last. A subscription applies it on its source's own delivery thread,
+ * so handing it over here only records it.
  * The reads run on a thread of their own -- not on the thread a source hands its changes over on, which must not
  * wait on the store.
  *
@@ -47,7 +48,7 @@ import java.util.function.Supplier;
  * is closed. A process that runs several units in turn -- a test JVM starting one server after another -- would
  * otherwise go on reading, every interval, for tails whose servers and stores are gone.
  */
-final class SourceAcknowledgements implements AutoCloseable {
+public final class SourceAcknowledgements implements AutoCloseable {
 
     /** How often each followed tail's chain is read for a new durable position. */
     static final Duration INTERVAL = Duration.ofSeconds(5);
@@ -64,7 +65,7 @@ final class SourceAcknowledgements implements AutoCloseable {
         return thread;
     });
 
-    SourceAcknowledgements() {
+    public SourceAcknowledgements() {
         long every = INTERVAL.toMillis();
         reader.scheduleWithFixedDelay(() -> followed.forEach(Followed::handOverQuietly),
                 every, every, TimeUnit.MILLISECONDS);
@@ -86,6 +87,71 @@ final class SourceAcknowledgements implements AutoCloseable {
         followed.add(one);
         one.handOverQuietly();
         return one;
+    }
+
+    /** Native capture acknowledgements remain bound to the original epoch and command guard. */
+    Subscription follow(io.tapstate.spi.store.SrsChainStore chains, String chainId, long epoch,
+            Subscription tail, CaptureHealth health, Runnable requireActive) {
+        return follow(chains, chainId, epoch, tail, health, requireActive, false);
+    }
+
+    Subscription follow(io.tapstate.spi.store.SrsChainStore chains, String chainId, long epoch,
+            Subscription tail, CaptureHealth health, Runnable requireActive, boolean deferFirstRead) {
+        Objects.requireNonNull(chains, "chains"); Objects.requireNonNull(requireActive, "requireActive");
+        Subscription guarded = new Subscription() {
+            @Override public void acknowledge(SourcePosition position) { requireActive.run(); tail.acknowledge(position); }
+            @Override public void close() { tail.close(); }
+        };
+        var one = new Followed(chainId, () -> {
+            requireActive.run();
+            var state = chains.load(chainId).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                    io.tapstate.spi.store.IoError.SRS_CHECKPOINT_UNPROVEN, java.util.Map.of("chain",chainId),null));
+            requireActive.run();
+            if (!chainId.equals(state.miningChainId()) || state.epoch() != epoch || state.checkpoint() == null
+                    || state.checkpoint().position().order().epoch() != epoch) throw new io.tapstate.core.common.TapstateException(
+                    io.tapstate.spi.store.IoError.SRS_CHECKPOINT_UNPROVEN,java.util.Map.of("chain",chainId),null);
+            return Optional.of(state.checkpoint().position());
+        }, guarded, health, followed);
+        followed.add(one);
+        if (!deferFirstRead) one.handOverQuietly();
+        return one;
+    }
+
+    /** Samples only the settled prefix of one original private channel execution. */
+    public Subscription follow(io.tapstate.spi.store.DirectChannelStore channels,
+            io.tapstate.spi.store.DirectChannelProgress opened, Subscription tail, CaptureHealth health,
+            Runnable requireActive) {
+        Objects.requireNonNull(channels, "channels"); Objects.requireNonNull(opened, "opened");
+        Objects.requireNonNull(tail, "tail"); Objects.requireNonNull(requireActive, "requireActive");
+        var original = opened.current();
+        var context = opened.context();
+        if (original == null) throw directUnavailable(context.channelId());
+        Subscription guarded = new Subscription() {
+            @Override public void acknowledge(SourcePosition position) { requireActive.run(); tail.acknowledge(position); }
+            @Override public void close() { tail.close(); }
+        };
+        var one = new Followed(context.channelId(), () -> {
+            requireActive.run();
+            var state = channels.load(context);
+            requireActive.run();
+            var current = state.current();
+            if (!context.equals(state.context()) || !opened.tables().equals(state.tables()) || current == null
+                    || original.epoch() != current.epoch() || !original.captureFence().equals(current.captureFence())
+                    || !original.pipelineFence().equals(current.pipelineFence())
+                    || original.anchor() != null && !original.anchor().equals(current.anchor()))
+                throw directUnavailable(context.channelId());
+            if (current.anchor() == null) return Optional.empty();
+            var settled = state.cursor().sinkAcked();
+            if (settled == null || settled.order().epoch() != original.epoch())
+                throw directUnavailable(context.channelId());
+            return Optional.of(settled);
+        }, guarded, health, followed);
+        followed.add(one); one.handOverQuietly(); return one;
+    }
+
+    private static io.tapstate.core.common.TapstateException directUnavailable(String channel) {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DIRECT_CHANNEL_UNAVAILABLE,
+                java.util.Map.of("channel", channel), null);
     }
 
     /**
@@ -113,6 +179,7 @@ final class SourceAcknowledgements implements AutoCloseable {
         private final Set<Followed> registry;
         private ChainPosition handed;
         private volatile boolean closed;
+        private boolean ended;
         private long lastWarnedNanos;
         private boolean warned;
 
@@ -169,10 +236,12 @@ final class SourceAcknowledgements implements AutoCloseable {
         }
 
         @Override
-        public void close() {
+        public synchronized void close() {
+            if (ended) return;
             closed = true;
             registry.remove(this);
             tail.close();
+            ended = true;
         }
     }
 }

@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.store.RequiredNoteOwner;
 import java.util.Objects;
 
 /**
@@ -12,11 +13,9 @@ import java.util.Objects;
  * they were written under, so two spellings of one node read as an empty notepad — indistinguishable
  * from a first run, which is the failure this exists to make impossible.
  *
- * <p>The two ids are joined on a dot, the same way a table is addressed by the source that reads it.
- * No two nodes can name one namespace: a pipeline id carries no dot of its own, so the first dot after
- * the prefix is always the separator and everything after it is the node's id, whatever that contains.
- * The guarantee is the pipeline id's, not the node id's — a scheme relying on both would be resting on
- * something nothing states.
+ * <p>The physical address contains the pipeline id, fixed connector purpose and logical node id.
+ * Pipeline ids have no dot and purpose is one fixed segment, so a dotted node id cannot erase either
+ * boundary. Source, view and sync nodes may legally share a logical id and still name separate notes.
  */
 public final class ConnectorStateNamespace {
 
@@ -41,7 +40,12 @@ public final class ConnectorStateNamespace {
 
     /** The namespace {@code node}'s connector keeps its own notes in, or null for a drive naming no node. */
     public static String of(PipelineNode node) {
-        return node == null ? null : PREFIX + node.pipelineId() + "." + node.nodeId();
+        return of(node, PipelineNode.Purpose.CAPTURE);
+    }
+
+    /** A fixed connector purpose distinguishes legal same-name source, view and sync nodes. */
+    public static String of(PipelineNode node, PipelineNode.Purpose purpose) {
+        return RequiredNoteOwner.namespace(node, purpose);
     }
 
     /** A physical capture's notes survive changes to the pipeline node that owns its subscription. */

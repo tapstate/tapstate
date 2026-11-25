@@ -1,0 +1,321 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConnectorRunBindings;
+import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.core.model.PipelineNode;
+import java.util.List;
+import java.util.Set;
+import io.tapstate.spi.store.PipelineStateMapping;
+import io.tapstate.spi.store.PipelineStateMappings;
+import org.bson.Document;
+
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.BiFunction;
+
+/** One current mapping per Pipeline; authoring creates it in the same configuration transaction. */
+public final class MongoPipelineStateMappings implements PipelineStateMappings {
+    private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+    private final MongoClient client;
+    private final MongoDatabase database;
+    private final MongoCollection<Document> mappings;
+    private final MongoCollection<Document> pipelines;
+
+    MongoPipelineStateMappings(MongoClient client, MongoDatabase database) {
+        this.client = Objects.requireNonNull(client, "client");this.database=Objects.requireNonNull(database,"database");
+        this.mappings = SystemCollections.OPERATOR_GENERATIONS.on(database)
+                .withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+        this.pipelines = SystemCollections.PIPELINES.on(database)
+                .withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+    }
+
+    @Override public Optional<PipelineStateMapping> read(String pipelineId) {
+        return read(pipelineId, (state, mapping) -> Optional.of(state));
+    }
+
+    Optional<PipelineStateMapping> read(String pipelineId, MongoReadBudget budget) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(budget, "budget");
+        return budget.transaction(client, session -> {
+            var bounded = budget.database(database);
+            Document pipeline = SystemCollections.PIPELINES.on(bounded).find(session,new Document("_id",pipelineId)).first();
+            Document mapping = SystemCollections.OPERATOR_GENERATIONS.on(bounded).find(session,new Document("_id",pipelineId)).first();
+            if (pipeline == null && mapping == null) return Optional.empty();
+            var state = decode(pipelineId,mapping);
+            if ((state.phase() == PipelineStateMapping.Phase.RETIRED) != (pipeline == null)) throw unreadable(pipelineId);
+            return Optional.of(state);
+        });
+    }
+
+    @Override public Optional<LogWindow> logWindow(String pipelineId) {
+        return read(pipelineId, (state, mapping) -> {
+            if (state.phase() == PipelineStateMapping.Phase.RETIRING
+                    || state.phase() == PipelineStateMapping.Phase.RETIRED) {
+                return Optional.empty();
+            }
+            long firstGeneration = 1;
+            if (mapping.containsKey("retirement")) {
+                var retirement = MongoPipelineRetirementFacts.read(mapping);
+                if (!retirement.phase().equals("COMPLETE")) throw unreadable(pipelineId);
+                long retiredGeneration = retirement.completed().scope().stateGeneration();
+                if (retiredGeneration >= state.stateGeneration()) throw unreadable(pipelineId);
+                firstGeneration = retiredGeneration + 1;
+            }
+            return Optional.of(new LogWindow(firstGeneration, state.stateGeneration()));
+        });
+    }
+
+    private <T> Optional<T> read(String pipelineId, BiFunction<PipelineStateMapping, Document, Optional<T>> project) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return StoreIo.call(() -> {
+            try (ClientSession session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    Document pipeline = pipelines.find(session, new Document("_id", pipelineId)).first();
+                    Document mapping = mappings.find(session, new Document("_id", pipelineId)).first();
+                    if (pipeline == null && mapping == null) return Optional.empty();
+                    PipelineStateMapping state = decode(pipelineId, mapping);
+                    if ((state.phase() == PipelineStateMapping.Phase.RETIRED) != (pipeline == null)) throw unreadable(pipelineId);
+                    return project.apply(state, mapping);
+                }, TRANSACTION);
+            }
+        });
+    }
+
+    void create(ClientSession session,String pipelineId) { create(session,pipelineId,() -> null); }
+    void create(ClientSession session,String pipelineId,java.util.function.Supplier<io.tapstate.spi.store.CacheBusinessScope> currentBusiness) {
+        createRow(session, pipelineId, currentBusiness);
+    }
+
+    /** Returns the exact row validated and written in the caller's current transaction. */
+    Document createRow(ClientSession session,String pipelineId,java.util.function.Supplier<io.tapstate.spi.store.CacheBusinessScope> currentBusiness) {
+        var validationSchema = validationSchema(session);
+        var prior=mappings.find(session,new Document("_id",pipelineId)).first();
+        if(prior==null) {
+            var initial = new Document("_id",pipelineId).append("stateGeneration",1L).append("phase","ACTIVE").append("operationId",null)
+                    .append("noteWriteFence",0L).append("cachePreparation",new Document("phase","UNASSIGNED"));
+            if (validationSchema != null) initial.append("validationPreparation", MongoValidationPreparationFacts.initial());
+            mappings.insertOne(session, initial);return initial;
+        }
+        var state=decode(pipelineId,prior);if(state.phase()!=PipelineStateMapping.Phase.RETIRED)throw retirementRequired(pipelineId);
+        var result=MongoPipelineRetirementFacts.read(prior).completed();
+        if(result.scope().stateGeneration()!=state.stateGeneration() || state.stateGeneration()>=Long.MAX_VALUE-2
+                || prior.getLong("noteWriteFence")>=Long.MAX_VALUE-1)throw retirementRequired(pipelineId);
+        var business=currentBusiness.get();if(business==null || !business.clusterId().equals(result.scope().clusterId()))throw retirementRequired(pipelineId);
+        var next=new io.tapstate.spi.store.PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),pipelineId,state.stateGeneration()+1);
+        MongoPipelineIntentStore.recreate(session,database,result.scope(),next);
+        var replacement=new Document(prior).append("stateGeneration",next.stateGeneration()).append("phase","ACTIVE")
+                .append("noteWriteFence",prior.getLong("noteWriteFence")+1).append("cachePreparation",new Document("phase","UNASSIGNED"));
+        if (validationSchema != null) {
+            if (!(prior.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
+            var previous = MongoValidationPreparationFacts.decode(value, MongoValidationSchema.scope(validationSchema).clusterId(), pipelineId);
+            if (previous.phase() != MongoValidationPreparationFacts.Phase.CLOSED) throw retirementRequired(pipelineId);
+            replacement.put("validationPreparation", MongoValidationPreparationFacts.encode(new MongoValidationPreparationFacts.State(
+                    java.util.UUID.randomUUID(), 0, MongoValidationPreparationFacts.Phase.UNASSIGNED, null, null, previous.previous())));
+        }
+        replacement.remove("connectorBindings");
+        replacement.remove("stateRebuild");
+        replacement.remove("cacheRecovery");
+        MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(prior,replacement,result.scope());
+        if(mappings.replaceOne(session,new Document("_id",pipelineId).append("stateGeneration",state.stateGeneration()).append("phase","RETIRED")
+                .append("noteWriteFence",prior.get("noteWriteFence")).append("retirement",prior.get("retirement")),replacement).getMatchedCount()!=1)throw retirementRequired(pipelineId);
+        return replacement;
+    }
+
+    void requireNoRetainedIdentity(ClientSession session, String resourceId) {
+        Document retained = mappings.find(session, new Document("_id", resourceId)).first();
+        if (retained != null) {
+            decode(resourceId, retained);
+            throw retirementRequired(resourceId);
+        }
+    }
+
+    void requireActive(ClientSession session, String pipelineId) {
+        requireActiveRow(session, pipelineId);
+    }
+
+    Document requireActiveRow(ClientSession session, String pipelineId) {
+        var schema = validationSchema(session);
+        Document current = mappings.find(session, new Document("_id", pipelineId)).first();
+        if (schema != null) {
+            if (current == null || !(current.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
+            MongoValidationPreparationFacts.decode(value, MongoValidationSchema.scope(schema).clusterId(), pipelineId);
+        }
+        PipelineStateMapping state = decode(pipelineId, current);
+        if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw retirementRequired(pipelineId);
+        return current;
+    }
+
+    private Document validationSchema(ClientSession session) {
+        var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        if (row == null) throw MongoValidationSchema.unreadable("version");
+        if (!MongoValidationSchema.configurationHasValidation(database, row)) return null;
+        return MongoValidationSchema.requireConfiguration(row, "READY");
+    }
+
+    static void requireNoSharedReferences(ClientSession session,MongoDatabase database,String operation) {
+        var row=SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,new Document("sharedRecovery.operationId",operation)).first();
+        if(row!=null) {
+            var retained=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable("shared-recovery"));
+            throw MongoPipelineSharedRecoveryFacts.required(retained.originalScope().pipelineId());
+        }
+    }
+    void reserveSharedRecovery(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope,String operation) {
+        var row=requireSharedOriginal(session,scope);
+        var original=MongoPipelineSharedRecoveryFacts.read(row);
+        if(original.filter(marker -> marker.operationId().equals(operation) && marker.originalScope().equals(scope)).isPresent())return;
+        MongoPipelineSharedRecoveryFacts.requireReady(session,database,row,scope);
+        long fence=row.getLong("noteWriteFence");if(fence>=Long.MAX_VALUE-1)throw retirementRequired(scope.pipelineId());
+        var marker=MongoPipelineSharedRecoveryFacts.encode(new MongoPipelineSharedRecoveryFacts.Pending(operation,scope));
+        if(mappings.updateOne(session,row,new Document("$set",new Document("sharedRecovery",marker)).append("$inc",new Document("noteWriteFence",1L))).getMatchedCount()!=1)
+            throw retirementRequired(scope.pipelineId());
+    }
+    void requireSharedReservation(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope,String operation) {
+        var row=requireSharedOriginal(session,scope);
+        var marker=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable(scope.pipelineId()));
+        if(!marker.operationId().equals(operation) || !marker.originalScope().equals(scope))throw retirementRequired(scope.pipelineId());
+    }
+    java.util.List<io.tapstate.spi.store.PipelineIntentScope> sharedReservations(ClientSession session,io.tapstate.spi.store.CacheBusinessScope scope,String operation) {
+        var result=new java.util.ArrayList<io.tapstate.spi.store.PipelineIntentScope>();
+        for(var row:mappings.find(session,new Document("sharedRecovery.operationId",operation))) {
+            var marker=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable("shared-recovery"));
+            var original=marker.originalScope();
+            if(!scope.clusterId().equals(original.clusterId()) || scope.bindingVersion()!=original.bindingVersion()
+                    || !scope.cacheIncarnation().equals(original.cacheIncarnation()))throw retirementRequired(original.pipelineId());
+            requireSharedReservation(session,original,operation);result.add(original);
+        }
+        return java.util.List.copyOf(result);
+    }
+    private Document requireSharedOriginal(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope) {
+        if(!session.hasActiveTransaction())throw new IllegalStateException("shared recovery mapping requires its CONFIG transaction");
+        var row=mappings.find(session,new Document("_id",scope.pipelineId())).first();var state=decode(scope.pipelineId(),row);
+        if(state.phase()!=PipelineStateMapping.Phase.ACTIVE || state.stateGeneration()!=scope.stateGeneration()
+                || pipelines.find(session,new Document("_id",scope.pipelineId())).first()==null)throw retirementRequired(scope.pipelineId());
+        var prepared=MongoPipelinePreparationFacts.decode(scope.pipelineId(),row,scope.clusterId());
+        if(prepared.phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE || !scope.equals(prepared.scope()))throw retirementRequired(scope.pipelineId());
+        MongoPipelineStateRebuilds.requireCompletedPrior(row,prepared);
+        if(row.containsKey("retirement"))MongoPipelineRetirementFacts.read(row).completed();
+        if(MongoCacheRecoveryFacts.read(row).filter(recovery -> !recovery.targetScope().equals(scope)).isPresent())throw retirementRequired(scope.pipelineId());
+        return row;
+    }
+
+    /** Deletion and kind changes enter the explicit retirement command, never this ordinary authoring path. */
+    void refuseRemoval(ClientSession session, String pipelineId) {
+        decode(pipelineId, mappings.find(session, new Document("_id", pipelineId)).first());
+        throw retirementRequired(pipelineId);
+    }
+
+    static Optional<ConnectorRunBindings> connectorBindings(Document mapping) {
+        if (!mapping.containsKey("connectorBindings")) return Optional.empty();
+        String pipeline = mapping.getString("_id");
+        try {
+            if (!(mapping.get("connectorBindings") instanceof Document row)
+                    || !row.keySet().equals(Set.of("formatVersion", "scope", "effectiveIntentRevision", "effective", "handoff"))
+                    || !Integer.valueOf(1).equals(row.get("formatVersion"))
+                    || !(row.get("effectiveIntentRevision") instanceof Long revision)) throw unreadable(pipeline);
+            var scope = MongoPipelinePreparationFacts.scope(row.get("scope", Document.class));
+            if (!pipeline.equals(scope.pipelineId())) throw unreadable(pipeline);
+            if (!mapping.getLong("stateGeneration").equals(scope.stateGeneration())) {
+                var replacement = MongoCacheRecoveryFacts.read(mapping).orElseThrow(() -> unreadable(pipeline));
+                if (!scope.equals(replacement.previousScope())) throw unreadable(pipeline);
+            }
+            ConnectorRunBindings.Handoff handoff = null;
+            if (row.get("handoff") != null) {
+                var pending = row.get("handoff", Document.class);
+                if (!pending.keySet().equals(Set.of("intentRevision", "phase", "candidates", "previous"))
+                        || !(pending.get("intentRevision") instanceof Long intentRevision)) throw unreadable(pipeline);
+                handoff = new ConnectorRunBindings.Handoff(intentRevision,
+                        ConnectorRunBindings.Phase.valueOf(pending.getString("phase")),
+                        connectorBindings(pending, "candidates"), connectorBindings(pending, "previous"));
+            }
+            return Optional.of(new ConnectorRunBindings(scope, revision, connectorBindings(row, "effective"), handoff));
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException malformed) {
+            throw unreadable(pipeline);
+        }
+    }
+
+    private static List<ConnectorRunBindings.Binding> connectorBindings(Document row, String field) {
+        return row.getList(field, Document.class).stream().map(value -> {
+            if (!value.keySet().equals(Set.of("nodeId", "purpose", "connectorId", "version", "sha256", "notes", "captureId", "chainId")))
+                throw new IllegalArgumentException("invalid connector binding fields");
+            var notes = value.get("notes", Document.class);
+            if (!notes.keySet().equals(Set.of("bindingVersion", "namespace", "kind", "ownerId", "stateGeneration", "generation"))
+                    || !(notes.get("bindingVersion") instanceof Long binding)
+                    || !(notes.get("stateGeneration") instanceof Long state)
+                    || !(notes.get("generation") instanceof Long generation))
+                throw new IllegalArgumentException("invalid connector note coordinates");
+            var scope = new RequiredNoteScope(new RequiredNoteOwner(binding, notes.getString("namespace"),
+                    RequiredNoteOwner.Kind.valueOf(notes.getString("kind")), notes.getString("ownerId"), state), generation);
+            return new ConnectorRunBindings.Binding(value.getString("nodeId"), PipelineNode.Purpose.valueOf(value.getString("purpose")),
+                    value.getString("connectorId"), value.getString("version"), value.getString("sha256"), scope,
+                    value.getString("captureId"), value.getString("chainId"));
+        }).toList();
+    }
+
+    static Document connectorBindings(ConnectorRunBindings value) {
+        var pending = value.handoff();
+        Document handoff = pending == null ? null : new Document("intentRevision", pending.intentRevision())
+                .append("phase", pending.phase().name()).append("candidates", bindingDocuments(pending.candidates()))
+                .append("previous", bindingDocuments(pending.previous()));
+        return new Document("formatVersion", 1).append("scope", MongoPipelinePreparationFacts.scope(value.scope()))
+                .append("effectiveIntentRevision", value.effectiveIntentRevision()).append("effective", bindingDocuments(value.effective()))
+                .append("handoff", handoff);
+    }
+
+    private static List<Document> bindingDocuments(List<ConnectorRunBindings.Binding> values) {
+        return values.stream().map(value -> {
+            var token = value.notes(); var owner = token.owner();
+            var notes = new Document("bindingVersion", owner.bindingVersion()).append("namespace", owner.namespace())
+                    .append("kind", owner.kind().name()).append("ownerId", owner.ownerId())
+                    .append("stateGeneration", owner.stateGeneration()).append("generation", token.generation());
+            return new Document("nodeId", value.nodeId()).append("purpose", value.purpose().name())
+                    .append("connectorId", value.connectorId()).append("version", value.version()).append("sha256", value.sha256())
+                    .append("notes", notes).append("captureId", value.captureId()).append("chainId", value.chainId());
+        }).toList();
+    }
+
+    static void writeConnectorBindings(ClientSession session, MongoDatabase database, Document mapping, ConnectorRunBindings value) {
+        if (mapping.getLong("noteWriteFence") >= Long.MAX_VALUE - 1)
+            throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+        var before = mapping.get("connectorBindings");
+        var filter = new Document("_id", mapping.getString("_id")).append("stateGeneration", mapping.get("stateGeneration"))
+                .append("phase", "ACTIVE").append("noteWriteFence", mapping.get("noteWriteFence"));
+        filter.append("connectorBindings", before == null ? new Document("$exists", false) : before);
+        if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session, filter,
+                new Document("$set", new Document("connectorBindings", connectorBindings(value)))
+                        .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1)
+            throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+    }
+
+    static PipelineStateMapping decode(String pipelineId, Document document) {
+        try {
+            if (document == null || !(document.get("stateGeneration") instanceof Long generation)
+                    || !(document.get("noteWriteFence") instanceof Long fence) || fence < 0 || fence == Long.MAX_VALUE) throw unreadable(pipelineId);
+            connectorBindings(document);
+            MongoCacheRecoveryFacts.read(document);
+            MongoPipelineSharedRecoveryFacts.read(document);
+            return new PipelineStateMapping(pipelineId, generation,
+                    PipelineStateMapping.Phase.valueOf(document.getString("phase")), document.getString("operationId"));
+        } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
+            throw unreadable(pipelineId);
+        }
+    }
+
+    private static TapstateException unreadable(String pipelineId) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "stateMapping"), null);
+    }
+    private static TapstateException retirementRequired(String pipelineId) {
+        return new TapstateException(StoreError.PIPELINE_RETIREMENT_REQUIRED, Map.of("pipeline", pipelineId), null);
+    }
+}

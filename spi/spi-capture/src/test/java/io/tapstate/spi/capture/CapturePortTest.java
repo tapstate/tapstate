@@ -25,6 +25,13 @@ class CapturePortTest {
     private static final CaptureConfig CONFIG = new CaptureConfig("mysql", Map.of(), List.of("orders"));
 
     @Test
+    void requiringPreparedMetadataCannotFallBackToAnOrdinaryRead() {
+        StubCapture capture = new StubCapture();
+        assertThat(SnapshotSession.openPrepared(capture, CONFIG, new SnapshotPreparation(1, null))).isEmpty();
+        assertThat(capture.lastBatch).isNull();
+    }
+
+    @Test
     void snapshotYieldsACloseableIteratorOfReadEnvelopes() {
         StubCapture capture = new StubCapture();
 

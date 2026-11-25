@@ -10,7 +10,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,10 +48,10 @@ class AStartRefusedForItsWidthLeavesNothingOnItsChainIT {
         FileEndpoints files = new FileEndpoints();
         files.seed(sourceAddress, TABLE, SeedRows.generated(1));
 
-        String store = SharedMongo.replicaSetUrl("refused_width_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(workspace(source, runningTarget, refusedTarget));
@@ -66,7 +65,7 @@ class AStartRefusedForItsWidthLeavesNothingOnItsChainIT {
             Await.until("the start asking for more processors than any member runs to be refused",
                     Duration.ofMinutes(2), () -> control.failureCode(REFUSED).isPresent(),
                     () -> "refused=" + control.state(REFUSED) + ", logs=" + control.logs(REFUSED));
-            assertThat(control.failureCode(REFUSED)).contains("actuation.no-safe-parallelism");
+            assertThat(control.failureCode(REFUSED)).contains("TS0360028");
 
             for (int batch = 1; batch <= BATCHES; batch++) {
                 files.cdc(sourceAddress, TABLE, CdcOp.INSERT, BATCH_SIZE);
@@ -84,7 +83,7 @@ class AStartRefusedForItsWidthLeavesNothingOnItsChainIT {
         }
     }
 
-    private static String consumers(StoreDocuments documents) {
+    private static String consumers(NativeSrsDocuments documents) {
         Map<String, Object> byChain = new LinkedHashMap<>();
         documents.miningChainIds().forEach(chain -> byChain.put(chain, documents.consumersOf(chain)));
         return byChain.toString();

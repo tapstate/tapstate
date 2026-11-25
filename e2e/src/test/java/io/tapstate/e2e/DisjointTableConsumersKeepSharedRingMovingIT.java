@@ -10,7 +10,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import org.bson.Document;
@@ -49,10 +48,10 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
         files.seed(sourceAddress, JOIN_TABLE, SeedRows.generated(1));
         files.seed(sourceAddress, NEST_TABLE, SeedRows.generated(1));
 
-        String store = SharedMongo.replicaSetUrl("disjoint_ring_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(workspace(source, joinTarget, nestTarget));
@@ -70,12 +69,12 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
                     () -> "chains=" + documents.miningChainIds() + ", join=" + control.state(JOIN)
                             + ", nest=" + control.state(NEST) + ", logs=" + control.logs(NEST));
             String chain = documents.miningChainIds().iterator().next();
-            Document joinCursor = documents.consumerOffset(chain, SrsConsumerId.of(JOIN, SOURCE).value())
-                    .get("perTableSeq", Document.class);
-            Document nestCursor = documents.consumerOffset(chain, SrsConsumerId.of(NEST, SOURCE).value())
-                    .get("perTableSeq", Document.class);
-            assertThat(joinCursor.keySet()).containsExactly(JOIN_TABLE);
-            assertThat(nestCursor.keySet()).containsExactly(NEST_TABLE);
+            var joinCursor = documents.consumerOffset(chain, SrsConsumerId.of(JOIN, SOURCE).value())
+                    .get("progress", Document.class).getList("perTableSeq", Document.class);
+            var nestCursor = documents.consumerOffset(chain, SrsConsumerId.of(NEST, SOURCE).value())
+                    .get("progress", Document.class).getList("perTableSeq", Document.class);
+            assertThat(joinCursor).extracting(row -> row.getString("table")).containsExactly(JOIN_TABLE);
+            assertThat(nestCursor).extracting(row -> row.getString("table")).containsExactly(NEST_TABLE);
 
             for (int batch = 1; batch <= BATCHES; batch++) {
                 files.cdc(sourceAddress, NEST_TABLE, CdcOp.INSERT, BATCH_SIZE);

@@ -49,8 +49,8 @@ class ARefusedSignInRegistersNoServerIT {
     @Test
     void aRefusedSignInBindsNothingAndRegistersNothing(@TempDir Path home, @TempDir Path workspace)
             throws IOException {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_refused_sign_in"))) {
-            new ControlPlane(server.baseUrl()).bootstrapAndLogin(USER, PASSWORD);
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            storage.loginAndAwaitBusiness(new ControlPlane(server.baseUrl()));
 
             // An unbound directory, the real server named on the line, and a password the server will
             // not take: the one run in which the question is asked and the answer turns out unusable.
@@ -61,7 +61,7 @@ class ARefusedSignInRegistersNoServerIT {
             assertThat(up.exitCode()).as(report(up)).isEqualTo(1);
             assertThat(up.stderr())
                     .as("the run stopped on the sign-in and not on something else")
-                    .contains("cli.auth-login-rejected");
+                    .contains("TS0330044");
             assertThat(registry(home))
                     .as("a server nobody ever signed in to is not one this machine knows about")
                     .doesNotContain(server.baseUrl().toString());

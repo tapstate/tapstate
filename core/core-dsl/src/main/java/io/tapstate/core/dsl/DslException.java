@@ -57,6 +57,13 @@ public final class DslException extends TapstateException {
         return new DslException(code(), path, line, column, source, args());
     }
 
+    @Override
+    public DslException withoutCause(Map<String, Object> replacementArgs) {
+        DslException copy = new DslException(code(), path, line, column, source, replacementArgs);
+        copy.setStackTrace(getStackTrace());
+        return copy;
+    }
+
     /** The {@link DslError} code (narrows {@link TapstateException#code()}). */
     @Override
     public DslError code() {

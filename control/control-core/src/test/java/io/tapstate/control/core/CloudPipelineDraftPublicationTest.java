@@ -35,6 +35,81 @@ class CloudPipelineDraftPublicationTest {
     private static final String EDITOR = "verified-cloud-user-b";
     private static final CanonicalWriter WRITER = new CanonicalWriter();
 
+    @Test
+    void previewUsesTheSameDependencySliceAsPublicationWithoutScanningUnrelatedArtifacts() {
+        var fixture = new Fixture(true, PipelineDraft.Mode.WIZARD);
+        var expected = fixture.service.preview("orders", 1);
+        fixture.artifacts.save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unrelated
+                connector: mongodb
+                config: { uri: "mongodb://localhost:27017/unrelated" }
+                """));
+        fixture.artifacts.useSlice = true;
+        fixture.artifacts.scans = 0;
+        assertThat(fixture.service.preview("orders", 1)).isEqualTo(expected);
+        assertThat(fixture.artifacts.scans).as("preview must not hydrate the entire workspace").isZero();
+        assertThat(fixture.artifacts.sliceReads).isEqualTo(1);
+        assertThat(fixture.drafts.lastPublication).isNull();
+    }
+
+    @Test
+    void documentPreviewCompilesTheSamePipelineWithoutScanningUnrelatedArtifacts() {
+        var fixture = new Fixture(true, PipelineDraft.Mode.WIZARD);
+        String dsl = WRITER.write(fixture.service.preview("orders", 1));
+        var draft = new ArtifactDraft(null, dsl);
+        var expected = fixture.apply.planPreviewWorkspace(List.of(draft));
+        fixture.artifacts.save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: transform
+                id: unrelated
+                type: filter
+                expr: "true"
+                """));
+        fixture.artifacts.useSlice = true;
+        fixture.artifacts.scans = 0;
+
+        var compiled = fixture.apply.planPreviewWorkspace(List.of(draft));
+
+        assertThat(fixture.artifacts.scans).as("document preview must not scan unrelated artifacts").isZero();
+        assertThat(fixture.artifacts.sliceReads).isEqualTo(1);
+        assertThat(compiled.plan()).isEqualTo(expected.plan());
+        assertThat(compiled.resources()).containsExactlyInAnyOrderElementsOf(expected.resources());
+    }
+
+    @Test
+    void publicationPassesThePlannedSourceSchemaToDerivation() {
+        var reads = new LinkedHashMap<String, Integer>();
+        var model = new io.tapstate.spi.store.DiscoveredSourceModel("mongo_input", "mongodb", NOW.toEpochMilli(),
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders", List.of(
+                        new io.tapstate.spi.store.SourceField("_id", "int", io.tapstate.core.common.TapstateType.INT64)),
+                        List.of("_id"), List.of()))));
+        io.tapstate.spi.store.SchemaStore schemas = new io.tapstate.spi.store.SchemaStore() {
+            @Override public void save(io.tapstate.spi.store.DiscoveredSourceModel ignored) {
+                throw new AssertionError("read only");
+            }
+            @Override public Optional<io.tapstate.spi.store.DiscoveredSourceModel> get(String id) {
+                reads.merge(id, 1, Integer::sum);
+                return id.equals("mongo_input") ? Optional.of(model) : Optional.empty();
+            }
+        };
+        var captured = new java.util.concurrent.atomic.AtomicReference<SchemaDerivation.PublishedInputs>();
+        SchemaDerivation derivation = new SchemaDerivation() {
+            @Override public void derive(String id) { throw new AssertionError("expected publication inputs"); }
+            @Override public void derivePublishedDraft(String id, PublishedInputs inputs, long generation) {
+                captured.set(inputs);
+            }
+        };
+        var fixture = new Fixture(true, PipelineDraft.Mode.DAG, schemas, derivation);
+
+        assertThat(fixture.service.publish("orders", 1, null, OWNER).published()).isTrue();
+        assertThat(reads).containsExactlyInAnyOrderEntriesOf(Map.of("mongo_input", 1, "mongo_target", 1));
+        assertThat(captured.get().models()).containsEntry("mongo_input", Optional.of(model));
+        assertThat(captured.get().definitions()).containsOnlyKeys("orders", "mongo_input", "mongo_target");
+        assertThat(captured.get().definitions().get("orders")).isEqualTo(fixture.drafts.lastPublication.artifact());
+    }
+
     @ParameterizedTest
     @EnumSource(PipelineDraft.Mode.class)
     void cloudPublicationAttributesTheArtifactToTheVerifiedPublisher(PipelineDraft.Mode mode) {
@@ -175,6 +250,11 @@ class CloudPipelineDraftPublicationTest {
         private final PipelineDraftService service;
 
         private Fixture(boolean cloud, PipelineDraft.Mode mode) {
+            this(cloud, mode, new EmptySchemaStore(), SchemaDerivation.none());
+        }
+
+        private Fixture(boolean cloud, PipelineDraft.Mode mode, io.tapstate.spi.store.SchemaStore schemas,
+                SchemaDerivation derivation) {
             DslParser parser = new DslParser();
             artifacts.save(parser.parse("""
                     version: tapstate/v1
@@ -195,7 +275,7 @@ class CloudPipelineDraftPublicationTest {
             Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
             AuditGate gate = new AuditGate(record -> {}, clock);
             apply = new ApplyService(TapstateCatalog::load, artifacts, gate,
-                    new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), null,
+                    schemas, PlanAdvisories.none(), derivation, null,
                     cloud ? ResourceAttributionPolicy.managedCloud() : ResourceAttributionPolicy.onPrem(),
                     cloud ? StateDatabasePolicy.CLOUD : StateDatabasePolicy.ON_PREM);
             service = new PipelineDraftService(drafts, new PipelineDraftCompiler(), WRITER, clock, gate, apply);
@@ -221,6 +301,18 @@ class CloudPipelineDraftPublicationTest {
     private static final class CanonicalStore implements ArtifactStore {
         private final Map<String, String> canonical = new LinkedHashMap<>();
         private final DslParser parser = new DslParser();
+        private boolean useSlice;
+        private int scans;
+        private int sliceReads;
+
+        @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
+            if (!useSlice) return Optional.empty();
+            sliceReads++;
+            var ids = new java.util.LinkedHashSet<String>(); ids.add(candidate.id());
+            io.tapstate.core.dsl.ReferenceGraph.declaredReferences(candidate).forEach(edge -> ids.add(edge.id()));
+            var resources = ids.stream().flatMap(id -> get(id).stream()).toList();
+            return Optional.of(new ReadableInventory(resources, Optional.empty(), Optional.empty(), ids));
+        }
 
         @Override
         public void saveAll(List<Resource> resources) {
@@ -234,6 +326,7 @@ class CloudPipelineDraftPublicationTest {
 
         @Override
         public List<Resource> list() {
+            scans++;
             return canonical.values().stream().map(parser::parse).toList();
         }
     }

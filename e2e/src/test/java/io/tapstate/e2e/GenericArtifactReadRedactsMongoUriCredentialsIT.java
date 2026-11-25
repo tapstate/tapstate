@@ -5,7 +5,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -30,10 +29,9 @@ class GenericArtifactReadRedactsMongoUriCredentialsIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void aGenericArtifactReadDoesNotReturnMongoUriCredentials(Tiers tier) {
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(
-                "artifact_read_redaction_" + tier.name().toLowerCase(Locale.ROOT)))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             control.apply(Map.of("atlas.tap.yml", SOURCE));
 

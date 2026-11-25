@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
@@ -13,7 +14,6 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -44,64 +44,68 @@ class AComputedDecimalChoiceIsRefusedAtApplyIT {
         Path target = Files.createDirectory(directory.resolve("target"));
         Path jar = E2eConnectorJar.buildInto(directory);
         Files.writeString(source.resolve(TABLE + ".csv"), "id,a,b\n7,70.00,80.00\n");
-        String database = "e2e_decimal_choice_" + UUID.randomUUID().toString().replace("-", "");
-        String storeUri = SharedMongo.replicaSetUrl(database);
-
-        try (ServerHandle first = InProcessServer.start(storeUri)) {
-            ControlPlane control = new ControlPlane(first.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(jar));
-            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
-        }
-
-        try (var client = MongoClients.create(storeUri)) {
-            var schemas = client.getDatabase(database).getCollection("source_schemas");
-            Document table = schemas.find(new Document("name", TABLE)).first();
-            assertThat(table).isNotNull();
-            List<Document> fields = table.getList("fields", Document.class);
-            for (String name : List.of("a", "b")) {
-                Document field = fields.stream().filter(value -> name.equals(value.getString("name")))
-                        .findFirst().orElseThrow();
-                field.put("type", "decimal(10,2)");
-                field.put("tapstateType", "DECIMAL");
-                field.put("numericType", new Document("bit", null).append("fixed", true)
-                        .append("unsigned", null).append("zerofill", null)
-                        .append("minValue", "-9999999999").append("maxValue", "9999999999")
-                        .append("precision", 10).append("scale", 2));
+        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+            try (ServerHandle first = InProcessServer.startPrepared(storage)) {
+                ControlPlane control = new ControlPlane(first.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(jar));
+                control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
             }
-            assertThat(schemas.replaceOne(new Document("_id", table.get("_id")), table).getMatchedCount())
-                    .isEqualTo(1);
-        }
 
-        try (ServerHandle second = InProcessServer.start(storeUri)) {
-            ControlPlane control = new ControlPlane(second.baseUrl());
-            control.login("e2e", "e2e-password");
-            ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
-                    "src_orders.tap.yml", sourceYaml(source),
-                    "tgt_orders.tap.yml", targetYaml(target),
-                    "pipeline.tap.yml", pipelineYaml()));
+            try (var client = MongoClients.create(storage.cacheUri())) {
+                var schemas = SystemCollections.CACHE_SOURCE_SCHEMAS.on(client.getDatabase(storage.cacheDatabase()));
+                Document published = schemas.find(new Document("_id", SOURCE)).first();
+                assertThat(published).isNotNull();
+                assertThat(published.get("cacheScope", Document.class).getString("clusterId")).isEqualTo(storage.clusterId());
+                Document table = schemas.find(new Document("name", TABLE)
+                        .append("generation", published.get("generation"))
+                        .append("cacheScope", published.get("cacheScope"))).first();
+                assertThat(table).isNotNull();
+                List<Document> fields = table.getList("fields", Document.class);
+                for (String name : List.of("a", "b")) {
+                    Document field = fields.stream().filter(value -> name.equals(value.getString("name")))
+                            .findFirst().orElseThrow();
+                    field.put("type", "decimal(10,2)");
+                    field.put("tapstateType", "DECIMAL");
+                    field.put("numericType", new Document("bit", null).append("fixed", true)
+                            .append("unsigned", null).append("zerofill", null)
+                            .append("minValue", "-9999999999").append("maxValue", "9999999999")
+                            .append("precision", 10).append("scale", 2));
+                }
+                assertThat(schemas.replaceOne(new Document("_id", table.get("_id")), table).getMatchedCount())
+                        .isEqualTo(1);
+            }
 
-            assertThat(refusal.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED.code());
-            assertThat(refusal.params()).containsEntry("expr", EXPRESSION)
-                    .containsEntry("column", "a").containsEntry("type", "DECIMAL")
-                    .containsEntry("table", TABLE).containsEntry("path", "transforms[0].fields.chosen");
-            assertThat(control.artifactIds()).doesNotContain(SOURCE, TARGET, PIPELINE);
-            assertThat(target.resolve(TABLE + ".csv")).doesNotExist();
+            try (ServerHandle second = InProcessServer.startPrepared(storage)) {
+                ControlPlane control = new ControlPlane(second.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
+                        "src_orders.tap.yml", sourceYaml(source),
+                        "tgt_orders.tap.yml", targetYaml(target),
+                        "pipeline.tap.yml", pipelineYaml()));
 
-            control.apply(Map.of(
-                    "src_orders.tap.yml", sourceYaml(source),
-                    "tgt_orders.tap.yml", targetYaml(target),
-                    "pipeline.tap.yml", pipelineYaml(true)));
-            assertThat(control.artifactIds()).contains(SOURCE, TARGET, PIPELINE);
-            control.lifecycle(PIPELINE, LifecycleVerb.START);
-            Path written = target.resolve(TABLE + ".csv");
-            Await.until("the integer choice to reach the target", () -> contents(written).lines().count() == 2,
-                    () -> "state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
-            List<String> lines = Files.readAllLines(written);
-            List<String> header = Arrays.asList(lines.get(0).split(",", -1));
-            List<String> row = Arrays.asList(lines.get(1).split(",", -1));
-            assertThat(header).contains("chosen");
-            assertThat(row.get(header.indexOf("chosen"))).isEqualTo("1");
+                assertThat(refusal.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED.code());
+                assertThat(refusal.params()).containsEntry("expr", EXPRESSION)
+                        .containsEntry("column", "a").containsEntry("type", "DECIMAL")
+                        .containsEntry("table", TABLE).containsEntry("path", "transforms[0].fields.chosen");
+                assertThat(control.artifactIds()).doesNotContain(SOURCE, TARGET, PIPELINE);
+                assertThat(target.resolve(TABLE + ".csv")).doesNotExist();
+
+                control.apply(Map.of(
+                        "src_orders.tap.yml", sourceYaml(source),
+                        "tgt_orders.tap.yml", targetYaml(target),
+                        "pipeline.tap.yml", pipelineYaml(true)));
+                assertThat(control.artifactIds()).contains(SOURCE, TARGET, PIPELINE);
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Path written = target.resolve(TABLE + ".csv");
+                Await.until("the integer choice to reach the target", () -> contents(written).lines().count() == 2,
+                        () -> "state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
+                List<String> lines = Files.readAllLines(written);
+                List<String> header = Arrays.asList(lines.get(0).split(",", -1));
+                List<String> row = Arrays.asList(lines.get(1).split(",", -1));
+                assertThat(header).contains("chosen");
+                assertThat(row.get(header.indexOf("chosen"))).isEqualTo("1");
+            }
         }
     }
 

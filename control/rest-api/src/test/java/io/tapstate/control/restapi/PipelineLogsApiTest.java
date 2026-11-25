@@ -15,6 +15,7 @@ import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineLogLevel;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
 import org.junit.jupiter.api.AfterAll;
@@ -29,6 +30,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
@@ -110,6 +112,32 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void logsRoundTripsTheSafeDiagnosticThroughTheAuthenticatedRead() {
+        var diagnostic = Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        context.getBean(FakeLogSink.class).append("pl1", new LogLine(2L, "WARN", "safe failure", diagnostic));
+        var body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+        assertThat(body.lines()).singleElement().satisfies(line -> assertThat(line.diagnostic()).isEqualTo(diagnostic));
+    }
+
+    @Test
+    void localizesTheSameCapturedLineOnEachRead() {
+        var fields = Map.<String, Object>of("code", "TS0360004", "codeSource", "tapstate-standard",
+                "params", Map.of("source", "orders"), "message", "Captured English cause");
+        context.getBean(FakeLogSink.class).append("pl1", new LogLine(2L, "WARN", "original log", fields));
+        for (var locale : List.of(java.util.Locale.SIMPLIFIED_CHINESE, java.util.Locale.ENGLISH)) {
+            var line = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                    .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                    .header("Accept-Language", locale.toLanguageTag()).retrieve().body(PipelineLogs.class).lines().getFirst();
+            var expected = io.tapstate.messages.MessageCatalog.bundled().render("TS0360004", Map.of("source", "orders"), locale);
+            assertThat(line.message()).isEqualTo("original log");
+            assertThat(line.diagnostic()).containsEntry("message", expected.message())
+                    .containsEntry("solution", expected.solution()).containsEntry("rawMessage", "Captured English cause");
+        }
+    }
+
+    @Test
     void logsHonorsTheRequestedLineLimit() {
         PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
@@ -117,6 +145,24 @@ class PipelineLogsApiTest {
 
         assertThat(body.lines()).extracting(LogLine::message)
                 .containsExactly("converged to RUNNING");
+    }
+
+    @Test
+    void logsResumesStrictlyAfterTheProvidedCursor() {
+        PipelineLogs initial = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        FakeLogSink sink = context.getBean(FakeLogSink.class);
+        sink.append("pl1", new LogLine(1_700_000_000_200L, "INFO", "checkpoint complete"));
+
+        PipelineLogs resumed = client().get().uri("/api/pipelines/pl1/logs?after="
+                        + initial.nextCursor().token())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        assertThat(resumed.lines()).extracting(LogLine::message).containsExactly("checkpoint complete");
+        assertThat(resumed.truncated()).isFalse();
     }
 
     @Test
@@ -129,7 +175,7 @@ class PipelineLogsApiTest {
                         return response.bodyTo(ApiError.class);
                     });
 
-            assertThat(body.code()).isEqualTo("control.malformed-request");
+            assertThat(body.code()).isEqualTo("TS0210001");
         }
     }
 
@@ -158,7 +204,20 @@ class PipelineLogsApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
+    }
+
+    @Test
+    void logLevelChangesTheMinimumSeverityForFuturePipelineLines() {
+        PipelineLogLevel level = client().post().uri("/api/pipelines/pl1:log-level")
+                .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("level", "WARN"))
+                .retrieve().toEntity(PipelineLogLevel.class).getBody();
+
+        assertThat(level).isEqualTo(PipelineLogLevel.WARN);
+        assertThat(context.getBean(PipelineLogQueryService.class).level("pl1"))
+                .isEqualTo(PipelineLogLevel.WARN);
     }
 
     // ---- the logs endpoint is a derivation of the registry ----
@@ -185,7 +244,7 @@ class PipelineLogsApiTest {
 
         assertThat(projected)
                 .as("only the logs face projects onto this focused context")
-                .containsExactly("pipeline.logs");
+                .containsExactlyInAnyOrder("pipeline.logs", "pipeline.log-level", "pipeline.logs");
     }
 
     /**
@@ -252,9 +311,11 @@ class PipelineLogsApiTest {
     /** An in-memory, seedable node-local log sink: append-ordered lines per pipeline id. */
     static final class FakeLogSink implements LogSink {
         private final Map<String, List<LogLine>> byId = new LinkedHashMap<>();
+        private final Map<String, PipelineLogLevel> levels = new LinkedHashMap<>();
 
         void clear() {
             byId.clear();
+            levels.clear();
         }
 
         @Override
@@ -265,6 +326,16 @@ class PipelineLogsApiTest {
         @Override
         public List<LogLine> tail(String pipelineId) {
             return List.copyOf(byId.getOrDefault(pipelineId, List.of()));
+        }
+
+        @Override
+        public void level(String pipelineId, PipelineLogLevel level) {
+            levels.put(pipelineId, level);
+        }
+
+        @Override
+        public PipelineLogLevel level(String pipelineId) {
+            return levels.getOrDefault(pipelineId, PipelineLogLevel.INFO);
         }
     }
 

@@ -2,6 +2,8 @@ package io.tapstate.runtime.engine;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.EngineErrorDefinitions;
 
 import java.util.Set;
 
@@ -22,15 +24,14 @@ public enum EngineError implements TapstateErrorCode {
      * A suspend / resume named a pipeline that has no running job to act on: {@code pipeline} is the
      * id the caller gave.
      */
-    NO_SUCH_JOB("engine.no-such-job", Set.of("pipeline")),
+    NO_SUCH_JOB(EngineErrorDefinitions.NO_SUCH_JOB),
 
     /**
      * A change's ordering value is outside the range the frontier transport encodes it in: {@code chain}
      * is the chain it belongs to, {@code epoch} and {@code seq} the generation and position that did not
      * fit. A capacity line of the transport rather than a defect — the widths are a build-time choice.
      */
-    FRONTIER_ORDER_NOT_ENCODABLE("engine.frontier-order-not-encodable",
-            Set.of("chain", "epoch", "seq")),
+    FRONTIER_ORDER_NOT_ENCODABLE(EngineErrorDefinitions.FRONTIER_ORDER_NOT_ENCODABLE),
 
     /**
      * A member was asked to act for a run it can no longer prove is the current one: {@code pipeline} is
@@ -41,7 +42,10 @@ public enum EngineError implements TapstateErrorCode {
      * whole point: the batch that provoked it is not written, so nothing outside the cluster is touched
      * twice by two runs of the same pipeline.
      */
-    EXECUTION_NOT_AUTHORIZED("engine.execution-not-authorized", Set.of("pipeline")),
+    EXECUTION_NOT_AUTHORIZED(EngineErrorDefinitions.EXECUTION_NOT_AUTHORIZED),
+
+    EXECUTION_LEASE_LOST(EngineErrorDefinitions.EXECUTION_LEASE_LOST),
+    EXECUTION_RENEWAL_FAILED(EngineErrorDefinitions.EXECUTION_RENEWAL_FAILED),
 
     /**
      * A run could not be started because the previous run of the same pipeline was still ending:
@@ -53,7 +57,7 @@ public enum EngineError implements TapstateErrorCode {
      * without throwing. A caller taking that as a start would leave the pipeline reporting a run it does
      * not have.
      */
-    JOB_STILL_ENDING("engine.job-still-ending", Set.of("pipeline", "seconds")),
+    JOB_STILL_ENDING(EngineErrorDefinitions.JOB_STILL_ENDING),
 
     /**
      * Running: a view selected a discovered alternate identity, but an update or delete reached its
@@ -62,8 +66,7 @@ public enum EngineError implements TapstateErrorCode {
      * Without the old key, a delete cannot remove the materialized row and a key-changing update
      * cannot remove the row under its previous identity, leaving stale data behind.
      */
-    VIEW_KEY_MISSING_FROM_BEFORE_IMAGE("engine.view-key-missing-from-before-image",
-            Set.of("view", "key", "operation")),
+    VIEW_KEY_MISSING_FROM_BEFORE_IMAGE(EngineErrorDefinitions.VIEW_KEY_MISSING_FROM_BEFORE_IMAGE),
 
     /**
      * A pipeline's data-plane job died on its own, for a reason the product had not already coded at its
@@ -71,7 +74,7 @@ public enum EngineError implements TapstateErrorCode {
      * A fault that does carry its own code keeps that code instead — this is the last resort, so that a
      * dead job always names a reason rather than reporting a bare state change.
      */
-    JOB_FAILED("engine.job-failed", Set.of("pipeline", "cause")),
+    JOB_FAILED(EngineErrorDefinitions.JOB_FAILED),
 
     /**
      * The member a pipeline ran on was shut down by its own out-of-memory handling, and the pipeline's job
@@ -79,7 +82,7 @@ public enum EngineError implements TapstateErrorCode {
      * member carried and every job operation asked of it afterwards, since nothing runs until the server is
      * restarted.
      */
-    OUT_OF_MEMORY("engine.out-of-memory", Set.of("pipeline")),
+    OUT_OF_MEMORY(EngineErrorDefinitions.OUT_OF_MEMORY),
 
     /**
      * Running: a chain's durable position has stopped moving for long enough to be worth saying so, while
@@ -94,8 +97,7 @@ public enum EngineError implements TapstateErrorCode {
      * retention, and when that rotates past it the pipeline has still not failed, it has merely lost the
      * ability to resume, taking every pipeline mining the same chain with it.
      */
-    FRONTIER_PINNED("engine.frontier-pinned",
-            Set.of("chain", "minutes", "gap", "cause"), Severity.WARNING),
+    FRONTIER_PINNED(EngineErrorDefinitions.FRONTIER_PINNED),
 
     /**
      * Running: a second row of a joined source arrived under a join key another row was already filed
@@ -110,8 +112,7 @@ public enum EngineError implements TapstateErrorCode {
      * indistinguishable from a correct one and every row it does hold looks entirely ordinary, so the
      * moment of replacement is the only place anything can observe it.
      */
-    JOIN_DIMENSION_ROW_DISPLACED("engine.join-dimension-row-displaced",
-            Set.of("source", "key"), Severity.WARNING),
+    JOIN_DIMENSION_ROW_DISPLACED(EngineErrorDefinitions.JOIN_DIMENSION_ROW_DISPLACED),
 
     /**
      * A change reached a node running on several processors without the key it is routed by: a key column
@@ -119,7 +120,7 @@ public enum EngineError implements TapstateErrorCode {
      * the stream the change travelled on and {@code columns} the key it was expected to carry. There is no
      * processor such a change could be sent to that keeps it in order with the other changes of its row.
      */
-    ROUTING_KEY_MISSING("engine.routing-key-missing", Set.of("node", "stream", "columns")),
+    ROUTING_KEY_MISSING(EngineErrorDefinitions.ROUTING_KEY_MISSING),
 
     /**
      * An update moved a row from one key to another at a node running on several processors. {@code node} is
@@ -127,7 +128,7 @@ public enum EngineError implements TapstateErrorCode {
      * on different processors, so no single place to send it keeps it in order with both - and applying it
      * out of order leaves a row behind under the old key or overwrites a newer value under the new one.
      */
-    KEY_CHANGE_ON_PARALLEL_NODE("engine.key-change-on-parallel-node", Set.of("node", "stream")),
+    KEY_CHANGE_ON_PARALLEL_NODE(EngineErrorDefinitions.KEY_CHANGE_ON_PARALLEL_NODE),
 
     /**
      * A run started on a different number of members than it was planned for: a member joined or left
@@ -135,8 +136,7 @@ public enum EngineError implements TapstateErrorCode {
      * were worked out for and {@code actual} the members the run started on. Stopped before any processor
      * ran, because every processor count and every set of writers worked out for the plan would be wrong.
      */
-    MEMBERSHIP_CHANGED_BEFORE_START("engine.membership-changed-before-start",
-            Set.of("pipeline", "planned", "actual")),
+    MEMBERSHIP_CHANGED_BEFORE_START(EngineErrorDefinitions.MEMBERSHIP_CHANGED_BEFORE_START),
 
     /**
      * The cluster refused operations on a pipeline's operator state for the whole stretch a run waits such a
@@ -145,34 +145,13 @@ public enum EngineError implements TapstateErrorCode {
      * verdicts converge, and this is the one that never cleared. {@code state} names the state, {@code seconds}
      * how long the run waited.
      */
-    CLUSTER_REFUSED_THE_STATE("engine.cluster-refused-the-state", Set.of("state", "seconds"));
+    CLUSTER_REFUSED_THE_STATE(EngineErrorDefinitions.CLUSTER_REFUSED_THE_STATE);
 
-    private final String code;
-    private final Set<String> placeholders;
-    private final Severity severity;
+    private final ProductErrorDefinition definition;
 
-    EngineError(String code, Set<String> placeholders) {
-        this(code, placeholders, Severity.ERROR);
-    }
+    EngineError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    EngineError(String code, Set<String> placeholders, Severity severity) {
-        this.code = code;
-        this.placeholders = placeholders;
-        this.severity = severity;
-    }
-
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return severity;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

@@ -158,6 +158,54 @@ class PreviewSelectionPlannerTest {
     }
 
     @Test
+    void refusesADroppedCompositeAssociationKeyBeforeReadingAnySamples() throws Exception {
+        String source = "banking";
+        String orders = "banking.bmsql_oorder";
+        String customers = "banking.bmsql_customer";
+        Map<String, String> joinKeys = Map.of("c_w_id", "o_w_id", "c_d_id", "o_d_id", "c_id", "o_c_id");
+        var sourceView = sourceView(List.of(
+                bankingTable(source, "bmsql_oorder", List.of("o_w_id", "o_d_id", "o_id", "o_c_id"),
+                        List.of("o_w_id", "o_d_id", "o_id")),
+                bankingTable(source, "bmsql_customer", List.of("c_w_id", "c_d_id", "c_id", "c_credit"),
+                        List.of("c_w_id", "c_d_id", "c_id"))), Set.of(orders, customers));
+
+        for (String droppedKey : List.of("c_w_id", "c_d_id", "c_id")) {
+            Step map = Step.inline("customer_pre", FromClause.list(FromRef.literal(customers)),
+                    new TransformBody.MapProjection(Map.of(droppedKey, FieldRule.drop()), null), null);
+            var customer = new Embed("customer", joinKeys, EmbedAs.FLAT, null,
+                    List.of("c_w_id", "c_d_id", "c_id"), null, null, null, null);
+            Step nest = Step.inline("nest", FromClause.aliases(Map.of(
+                    "root", FromRef.literal(orders), "customer", FromRef.literal("customer_pre"))),
+                    new TransformBody.Nest(null, null, new NestRoot("root",
+                            List.of("o_w_id", "o_d_id", "o_id"), null, null, List.of(customer))), null);
+            PipelineResource pipeline = new PipelineResource("pipeline", null,
+                    List.of(SourceRef.spec(source, true)), List.of(map, nest),
+                    new ViewBlock.Inline("orders_view", FromRef.literal("nest"), "o_id", null), null, null, null);
+            withPlanner(sourceView, (request, calls) -> rows(List.of(Envelope.read(NOW.toEpochMilli(), orders,
+                    Map.of("o_w_id", 1, "o_d_id", 2, "o_id", 3, "o_c_id", 4), Map.of()))),
+                    (planner, member, calls) -> {
+                        assertThatThrownBy(() -> planner.load("author", "pipeline", "dropped-" + droppedKey,
+                                pipeline, null, 1, NOW.plusSeconds(10), new BoundedQueryCancellation()))
+                                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                                    assertThat(failure.code())
+                                            .isEqualTo(ActuationError.PREVIEW_ASSOCIATION_KEY_DROPPED);
+                                    assertThat(failure.args()).isEqualTo(Map.of("relation", "customer",
+                                            "field", droppedKey, "transform", "customer_pre", "droppedField", droppedKey));
+                                });
+                        assertThat(calls).as("sample reads before refusing dropped key %s", droppedKey).hasValue(0);
+                    });
+        }
+    }
+
+    private static PreviewSourceTable bankingTable(String source, String name, List<String> columns,
+            List<String> key) {
+        return new PreviewSourceTable(source + "." + name, source, "test", Map.of(),
+                new TableSchema(name, columns.stream().map(field -> new FieldSchema(field, "integer")).toList()),
+                new SourceTable(name, columns.stream().map(field -> new SourceField(field, "integer")).toList(),
+                        key, List.of()));
+    }
+
+    @Test
     void mergesRepeatedSourceReadsByDiscoveredPrimaryKey() throws Exception {
         withPlanner(oneSource(), (request, calls) -> rows(List.of()), (planner, member, calls) -> {
             Object context = context(planner, PIPELINE, oneSource());

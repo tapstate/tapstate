@@ -27,12 +27,14 @@ class TheSameTableFromTwoSourcesReachesOneViewIT {
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
+        RealConnectorGate.require("mongodb");
     }
 
     @BeforeEach
     void stageTheConnector() throws IOException {
         Path jars = Files.createDirectory(directory.resolve("connectors"));
         E2eConnectorJar.buildInto(jars);
+        Files.copy(ConnectorJars.pathFor("mongodb"), jars.resolve("mongodb-connector.jar"));
         previousConnectorsDir = System.setProperty("tapstate.e2e.connectors-dir", jars.toString());
     }
 
@@ -50,16 +52,16 @@ class TheSameTableFromTwoSourcesReachesOneViewIT {
     void independentSnapshotsAndChangesLandOnceAndSurviveRestart(Tiers tier) throws IOException {
         Path left = Files.createDirectory(directory.resolve("left"));
         Path right = Files.createDirectory(directory.resolve("right"));
-        Path target = Files.createDirectory(directory.resolve("target"));
-        Map<String, String> environment = Map.of("LEFT_DIR", left.toString(), "RIGHT_DIR", right.toString(),
-                "TGT_DIR", target.toString());
         Envelope specification = EnvelopeParser.parse(Examples.read(WORKSPACE.resolve("spec.e2e.yml")));
-        String storeUri = SharedMongo.replicaSetUrl("e2e_consolidated_" + tier.name().toLowerCase(java.util.Locale.ROOT));
-        try (ServerHandle server = tier.launch(storeUri); Endpoints files = new FileEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage); Endpoints files = new FileEndpoints();
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            Map<String, String> environment = Map.of("LEFT_DIR", left.toString(), "RIGHT_DIR", right.toString(),
+                    "TGT_URI", storage.masterUri());
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(control, WORKSPACE,
-                    Map.of(E2eConnectorJar.CONNECTOR_ID, files), environment::get);
+                    Map.of(E2eConnectorJar.CONNECTOR_ID, files, "mongodb", mongo), environment::get);
             try {
                 new E2eExecutor(binding, new FilePipelineLoader(WORKSPACE),
                         Duration.ofSeconds(60), Duration.ofMillis(200)).execute(specification);
@@ -68,8 +70,8 @@ class TheSameTableFromTwoSourcesReachesOneViewIT {
                         specification, binding, "consolidated_orders");
                 throw failure;
             }
-            assertThat(files.count(EndpointAddress.uri(target.toString()), "orders_all"))
-                    .as("six distinct rows in the target directory, which neither source was seeded into")
+            assertThat(mongo.count(EndpointAddress.uri(storage.masterUri()), "orders_all"))
+                    .as("six distinct rows in the managed target database, separate from both file sources")
                     .isEqualTo(6);
         }
     }

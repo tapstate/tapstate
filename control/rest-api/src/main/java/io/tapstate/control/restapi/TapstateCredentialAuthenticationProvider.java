@@ -1,10 +1,15 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.CredentialAuthentication;
+import io.tapstate.control.core.CredentialEvidence;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.VerifiedToken;
+import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.StorageQuota;
+import io.tapstate.core.common.TapstateException;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.Authentication;
@@ -22,14 +27,32 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
 
     @Override
     public Authentication authenticate(Authentication authentication) {
+        try { return verify(authentication); }
+        catch (TapstateException failure) {
+            if (failure.code() == ControlError.UNAUTHENTICATED || failure.code() == ControlError.AUTH_FAILED)
+                throw new BadCredentialsException("invalid bearer credential");
+            if (StorageQuota.isQuotaCode(failure.code()))
+                throw new CodedAuthenticationFailure(ControlError.STORAGE_QUOTA_EXCEEDED);
+            throw new CodedAuthenticationFailure(failure.code() == ControlError.CLOUD_AUTH_UNAVAILABLE
+                    ? ControlError.CLOUD_AUTH_UNAVAILABLE : ControlError.STORAGE_UNAVAILABLE);
+        }
+    }
+
+    private Authentication verify(Authentication authentication) {
         TapstateCredentialAuthenticationToken credential = (TapstateCredentialAuthenticationToken) authentication;
-        VerifiedToken verified = credentials.authenticate(credential.credential())
+        var original = credentials.authenticateContext(credential.credential())
                 .orElseThrow(() -> new BadCredentialsException("invalid bearer credential"));
+        VerifiedToken verified = original.token();
         TapstatePrincipal principal = TokenService.isMachineToken(credential.credential())
                 ? TapstatePrincipal.machineToken(verified)
                 : CloudSessionService.isSessionToken(credential.credential())
                         ? TapstatePrincipal.cloudSession(verified) : TapstatePrincipal.humanJwt(verified);
-        return new TapstateAuthentication(principal);
+        // Authentication is fixed at HTTP entry. Later guards retain the selected owner's
+        // local lifetime; the next HTTP request authenticates its credential again.
+        Runnable active = original.evidence().map(CredentialEvidence::requireLocallyActive).orElse(() -> {});
+        var request = new CredentialAuthentication(original.token(), original.storageScope(),
+                original.organizationId(), active, original.evidence(), original.setupScope());
+        return new TapstateAuthentication(principal, request);
     }
 
     @Override

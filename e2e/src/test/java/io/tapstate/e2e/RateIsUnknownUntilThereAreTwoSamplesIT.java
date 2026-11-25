@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * both readings itself, waiting for the server to publish a newer observation, and prints rows per second
  * in the one answer -- with a number, which may be nought when nothing moved, but only ever after two
  * readings.
+ * A run may initially have no published counter; rows move only after the watch holds its first
+ * concrete reading, so the following sample must observe that movement.
  *
  * <p>The first line of the watch is what decides the first half: a watch that printed {@code 0.0 rows/s}
  * there would read as a pipeline moving nothing, which is what a stalled one looks like, and the two call
@@ -49,15 +51,15 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
 
     @Test
     void aWatchOpensNotKnowingAndThenSaysANumberAndAOneShotStatusSaysOne(@TempDir Path directory) throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("rate_two_samples_state");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             String pipelineId = running.pipelineId();
 
             try (CliProcess watch = CliProcess.onAPipe(Map.of("TAPSTATE_PASSWORD", PASSWORD),
                     "-c", server.baseUrl().toString(), "-u", USER,
                     "status", pipelineId, "--watch")) {
-                String opened = watch.awaitOutput(seen -> seen.contains(pipelineId + "  moving  not known"), TIMEOUT,
+                String opened = watch.awaitOutput(seen -> seen.contains(pipelineId + "  moving  not known yet -- one reading"), TIMEOUT,
                         "the watch's first movement line, which has one reading and says so");
                 assertThat(opened).as("one reading is not a rate of nought").doesNotContain("rows/s");
 
@@ -69,12 +71,11 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
                         .isLessThan(moved.indexOf(positiveRate(moved)));
             }
 
-            // Asked for, because this session's output is a pipe rather than a terminal: the second
-            // reading a rate is made of costs a wait, and a verb people run in a loop does not spend it
-            // unless somebody is looking or somebody asks. Both halves are witnessed here, since a flag
-            // nobody exercises is a flag that stops working.
-            CliOnce.Run status = CliOnce.runSession(PASSWORD, "status " + pipelineId + " --rate\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            // The second reading costs a wait, so a one-shot caller asks for it explicitly. A bare
+            // invocation owns the full-screen workbench and therefore requires a terminal; this pipe
+            // exercises the business verb directly.
+            CliOnce.Run status = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "status", pipelineId, "--rate");
             assertThat(status.exitCode())
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", status.stdout(), status.stderr())
                     .isZero();
@@ -86,8 +87,8 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
                     .containsPattern("moving     .*\\bout \\d+\\.\\d rows/s \\(over \\d+\\.\\ds of the pipeline's own time\\)")
                     .contains("lag        ");
 
-            CliOnce.Run plain = CliOnce.runSession(PASSWORD, "status " + pipelineId + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            CliOnce.Run plain = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "status", pipelineId);
             assertThat(plain.exitCode()).isZero();
             plain.stdout().lines().filter(line -> line.startsWith("moving"))
                     .forEach(line -> System.out.println("one-shot status without --rate said: " + line));

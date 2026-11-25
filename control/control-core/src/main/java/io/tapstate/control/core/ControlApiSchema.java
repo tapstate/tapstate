@@ -51,6 +51,7 @@ public final class ControlApiSchema {
     private static Map<String, SchemaRef> refs() {
         Map<String, SchemaRef> refs = new LinkedHashMap<>();
         bind(refs, "system.version", "SystemVersion");
+        StorageOperationSchemas.STEMS.forEach((id, stem) -> bind(refs, id, stem));
         bind(refs, "connector.list", "ConnectorList");
         bind(refs, "connector.get", "ConnectorGet");
         bind(refs, "source.list", "SourceList");
@@ -68,6 +69,7 @@ public final class ControlApiSchema {
         bind(refs, "artifact.get", "ArtifactGet");
         bind(refs, "pipeline.list", "PipelineList");
         bind(refs, "pipeline.start", "PipelineStart");
+        bind(refs, "pipeline.start-checks", "PipelineStartChecks");
         bind(refs, "pipeline.stop", "PipelineStop");
         bind(refs, "pipeline.pause", "PipelinePause");
         bind(refs, "pipeline.resume", "PipelineResume");
@@ -225,7 +227,33 @@ public final class ControlApiSchema {
 
         Map<String, Object> pipelineId = object(List.of("id"), Map.of("id", id), false);
         pair(defs, "PipelineList", listRequest, opaque);
-        pair(defs, "PipelineStart", pipelineId, opaque);
+        // A start carries the answers to its start checks, and the definition they were given against.
+        // Neither is required, because a start with nothing to answer is a bare one; answers without the
+        // precondition are refused, because an answer belongs to the definition its report was evaluated on.
+        Map<String, Object> decision = object(
+                List.of("finding", "action"),
+                Map.of(
+                        "finding", string("The key of the finding answered, as the start checks report it"),
+                        "action", string("The id of the answer chosen, one that finding offers")),
+                false);
+        Map<String, Object> decisions = new LinkedHashMap<>(array(decision));
+        decisions.put("description", "Answers to the questions the start checks ask, each one chosen by the "
+                + "person starting the Pipeline");
+        Map<String, Object> startRequest = object(
+                List.of("id"),
+                Map.of(
+                        "id", id,
+                        "decisions", decisions,
+                        "expectedContentHash",
+                        string("The contentHash of the start check report the answers were given against; "
+                                + "required with decisions")),
+                false);
+        pair(defs, "PipelineStart", startRequest, opaque);
+        Map<String, Object> intent = new LinkedHashMap<>(enumString("start", "rerun"));
+        intent.put("description", "Which start to check: a plain start (the default), or a rerun from the "
+                + "beginning -- a stop that clears this pipeline's state followed by a start");
+        pair(defs, "PipelineStartChecks",
+                object(List.of("id"), Map.of("id", id, "intent", intent), false), opaque);
         Map<String, Object> stopRequest = object(
                 List.of("id", "purgeState"),
                 Map.of("id", id, "purgeState", Map.of("type", "boolean", "description",
@@ -277,6 +305,7 @@ public final class ControlApiSchema {
         pair(defs, "DataBrowserFind",
                 object(List.of("sourceId", "collection"), findProperties, false),
                 opaque);
+        defs.putAll(StorageOperationSchemas.definitions());
         return immutableMap(defs);
     }
 
@@ -427,7 +456,8 @@ public final class ControlApiSchema {
                 "Processors per member; absent for a node run as one processor for the cluster"));
         node.put("effective", positiveInteger("Processors the node runs in total"));
         node.put("reasons", array(string("Why the width is what it is: requested-one, source-reads-not-split, "
-                + "single-target-keyless, key-not-derivable, rounded-up, rounded-down, or budget:<name>")));
+                + "single-target-keyless, key-not-derivable, state-has-one-writer, rounded-up, rounded-down, "
+                + "or budget:<name>")));
         node.put("batch", object(List.of("maxRecords", "maxWaitMillis"), batch, false));
         Map<String, Object> resources = new LinkedHashMap<>();
         resources.put("writers", positiveInteger("Processors writing the sink's rows, across the run"));

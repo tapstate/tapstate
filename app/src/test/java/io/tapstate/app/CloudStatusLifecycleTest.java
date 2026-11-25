@@ -133,8 +133,11 @@ class CloudStatusLifecycleTest {
         }, () -> "nonce"));
         lifecycle.onApplicationEvent(ready(owner));
         Logger logger = (Logger) LoggerFactory.getLogger(CloudStatusLifecycle.class);
+        var previousLevel = logger.getLevel();
         ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.setContext(logger.getLoggerContext());
         logs.start();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         logger.addAppender(logs);
         try {
             scheduled.getFirst().run();
@@ -142,12 +145,13 @@ class CloudStatusLifecycleTest {
             scheduled.getFirst().run();
             assertThat(calls.get()).isEqualTo(2);
             assertThat(logs.list).singleElement().satisfies(event -> {
-                assertThat(event.getFormattedMessage()).isEqualTo("Cloud status report failed [control.malformed-request]");
+                assertThat(event.getFormattedMessage()).isEqualTo("Cloud status report failed [TS0210001]");
                 assertThat(event.getThrowableProxy()).isNull();
             });
         } finally {
             logger.detachAppender(logs);
             logs.stop();
+            logger.setLevel(previousLevel);
         }
     }
 

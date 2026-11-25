@@ -14,6 +14,8 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -27,6 +29,51 @@ import java.util.concurrent.Executors;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class McpOperationExecutorTest {
+
+    @Test
+    void artifactWarningsAreReadableWithoutTurningSuccessfulOperationsIntoErrors() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 200, """
+                {"valid":true,"diagnostics":[],"outcomes":[{"id":"orders","change":"CREATED"}],
+                 "warnings":[{"code":"TS0010032","params":{"pipeline":"orders","setting":"parallelism","instead":"node.parallelism"}},
+                             {"code":"future.warning","params":{"detail":"keep"},"message":"Server explanation"}]}
+                """));
+        try (HttpControlClient client = new HttpControlClient()) {
+            var executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+            for (String operation : List.of("artifact.validate", "artifact.apply")) {
+                var result = executor.execute(ControlOperations.registry().resolve(operation), Map.of());
+                assertThat(result.error()).isFalse();
+                assertThat(result.body()).containsEntry("valid", true).containsEntry("diagnostics", List.of())
+                        .containsEntry("outcomes", List.of(Map.of("id", "orders", "change", "CREATED")));
+                var warnings = (List<?>) result.body().get("warnings");
+                var known = (Map<?, ?>) warnings.getFirst();
+                assertThat(known.get("code")).isEqualTo("TS0010032");
+                assertThat(known.get("message")).isEqualTo("Pipeline orders sets parallelism, which no longer decides anything; nothing reads it.");
+                assertThat(known.get("solution").toString()).contains("node.parallelism");
+                assertThat(warnings.get(1)).isEqualTo(Map.of("code", "future.warning",
+                        "params", Map.of("detail", "keep"), "message", "Server explanation"));
+            }
+        } finally { server.stop(0); }
+    }
+
+    @Test void storageToolsPostTheSameSharedBodyAndNeverPutSecretsInUrls() throws Exception {
+        var paths = new ArrayList<String>(); var requests = new ArrayList<Object>();
+        HttpServer server = server(exchange -> {
+            paths.add(exchange.getRequestURI().toString());
+            assertThat(exchange.getRequestMethod()).isEqualTo("POST");
+            requests.add(JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            answer(exchange, 200, "{\"phase\":\"UNKNOWN\"}");
+        });
+        try (HttpControlClient client = new HttpControlClient()) {
+            var executor = new McpOperationExecutor(baseOf(server), "bearer", Map.of(), client);
+            var body = Map.<String,Object>of("transferKey", "sentinel-transfer-key", "operationId", "original");
+            for (var id : new java.util.TreeSet<>(io.tapstate.control.client.StorageControlClient.OPERATIONS)) {
+                assertThat(executor.execute(ControlOperations.registry().resolve(id), body).error()).as(id).isFalse();
+                assertThat(paths.getLast()).isEqualTo(io.tapstate.control.client.StorageControlClient.path(id)).doesNotContain("sentinel");
+                assertThat(requests.getLast()).isEqualTo(body);
+            }
+            assertThat(paths).hasSize(12).contains("/api/storage/setup/activate");
+        } finally { server.stop(0); }
+    }
 
     @Test
     void connectionOperationsWaitForTheConnectorBeyondTheHeavyBudget() throws Exception {
@@ -109,6 +156,7 @@ class McpOperationExecutorTest {
                             Map.of("id", "orders", "expectedContentHash", "a".repeat(64))),
                     Map.entry(ControlOperations.PIPELINE_LIST, Map.of()),
                     Map.entry(ControlOperations.PIPELINE_START, pipeline),
+                    Map.entry(ControlOperations.PIPELINE_START_CHECKS, Map.of("id", "orders", "intent", "rerun")),
                     Map.entry(ControlOperations.PIPELINE_STOP, stop),
                     Map.entry(ControlOperations.PIPELINE_PAUSE, pipeline),
                     Map.entry(ControlOperations.PIPELINE_RESUME, pipeline),
@@ -123,6 +171,10 @@ class McpOperationExecutorTest {
                             Map.of("sourceId", "views", "collection", "order_state")),
                     Map.entry(ControlOperations.DATA_BROWSER_FIND,
                             Map.of("sourceId", "views", "collection", "order_state")));
+
+            calls = new ArrayList<>(calls);
+            for (var id : new java.util.TreeSet<>(io.tapstate.control.client.StorageControlClient.OPERATIONS))
+                calls.add(Map.entry(ControlOperations.registry().resolve(id), Map.of()));
 
             // "Every" is derived, not counted by hand. The routing is a switch over operation ids, and
             // the failure it has is silent in exactly this shape: a verb marked open on this face with
@@ -147,7 +199,8 @@ class McpOperationExecutorTest {
                     "/api/connections/orders/test-result", "/api/connections:discover-schema",
                     "/api/connections/orders/schema", "/api/artifacts:validate", "/api/artifacts:apply",
                     "/api/artifacts/orders", "/api/pipelines:artifacts?limit=50&offset=0",
-                    "/api/pipelines/orders:start", "/api/pipelines/orders:stop",
+                    "/api/pipelines/orders:start", "/api/pipelines/orders/start-checks?intent=rerun",
+                    "/api/pipelines/orders:stop",
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
                     "/api/pipelines/orders/snapshot", "/api/pipelines/orders/logs?limit=200",
@@ -286,7 +339,7 @@ class McpOperationExecutorTest {
     @Test
     void sourceListPreservesServerErrorsInsteadOfProjectingThem() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 400,
-                "{\"code\":\"control.malformed-request\",\"message\":\"bad page\"}"));
+                "{\"code\":\"TS0210001\",\"message\":\"bad page\"}"));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
@@ -294,7 +347,7 @@ class McpOperationExecutorTest {
             McpResult result = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+            assertThat(result.body()).containsEntry("code", "TS0210001");
         } finally {
             server.stop(0);
         }
@@ -315,8 +368,8 @@ class McpOperationExecutorTest {
             McpResult missingItems = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
             McpResult missingConnector = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
 
-            assertThat(missingItems.body()).containsEntry("code", "mcp.invalid-server-response");
-            assertThat(missingConnector.body()).containsEntry("code", "mcp.invalid-server-response");
+            assertThat(missingItems.body()).containsEntry("code", "TS0260003");
+            assertThat(missingConnector.body()).containsEntry("code", "TS0260003");
         } finally {
             server.stop(0);
         }
@@ -346,10 +399,10 @@ class McpOperationExecutorTest {
 
             assertThat(floatingPoint.error()).isFalse();
             assertThat(paths).containsExactly("/api/pipelines:artifacts?limit=2&offset=1");
-            assertThat(fractional.body()).containsEntry("code", "control.malformed-request");
-            assertThat(text.body()).containsEntry("code", "control.malformed-request");
-            assertThat(negativeOffset.body()).containsEntry("code", "control.malformed-request");
-            assertThat(largeOffset.body()).containsEntry("code", "control.malformed-request");
+            assertThat(fractional.body()).containsEntry("code", "TS0210001");
+            assertThat(text.body()).containsEntry("code", "TS0210001");
+            assertThat(negativeOffset.body()).containsEntry("code", "TS0210001");
+            assertThat(largeOffset.body()).containsEntry("code", "TS0210001");
         } finally {
             server.stop(0);
         }
@@ -421,7 +474,7 @@ class McpOperationExecutorTest {
             McpResult result = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of("id", "orders"));
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.unreachable");
+            assertThat(result.body()).containsEntry("code", "TS0210005");
         }
     }
 
@@ -657,12 +710,13 @@ class McpOperationExecutorTest {
         }
     }
 
-    @Test
-    void aRefusedArtifactDeleteIsStillReportedAsTheServerStatedIt() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0240003", "artifact.version-conflict"})
+    void aRefusedArtifactDeleteIsStillReportedAsTheServerStatedIt(String code) throws Exception {
         // The body added above must not swallow a refusal into a success: a delete the server rejected
         // reported as {"removed": true} is worse than the empty body it replaced.
         HttpServer server = server(exchange -> answer(exchange, 409,
-                "{\"code\":\"artifact.version-conflict\",\"message\":\"it changed\"}"));
+                JsonWriter.write(Map.of("code", code, "message", "it changed"))));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
@@ -671,10 +725,161 @@ class McpOperationExecutorTest {
                     Map.of("id", "orders", "expectedContentHash", "a".repeat(64)));
 
             assertThat(result.error()).isTrue();
-            assertThat(JsonWriter.write(result.body())).contains("artifact.version-conflict");
+            assertThat(JsonWriter.write(result.body())).contains(code);
             // Asserted non-empty first: "does not contain" is satisfied by a body that carries nothing
             // at all, which is the outcome this whole test exists to rule out.
             assertThat(result.body()).isNotEmpty().doesNotContainKey("removed");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // ---- the start, through its start checks ---------------------------------------------------------
+
+    /** The versioned report every client reads, read where it lives. */
+    private static final Path CLIENT_FIXTURE = Path.of("..").toAbsolutePath().normalize()
+            .resolve("rest-api/src/test/resources/start-checks/client-fixture-v1.json");
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> answerableReport() throws IOException {
+        Map<String, Object> fixture = (Map<String, Object>) JsonReader.parse(Files.readString(CLIENT_FIXTURE));
+        assertThat(fixture.get("fixtureVersion")).as("the fixture version this face is written against")
+                .isEqualTo(1L);
+        return (Map<String, Object>) fixture.get("answerable");
+    }
+
+    /**
+     * A server with start checks, as far as a start goes: one carrying answers and their precondition goes
+     * ahead, one carrying answers without it is refused for the precondition, and one carrying no answers is
+     * stopped with the report. Every body and precondition it is sent is written down.
+     */
+    private static HttpServer startCheckingServer(
+            Map<String, Object> report, List<String> bodies, List<String> preconditions) throws IOException {
+        return server(exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            String ifMatch = exchange.getRequestHeaders().getFirst("If-Match");
+            bodies.add(body);
+            preconditions.add(String.valueOf(ifMatch));
+            Object decisions = body.isBlank() ? null : ((Map<?, ?>) JsonReader.parse(body)).get("decisions");
+            if (decisions == null) {
+                Map<String, Object> refusal = new LinkedHashMap<>();
+                refusal.put("code", "lifecycle.start-needs-confirmation");
+                refusal.put("params", Map.of("pipeline", "lead_view", "questions", 2));
+                refusal.put("message", "lead_view needs 2 answers before it starts.");
+                refusal.put("startChecks", report);
+                answer(exchange, 409, JsonWriter.write(refusal));
+            } else if (ifMatch == null) {
+                answer(exchange, 428, "{\"code\":\"pipeline.precondition-required\",\"message\":\"none\"}");
+            } else {
+                answer(exchange, 200, "{\"pipelineId\":\"lead_view\",\"targetState\":\"RUNNING\"}");
+            }
+        });
+    }
+
+    @Test
+    void aStartItsChecksStopComesBackWithTheWholeReport() throws Exception {
+        Map<String, Object> report = answerableReport();
+        HttpServer server = startCheckingServer(report, new ArrayList<>(), new ArrayList<>());
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view"));
+
+            assertThat(result.error()).isTrue();
+            // the report as the server sent it, beside the four fields every refusal has: what the caller
+            // puts to a person, every question with the answers it offers
+            assertThat(result.body())
+                    .containsEntry("code", "lifecycle.start-needs-confirmation")
+                    .containsEntry("status", 409)
+                    .containsEntry("startChecks", report);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void answersToEveryQuestionInTheReportStartThePipeline() throws Exception {
+        Map<String, Object> report = answerableReport();
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> preconditions = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startCheckingServer(report, bodies, preconditions);
+        // an answer each question offers, the action no client knows by name included
+        List<Map<String, Object>> decisions = new ArrayList<>();
+        for (Object item : (List<?>) report.get("findings")) {
+            Map<?, ?> finding = (Map<?, ?>) item;
+            if ("CONFIRM".equals(finding.get("behavior"))) {
+                Map<?, ?> offered = (Map<?, ?>) ((List<?>) finding.get("actions")).get(0);
+                decisions.add(Map.of("finding", finding.get("key"), "action", offered.get("id")));
+            }
+        }
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view",
+                    "decisions", decisions, "expectedContentHash", report.get("contentHash")));
+
+            // A start sent with no body would be stopped again with the same report.
+            assertThat(result.error()).as("%s", result.body()).isFalse();
+            assertThat(JsonReader.parse(bodies.getLast())).isEqualTo(Map.of("decisions", decisions));
+            assertThat(preconditions.getLast()).isEqualTo("\"" + report.get("contentHash") + "\"");
+            assertThat(decisions).extracting(decision -> decision.get("action")).containsExactly("clear", "accept");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void answersWithoutThePreconditionAreRefusedBeforeAnyRequest() throws Exception {
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startCheckingServer(answerableReport(), bodies, new ArrayList<>());
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view",
+                    "decisions", List.of(Map.of("finding", "target-not-empty/views/lead", "action", "keep"))));
+
+            assertThat(result.error()).isTrue();
+            assertThat(JsonWriter.write(result.body())).contains("expectedContentHash");
+            assertThat(bodies).isEmpty();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aBareStartSendsNeitherAnswersNorAPrecondition() throws Exception {
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> preconditions = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startCheckingServer(answerableReport(), bodies, preconditions);
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view", "decisions", List.of()));
+
+            assertThat(bodies).containsExactly("");
+            assertThat(preconditions).containsExactly("null");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aStartHasTheHeavyBudgetBecauseItsChecksLookAtEveryTarget() throws Exception {
+        HttpServer server = server(exchange -> {
+            try {
+                Thread.sleep(600);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            answer(exchange, 200, "{\"pipelineId\":\"orders\",\"targetState\":\"RUNNING\"}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofMillis(150), Duration.ofSeconds(5))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "orders"));
+
+            // on the light budget this answer arrives after the request has been given up on
+            assertThat(result.error()).as("%s", result.body()).isFalse();
         } finally {
             server.stop(0);
         }
@@ -690,7 +895,7 @@ class McpOperationExecutorTest {
                     new Operation("test.unsupported", Scope.READ, false, null, Map.of()), Map.of());
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+            assertThat(result.body()).containsEntry("code", "TS0210001");
         }
     }
 
@@ -703,8 +908,8 @@ class McpOperationExecutorTest {
             McpResult missing = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of());
             McpResult blank = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of("id", " "));
 
-            assertThat(missing.body()).containsEntry("code", "control.malformed-request");
-            assertThat(blank.body()).containsEntry("code", "control.malformed-request");
+            assertThat(missing.body()).containsEntry("code", "TS0210001");
+            assertThat(blank.body()).containsEntry("code", "TS0210001");
             assertThat(missing.error()).isTrue();
             assertThat(blank.error()).isTrue();
         }
@@ -781,7 +986,7 @@ class McpOperationExecutorTest {
     private static void assertSourceDraftUnavailable(
             int connectorStatus, String connectorBody, String draftBody) throws Exception {
         assertThat(sourceDraftResult(connectorStatus, connectorBody, draftBody).body())
-                .containsEntry("code", "mcp.connector-spec-unavailable");
+                .containsEntry("code", "TS0260001");
     }
 
     private static void answer(HttpExchange exchange, int status, String body) throws IOException {

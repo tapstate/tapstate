@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.List;
 
 /**
  * The side record of what a pipeline step works its own columns out to be, keyed by the pipeline and
@@ -40,6 +41,13 @@ public interface DerivedSchemaStore {
     /** The latest recorded derivation for a step, or empty where the step has never recorded one. */
     Optional<DerivedSchema> latest(String pipelineId, String stepId);
 
+    /** Reads the requested latest records, omitting missing steps; a failed read never returns a partial result. */
+    default Map<String, DerivedSchema> latestMany(String pipelineId, java.util.Set<String> stepIds) {
+        var captured = java.util.Set.copyOf(stepIds); var found = new java.util.LinkedHashMap<String, DerivedSchema>();
+        for (String step : captured) latest(pipelineId, step).ifPresent(record -> found.put(step, record));
+        return java.util.Collections.unmodifiableMap(found);
+    }
+
     /**
      * Records a derivation for a step. Appends a new version when {@code schema} differs from the
      * latest recorded one; when it is the same, updates that version's {@code derivedFrom} and
@@ -52,6 +60,41 @@ public interface DerivedSchemaStore {
      */
     void record(String pipelineId, String stepId, Map<String, String> schema, String statement,
             String derivedFrom, String derivedBy);
+
+    /** One model to record, captured independently of later caller mutations. */
+    record Recording(String stepId, Map<String, String> schema, String statement,
+            String derivedFrom, String derivedBy) {
+        public Recording {
+            schema = new DerivedSchema(0, schema, statement, derivedFrom, derivedBy).schema();
+        }
+    }
+
+    /** Records a bounded group in order; backends may share one transaction for the group. */
+    default void recordBatch(String pipelineId, List<Recording> recordings) {
+        for (Recording recording : List.copyOf(recordings)) {
+            record(pipelineId, recording.stepId(), recording.schema(), recording.statement(),
+                    recording.derivedFrom(), recording.derivedBy());
+        }
+    }
+
+    record Change(String stepId, DerivedSchema derivation) {}
+
+    /** Records changes in submission order while retaining each step's version and pin rules. */
+    default void recordMany(String pipelineId, List<Change> changes) {
+        for (Change change : changes) {
+            var value = change.derivation();
+            record(pipelineId, change.stepId(), value.schema(), value.statement(), value.derivedFrom(), value.derivedBy());
+        }
+    }
+
+    /** Records the run's derivations and pins the versions just recorded. */
+    default void recordAndPinMany(String pipelineId, List<Change> changes) {
+        recordMany(pipelineId, changes);
+        for (Change change : changes)
+            latest(pipelineId, change.stepId()).ifPresent(value -> pin(pipelineId, change.stepId(), value.version()));
+    }
+
+    default boolean supportsStartupBatch() { return false; }
 
     /**
      * Notes which version of a step's history a run is holding on to. Written by the assembly a run is

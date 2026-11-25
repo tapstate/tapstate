@@ -31,11 +31,11 @@ class BothPipelinesOnOneSourceConnectionDeliverIT {
 
         String firstTargetUri = SharedMongo.replicaSetUrl("two_pipeline_first_target");
         String secondTargetUri = SharedMongo.replicaSetUrl("two_pipeline_second_target");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("two_pipeline_store"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

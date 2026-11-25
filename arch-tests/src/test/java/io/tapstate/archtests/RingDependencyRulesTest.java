@@ -1,11 +1,11 @@
 package io.tapstate.archtests;
 
 import com.tngtech.archunit.base.DescribedPredicate;
+import com.tngtech.archunit.core.domain.Dependency;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaFieldAccess;
 import com.tngtech.archunit.core.domain.JavaModifier;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.spi.store.PipelineDraftSummary;
@@ -21,6 +21,7 @@ import static com.tngtech.archunit.core.domain.JavaClass.Predicates.assignableTo
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.equivalentTo;
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAPackage;
 import static com.tngtech.archunit.core.domain.properties.HasName.Predicates.name;
+import static com.tngtech.archunit.lang.conditions.ArchConditions.onlyHaveDependenciesWhere;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -39,9 +40,7 @@ class RingDependencyRulesTest {
 
     @BeforeAll
     static void importTapstateClasses() {
-        tapstateClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        tapstateClasses = ProductionClassImports.packages("io.tapstate");
     }
 
     @Test
@@ -137,9 +136,10 @@ class RingDependencyRulesTest {
                         "io.tapstate.control.client..",
                         // the shared error-code message catalog + renderer (presentation layer)
                         "io.tapstate.messages..",
-                        // the CLI's own facade libraries
+                        // The CLI's facade libraries, also pinned by cli/pom.xml.
                         "picocli..",
-                        "org.jline..")
+                        "org.jline..",
+                        "dev.tamboui..")
                 .allowEmptyShould(true)
                 .because("the CLI talks to services through the framework-free HTTP client only; it "
                         + "must have no dependency on control services or runtime modules; the message catalog is "
@@ -397,46 +397,43 @@ class RingDependencyRulesTest {
                                 type -> type.getName().startsWith(PipelineDraft.class.getName() + "$")))
                         .or(equivalentTo(PipelineDraftMutation.class));
         classes().that().resideInAPackage("io.tapstate.control.restapi..")
-                .should().onlyDependOnClassesThat(allowedRestApiDependencies)
+                .should(onlyHaveDependenciesWhere(DescribedPredicate.describe(
+                        "allowed HTTP adapter dependencies and the checkpoint error code",
+                        dependency -> allowedRestApiDependencies.test(dependency.getTargetClass())
+                                || isPipelineStatusCheckpointError(dependency))))
                 .allowEmptyShould(true)
                 .because("the HTTP presentation adapter sits on control-core, the kernel, the shared "
                         + "message catalog and the servlet substrate; it does not reach the ports directly")
                 .check(tapstateClasses);
     }
 
+    /** One error-code field read in the catalog status mapper. It grants no storage port access. */
+    private static boolean isPipelineStatusCheckpointError(Dependency dependency) {
+        return dependency.convertTo(JavaFieldAccess.class).stream().anyMatch(access ->
+                access.getOriginOwner().getName().equals("io.tapstate.control.restapi.PipelineStatusResponse")
+                        && access.getOrigin().getName().equals("of")
+                        && access.getOrigin().getRawParameterTypes().stream().map(JavaClass::getName).toList()
+                                .equals(List.of("io.tapstate.control.core.PipelineCatalogItem",
+                                        "io.tapstate.messages.MessageCatalog", "java.time.Clock", "java.util.Locale"))
+                        && access.getAccessType() == JavaFieldAccess.AccessType.GET
+                        && access.getTarget().getFullName().equals("io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE"));
+    }
+
     @Test
-    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly the seven named probes "
-            + "— no further channel")
+    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly eleven named probes")
     void r5_controlToRuntimeSyncWhitelistHasNoFurtherChannel() {
-        // A control-to-runtime sync channel is a runtime interface control reaches for. The whitelist is
-        // a closed set of exactly seven such interfaces: connection test, schema discovery, the four
-        // data-browser channels, and finite Pipeline preview. The probes' value types are storage-port
-        // types (the connection config or query request they take, the result they return), carried as
-        // payload, not channels of their own. This gate bans a further channel — another probe interface
-        // control depends on. Widening the whitelist must change this gate and the sync-whitelist
-        // decision, not slip in beside it (an eighth probe interface control reaches for turns this red).
-        //
-        // The set is spelled out here because the decision is what the names encode; the four query
-        // channels are named ahead of the code that implements them, so until then this gate is green
-        // without proving anything. What it does from the first day is refuse an eighth.
-        DescribedPredicate<JavaClass> aRuntimeSyncChannelOutsideTheWhitelist =
-                resideInAPackage("io.tapstate.runtime.probe..")
-                        .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.ConnectionProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.SchemaDiscoveryProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserCollectionsProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserFindProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserStatsProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserTailProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.PipelinePreviewProbe")))
-                        .as("a control-to-runtime sync channel outside the whitelist");
+        // Payload records and admitted leases are not additional runtime operations.
+        DescribedPredicate<JavaClass> outside = resideInAPackage("io.tapstate.runtime.probe..")
+                .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface));
+        for (String probe : java.util.List.of("ConnectionProbe", "SchemaDiscoveryProbe", "DataBrowserCollectionsProbe",
+                "DataBrowserFindProbe", "DataBrowserStatsProbe", "DataBrowserTailProbe", "PipelinePreviewProbe",
+                "ValidationEvaluationProbe", "ValidationStartProbe", "ValidationProgressProbe", "ValidationStopProbe")) {
+            outside = outside.and(DescribedPredicate.not(name("io.tapstate.runtime.probe." + probe)));
+        }
         noClasses().that().resideInAPackage("io.tapstate.control..")
-                .should().dependOnClassesThat(aRuntimeSyncChannelOutsideTheWhitelist)
+                .should().dependOnClassesThat(outside.as("a runtime sync channel outside the closed whitelist"))
                 .allowEmptyShould(true)
-                .because("the control-to-runtime sync whitelist is a closed set of exactly seven members "
-                        + "— connection, discovery, four data-browser, and Pipeline preview probes; "
-                        + "a further synchronous channel must change this gate and the sync-whitelist "
-                        + "decision, not slip in beside it")
+                .because("exactly eleven named, single-operation channels are admitted")
                 .check(tapstateClasses);
     }
 

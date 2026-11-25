@@ -31,6 +31,8 @@ with tempfile.TemporaryDirectory() as tmp:
     put('durations.json',json.dumps({'sample.PublishedExamplesIT':10000, 'sample.PublishedExamplesIT#examples/sample0/case.e2e.yml':100}))
     call('plan','--durations',root/'durations.json','--output',root/'plan.json')
     plan=json.loads((root/'plan.json').read_text()); assert len(plan['shards'])==10
+    put('bin/mvn','#!/bin/sh\nexit 0\n'); (root/'bin/mvn').chmod(0o755)
+    os.environ['PATH']=str(root/'bin')+':'+os.environ['PATH']
     assert {t['class'] for t in plan['expected']}=={'sample.'+n for n in names}, 'deferred external Atlas witnesses must be absent from the active cohort'
     assert plan['connector_deferrals']['classes']==deferred and plan['requires_atlas_fixtures'] is False
     assert len(plan['expected'])==20
@@ -67,6 +69,7 @@ with tempfile.TemporaryDirectory() as tmp:
     def pack(shard,ok=True): call('pack','--plan',root/'plan.json','--shard',shard['id'],'--output',artifacts/shard['id'],ok=ok)
     for shard in plan['shards']:
         shutil.rmtree(root/'e2e/target',ignore_errors=True)
+        call('run','--plan',root/'plan.json','--shard',shard['id'],'--repo-local',root/'m2')
         suites={}; ledger=[]
         for test in shard['tests']:
             name=test['class']; put('e2e/target/test-classes/'+name.replace('.','/')+'.class','bytecode')
@@ -94,6 +97,35 @@ with tempfile.TemporaryDirectory() as tmp:
         call('verify','--plan',root/'plan.json','--artifacts',artifacts,'--restore',root/'restored',ok=ok)
         if not ok: assert not (root/'restored').exists()
     verify()
+    # The same complete report set must be bound to the selected shipping inputs.
+    canonical=pathlib.Path(os.environ['WITNESS_GATE']).resolve().parents[2]
+    release_lock=json.loads((canonical/'deploy/cloud/connectors.lock.json').read_text())
+    put('deploy/cloud/connectors.lock.json',json.dumps(release_lock))
+    lock_sha=hashlib.sha256((root/'deploy/cloud/connectors.lock.json').read_bytes()).hexdigest()
+    release_ids={'mysql','mongodb','postgres','oracle','sqlserver','mongodb-atlas','aws-rds-mysql','dummy'}
+    identity=dict(schema=1,mode='release',source_sha=plan['source_sha'],release='connectors-preview',lock_sha256=lock_sha,
+                  connectors=[dict(id=e['id'],file=e['id']+'-connector.jar',**{k:e[k] for k in ['bytes','sha256','pdkApiVersion','upstreamRevision']})
+                              for e in sorted(release_lock['connectors'],key=lambda e:e['id']) if e['id'] in release_ids])
+    release_plan=copy.deepcopy(plan);release_plan['connector_input_mode']='release'
+    put('release-plan.json',json.dumps(release_plan));put('selected-inputs.json',json.dumps(identity))
+    for selected in plan['shards']:
+        (artifacts/selected['id']/'connector-inputs.json').write_text(json.dumps(identity))
+    def shipping(ok=True,mode='release',inputs=True):
+        shutil.rmtree(root/'shipping-restored',ignore_errors=True)
+        extra=['--inputs',root/'selected-inputs.json'] if inputs else []
+        call('verify','--input-mode',mode,*extra,'--plan',root/'release-plan.json','--artifacts',artifacts,
+             '--restore',root/'shipping-restored',ok=ok)
+        if not ok:assert not (root/'shipping-restored').exists()
+    shipping()
+    shipping(False,inputs=False)
+    shipping(False,mode='upstream')
+    item=artifacts/plan['shards'][0]['id']/'connector-inputs.json'
+    changed=copy.deepcopy(identity);changed['mode']='upstream';item.write_text(json.dumps(changed));shipping(False)
+    item.write_text(json.dumps(identity))
+    changed=copy.deepcopy(identity);changed['connectors'][0]['sha256']='0'*64
+    put('selected-inputs.json',json.dumps(changed));shipping(False)
+    put('selected-inputs.json',json.dumps(identity));shipping()
+    for selected in plan['shards']:(artifacts/selected['id']/'connector-inputs.json').unlink()
     policy_path.write_text(json.dumps(dict(policy,reason='Changed policy requires a fresh plan.')))
     verify(False)
     policy_path.write_text(json.dumps(policy)); verify()
@@ -159,5 +191,23 @@ with tempfile.TemporaryDirectory() as tmp:
     selected=next(s for s in plan['shards'] if s['id']==sweep[0])
     assert Counter(selection.split(','))==Counter(t['example'] for t in selected['tests'] if 'example' in t)
     assert '-DforkCount=1' in args and '-DreuseForks=true' in args and '-Djunit.jupiter.execution.parallel.enabled=false' in args
-print('connector-witnesses smoke: explicit Atlas deferral/restoration, policy binding, XML preservation and original 27 adverse scenario types passed')
+    # The wrapper must let the guarded runner preflight before it deletes either ledger.
+    with tempfile.TemporaryDirectory() as external_tmp:
+        outside=pathlib.Path(external_tmp)
+        foreign={'witness-ledger.txt':'external ordinary ledger',
+                 'witness-ledgers/123.txt':'external selected ledger',
+                 'failsafe-reports/TEST-foreign.xml':'external XML',
+                 'jacoco.exec':'external coverage'}
+        for name,value in foreign.items():
+            path=outside/name; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(value)
+        target=root/'e2e/target'; backup_target=root/'e2e/target-owned-backup'
+        target.rename(backup_target); target.symlink_to(outside,target_is_directory=True)
+        (root/'mvn-args').unlink(missing_ok=True)
+        try:
+            rejected=call('run','--plan',root/'plan.json','--shard',sweep[0],'--repo-local',root/'m2',ok=False)
+            assert 'unsafe cleanup path' in rejected.stderr and not (root/'mvn-args').exists()
+            assert all((outside/name).is_file() and (outside/name).read_text()==value for name,value in foreign.items()), 'wrapper modified external evidence before preflight'
+        finally:
+            target.unlink(); backup_target.rename(target)
+print('connector-witnesses smoke: explicit Atlas deferral/restoration, policy binding, XML preservation and 28 adverse admission/run scenario types passed')
 PY

@@ -134,6 +134,7 @@ class OracleFixtureChangeCaptureIT {
     @Test
     @Timeout(value = 6, unit = TimeUnit.MINUTES)
     void anInflightTransactionDoesNotAbortChangeCaptureSetup() throws Exception {
+        System.err.printf("oracle-fixture-probe method-start epoch-ms=%d%n", System.currentTimeMillis());
         DockerGate.require();
         ImageNameSubstitutor originalSubstitutor = ImageNameSubstitutor.instance();
         String delayedImage = new ImageFromDockerfile()
@@ -153,10 +154,16 @@ class OracleFixtureChangeCaptureIT {
                         input=$(mktemp)
                         cat > "$input"
                         if grep -q 'ALTER DATABASE ADD SUPPLEMENTAL LOG DATA' "$input"; then
-                          awk '/ALTER DATABASE ADD SUPPLEMENTAL LOG DATA/ {
+                          awk 'BEGIN { print "SPOOL /tmp/tapstate-initialization.log" }
+                          /^PROMPT / {
+                            print "HOST date -u >> /tmp/tapstate-initialization-stage.log"
+                            print "HOST echo " sprintf("%c", 39) $0 sprintf("%c", 39)                               " >> /tmp/tapstate-initialization-stage.log"
+                          }
+                          /ALTER DATABASE ADD SUPPLEMENTAL LOG DATA/ {
                             print "HOST bash /tmp/tapstate-hold-transaction.sh"
                           } { print }' "$input" > "$input.delayed"
                           input="$input.delayed"
+                          printf '%s\\n' "$$" > /tmp/tapstate-main-sqlplus.pid
                         fi
                         exec "$ORACLE_HOME/bin/sqlplus-probe-real" "$@" < "$input"
                         """)
@@ -166,15 +173,25 @@ class OracleFixtureChangeCaptureIT {
                         "$ORACLE_HOME/bin/sqlplus-probe-real" -s / as sysdba \
                           > /tmp/tapstate-transaction.log 2>&1 <<'SQL' &
                         WHENEVER SQLERROR EXIT FAILURE ROLLBACK
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-before-create epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         CREATE TABLE SYSTEM.TAPSTATE_LOGGING_HOLD (ID NUMBER);
                         INSERT INTO SYSTEM.TAPSTATE_LOGGING_HOLD VALUES (1);
+                        PROMPT capture-probe: holder inserted the row;
                         HOST touch /tmp/tapstate-transaction-ready
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-ready epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-sleep-start epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         BEGIN DBMS_SESSION.SLEEP(130); END;
                         /
+                        PROMPT capture-probe: holder sleep completed;
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-sleep-end epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         ROLLBACK;
+                        PROMPT capture-probe: holder rollback completed;
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-rollback-end epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
+                        HOST date -u '+oracle-fixture-probe holder-stage=holder-exit epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         EXIT;
                         SQL
                         holder=$!
+                        printf '%s\\n' "$holder" > /tmp/tapstate-transaction.pid
                         for attempt in {1..30}; do
                           if [ -f /tmp/tapstate-transaction-ready ]; then
                             printf 'capture-probe: real transaction active; bounded rollback in 130 seconds\\n'
@@ -211,6 +228,13 @@ class OracleFixtureChangeCaptureIT {
         sharedServer.set(null, null);
         try {
             var settings = SharedOracle.settings("logging_wait_probe");
+            OracleContainer runningServer = (OracleContainer) sharedServer.get(null);
+            var journal = runningServer.execInContainer("bash", "-c",
+                    "cat /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log");
+            assertThat(journal.getExitCode()).isZero();
+            assertThat(stageTime(journal.getStdout(), "main-stage=force-logging"))
+                    .as("logging setup must wait until the controlled ROOT transaction is released")
+                    .isGreaterThanOrEqualTo(stageTime(journal.getStdout(), "holder-stage=holder-sleep-end"));
             try (var connection = DriverManager.getConnection(
                     "jdbc:oracle:thin:@//" + settings.get("host") + ":" + settings.get("port") + "/FREE",
                     settings.get("user").toString(), settings.get("password").toString());
@@ -221,6 +245,21 @@ class OracleFixtureChangeCaptureIT {
                 assertThat(logging.getString(1)).isEqualTo("ARCHIVELOG");
                 assertThat(logging.getString(2)).isEqualTo("YES");
                 assertThat(logging.getString(3)).isEqualTo("YES");
+            }
+            try (var connection = DriverManager.getConnection(
+                    "jdbc:oracle:thin:@//" + settings.get("host") + ":" + settings.get("port") + "/FREEPDB1",
+                    settings.get("user").toString(), settings.get("password").toString());
+                 var statement = connection.createStatement();
+                 var logging = statement.executeQuery(
+                         "SELECT SYS_CONTEXT('USERENV', 'CON_NAME'), LOG_MODE, SUPPLEMENTAL_LOG_DATA_MIN, "
+                                 + "FORCE_LOGGING, (SELECT OPEN_MODE FROM V$PDBS WHERE NAME = 'FREEPDB1') "
+                                 + "FROM V$DATABASE")) {
+                assertThat(logging.next()).isTrue();
+                assertThat(logging.getString(1)).isEqualTo("FREEPDB1");
+                assertThat(logging.getString(2)).isEqualTo("ARCHIVELOG");
+                assertThat(logging.getString(3)).isEqualTo("YES");
+                assertThat(logging.getString(4)).isEqualTo("YES");
+                assertThat(logging.getString(5)).isEqualTo("READ WRITE");
             }
         } finally {
             try {
@@ -233,6 +272,13 @@ class OracleFixtureChangeCaptureIT {
                 substitutor.set(null, originalSubstitutor);
             }
         }
+    }
+
+    private static long stageTime(String journal, String stage) {
+        String prefix = "oracle-fixture-probe " + stage + " epoch-ms=";
+        return journal.lines().filter(line -> line.startsWith(prefix))
+                .mapToLong(line -> Long.parseLong(line.substring(prefix.length())))
+                .findFirst().orElseThrow(() -> new AssertionError("Missing Oracle fixture stage: " + stage));
     }
 
     private static Field accessibleField(Class<?> owner, String name) throws NoSuchFieldException {

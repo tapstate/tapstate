@@ -57,7 +57,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 id -> loaded(),
                 id -> Map.of("chain-a", 4L),
                 id -> Map.of("nest.orders.doc.$root",
-                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))),
+                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))
+                                .withKeyCounts(1_200L, 60L)),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of("chain-b", 61_000L),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -67,9 +68,94 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 Clock.fixed(AT, ZoneOffset.UTC));
     }
 
+    @Test void nestCommitDistributionsAndRootCountUseTheExistingFactsOutput() {
+        var keys = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_KEYS, 8);
+        var trips = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_ROUND_TRIPS, 4);
+        var duration = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_DURATION, 0.005);
+        var commits = new io.tapstate.core.lifecycle.StateCommitReading(1, keys, trips, duration, 2, LOAD_BEGAN);
+        var reading = new NestStateReading(1, 2, 3, 4)
+                .withContext(new io.tapstate.core.lifecycle.NestKeyAccess(8, 8, 0, "run"),
+                        new io.tapstate.core.lifecycle.NestOrigin("order-doc", "[]", "state"))
+                .withRootsRendered(6, LOAD_BEGAN).withCommits(commits);
+        var facts = everythingWired().facts("orders", PipelineState.RUNNING, AT, Map.of("root", reading),
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), loaded());
+        var named = new HashMap<String, MetricFact>();
+        facts.forEach(fact -> named.put(fact.name(), fact));
+        assertThat(named).containsKeys("tapstate.pipeline.nest.read.keys", "tapstate.pipeline.nest.roots.rendered",
+                "tapstate.pipeline.nest.namespace.info", "tapstate.pipeline.state.commit.groups",
+                "tapstate.pipeline.state.commit.keys", "tapstate.pipeline.state.commit.round_trips",
+                "tapstate.pipeline.state.commit.duration", "tapstate.pipeline.state.evictions");
+        assertThat(named.get("tapstate.pipeline.state.commit.keys").unit()).isEqualTo("{key}");
+        assertThat(named.get("tapstate.pipeline.state.commit.keys").points()).singleElement()
+                .satisfies(point -> {
+                    assertThat(point.attributes()).containsEntry(MetricAttributes.NEST_NAMESPACE, "root");
+                    assertThat(point.histogram()).isEqualTo(keys);
+                });
+        assertThat(named.get("tapstate.pipeline.nest.roots.rendered").points()).singleElement()
+                .satisfies(point -> assertThat(point.value()).isEqualTo(6L));
+    }
+
+    @Test void howHeavyStateIsToKeepReachesTheFacts() {
+        var documents = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_DOCUMENT_BYTES, 900_000);
+        var groups = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_BYTES, 900_000);
+        var folds = histogram(io.tapstate.core.lifecycle.HistogramBounds.ROLLUP_FOLD_DURATION, 0.002);
+        var root = new NestStateReading(1, 2, 3, 4).withWeight(
+                new io.tapstate.core.lifecycle.StateWeightReading(documents, 1_400_000L, groups, folds, LOAD_BEGAN));
+        var level = new NestStateReading(1, 2, 3, 4).withWeight(
+                new io.tapstate.core.lifecycle.StateWeightReading(documents, 900_000L, groups, null, LOAD_BEGAN));
+        var facts = everythingWired().facts("orders", PipelineState.RUNNING, AT,
+                Map.of("root", root, "level", level), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), loaded());
+        var named = new HashMap<String, MetricFact>();
+        facts.forEach(fact -> named.put(fact.name(), fact));
+        assertThat(named.get("tapstate.pipeline.state.document.bytes").unit()).isEqualTo("By");
+        assertThat(named.get("tapstate.pipeline.state.document.bytes").points()).hasSize(2);
+        assertThat(named.get("tapstate.pipeline.state.commit.bytes").points()).hasSize(2);
+        assertThat(named.get("tapstate.pipeline.state.document.bytes.max").points())
+                .anySatisfy(point -> {
+                    assertThat(point.attributes()).containsEntry(MetricAttributes.NEST_NAMESPACE, "root");
+                    assertThat(point.value()).isEqualTo(1_400_000L);
+                });
+        // only the level that renders rollup fields has folds to report
+        assertThat(named.get("tapstate.pipeline.nest.rollup.fold.duration").points()).singleElement()
+                .satisfies(point -> assertThat(point.histogram()).isEqualTo(folds));
+    }
+
+    private static io.tapstate.core.lifecycle.HistogramValue histogram(io.tapstate.core.lifecycle.HistogramBounds bounds, double value) {
+        var buckets = new java.util.ArrayList<Long>(java.util.Collections.nCopies(bounds.buckets(), 0L));
+        int bucket = (int) bounds.bounds().stream().takeWhile(bound -> value > bound).count();
+        buckets.set(bucket, 1L);
+        return bounds.value(1, value, buckets);
+    }
+
     /** One table's finished load, with a total, so both of the load's measurements are in play. */
     private static SnapshotReading loaded() {
         return new SnapshotReading(Map.of("orders", new TableSnapshot(90_000L, 120_000L, 75)), LOAD_BEGAN);
+    }
+
+    @Test
+    @DisplayName("what an aggregate step reports reaches the stored view under its step, and nothing is invented for a step that reported nothing")
+    void anAggregateStepsReadingsReachTheStoredView() {
+        state.create("orders", PipelineState.RUNNING.name(), AT);
+        ObservationPublisher publisher = everythingWired().withAggregateReadings(id -> Map.of(
+                "aggregateGroups.by_region", 3L, "aggregateFailedGroups.by_region", 1L,
+                "aggregateRows.by_region", 40L, "aggregateGroups.by_day", 4L));
+
+        publisher.publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        assertThat(published.metrics())
+                .containsEntry("aggregateGroups.by_region", 3L)
+                .containsEntry("aggregateFailedGroups.by_region", 1L)
+                .containsEntry("aggregateRows.by_region", 40L)
+                .containsEntry("aggregateGroups.by_day", 4L)
+                // Not measured is not zero: a step that has not finished a pass reports no size, and
+                // one with no refused input reports no count of them.
+                .doesNotContainKeys("aggregateFailedGroups.by_day", "aggregateOrderConflicts.by_region");
+        MetricFact groups = published.facts().stream()
+                .filter(fact -> fact.name().equals("tapstate.pipeline.aggregate.groups")).findFirst().orElseThrow();
+        assertThat(groups.unit()).isEqualTo("{group}");
+        assertThat(groups.points()).hasSize(2).allSatisfy(point ->
+                assertThat(point.attributes()).containsKeys(MetricAttributes.PIPELINE_ID, MetricAttributes.AGGREGATE_STEP));
     }
 
     @Test
@@ -82,7 +168,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
 
         List<MetricFact> measured = publisher.facts("orders", PipelineState.RUNNING, AT,
                 Map.of("nest.orders.doc.$root",
-                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))),
+                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))
+                                .withKeyCounts(1_200L, 60L)),
                 Map.of("chain-a", 4L), Map.of("chain-b", 61_000L),
                 Map.of("nest.orders.doc.$root", 3L), Map.of("orders.region", 120L),
                 Map.of("orders.region", 1_000L), loaded());
@@ -90,7 +177,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
         // empty set: the count is asserted before the two are compared. Failures are the one family with
         // no source to wire -- they are counted from a cause handed over on a witnessing pass, so they are
         // absent here and are covered by the case that feeds one.
-        assertThat(measured).hasSize(14);
+        assertThat(measured).hasSize(16);
         FlatMetricProjection flat = FlatMetricProjection.of(measured, ObservationPublisher.FLAT_REDUCTIONS);
         // The load's two measurements are the only ones this face cannot carry, and it says so rather than
         // letting them go missing. They are not lost with them: the same observation carries the same load
@@ -105,6 +192,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "tapstate.pipeline.frontier.gap", "tapstate.pipeline.frontier.stall",
                 "tapstate.pipeline.nest.entries", "tapstate.pipeline.nest.accesses",
                 "tapstate.pipeline.nest.backfills", "tapstate.pipeline.nest.backfill.time",
+                "tapstate.pipeline.nest.key.accesses", "tapstate.pipeline.nest.cold.keys",
                 "tapstate.pipeline.nest.pending.high_water", "tapstate.pipeline.nest.stored",
                 "tapstate.pipeline.nest.dead_lettered",
                 "tapstate.pipeline.join.recompute.rows", "tapstate.pipeline.join.recompute.rows.total",
@@ -122,6 +210,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "nestStateEntries.nest.orders.doc.$root",
                 "nestStateAccesses.nest.orders.doc.$root",
                 "nestStateBackfills.nest.orders.doc.$root",
+                "nestStateKeyAccesses.nest.orders.doc.$root",
+                "nestStateColdKeys.nest.orders.doc.$root",
                 "nestStateBackfillMillis.nest.orders.doc.$root",
                 "nestStatePendingHighWater.nest.orders.doc.$root",
                 "nestStateStored.nest.orders.doc.$root",
@@ -132,6 +222,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 .containsEntry("frontierGap.chain-a", 4L)
                 .containsEntry("frontierStalledMillis.chain-b", 61_000L)
                 .containsEntry("nestStateStored.nest.orders.doc.$root", 400_000L)
+                .containsEntry("nestStateKeyAccesses.nest.orders.doc.$root", 1_200L)
+                .containsEntry("nestStateColdKeys.nest.orders.doc.$root", 60L)
                 .containsEntry("nestDeadLettered.nest.orders.doc.$root", 3L);
         assertThat(published.snapshot())
                 .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));

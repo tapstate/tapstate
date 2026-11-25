@@ -86,13 +86,13 @@ class ACdcSourceReadsOnlyItsOwnDatabaseIT {
         // after the source is live tests the narrower half and would pass either way.
         update(unwatched, LEAK);
         {
-            String storeUri = SharedMongo.replicaSetUrl("cdc_scope_store");
             String targetUri = SharedMongo.replicaSetUrl("cdc_scope_target");
 
-            try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

@@ -58,8 +58,8 @@ class AMemberThatCannotStageTheConnectorRefusesTheStartIT {
         Path staging = inTheWay.resolve("plugins");
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_unstaged_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.startStaging(store, "e2e-unstaged", UNABLE, staging)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startStaging(storage, UNABLE, staging)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.memberOtherThan(UNABLE);
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -74,7 +74,7 @@ class AMemberThatCannotStageTheConnectorRefusesTheStartIT {
 
                 ControlPlane.Failure refused = Await.answered("the start to be refused", Duration.ofMinutes(3),
                         () -> control.failure(PIPELINE));
-                assertThat(refused.code()).isEqualTo("actuation.connector-unavailable-on-member");
+                assertThat(refused.code()).isEqualTo("TS0360031");
                 assertThat(refused.params())
                         .as("the refusal names the member that cannot load the connector, and the connector")
                         .containsEntry("member", UNABLE)

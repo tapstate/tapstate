@@ -61,14 +61,14 @@ printf 'docker %s\n' "$*" >> "$STUB_LOG"
 case "$1 $2 $3" in
     'login ghcr.io --username')
         IFS= read -r token || true
-        [[ "$token" == "$STUB_TOKEN" && "${STUB_LOGIN_FAIL:-false}" != true ]]
+        if [[ "$token" != "$STUB_TOKEN" || "${STUB_LOGIN_FAIL:-false}" == true ]]; then exit 1; fi
         ;;
     'buildx imagetools create')
-        [[ "${STUB_PUSH_FAIL:-false}" != true ]]
+        if [[ "${STUB_PUSH_FAIL:-false}" == true ]]; then exit 1; fi
         touch "$STUB_PUSHED"
         ;;
     'buildx imagetools inspect')
-        [[ "${STUB_READ_FAIL:-false}" != true ]]
+        if [[ "${STUB_READ_FAIL:-false}" == true ]]; then exit 1; fi
         if [[ "${STUB_DIGEST_MISMATCH:-false}" == true ]]; then printf other; else cat "$STUB_MANIFEST"; fi
         ;;
     *) exit 98 ;;
@@ -78,7 +78,7 @@ cat > "$WORK/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'curl %s\n' "$*" >> "$STUB_LOG"
-[[ "$1" == --disable ]]
+[[ "$1" == --disable ]] || exit 1
 output='' header_file='' url=''
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -95,7 +95,7 @@ done
 [[ -n "$output" ]]
 case "$url" in
     "https://ghcr.io/token?service=ghcr.io&scope=repository:tapstate/$STUB_PACKAGE:pull")
-        [[ -z "$header_file" && "${STUB_ANONYMOUS_TOKEN_FAIL:-false}" != true ]]
+        if [[ -n "$header_file" || "${STUB_ANONYMOUS_TOKEN_FAIL:-false}" == true ]]; then exit 1; fi
         case "${STUB_ANONYMOUS_TOKEN_INVALID:-false}" in
             true) printf '{"token":null}' > "$output" ;;
             newline) printf '{"token":"anonymous\\r\\nX-Injected: value"}' > "$output" ;;
@@ -106,9 +106,9 @@ case "$url" in
         esac
         ;;
     "https://ghcr.io/v2/tapstate/$STUB_PACKAGE/manifests/$STUB_DIGEST")
-        [[ "${STUB_ANONYMOUS_READ_FAIL:-false}" != true ]]
-        [[ -n "$header_file" && "$(cat "$header_file")" == "Authorization: Bearer $STUB_ANONYMOUS_TOKEN_VALUE" ]]
-        [[ -z "$(find "$header_file" ! -perm 0600 -print)" ]]
+        if [[ "${STUB_ANONYMOUS_READ_FAIL:-false}" == true || -z "$header_file" \
+                || "$(cat "$header_file")" != "Authorization: Bearer $STUB_ANONYMOUS_TOKEN_VALUE" \
+                || -n "$(find "$header_file" ! -perm 0600 -print)" ]]; then exit 1; fi
         if [[ "${STUB_ANONYMOUS_DIGEST_MISMATCH:-false}" == true ]]; then
             printf other > "$output"
         else
@@ -123,6 +123,12 @@ chmod +x "$WORK/bin/gh" "$WORK/bin/docker" "$WORK/bin/curl"
 run_publish() {
     : > "$WORK/commands.log"
     rm -f "$WORK/pushed"
+    local -a publish_args
+    publish_args=("${TEST_MODE:-publish}" --archive "$WORK/cloud-image.tar"
+        --version "${TEST_VERSION:-0.6.0}" --expected-digest "${TEST_DIGEST:-$DIGEST}")
+    if [[ -n "${TEST_DEV_SOURCE_SHA:-}" ]]; then
+        publish_args+=(--dev-source-sha "$TEST_DEV_SOURCE_SHA")
+    fi
     env PATH="$WORK/bin:$PATH" CLOUD_GHCR_USERNAME="${TEST_USERNAME-publisher}" \
         CLOUD_GHCR_TOKEN="${TEST_TOKEN-$TOKEN}" GITHUB_OUTPUT="${TEST_GITHUB_OUTPUT:-}" \
         GITHUB_ACTIONS="${TEST_ACTIONS:-false}" GITHUB_REPOSITORY="${TEST_REPOSITORY:-tapstate/tapstate}" \
@@ -147,8 +153,7 @@ run_publish() {
         STUB_ANONYMOUS_TOKEN_INVALID="${STUB_ANONYMOUS_TOKEN_INVALID:-false}" \
         STUB_ANONYMOUS_READ_FAIL="${STUB_ANONYMOUS_READ_FAIL:-false}" \
         STUB_ANONYMOUS_DIGEST_MISMATCH="${STUB_ANONYMOUS_DIGEST_MISMATCH:-false}" \
-        bash "$PUBLISHER" "${TEST_MODE:-publish}" --archive "$WORK/cloud-image.tar" \
-            --version "${TEST_VERSION:-0.6.0}" --expected-digest "${TEST_DIGEST:-$DIGEST}"
+        bash "$PUBLISHER" "${publish_args[@]}"
 }
 
 expect_failure() {
@@ -278,9 +283,17 @@ if TEST_MODE=publish-dev TEST_VERSION=0.7.0 STUB_EXISTING_DIGEST=sha256:previous
         && ! grep -qE 'tapstate-cloud:0[.]7[.]0([[:space:]]|$)' "$WORK/commands.log"; then
     ok 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'
 else bad 'a repeated dev version replaces only the dev-suffixed tag and emits the checked digest'; fi
+if TEST_MODE=publish-dev TEST_VERSION=0.7.0 TEST_DEV_SOURCE_SHA=abcdef0123456789abcdef0123456789abcdef01 \
+        TEST_GITHUB_OUTPUT="$WORK/action-output" run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF 'imagetools create --tag ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-abcdef012345 ' "$WORK/commands.log" \
+        && grep -qxF 'tag=ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-abcdef012345' "$WORK/action-output"; then
+    ok 'feature dev builds use a source-specific tag and cannot replace the main candidate tag'
+else bad 'feature dev builds use a source-specific tag and cannot replace the main candidate tag'; fi
 if grep -qF "https://ghcr.io/v2/tapstate/tapstate-cloud/manifests/$DIGEST" "$WORK/commands.log"; then
     ok 'dev availability is also verified anonymously by digest'
 else bad 'dev availability is also verified anonymously by digest'; fi
+TEST_MODE=publish-dev TEST_DEV_SOURCE_SHA=not-a-commit expect_failure \
+    'a branch-specific dev tag requires a full lowercase commit SHA' 'dev source SHA'
 if TEST_MODE=publish-dev STUB_EXISTING_DIGEST="$DIGEST" run_publish > "$WORK/out" 2> "$WORK/err" \
         && ! grep -qF 'imagetools create' "$WORK/commands.log"; then
     ok 'a matching dev digest is idempotent'

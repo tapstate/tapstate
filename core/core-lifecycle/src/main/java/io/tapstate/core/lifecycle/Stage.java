@@ -33,7 +33,9 @@ public enum Stage {
     /** Widening driving rows against mirrored dimensions: every vertex a join step draws. */
     JOIN,
     /** Writing rows out, to a target or into the state store as a view. */
-    SINK;
+    SINK,
+    /** Independent validation work, separate from production reads, transforms and writes. */
+    VALIDATION;
 
     /** The spelling this stage has as an attribute value: the lower-case word. */
     public String attributeValue() {

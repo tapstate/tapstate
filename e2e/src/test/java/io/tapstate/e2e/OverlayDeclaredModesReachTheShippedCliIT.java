@@ -39,7 +39,7 @@ class OverlayDeclaredModesReachTheShippedCliIT {
 
         assertThat(run.exitCode()).as("validate must refuse, so it cannot exit 0").isNotZero();
         assertThat(run.stdout() + run.stderr())
-                .contains("dsl.unsupported-mode")
+                .contains("TS0010013")
                 .contains("stream");
     }
 

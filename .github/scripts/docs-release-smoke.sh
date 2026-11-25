@@ -474,7 +474,7 @@ cat > "$stub_dir/gh" <<'STUB'
 #!/bin/sh
 echo "$*" >> "$GH_STUB_LOG"
 case "$*" in
-  "issue list"*) echo '[]'; exit 0 ;;
+  "issue list"*) printf '%s\n' "${GH_STUB_ISSUES:-[]}"; exit 0 ;;
 esac
 exit 0
 STUB
@@ -489,6 +489,47 @@ elif printf '%s' "$out" | grep -q 'treating as not done'; then
 else
     fail "a lookup that names no single issue says so where the release reports" "stdout was: $out"
 fi
+
+# Retirement is a lifecycle marker, not publication evidence. Exercise the shared
+# lookup through both verbs, retaining ambiguity when more than one request remains.
+retired='{"title":"Release 0.4.1: publish the documentation site","state":"CLOSED","stateReason":"NOT_PLANNED","number":117}'
+current='{"title":"Release 0.4.1: publish the documentation site","state":"OPEN","stateReason":"","number":119}'
+lifecycle_live() {
+    local issues="$1" verb="$2"; shift 2
+    : > "$log"
+    GH_STUB_LOG="$log" GH_STUB_ISSUES="$issues" PATH="$stub_dir:$PATH" \
+        bash "$script" "$verb" 0.4.1 --notes-url "$url" "$@" 2>&1
+}
+
+out="$(lifecycle_live "[$retired,$current]" retire)"
+if grep -q 'issue close 119 ' "$log" && ! grep -q 'issue close 117 ' "$log" \
+   && ! grep -q 'issue comment 117 ' "$log"; then
+    pass "retire withdraws the current request and preserves retired history"
+else
+    fail "retire withdraws the current request and preserves retired history" "calls: $(cat "$log")"
+fi
+lacks "retired history does not make retirement ambiguous" "treating as not done" "$out"
+
+out="$(lifecycle_live "[$retired]" settle --plan)"
+contains "a retired request alone cannot prove publication" "site not published yet" "$out"
+lacks "retired history alone cuts no documentation tag" "site is published:" "$out"
+
+other="$(printf '%s' "$current" | jq '.number = 121')"
+out="$(lifecycle_live "[$retired,$current,$other]" retire)"
+contains "two active requests remain visibly ambiguous at retirement" "(2 found); treating as not done" "$out"
+if ! grep -q 'issue close\|issue comment' "$log"; then
+    pass "ambiguous active requests are not withdrawn by guessing"
+else
+    fail "ambiguous active requests are not withdrawn by guessing" "calls: $(cat "$log")"
+fi
+out="$(lifecycle_live "[$retired,$current,$other]" settle --plan)"
+contains "two active requests remain visibly ambiguous at settlement" "(2 found); treating as not done" "$out"
+contains "ambiguous active requests cannot prove publication" "site not published yet" "$out"
+
+completed="$(printf '[%s,%s]' "$current" "$other" | jq 'map(.state = "CLOSED" | .stateReason = "COMPLETED")')"
+out="$(lifecycle_live "$completed" settle --plan)"
+contains "two completed requests are not resolved by choosing the newest" "(2 found); treating as not done" "$out"
+lacks "ambiguous completed requests cut no documentation tag" "site is published:" "$out"
 rm -rf "$stub_dir"
 
 # --- the page follow-ups a release does not wait for -------------------------------------------
@@ -589,6 +630,13 @@ carries "the second issue that is sent carries it too" "$log"
 log="$body_dir/log-settle-closed"; : > "$log"; live "$log" settle CLOSED
 carries "and a request already finished is told at the end" "$log"
 rm -rf "$body_dir"
+
+# Keep the single-attempt regression in the existing CI script lane.
+if bash "$here/docs-release-retired-request-smoke.sh"; then
+    pass "retired history does not hide the current request through completion"
+else
+    fail "retired history does not hide the current request through completion" "the lifecycle regression failed"
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then

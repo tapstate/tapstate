@@ -85,10 +85,11 @@ class DataBrowserFindShapeIT {
         writeWorkspace();
         seedSortableRows();
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_browser_find_shape"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, Map.of(E2eConnectorJar.BROWSABLE_CONNECTOR_ID, files), env());
             binding.registerConnector(E2eConnectorJar.BROWSABLE_CONNECTOR_ID);
@@ -119,7 +120,7 @@ class DataBrowserFindShapeIT {
             // hand back a page the caller never asked for and cannot distinguish from the one it did.
             assertThat(control.findExpectingRefusal("src_file", COLLECTION, Map.of("limit", OVER_THE_CAP)).code())
                     .as("asking for more rows than this face will serve")
-                    .isEqualTo("data-browser.invalid-limit");
+                    .isEqualTo("TS0390002");
 
             // (4) An order that was asked for is an order that is applied. Descending, because ascending is
             // what several wrong implementations return by accident - the file's own order is ascending.

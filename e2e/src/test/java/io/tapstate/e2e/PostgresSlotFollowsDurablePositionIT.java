@@ -55,12 +55,12 @@ class PostgresSlotFollowsDurablePositionIT {
     void theSlotMovesPastEachTransactionOnceItLandsAndOnToTheHeadOnceWritingStops() throws Exception {
         Map<String, Object> source = SharedPostgres.settings("slot_follows_src");
         createTables(source);
-        String storeUri = SharedMongo.replicaSetUrl("slot_follows_store");
         String targetUri = SharedMongo.replicaSetUrl("slot_follows_target");
 
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage); MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             Map<String, String> resources = new LinkedHashMap<>();

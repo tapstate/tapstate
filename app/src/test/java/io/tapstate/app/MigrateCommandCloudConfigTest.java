@@ -31,7 +31,7 @@ class MigrateCommandCloudConfigTest {
                 "migrate", "--list",
                 "--tapstate.cloud.base-url=https://cloud.example",
                 "--tapstate.cloud.token=sentinel-token",
-                "--tapstate.cloud.atlas-uri=mongodb://user:sentinel-password@atlas.example/metadata",
+                "--tapstate.cloud.atlas-uri=mongodb://user:sentinel-password@atlas.example/" + "c".repeat(63),
                 "--tapstate.cloud.cluster-id=migrate-cluster");
 
         assertThat(complete.exitCode()).isZero();

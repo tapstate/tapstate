@@ -37,9 +37,9 @@ class CliPipedSessionStatusIT {
 
     @Test
     void aSessionThatRefusedACommandFailsTheProcess() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_session"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             // the refusal is deliberately not the last line: a status read off the end of the session
             // would be the status of `exit`, which always succeeds
@@ -57,9 +57,9 @@ class CliPipedSessionStatusIT {
 
     @Test
     void aSessionThatRefusedNothingStillSucceeds() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_session_ok"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             // the other half: without this, a session that always failed would pass the case above
             CliOnce.Run run = CliOnce.runSession(PASSWORD, "ls\nexit\n",

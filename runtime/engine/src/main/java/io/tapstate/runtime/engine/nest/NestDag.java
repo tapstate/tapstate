@@ -103,6 +103,16 @@ public final class NestDag {
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
             }
+            if (!spec.isAssembler() && binding.stores().hasReleaseRecovery()) {
+                String name = spec.name() + ":recovery";
+                Vertex recovery = dag.newVertex(name, ProcessorMetaSupplier.forceTotalParallelismOne(
+                        new NestRecoverySupplier(spec, binding.stores()), name));
+                NodeWidth.totalOne(width.node(), null).drawingInto(width.drawn()).sized(recovery);
+                // This source is independent and finite. Its completion precedes data and watermarks,
+                // so a new frontier cannot claim coverage before cold handoffs have been offered.
+                dag.edge(width.into(Edge.from(recovery).to(vertex, spec.inbound().size()).priority(-1),
+                        vertex.getName(), (Object item) -> ((NestReleaseRecovery.Wake) item).key()));
+            }
             assembler = vertex;
         }
         // Drawn after the assembler and never mistaken for it: a lookup takes no part in assembly, and the
@@ -171,6 +181,13 @@ public final class NestDag {
         // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
         draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
                 leavingKey(lookup.referenceFields(), lookup.mapName()), nextOutbound, width);
+        if (lookup.alternative()) {
+            // Keyed by the alternative value each row held before, so a row that moved to another value is
+            // taken out from under the one it left by the instance holding that entry. Only an alternative
+            // needs it: everywhere else rows are filed by what identifies them, which an edit does not move.
+            draw(dag, source, vertex, LookupProcessor.DEPARTED_ROWS,
+                    leavingKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
+        }
 
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
@@ -339,6 +356,21 @@ public final class NestDag {
                 destination.getName(), key));
     }
 
+    private static final class NestRecoverySupplier implements ProcessorSupplier {
+        private static final long serialVersionUID = 1L;
+        private final NestVertex vertex;
+        private final NestBinding.NestStores stores;
+        private transient NestBinding.NestStores bound;
+        private NestRecoverySupplier(NestVertex vertex, NestBinding.NestStores stores) {
+            this.vertex = vertex; this.stores = stores;
+        }
+        @Override public void init(Context context) { bound = stores.bind(context.hazelcastInstance()); }
+        @Override public Collection<? extends Processor> get(int count) {
+            if (count != 1) throw new IllegalStateException("a recovery input has one producer");
+            return List.of(new NestReleaseRecovery(after -> bound.pendingReleaseKeys(vertex, after)));
+        }
+    }
+
     private static ProcessorSupplier processorsFor(NestVertex spec, NestTopology topology,
             NestBinding binding, String outputStream, NestFrontier frontier,
             Map<Integer, List<String>> chainsByOrdinal) {
@@ -355,7 +387,28 @@ public final class NestDag {
                 : NestSendPolicy.everyChange();
         return new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
                 axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
-                topology.lookups(), binding.settleMissingReferencesOnComplete());
+                topology.lookups(), binding.settleMissingReferencesOnComplete(),
+                lookupSnapshots(topology, binding, frontier));
+    }
+
+    private static Map<String, LookupSnapshot> lookupSnapshots(
+            NestTopology topology, NestBinding binding, NestFrontier frontier) {
+        Map<String, LookupSnapshot> snapshots = new LinkedHashMap<>();
+        if (frontier == null || binding.snapshotEpochs().isEmpty()) {
+            return snapshots;
+        }
+        for (NestLookup lookup : topology.lookups()) {
+            List<String> chains = frontier.chainsOfAlias(lookup.alias());
+            if (chains.isEmpty() || !binding.snapshotEpochs().keySet().containsAll(chains)) {
+                continue;
+            }
+            Map<String, Long> epochs = new LinkedHashMap<>();
+            chains.forEach(chain -> epochs.put(chain, binding.snapshotEpochs().get(chain)));
+            int ordinal = lookup.referrerPathId().isEmpty() ? lookup.touchOrdinal()
+                    : topology.assembler().inboundFor(List.of(lookup.referrerPathId().getFirst())).ordinal();
+            snapshots.put(lookup.mapName(), new LookupSnapshot(ordinal, epochs));
+        }
+        return snapshots;
     }
 
     /**
@@ -487,6 +540,7 @@ public final class NestDag {
         private final NestSendPolicy sending;
         private final List<NestLookup> lookups;
         private final boolean settleMissingReferencesOnComplete;
+        private final Map<String, LookupSnapshot> lookupSnapshots;
         private transient ReplayFloor floor;
         private transient NestBinding.NestStores bound;
         private transient NestDeadLetter boundDeadLetter;
@@ -495,11 +549,12 @@ public final class NestDag {
                 NestDeadLetter deadLetter, String outputStream, ChainAxes axes,
                 Map<Integer, List<String>> chainsByOrdinal, ReplayFloorFactory replayFloor,
                 NestSettings settings, NestClock clock, NestSendPolicy sending, List<NestLookup> lookups,
-                boolean settleMissingReferencesOnComplete) {
+                boolean settleMissingReferencesOnComplete, Map<String, LookupSnapshot> lookupSnapshots) {
             this.lookups = lookups;
             this.clock = clock;
             this.sending = sending;
             this.settleMissingReferencesOnComplete = settleMissingReferencesOnComplete;
+            this.lookupSnapshots = Map.copyOf(lookupSnapshots);
             this.spec = spec;
             this.slots = slots;
             this.stores = stores;
@@ -530,7 +585,7 @@ public final class NestDag {
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
                                 bound.forParking(spec), boundDeadLetter, referenced(),
-                                settleMissingReferencesOnComplete)
+                                settleMissingReferencesOnComplete, lookupSnapshots)
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
                                 chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
             }

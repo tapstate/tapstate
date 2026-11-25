@@ -1,0 +1,34 @@
+{
+  "version": "v1",
+  "clusterId": "6475a2b3c1d4e5f6a7b8c9d0",
+  "claimPath": "/v1/api/clusters/6475a2b3c1d4e5f6a7b8c9d0/configuration-initialization/claim",
+  "completePath": "/v1/api/clusters/6475a2b3c1d4e5f6a7b8c9d0/configuration-initialization/complete",
+  "claimRequest": {
+    "bootId": "550e8400-e29b-41d4-a716-446655440001",
+    "configurationHash": "054d68a2c31d3e16dca4f5225a4a2a3adcac13c769fc91e8f47acf1aca9dad87"
+  },
+  "completeRequest": {
+    "operationId": "550e8400-e29b-41d4-a716-446655440000",
+    "configurationHash": "054d68a2c31d3e16dca4f5225a4a2a3adcac13c769fc91e8f47acf1aca9dad87"
+  },
+  "claimResponse": {
+    "code": "ok",
+    "data": {
+      "clusterId": "6475a2b3c1d4e5f6a7b8c9d0",
+      "operationId": "550e8400-e29b-41d4-a716-446655440000",
+      "phase": "CLAIMED",
+      "configurationHash": "054d68a2c31d3e16dca4f5225a4a2a3adcac13c769fc91e8f47acf1aca9dad87",
+      "creationGranted": true
+    }
+  },
+  "completeResponse": {
+    "code": "ok",
+    "data": {
+      "clusterId": "6475a2b3c1d4e5f6a7b8c9d0",
+      "operationId": "550e8400-e29b-41d4-a716-446655440000",
+      "phase": "COMPLETE",
+      "configurationHash": "054d68a2c31d3e16dca4f5225a4a2a3adcac13c769fc91e8f47acf1aca9dad87",
+      "creationGranted": false
+    }
+  }
+}

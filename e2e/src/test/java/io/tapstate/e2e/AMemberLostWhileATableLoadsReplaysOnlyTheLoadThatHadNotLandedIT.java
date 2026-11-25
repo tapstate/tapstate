@@ -74,8 +74,8 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
         Holds holds = new Holds(directory.resolve("holds"));
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_lost_mid_load_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-lost-mid-load")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -131,7 +131,9 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                         () -> "rows at the target: " + LANDED + " " + files.count(targetAddress, LANDED) + ", "
                                 + LOADING + " " + files.count(targetAddress, LOADING) + "; the pipeline is "
                                 + survivor.state(PIPELINE));
-                assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);
+                Await.until("the surviving execution to publish RUNNING", Duration.ofMinutes(1),
+                        () -> survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> "state = " + survivor.state(PIPELINE));
                 assertThat(survivor.executionGenerationOf(PIPELINE).orElseThrow())
                         .as("the run that died was replaced").isGreaterThan(generation);
                 assertThat(loadsRead(reads, LANDED) - landedReadsBefore)

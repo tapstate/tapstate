@@ -327,6 +327,53 @@ class SrsLogRingbufferStoreTest {
     }
 
     @Test
+    void aConfirmationTrimmedBetweenBoundsAndVerificationStillResumesTheUnreadSuffix() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            ring.appendAll(List.of(change("low", "Low", 4L), change("high", "High", 4L),
+                    change("last", "Medium", 4L)));
+            log.trimOnNextBatch = 0L;
+            List<Long> published = new ArrayList<>();
+            SrsRingReader reader = SrsRingReader.resumingAfter(ring, 0L,
+                    new ChainPosition(new SourceOrder(4L, 0L), "low"), published::add, RING, log);
+            assertThat(reader.nextReadSequence()).isEqualTo(1L);
+            List<String> out = new ArrayList<>();
+            reader.fill((item, seq) -> out.add(item.after().get("priority").toString()), 32);
+            assertThat(out).containsExactly("High", "Medium");
+            assertThat(published).containsExactly(2L);
+        });
+    }
+
+    @Test
+    void trimmingTheUnreadSuffixDuringConfirmationVerificationStillRefusesRecovery() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            ring.appendAll(List.of(change("low", "Low", 4L), change("high", "High", 4L)));
+            log.trimOnNextBatch = 1L;
+            List<Long> published = new ArrayList<>();
+            assertGap(() -> SrsRingReader.resumingAfter(ring, 0L,
+                    new ChainPosition(new SourceOrder(4L, 0L), "low"), published::add, RING, log), 1L, "trimmed");
+            assertThat(published).isEmpty();
+        });
+    }
+
+    @Test
+    void aMissingRetainedConfirmationIsNeverTreatedAsAnAlreadyTrimmedPrefix() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            ring.appendAll(List.of(change("low", "Low", 4L), change("high", "High", 4L)));
+            log.rings.get(RING).remove(0L);
+            List<Long> published = new ArrayList<>();
+            assertGap(() -> SrsRingReader.resumingAfter(ring, 0L,
+                    new ChainPosition(new SourceOrder(4L, 0L), "low"), published::add, RING, log), 0L, "no record");
+            assertThat(published).isEmpty();
+        });
+    }
+
+    @Test
     void aRecordWithNoOriginalGenerationCannotBeReplayedAfterRestart() {
         RecordingLog log = new RecordingLog();
         withMember(log, member -> member.getRingbuffer(RING).add(item("legacy", 1L)));
@@ -544,6 +591,7 @@ class SrsLogRingbufferStoreTest {
         private int storeCalls;
         private int storeAllCalls;
         private volatile int readBatchCalls;
+        private Long trimOnNextBatch;
 
         @Override
         public void store(String ring, long seq, SrsLogRecord record) {
@@ -583,6 +631,9 @@ class SrsLogRingbufferStoreTest {
         @Override
         public SrsLogBatch readBatch(String ring, long firstSeq, int maxSize) {
             readBatchCalls++;
+            Long cut = trimOnNextBatch;
+            trimOnNextBatch = null;
+            if (cut != null) trim(ring, cut);
             NavigableMap<Long, SrsLogRecord> records = rings.get(ring);
             return new SrsLogBatch(bounds(ring), records == null ? Map.of()
                     : records.subMap(firstSeq, true, firstSeq + maxSize, false));

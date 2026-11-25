@@ -5,7 +5,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
-import java.util.Locale;
+import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -23,10 +23,9 @@ class PipelineDraftAuthoringRoundTripIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void aDagDraftKeepsItsModeMetadataAndGraphAcrossAnHttpRead(Tiers tier) {
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(
-                PIPELINE_ID + "_" + tier.name().toLowerCase(Locale.ROOT)))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             Map<String, Object> graph = Map.of(
                     "nodes", java.util.List.of(Map.of(
@@ -47,13 +46,15 @@ class PipelineDraftAuthoringRoundTripIT {
                     "description", "Persisted independently of compiled DSL",
                     "graph", graph));
 
+            Map<String, Object> persistedGraph = new HashMap<>(graph);
+            persistedGraph.put("sourceNodeConfigs", Map.of());
             assertThat(saved)
                     .containsEntry("pipelineId", PIPELINE_ID)
                     .containsEntry("mode", "dag")
                     .containsEntry("name", "Orders editor draft")
                     .containsEntry("description", "Persisted independently of compiled DSL")
-                    .containsEntry("revision", 1L);
-            assertThat(saved.get("graph")).isEqualTo(graph);
+                    .containsEntry("revision", 1L)
+                    .containsEntry("graph", persistedGraph);
 
             Map<String, Object> status = control.pipelineStatus(PIPELINE_ID);
             assertThat(status).containsEntry("state", "NEW")

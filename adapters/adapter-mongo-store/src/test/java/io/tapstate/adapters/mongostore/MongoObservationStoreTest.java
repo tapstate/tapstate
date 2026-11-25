@@ -32,6 +32,31 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 class MongoObservationStoreTest {
 
     @Test
+    void optionalInitialLoadRoundTripsWithoutChangingTheLegacySnapshotGolden() {
+        var at = Instant.parse("2026-10-28T09:00:00Z");
+        var load = new io.tapstate.core.lifecycle.InitialLoad("execution:p:2:planned", at, "snapshot_and_cdc",
+                Map.of("orders", new io.tapstate.core.lifecycle.InitialLoad.Table(
+                        io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 30L, null)));
+        var observation = new Observation("p", PipelineState.RUNNING, Map.of(),
+                Map.of("old", new TableSnapshot(7, null, null)), Map.of(), null, at, List.of(), load);
+        Document document = MongoObservationStore.toDocument(observation);
+        assertThat(((Document) document.get("initialLoad")).get("observedAt")).isEqualTo(Date.from(at));
+        assertThat(((Document) ((Document) document.get("initialLoad")).get("tables")).get("orders"))
+                .isEqualTo(new Document("stage", "READING").append("rowsRead", 30L));
+        assertThat(document.get("snapshot")).isEqualTo(new Document("old", new Document("rowsDone", 7L)));
+        assertThat(MongoObservationStore.toObservation(document)).isEqualTo(observation);
+        document.remove("initialLoad");
+        assertThat(MongoObservationStore.toObservation(document).initialLoad()).isNull();
+    }
+
+    @Test
+    void malformedInitialLoadUsesTheExistingCodedCorruptionPath() {
+        var document = new Document("_id", "p").append("state", "RUNNING").append("initialLoad", new Document());
+        assertThat(catchThrowable(() -> MongoObservationStore.toObservation(document)))
+                .isInstanceOf(TapstateException.class);
+    }
+
+    @Test
     void documentCarriesIdStateMetricsAndSnapshot() {
         Observation obs = new Observation("orders_sync", PipelineState.RUNNING,
                 Map.of("recordCount", 128500L, "lag", 42000L),
@@ -176,19 +201,19 @@ class MongoObservationStoreTest {
     @Test
     void documentCarriesTheCodedFailure() {
         Observation obs = new Observation("orders_sync", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders_sync", "cause", "sink refused")));
+                new ObservationFailure("TS0440008", Map.of("pipeline", "orders_sync", "cause", "sink refused")));
 
         Document document = MongoObservationStore.toDocument(obs);
 
         Document failure = (Document) document.get("failure");
-        assertThat(failure.getString("code")).isEqualTo("engine.job-failed");
+        assertThat(failure.getString("code")).isEqualTo("TS0440008");
         assertThat(((Document) failure.get("params")).get("cause")).isEqualTo("sink refused");
     }
 
     @Test
     void roundTripPreservesTheCodedFailure() {
         Observation obs = new Observation("orders_sync", PipelineState.FAILED, Map.of("errorCount", 1L), Map.of(),
-                Map.of(), new ObservationFailure("engine.job-failed", Map.of("pipeline", "orders_sync")));
+                Map.of(), new ObservationFailure("TS0440008", Map.of("pipeline", "orders_sync")));
 
         assertThat(MongoObservationStore.toObservation(MongoObservationStore.toDocument(obs))).isEqualTo(obs);
     }

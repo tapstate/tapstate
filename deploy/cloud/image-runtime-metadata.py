@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
+import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,11 +14,21 @@ SPEC = importlib.util.spec_from_file_location("runtime_web_provenance", ROOT / "
 assert SPEC is not None and SPEC.loader is not None
 PROVENANCE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROVENANCE)
-SDK = "BOOT-INF/lib/cloud-control-plane-sdk-0.1.1-850e47e4-SNAPSHOT.jar"
-SDK_SHA = "a0fd1048afb562d4702b220ddb2db8664c686f5097738b264ad3cd1eb38148b3"
+def sdk_entry(version: str) -> str:
+    # Maven keeps the base snapshot name in the Boot JAR even for an exact timestamp request.
+    if not re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-(?:SNAPSHOT|[0-9]{8}\.[0-9]{6}-[1-9][0-9]*)', version):
+        raise ValueError("invalid locked Cloud SDK coordinate")
+    base = re.sub(r'-[0-9]{8}\.[0-9]{6}-[1-9][0-9]*$', '-SNAPSHOT', version)
+    return f"BOOT-INF/lib/cloud-control-plane-sdk-{base}.jar"
 
 
-def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict:
+SDK_VERSION = ET.parse(ROOT / "pom.xml").findtext(
+    "{http://maven.apache.org/POM/4.0.0}properties/{http://maven.apache.org/POM/4.0.0}cloud.sdk.version")
+SDK = sdk_entry(SDK_VERSION or "")
+SDK_SHA = "e74bbb9d24dec2a91a8ba6fc23201b0e9cb67c1537e35da5581ecec3b723f255"
+
+
+def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path, seed_lock: Path | None = None) -> dict:
     contents = jar_path.read_bytes()
     props = PROVENANCE.properties_from_jar(contents, profile)
     if props["web.profile"] != profile:
@@ -44,12 +56,15 @@ def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict
     if any(key in environment for key in ["TAPSTATE_CLOUD_BASE_URL", "TAPSTATE_CLOUD_TOKEN",
                                          "TAPSTATE_CLOUD_ATLAS_URI", "TAPSTATE_CLOUD_CLUSTER_ID", "CLUSTER_ID"]):
         raise ValueError("deployment configuration must not be baked into the image")
-    if (environment.get("TAPSTATE_CONNECTORS_SEED_DIR") == "/opt/tapstate/connectors") != (profile == "cloud"):
-        raise ValueError("the image connector seed configuration has the wrong profile")
+    if environment.get("TAPSTATE_CONNECTORS_SEED_DIR") != "/opt/tapstate/connectors":
+        raise ValueError("the image must use its packaged connector seed")
     with zipfile.ZipFile(jar_path) as jar:
         if hashlib.sha256(jar.read(SDK)).hexdigest() != SDK_SHA:
             raise ValueError("runtime smoke requires the locked actual SDK bytes")
-        if jar.read("META-INF/tapstate/connectors.lock.json") != lock.read_bytes():
+        if json.loads(lock.read_text()).get("schemaVersion") == 3:
+            if "META-INF/tapstate/supported-connectors.json" not in jar.namelist():
+                raise ValueError("runtime Boot JAR does not carry its official connector support manifest")
+        elif jar.read("META-INF/tapstate/connectors.lock.json") != lock.read_bytes():
             raise ValueError("runtime Boot JAR does not carry the selected connector lock")
         manifest = jar.read("META-INF/tapstate-web.files.sha256").decode()
     web_files = {name.removeprefix("./"): digest for digest, name in
@@ -59,7 +74,7 @@ def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict
             "webProfile": profile, "webFilesSha256": props["files.sha256"],
             "bootJarSha256": props["image.boot-jar.sha256"],
             "cloudConsoleUrl": props.get("cloud.console.url"), "webFiles": web_files,
-            "connectorIds": [row["id"] for row in json.loads(lock.read_text())["connectors"]]}
+            "connectorIds": [row["id"] for row in json.loads((seed_lock or lock).read_text())["connectors"]]}
 
 
 def paired(cloud: dict, onprem: dict) -> None:
@@ -73,11 +88,11 @@ def paired(cloud: dict, onprem: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["cloud-jar", "onprem-jar", "cloud-image", "onprem-image", "lock", "output"]:
+    for name in ["cloud-jar", "onprem-jar", "cloud-image", "onprem-image", "lock", "onprem-lock", "output"]:
         parser.add_argument("--" + name, required=True, type=Path)
     args = parser.parse_args()
     cloud = metadata(args.cloud_jar, args.cloud_image, "cloud", args.lock)
-    onprem = metadata(args.onprem_jar, args.onprem_image, "onprem", args.lock)
+    onprem = metadata(args.onprem_jar, args.onprem_image, "onprem", args.lock, args.onprem_lock)
     paired(cloud, onprem)
     for profile, value in [("cloud", cloud), ("onprem", onprem)]:
         (args.output / f"{profile}.json").write_text(json.dumps(value, sort_keys=True) + "\n")

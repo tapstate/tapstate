@@ -75,6 +75,11 @@ specification content, but it does not always win: where this repository declare
 connector, ours outranks it, and the difference is reported rather than silently resolved. See
 [Declaring modes](declaring-modes.md).
 
+A spec-only refresh updates only connectors already in the bundled catalog. New upstream ids remain
+in the drift report until a full refresh supplies their capability face; they are not added to the
+catalog with empty modes. Existing catalog entries without bitmap records remain eligible for
+specification updates.
+
 ## Running a refresh yourself
 
 One script, both depths. It needs a connectors checkout - there is no way to regenerate without one,
@@ -187,3 +192,46 @@ request from that run, and moves the seven-day ceiling aside so that it can - a 
 edited the catalog itself reads as zero days old, so the ceiling would otherwise hold every time.
 Without that label a pull request run stops one step short of opening anything, deliberately: the
 catalog it would carry was rebuilt from code that is still under review.
+
+## Connection diagnostic definitions
+
+Connector catalogs may include `META-INF/tapstate/connection-diagnostics.json` with
+`formatVersion: 1`, `connectorId`, and a `definitions` array. Each entry declares
+`rawCode`, the complete `code`, and `en` text. Optional `zh-CN` and `zh-TW` entries
+have the same shape. Text entries may contain `message`, `solution`, and `dynamic`.
+Dynamic text uses positional `{}` placeholders and the exact argument count and order.
+
+For an existing PDK artifact, use the build-time exporter with the original JAR and explicitly
+owned annotation classes. The tool reads the existing full-code contract and rejects repeated
+complete codes before indexing them. Example for an isolated PostgreSQL artifact:
+
+```sh
+mvn -pl adapters/adapter-pdk -am -Dtest=PdkDiagnosticCatalogTest \
+  -Dsurefire.failIfNoSpecifiedTests=false \
+  -Dtapstate.diagnostics.export.artifact=/absolute/path/postgres-connector.jar \
+  -Dtapstate.diagnostics.export.classes=io.tapdata.connector.postgres.error.PostgresErrorCode \
+  -Dtapstate.diagnostics.export.connector=postgres \
+  -Dtapstate.diagnostics.export.output=/absolute/path/connection-diagnostics.json test
+```
+
+The connector release build supplies the resource before signing or hashing the final JAR.
+Tapstate opens it from the connector artifact selected by the registry. A missing or invalid
+resource leaves existing connector error codes and available diagnostics readable. A code belonging
+to one registered artifact never borrows another artifact's text. Existing connector builds can
+continue without diagnostic metadata.
+
+Tapstate owns its TS definitions. For a connection definition, first search the registered
+definitions for the same trigger, useful parameters, and recovery. Reuse an existing definition
+when it has the same meaning. Register a new definition in `ConnectionDiagnosticCatalog` with a
+new module-appropriate identity and add matching English, Simplified Chinese, and Traditional
+Chinese entries. Review the identity against the trusted base and published release definitions.
+Once published, keep its identity reserved even when its last caller is removed. Review the
+appearance and fallback independently from the code's business outcome.
+
+The current server assembly keeps the existing response and write formats. Diagnostic snapshots
+and extended writes are exercised in the isolated assembly against a selected CACHE binding.
+
+Before enabling extended writes, retain a packaged reader that accepts the complete stored
+diagnostic shape, including verification status. Compare existing report reads before the new
+writer starts, then repeat the reads after returning to the retained reader on the same CACHE.
+A build that rejects a field in the retained diagnostic requires an earlier rollback boundary.
