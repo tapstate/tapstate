@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import io.tapstate.adapters.pdk.ConnectorError;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -112,7 +113,18 @@ class RealDummyPipelineIT {
             String failureCode = Await.answered("the Dummy capture failure code to be published",
                     Duration.ofSeconds(10), () -> control.failureCode(failing));
             assertThat(failureCode).isEqualTo(ConnectorError.CAPTURE_FAILED.code());
-            assertThat(control.logs(failing)).contains("bad-interval");
+            var response = control.sourceRequest("GET", "/api/pipelines/" + failing + "/logs", null, null, 200);
+            assertThat(response.body()).contains("bad-interval");
+            var log = (Map<?, ?>) JsonReader.parse(response.body());
+            var terminal = ((List<?>) log.get("lines")).stream()
+                    .map(row -> (Map<?, ?>) row)
+                    .filter(row -> String.valueOf(row.get("message")).startsWith("Pipeline " + failing + " entered FAILED ["))
+                    .toList();
+            assertThat(terminal).singleElement().satisfies(row -> {
+                assertThat(row.get("level")).isEqualTo("ERROR");
+                assertThat(row.get("message")).asString().contains("[" + failureCode + "]");
+                assertThat(((Map<?, ?>) row.get("diagnostic")).get("code")).isEqualTo(failureCode);
+            });
             cli(server, storage, "status " + failing + "\nexit\n");
 
             long afterFailure = recordsOut(control, cdc);
