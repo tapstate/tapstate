@@ -150,6 +150,12 @@ public final class RateSampler {
         }
     }
 
+    /** A final publication waits for every retained append of this Pipeline, including an older scope. */
+    public boolean idle(io.tapstate.spi.store.PipelineIntentScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        synchronized (appending) { return !appending.containsKey(scope.pipelineId()); }
+    }
+
     /** Drops cadence and pending work for deleted Pipelines without waiting for their active append. */
     public void forgetPipelinesOutside(Collection<String> live) {
         var kept = Set.copyOf(live);

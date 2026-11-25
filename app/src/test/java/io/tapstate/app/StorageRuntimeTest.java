@@ -92,9 +92,10 @@ class StorageRuntimeTest {
             verify(cache).loadAuthScope(PREPARATION.authScope());
             verify(cache, never()).prepareAuth(any(), any(), any());
             verify(cache, never()).prepareInitialBusiness(any(), any());
-            doThrow(StorageRuntime.unavailable()).when(cache).verifyBusinessReady(PREPARATION.businessScope());
+            doThrow(StorageRuntime.unavailable()).when(cache).loadBusinessScope(PREPARATION.businessScope());
             assertThatThrownBy(() -> root.startBusiness(bound, ignored -> { calls.incrementAndGet(); throw new AssertionError(); }))
                     .isInstanceOf(TapstateException.class);
+            verify(cache, never()).verifyBusinessReady(any());
             assertThat(calls).hasValue(0);
             assertThat(root.businessStarted()).isFalse();
         }

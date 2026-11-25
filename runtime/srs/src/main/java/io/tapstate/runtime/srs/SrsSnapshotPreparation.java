@@ -30,6 +30,11 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
     }
     public SrsSnapshotPreparation(SrsStoreViews views,SrsConsumerRun run,Map<String,String> tableRings,long firstSnapshotEpoch,Runnable requireActive,
             SrsFreshFullPreparation freshFull, java.time.Instant preparedAt) {
+        this(views, run, tableRings, firstSnapshotEpoch, requireActive, freshFull, preparedAt, null);
+    }
+
+    SrsSnapshotPreparation(SrsStoreViews views,SrsConsumerRun run,Map<String,String> tableRings,long firstSnapshotEpoch,Runnable requireActive,
+            SrsFreshFullPreparation freshFull, java.time.Instant preparedAt, SrsConsumerProgress retained) {
         this.run = Objects.requireNonNull(run,"run"); this.requireActive = Objects.requireNonNull(requireActive,"requireActive");
         this.freshFull = freshFull; this.preparedAt = Objects.requireNonNull(preparedAt, "preparedAt");
         this.tableRings = Collections.unmodifiableMap(new TreeMap<>(tableRings));
@@ -37,8 +42,12 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
             throw new IllegalArgumentException("a prepared snapshot requires selected tables and their original rings");
         requireUsable(); var stores = Objects.requireNonNull(views,"views").srs(run.cacheScope(),this::requireUsable);
         this.consumers = stores.consumers().guardedBy(this::requireUsable); this.models = stores.models().guardedBy(this::requireUsable);
-        this.original = consumers.progress(run.context()).orElseThrow(this::unavailable); requireUsable();
-        if (original.membershipRevision() != run.membershipRevision() || !original.cursor().perTableSeq().keySet().containsAll(this.tableRings.keySet())) throw unavailable();
+        if (retained != null && freshFull != null) throw unavailable();
+        this.original = retained != null ? retained : (freshFull == null
+                ? consumers.snapshotResumeProgress(run.context()) : consumers.progress(run.context())).orElseThrow(this::unavailable);
+        requireUsable();
+        if (!original.context().equals(run.context()) || original.membershipRevision() != run.membershipRevision()
+                || !original.cursor().perTableSeq().keySet().containsAll(this.tableRings.keySet())) throw unavailable();
         this.owed = this.tableRings.keySet().stream().filter(table -> !original.cursor().snapshotCompletedTables().contains(table)).toList();
         var chain = original.snapshot() != null ? null : freshFull != null ? freshFull.originalChain()
                 : stores.chains().guardedBy(this::requireUsable).load(run.miningChainId()).orElseThrow(this::unavailable);

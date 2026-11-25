@@ -231,6 +231,9 @@ boot.control-advertise-url-invalid:
 boot.discovery-config-invalid:
   message: "The cluster discovery configuration is invalid: {detail}."
   solution: "Choose one explicit discovery mode and provide all inputs required by that mode."
+boot.migration-mode-conflict:
+  message: "Choose either CONFIG component preparation or one migration inspection mode."
+  solution: "Run CONFIG component preparation and migration inspection separately."
 boot.hazelcast-unavailable:
   message: "The embedded Hazelcast member could not start."
   solution: "Another process may already be using the member port; free it, or set tapstate.hz.member-port to one that is free, then restart."
@@ -631,6 +634,12 @@ store.source-config-keyring-not-ready:
 store.source-config-keyring-rotation-blocked:
   message: "The prepared Source config key cannot become active because a live node has not loaded it."
   solution: "Wait for every current node session to renew, or remove the failed node and wait for its lease to expire, then retry rotation."
+store.config-component-identity-required:
+  message: "The existing CONFIG schema needs its component identity recorded."
+  solution: "Stop the CONFIG writers and run the server binary with migrate --prepare-config-component-identity on the original CONFIG endpoint."
+store.config-component-identity-unverified:
+  message: "The original CONFIG component identity could not be verified."
+  solution: "Contact support to confirm the original CONFIG components before proceeding."
 store.initialization-refused:
   message: "Configuration initialization cannot proceed for this installation operation."
   solution: "Verify the original installation identity, operation and generation. Inspect the existing configuration; do not reset its identity or encryption key."

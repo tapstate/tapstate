@@ -12,7 +12,7 @@ class StartupDiagnosticContractTest {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(BootError.values()));
         codes.addAll(List.of(RoleError.values()));
-        assertThat(codes).hasSize(32);
+        assertThat(codes).hasSize(33);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = (code instanceof BootError ? "boot." : "role.")

@@ -22,6 +22,10 @@ public interface CacheRecoveryStore {
     /** The exact Cluster confirmation publishes RUNNING, all mappings and stopped intents together. */
     List<PipelineCacheRecovery> stageCluster(StorageRecoveryCommands.Plan confirmed);
     Optional<PipelineCacheRecovery> read(String pipelineId);
+
+    default Optional<PipelineCacheRecovery> readForCaptureStartup(String pipelineId) {
+        return read(pipelineId);
+    }
     /** Read-only inspection of original private contexts; this never grants release or access to their values. */
     default List<RequiredNoteContext> inspectPrivateContexts(String pipelineId) {
         throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,java.util.Map.of(),null);

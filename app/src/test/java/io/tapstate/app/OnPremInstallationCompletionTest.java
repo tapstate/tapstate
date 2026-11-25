@@ -511,4 +511,23 @@ class OnPremInstallationCompletionTest {
             verify(f.configuration, never()).prepareInitialValidationSchema(any(), any(), any());
         }
     }
+    @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
+        try (var f = new Fixture(directory.resolve("retained-catalog"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            doThrow(new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", "cache-metadata", "field", "collections"), null))
+                    .when(f.cache).verifyBusinessReady(f.preparation.businessScope());
+            f.root.loadExisting(ignored -> f.business);
+            var original = f.root.runtime().boundForObservation().orElseThrow();
+            assertThat(f.root.runtime().business()).contains(f.business);
+            assertThatCode(original::requireBusiness).doesNotThrowAnyException();
+            assertThat(f.installation.firstAdministratorReady()).isTrue();
+            assertThat(f.completions).hasValue(1);
+            verify(f.business).start();
+            verify(f.cache, atLeastOnce()).loadBusinessScope(f.preparation.businessScope());
+            verify(f.cache, never()).verifyBusinessReady(any());
+            verify(f.cache, never()).prepareInitialBusiness(any(), any());
+        }
+    }
+
 }

@@ -205,6 +205,13 @@ public final class OperatorMapBindings implements AutoCloseable {
         requireOpen(); return initializingMaps.entrySet().stream().filter(entry -> entry.getValue().bound == null)
                 .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
+    /** Unknown initializers cannot prove absence; known descriptors cover every state generation. */
+    public synchronized boolean hasPipelineWork(String pipeline) {
+        requireOpen();
+        return initializingMaps.values().stream().anyMatch(pending -> pending.bound == null)
+                || slots.values().stream().anyMatch(held -> held.active.get()
+                        && held.binding.placement().scope().pipelineId().equals(pipeline));
+    }
     /** Returns fixed descriptors only; retirement never reconstructs an address from a map name. */
     public synchronized List<OperatorMapBinding> originals(io.tapstate.spi.store.PipelineIntentScope scope) {
         requireOpen();

@@ -88,10 +88,9 @@ final class MongoSrsConsumerRecords {
     }
     Cursor cursor(SrsConsumerMembership membership, Document row) {
         try {
-            if (row == null || !row.keySet().equals(Set.of("_id", "formatVersion", "stateGeneration", "membershipRevision", "progressRevision", "progress", "snapshot", "writerRun", "ringDoneThrough", "contentHash"))
-                    || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("progressRevision") instanceof Long revision)
-                    || !Long.valueOf(membership.context().stateGeneration()).equals(row.get("stateGeneration"))
-                    || !Long.valueOf(membership.revision()).equals(row.get("membershipRevision")) || !id(membership.context().key()).equals(row.get("_id"))) throw unreadable();
+            if (row == null || !row.keySet().equals(Set.of("_id", "formatVersion", "stateGeneration", "membershipRevision", "progressRevision", "progress", "snapshot", "writerRun", "ringDoneThrough", "contentHash"))) throw unreadable();
+            cursorIdentity(membership,row);
+            long revision=row.getLong("progressRevision");
             Document progress = row.get("progress", Document.class);
             if (!progress.keySet().equals(Set.of("perTableSeq", "sinkAcked", "snapshotCompletedTables", "cdcStartPosition", "snapshotEpoch", "sinkAckedByTable", "progressKind"))
                     || !"SRS".equals(progress.get("progressKind")) || !(progress.get("snapshotEpoch") instanceof Long epoch)
@@ -121,6 +120,15 @@ final class MongoSrsConsumerRecords {
                     || !cursor(membership, value, revision, snapshot,writerRun,done).equals(row)) throw unreadable();
             return new Cursor(value, revision, snapshot,writerRun,Map.copyOf(done));
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+    }
+
+    /** Fixed cursor coordinates can be checked without materializing its private progress payload. */
+    void cursorIdentity(SrsConsumerMembership membership, Document row) {
+        if (row == null || !Integer.valueOf(1).equals(row.get("formatVersion"))
+                || !(row.get("progressRevision") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE
+                || !Long.valueOf(membership.context().stateGeneration()).equals(row.get("stateGeneration"))
+                || !Long.valueOf(membership.revision()).equals(row.get("membershipRevision"))
+                || !id(membership.context().key()).equals(row.get("_id"))) throw unreadable();
     }
     /** Keep the physical ring place even if a later durable bound ends a whole prior epoch. */
     static Map<String,Long> confirmedFloors(ConsumerOffset cursor,Map<String,Long> retained) {

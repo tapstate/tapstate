@@ -125,11 +125,8 @@ class RuntimeConvergenceConfiguration {
                 id -> captureCoordinator.initialLoad(id,
                         executionPlans.current(List.of(id)).get(id),
                         Instant.now()),
-                Clock.systemUTC())
-                // What each aggregate step holds and what it could not apply or give exactly. A group
-                // held at its last good values is marked in its own row, but only a reader of that row
-                // sees the mark; this is where the pipeline says it has any.
-                .withAggregateReadings(engine::aggregateReadings);
+                (id, at) -> captureCoordinator.measurements(id, executionPlans.current(List.of(id)).get(id), at),
+                Clock.systemUTC()).withAggregateReadings(engine::aggregateReadings);
     }
 
     /**
@@ -158,7 +155,7 @@ class RuntimeConvergenceConfiguration {
         return new RateSampler(storePort.rateHistory(), history.getSampleInterval());
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,

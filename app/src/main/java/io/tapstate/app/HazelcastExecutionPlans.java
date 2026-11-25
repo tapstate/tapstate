@@ -50,14 +50,17 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                 publish(LAST_MAP_NAME, new ScopedPlan(original, plan, true), active);
                 publish(MAP_NAME, new ScopedPlan(original, plan, true), active);
             }
-            @Override public void forget(String pipeline) {
+            @Override public void forget(String pipeline) { forgetIfPresent(pipeline); }
+
+            @Override public boolean forgetIfPresent(String pipeline) {
                 // Confirmed retirement may finish after authorization expired; exact CAS cannot remove a successor.
                 if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
-                var map = member.<String,Object>getMap(MAP_NAME); Object held = map.get(pipeline);
-                if (held == null) return;
+                var map = member.<String, Object>getMap(MAP_NAME);
+                Object held = map.get(pipeline);
+                if (held == null) return false;
                 if (!(held instanceof ScopedPlan prior)) throw ThreeLayerStorePort.refused();
-                if (prior.original().equals(original) && prior.live())
-                    map.replace(pipeline, prior, new ScopedPlan(original, prior.plan(), false));
+                return prior.original().equals(original) && prior.live()
+                        && map.replace(pipeline, prior, new ScopedPlan(original, prior.plan(), false));
             }
             @Override public void forget(ExecutionPlan expected) {
                 Objects.requireNonNull(expected, "expected");
@@ -72,7 +75,7 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                     map.replace(expected.pipelineId(), prior, new ScopedPlan(original, expected, false));
             }
             @Override public ExecutionPlan last(String pipeline) {
-                active.run(); if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
+                if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
                 Object held = member.<String,Object>getMap(LAST_MAP_NAME).get(pipeline); active.run();
                 if (held == null) return null;
                 if (!(held instanceof ScopedPlan prior) || !sameBusiness(prior.original(), original)) throw ThreeLayerStorePort.refused();
@@ -84,7 +87,7 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
     private void publish(String name, ScopedPlan candidate, Runnable active) {
         var map = member.<String,Object>getMap(name); String pipeline = candidate.original().pipelineId();
         for (int attempt = 0; attempt < 32; attempt++) {
-            active.run(); Object held = map.get(pipeline); active.run();
+            Object held = map.get(pipeline); active.run();
             if (held == null) { if (map.putIfAbsent(pipeline, candidate) == null) return; }
             else {
                 if (!(held instanceof ScopedPlan prior) || !sameBusiness(prior.original(), candidate.original())
@@ -98,6 +101,22 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
         }
         throw ThreeLayerStorePort.refused();
     }
+    /** Strict absence proof; topology errors and unscoped historical values remain unknown. */
+    boolean terminalAt(io.tapstate.spi.store.PipelineIntentScope scope, io.tapstate.spi.store.WorkloadClaimFence ceiling) {
+        Object held = member.<String,Object>getMap(MAP_NAME).get(scope.pipelineId());
+        if (held == null) return true;
+        if (!(held instanceof ScopedPlan plan) || plan.live()) return false;
+        return originalOrPrior(plan.original(), scope, ceiling);
+    }
+
+    static boolean originalOrPrior(ExecutionFence prior, io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.WorkloadClaimFence ceiling) {
+        if (prior.scope() == null || !sameBusiness(prior, new ExecutionFence(scope, ceiling))
+                || prior.scope().stateGeneration() > scope.stateGeneration()) return false;
+        ScopedPipelineCaptureCoordinator.requireNotLater(prior, ceiling);
+        return true;
+    }
+
     private static boolean sameBusiness(ExecutionFence left, ExecutionFence right) {
         return left.scope() != null && right.scope() != null && left.pipelineId().equals(right.pipelineId())
                 && left.scope().clusterId().equals(right.scope().clusterId())

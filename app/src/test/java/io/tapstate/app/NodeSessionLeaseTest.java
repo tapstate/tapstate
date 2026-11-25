@@ -11,6 +11,8 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import io.tapstate.spi.store.ProcessNodeSession;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -31,6 +33,25 @@ class NodeSessionLeaseTest {
     private static final WorkloadClaim CLAIM = new WorkloadClaim(
             new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, "node-a"),
             new WorkloadOwner("node-a", "boot-1"), 1, 0, 0, Instant.now().plusSeconds(30));
+
+    @Test void singleNodeSurvivesTheTimedWindowWithoutMongoRenewalAndReleasesItsOriginalGeneration() {
+        var key = new WorkloadClaimKey("local", WorkloadClaimType.NODE_SESSION, "local");
+        var claim = new WorkloadClaim(key, new WorkloadOwner("local", "boot"),
+                4, 0, 0, ProcessNodeSession.PROCESS_OWNED);
+        var store = Mockito.mock(WorkloadClaimStore.class);
+        var clock = new AtomicLong();
+        var original = WorkloadClaimFence.from(claim);
+        try (var lease = new NodeSessionLease(store, claim, 0, Duration.ofSeconds(2), Duration.ofMillis(500),
+                () -> { throw new AssertionError("a process owner has no timed expiry"); }, clock::get)) {
+            clock.set(Duration.ofDays(3).toNanos());
+            assertThat(lease.currentFence()).contains(original);
+            assertThat(ProcessNodeSession.owns(original)).isTrue();
+            Mockito.verifyNoInteractions(store);
+        }
+        assertThat(ProcessNodeSession.owns(original)).isFalse();
+        Mockito.verify(store).release(claim);
+        Mockito.verifyNoMoreInteractions(store);
+    }
 
     @Test
     void aLiveNodeSessionIsRenewedAndReleasedBeforeTheMemberIsDestroyed() throws Exception {

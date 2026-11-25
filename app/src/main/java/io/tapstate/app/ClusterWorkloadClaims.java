@@ -32,18 +32,47 @@ final class ClusterWorkloadClaims {
         this.admission=admission;
     }
     ClusterWorkloadClaims draining(AdmissionDrain admission){return new ClusterWorkloadClaims(store,membership,admission);}
-    private <T>T call(java.util.function.Supplier<T> action){
-        return call(action, Long.MAX_VALUE);
+    private enum Operation { ORDINARY, ACQUISITION, INITIAL_ACQUISITION, RENEWAL }
+
+    private <T> T call(java.util.function.Supplier<T> action) {
+        return call(action, Long.MAX_VALUE, null, Operation.ORDINARY, true);
     }
-    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos){
-        return call(action, budgetNanos, false);
+
+    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey renewal) {
+        return call(action, budgetNanos, renewal, Operation.RENEWAL, true);
     }
-    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos, boolean renewal){
-        return call(action, budgetNanos, renewal, true);
+
+    private <T> T acquire(WorkloadClaimKey key, boolean requireCurrentResult, java.util.function.Supplier<T> action) {
+        return acquire(key, requireCurrentResult, action, false);
     }
-    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, boolean renewal,
-            boolean requireCurrentResult) {
-        if(admission==null)return action.get();
+
+    private <T> T acquire(WorkloadClaimKey key, boolean requireCurrentResult, java.util.function.Supplier<T> action, boolean initialStart) {
+        return call(action, Long.MAX_VALUE, key, initialStart ? Operation.INITIAL_ACQUISITION : Operation.ACQUISITION, requireCurrentResult);
+    }
+
+    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey key,
+            Operation kind, boolean requireCurrentResult) {
+        return call(action, budgetNanos, key, kind, requireCurrentResult, java.util.Set.of());
+    }
+
+    private <T> T call(java.util.function.Supplier<T> action, long budgetNanos, WorkloadClaimKey key,
+            Operation kind, boolean requireCurrentResult, java.util.Set<WorkloadClaimKey> recoveries) {
+        if (kind == Operation.RENEWAL && !recoveries.isEmpty()
+                && !(store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore))
+            throw new io.tapstate.spi.store.WorkloadClaimRenewalException(
+                    io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED,
+                    "earlier Pipeline recovery requires its original renewal capacity");
+        if (admission == null) {
+            if (kind == Operation.RENEWAL && !recoveries.isEmpty())
+                return ((io.tapstate.spi.store.DeadlineWorkloadClaimStore) store).withRenewalDeadline(
+                        key, recoveries, System.nanoTime() + budgetNanos, () -> {}, action);
+            if(kind==Operation.INITIAL_ACQUISITION&&key.type()==WorkloadClaimType.CAPTURE
+                    &&store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
+                return bounded.withInitialCaptureAcquisition(key,()->{},action);
+            if ((kind == Operation.ACQUISITION || kind == Operation.INITIAL_ACQUISITION) && store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
+                return bounded.withClaimAcquisition(key, () -> {}, action);
+            return action.get();
+        }
         if(!admission.enter())throw ThreeLayerStorePort.refused();
         try {
             T result;
@@ -51,8 +80,15 @@ final class ClusterWorkloadClaims {
                 long deadline = budgetNanos == Long.MAX_VALUE ? admission.deadlineNanos()
                         : Math.min(admission.deadlineNanos(), System.nanoTime() + budgetNanos);
                 Runnable active = () -> { if (!admission.accepting()) throw ThreeLayerStorePort.refused(); };
-                result = renewal ? bounded.withRenewalDeadline(deadline, active, action)
-                        : bounded.withDeadline(deadline, active, action);
+                result = switch (kind) {
+                    case ORDINARY -> bounded.withDeadline(deadline, active, action);
+                    case ACQUISITION -> bounded.withClaimAcquisitionDeadline(key, deadline, active, action);
+                    case INITIAL_ACQUISITION -> key.type()==WorkloadClaimType.CAPTURE
+                            ? bounded.withInitialCaptureAcquisition(key,deadline,active,action)
+                            : bounded.withInitialPipelineAcquisition(key, deadline, active, action);
+                    case RENEWAL -> recoveries.isEmpty() ? bounded.withRenewalDeadline(key, deadline, active, action)
+                            : bounded.withRenewalDeadline(key, recoveries, deadline, active, action);
+                };
             } else result = action.get();
             if (requireCurrentResult && !admission.current()) throw ThreeLayerStorePort.refused();
             return result;
@@ -69,7 +105,20 @@ final class ClusterWorkloadClaims {
         if (key.type() != WorkloadClaimType.NODE_SESSION && !membership.businessEligible()) {
             return Optional.empty();
         }
-        return call(()->Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
+        if (key.type() == WorkloadClaimType.NODE_SESSION) return call(() -> Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
+        return acquire(key, true, () -> Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
+    }
+
+    Optional<WorkloadClaimAttempt> acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision, boolean initial) {
+        return membership.businessEligible()
+                ? acquire(key, true, () -> Optional.of(store.acquireNodeBackedCapture(key, node, revision)), initial)
+                : Optional.empty();
+    }
+
+    Optional<WorkloadClaimAttempt> acquireInitialCapture(WorkloadClaimKey key,WorkloadOwner owner,long topologyRevision,Duration ttl) {
+        if(key.type()!=WorkloadClaimType.CAPTURE)throw new IllegalArgumentException("initial Capture acquisition requires a Capture key");
+        if(!membership.businessEligible())return Optional.empty();
+        return acquire(key,true,()->Optional.of(store.acquire(key,owner,topologyRevision,ttl)),true);
     }
 
     Optional<WorkloadClaim> acquireValidationExecution(
@@ -77,22 +126,32 @@ final class ClusterWorkloadClaims {
         var current = membership.committed();
         if (!membership.businessEligible() || current == null || current.revision() != topologyRevision)
             return Optional.empty();
-        return call(() -> store.acquireValidationExecution(key, owner, topologyRevision, ttl));
+        return acquire(key, true, () -> store.acquireValidationExecution(key, owner, topologyRevision, ttl));
     }
 
     Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
+        return acquirePipeline(scope, owner, topologyRevision, ttl, false);
+    }
+
+    Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
+            long topologyRevision, Duration ttl, boolean initialStart) {
         return membership.businessEligible()
                 // Return a known grant for fenced cleanup even when local admission expires.
-                ? call(() -> Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)),
-                        Long.MAX_VALUE, false, false) : Optional.empty();
+                ? acquire(new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId()),
+                        false, () -> Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)), initialStart) : Optional.empty();
     }
 
     Optional<WorkloadClaimAttempt> acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
             long topologyRevision) {
+        return acquireNodeBackedPipeline(scope, node, topologyRevision, false);
+    }
+
+    Optional<WorkloadClaimAttempt> acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
+            long topologyRevision, boolean initialStart) {
         return membership.businessEligible()
-                ? call(() -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision)),
-                        Long.MAX_VALUE, false, false) : Optional.empty();
+                ? acquire(new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId()),
+                        false, () -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision)), initialStart) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
@@ -135,6 +194,11 @@ final class ClusterWorkloadClaims {
 
     /** Keeps a scoped run's exact fence across joins; only a subsequent submission adopts the new topology. */
     Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl, long budgetNanos) {
+        return renewScopedActuation(expected, ttl, budgetNanos, java.util.Set.of());
+    }
+
+    Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl, long budgetNanos,
+            java.util.Set<WorkloadClaimKey> recoveries) {
         if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
             throw new IllegalArgumentException("a scoped actuation renewal requires a Pipeline claim");
         ClusterMembership current = membership.committed();
@@ -142,7 +206,7 @@ final class ClusterWorkloadClaims {
                 || !current.clusterId().equals(expected.key().clusterId())
                 || current.revision() < expected.topologyRevision()
                 || expected.executionGeneration() == 0 && current.revision() != expected.topologyRevision()) return Optional.empty();
-        return call(()->store.renew(expected, ttl), budgetNanos, true);
+        return call(() -> store.renew(expected, ttl), budgetNanos, expected.key(), Operation.RENEWAL, true, recoveries);
     }
 
     /**
@@ -155,13 +219,18 @@ final class ClusterWorkloadClaims {
     }
 
     Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl, long budgetNanos) {
+        return renewActuationControl(expected, ttl, budgetNanos, java.util.Set.of());
+    }
+
+    Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl, long budgetNanos,
+            java.util.Set<WorkloadClaimKey> recoveries) {
         return membership.singleControlEligible(expected)
-                ? call(() -> store.renew(expected, ttl), budgetNanos, true) : Optional.empty();
+                ? call(() -> store.renew(expected, ttl), budgetNanos, expected.key(), Operation.RENEWAL, true, recoveries) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> confirmPipelineRenewal(PipelineIntentScope scope, WorkloadClaim expected, long budgetNanos) {
         if (!membership.businessEligible() && !membership.singleControlEligible(expected)) return Optional.empty();
-        return call(() -> store.readPipeline(scope), budgetNanos, true);
+        return call(() -> store.readPipeline(scope), budgetNanos, expected.key());
     }
 
     /** Read-only reporting proof for the exact retained SINGLE execution, never a business grant. */

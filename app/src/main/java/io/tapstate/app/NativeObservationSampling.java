@@ -41,6 +41,7 @@ final class NativeObservationSampling {
     private final String defaultSource;
     private final Clock clock;
     private final Map<String, Published> published = new ConcurrentHashMap<>();
+    private final Map<String, TerminalPublication> terminals = new ConcurrentHashMap<>();
 
     NativeObservationSampling(MongoConfigurationDomain configuration, MongoCacheDomain cache, ScopedPipelineCaptureCoordinator captures,
             Function<String, Optional<ExecutionFence>> execution, Function<String, ExecutionPlan> plans, String defaultSource, Clock clock) {
@@ -95,6 +96,7 @@ final class NativeObservationSampling {
             PipelineIntentStore.ActuationReading config, BooleanSupplier stillCurrent, Runnable requireCurrentTicket,
             Supplier<Optional<Observation>> fallback, UnaryOperator<ObservationStore> deferred) {
         String id = pass.scope().pipelineId();
+        if (!afterTerminal(pass, checkpoint)) return Optional.empty();
         var original = new ExecutionFence(pass.scope(), pass.claim());
         if (execution.apply(id).filter(original::equals).isEmpty()) {
             forget(id);
@@ -108,7 +110,7 @@ final class NativeObservationSampling {
         var observation = fallback.get();
         if (deferred == null && observation.filter(value -> value.state() == PipelineState.RUNNING).isPresent()
                 && execution.apply(id).filter(original::equals).isPresent()) {
-            published.put(id, reading);
+            synchronized (published) { if (afterTerminal(pass, checkpoint)) published.put(id, reading); }
         }
         return observation;
     }
@@ -116,7 +118,9 @@ final class NativeObservationSampling {
     void recordPublishedRunning(PipelineConvergencePass pass, CheckpointDoc checkpoint) {
         var original = new ExecutionFence(pass.scope(), pass.claim());
         if (execution.apply(pass.scope().pipelineId()).filter(original::equals).isPresent()) {
-            published.put(pass.scope().pipelineId(), new Published(checkpoint.epoch(), original));
+            synchronized (published) {
+                if (afterTerminal(pass, checkpoint)) published.put(pass.scope().pipelineId(), new Published(checkpoint.epoch(), original));
+            }
         }
     }
 
@@ -207,7 +211,21 @@ final class NativeObservationSampling {
         return true;
     }
 
+    void terminal(TerminalPublication terminal) {
+        synchronized (published) {
+            terminals.put(terminal.scope().pipelineId(), terminal);
+            published.remove(terminal.scope().pipelineId());
+        }
+    }
+
+    private boolean afterTerminal(PipelineConvergencePass pass, CheckpointDoc checkpoint) {
+        var terminal = terminals.get(pass.scope().pipelineId());
+        if (terminal == null || !terminal.scope().equals(pass.scope()) || !terminal.claim().equals(pass.claim())) return true;
+        return pass.intent() != null && pass.intent().intentRevision() > terminal.intentRevision()
+                || checkpoint.epoch() > terminal.checkpointEpoch();
+    }
+
     void forget(String id) { published.remove(id); }
 
-    void retain(Collection<String> ids) { published.keySet().retainAll(ids); }
+    void retain(Collection<String> ids) { published.keySet().retainAll(ids); terminals.keySet().retainAll(ids); }
 }

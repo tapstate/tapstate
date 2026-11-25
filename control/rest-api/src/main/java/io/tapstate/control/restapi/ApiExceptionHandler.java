@@ -31,7 +31,6 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.util.Map;
 import java.util.HashMap;
-import java.util.TreeMap;
 import java.util.Locale;
 
 /**
@@ -60,13 +59,24 @@ class ApiExceptionHandler {
         this.catalog = catalog;
     }
 
+    private static String diagnosticMessage(String message) {
+        var authentication = org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
+        return authentication != null && authentication.isAuthenticated()
+                && !(authentication instanceof org.springframework.security.authentication.AnonymousAuthenticationToken)
+                ? io.tapstate.core.common.OperationErrorDiagnostics.appendTo(message) : message;
+    }
+
+    private static ApiError diagnosed(ApiError body) {
+        return new ApiError(body.code(), body.params(), diagnosticMessage(body.message()), body.solution(), body.diagnostic());
+    }
+
     @ExceptionHandler(TapstateException.class)
     ResponseEntity<ApiError> handle(TapstateException e) {
         if (StorageQuota.isQuotaCode(e.code()))
             e = new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         markCloudError(e.code());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
-        ApiError body = ApiError.from(e, catalog, requestLocale());
+        ApiError body = diagnosed(ApiError.from(e, catalog, requestLocale()));
         HttpStatus status=statusFor(e.code());
         if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
                 &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;
@@ -76,7 +86,7 @@ class ApiExceptionHandler {
     @ExceptionHandler(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition.class)
     ResponseEntity<ApiError> handleValidationConflict(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition failure){
         return ResponseEntity.status(HttpStatus.CONFLICT).cacheControl(CacheControl.noStore())
-                .body(ApiError.render(failure.code(), failure.args(), Map.of(), catalog, requestLocale()));
+                .body(diagnosed(ApiError.render(failure.code(), failure.args(), Map.of(), catalog, requestLocale())));
     }
 
     @ExceptionHandler(UnavailableCodedException.class)
@@ -91,7 +101,7 @@ class ApiExceptionHandler {
      */
     @ExceptionHandler(StartRefusal.class)
     ResponseEntity<StartRefusalError> handle(StartRefusal e) {
-        StartRefusalError body = new StartRefusalError(ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale()), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
+        StartRefusalError body = new StartRefusalError(diagnosed(ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale())), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -112,7 +122,7 @@ class ApiExceptionHandler {
     @ExceptionHandler(BadRequestCodedException.class)
     ResponseEntity<ApiError> handle(BadRequestCodedException e) {
         markCloudError(e.code());
-        ApiError body = ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale());
+        ApiError body = diagnosed(ApiError.render(e.code(), e.args(), Map.of(), catalog, requestLocale()));
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).cacheControl(CacheControl.noStore()).body(body);
     }
 
