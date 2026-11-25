@@ -180,7 +180,6 @@ public enum IoError implements TapstateErrorCode {
 
     /** A pipeline transaction may have committed, so its result must be checked before retrying. */
     PIPELINE_COMMIT_OUTCOME_UNKNOWN(IoErrorDefinitions.PIPELINE_COMMIT_OUTCOME_UNKNOWN),
-
     KEY_MOVE_RECOVERY_UNCERTAIN(IoErrorDefinitions.KEY_MOVE_RECOVERY_UNCERTAIN);
 
     private final ProductErrorDefinition definition;

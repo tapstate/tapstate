@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine.nest;
 
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -55,7 +56,11 @@ final class RootMoveDispatcher extends AbstractProcessor implements Staged {
 
     @Override protected void init(Processor.Context context) {
         timer = StageTimer.of(stage(), context);
-        notices = new RootMoveAcks.Inbox(context.hazelcastInstance());
+        if (notices == null) withRootHandoverTransport(context.hazelcastInstance());
+    }
+
+    void withRootHandoverTransport(HazelcastInstance member) {
+        notices = new RootMoveAcks.Inbox(member);
     }
 
     @Override public void close() { if (notices != null) notices.close(); }
