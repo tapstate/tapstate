@@ -101,6 +101,20 @@ final class PipelineDiagnostics {
         if (current != null) { current.details.put("source_id", identifier(source)); event("source_selected"); }
     }
 
+    static String currentPassId() {
+        var current = CURRENT.get();
+        return current == null ? null : (String) current.root.facts.get("pass_id");
+    }
+
+    static <T> T observationWrite(String pipeline, String sampleId, Supplier<T> action) {
+        if (sampleId == null) return action.get();
+        return measure(pipeline, Phase.PIPELINE_PUBLISH, () -> {
+            var current = CURRENT.get();
+            if (current != null) current.details.put("observation_sample_id", sampleId);
+            return action.get();
+        });
+    }
+
     static void job(long id) {
         var current = CURRENT.get();
         if (current != null) current.root.facts.put("jet_job_id", Long.toUnsignedString(id, 16));

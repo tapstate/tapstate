@@ -1478,6 +1478,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         // Guarded by the coordinator monitor while physical retirement runs without it.
         boolean stopping;
         CompletableFuture<Void> operationAttempt;
+        CompletableFuture<Void> retentionRead;
         boolean maintenanceRetirementPending;
         Owner(CapturePreparation prepared,WorkloadClaim initial) { this.prepared=prepared;this.initial=initial;this.fence=WorkloadClaimFence.from(initial); }
         void finishCheckpointingForRetirement() {
@@ -2046,7 +2047,48 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         for (var owner : List.copyOf(owners.values())) {
             if (owner.prepared.mode() == CapturePreparation.Mode.SHARED_SRS
                     && (!owner.ended.get() || owner.handingOff || owner.maintenanceRetirementPending))
-                scheduleOwnerOperation(owner, () -> maintainOwner(owner));
+                scheduleMaintenance(owner);
+        }
+    }
+
+    private void scheduleMaintenance(Owner owner) {
+        if (ownerOperations.isShutdown() || owner.stopping) return;
+        var physical = owner.physical;
+        var current = owner.controlStores;
+        if (owner.ended.get() || owner.drainingReports() || owner.retry.waiting() || current == null
+                || physical == null || !physical.live.get() || physical.tail == null || physical.failureFact().isPresent()) {
+            scheduleOwnerOperation(owner, () -> maintainOwner(owner));
+            return;
+        }
+        if (owner.retentionRead != null) return;
+        long revision = owner.demandRevision;
+        owner.retentionRead = CompletableFuture.runAsync(() -> {
+            try {
+                var sample = readMaintenanceSample(owner, current);
+                CompletableFuture<Void> reservation;
+                synchronized (this) {
+                    // A new attachment, physical replacement or retirement invalidates the sample, including its failure.
+                    if (hostClosing || owners.get(owner.prepared.captureId()) != owner || owner.stopping
+                            || owner.ended.get() || owner.drainingReports() || owner.demandRevision != revision
+                            || owner.physical != physical || !physical.live.get()) return;
+                    reservation = reserveOwnerOperation(owner);
+                }
+                try { maintainOwner(owner, sample); }
+                finally { finishOwnerOperation(owner, reservation); }
+            } finally {
+                synchronized (this) { owner.retentionRead = null; }
+            }
+        }, ownerOperations);
+    }
+
+    private record MaintenanceSample(SrsStores stores, SrsConsumerStore.RetentionSnapshot snapshot, Throwable failure) {}
+
+    private MaintenanceSample readMaintenanceSample(Owner owner, SrsStores current) {
+        try {
+            owner.require();
+            return new MaintenanceSample(current, retentionSnapshot(owner, current), null);
+        } catch (RuntimeException | Error failure) {
+            return new MaintenanceSample(current, null, failure);
         }
     }
 
@@ -2074,7 +2116,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         attempt.complete(null);
     }
 
-    private void maintainOwner(Owner owner) {
+    private void maintainOwner(Owner owner) { maintainOwner(owner, null); }
+
+    private void maintainOwner(Owner owner, MaintenanceSample sample) {
         if (owner.ended.get()) {
             try {
                 if (owner.handingOff) finishLost(owner);
@@ -2098,7 +2142,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             var failure = physical == null ? Optional.<io.tapstate.core.common.FailureFact>empty() : physical.failureFact();
             if (failure.isEmpty()) {
                 if (owner.retry.waiting()) recoverSharedRead(owner, physical, openingFailure);
-                else maintainTail(owner, openingFailure::set);
+                else maintainTail(owner, sample, openingFailure::set);
                 return;
             }
             var fact = failure.orElseThrow();
@@ -2142,7 +2186,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         owner.retry.attempting();
         LOG.info("Reopening shared capture {} from its durable checkpoint", owner.prepared.captureId());
         try {
-            maintainTail(owner, openingFailure::set);
+            maintainTail(owner, null, openingFailure::set);
         } catch (RuntimeException opening) {
             if (!owner.retry.waiting() || owner.physical != null) throw opening;
         }
@@ -2166,17 +2210,22 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         synchronized (this) { owners.remove(owner.prepared.captureId(), owner); }
     }
 
-    private void maintainTail(Owner owner,
-            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
-        var current = tailStores(owner);
-        String chainId = owner.prepared.chainId();
-        SrsConsumerStore.RetentionSnapshot snapshot = null;
+    private SrsConsumerStore.RetentionSnapshot retentionSnapshot(Owner owner, SrsStores current) {
         try {
-            snapshot = current.consumers().retentionSnapshot(chainId).orElse(null);
+            return current.consumers().retentionSnapshot(owner.prepared.chainId()).orElse(null);
         } catch (TapstateException unavailable) {
             if (unavailable.code() != IoError.STORE_UNAVAILABLE) throw unavailable;
             owner.require();
+            return null;
         }
+    }
+
+    private void maintainTail(Owner owner, MaintenanceSample sample,
+            java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure) {
+        if (sample != null && sample.failure() != null) throwFailure(sample.failure());
+        var current = sample == null ? tailStores(owner) : sample.stores();
+        var snapshot = sample == null ? retentionSnapshot(owner, current) : sample.snapshot();
+        String chainId = owner.prepared.chainId();
         var original = owner.physical;
         ensureTail(owner, current, false, snapshot, openingFailure, false);
         try {

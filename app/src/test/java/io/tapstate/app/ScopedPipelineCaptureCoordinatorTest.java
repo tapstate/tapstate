@@ -293,6 +293,8 @@ class ScopedPipelineCaptureCoordinatorTest {
             for (Object owner : owners.values()) {
                 var attempt = (CompletableFuture<?>) org.springframework.test.util.ReflectionTestUtils.getField(owner, "operationAttempt");
                 if (attempt != null) attempts.add(attempt);
+                var read = (CompletableFuture<?>) org.springframework.test.util.ReflectionTestUtils.getField(owner, "retentionRead");
+                if (read != null) attempts.add(read);
             }
         }
         for (var attempt : attempts) attempt.get(3, TimeUnit.SECONDS);
@@ -901,6 +903,40 @@ class ScopedPipelineCaptureCoordinatorTest {
                     eq(WorkloadClaimFence.from(held.claim())), any(), same(snapshot));
             verify(stores.consumers(), never()).controlSnapshot(held.chain());
             verify(f.runtime, times(1)).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aPendingRetentionReadIsSingleFlightAndCannotAffectAReplacement(boolean readFails) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var snapshot = new SrsConsumerStore.RetentionSnapshot(stores.chains().load(held.chain()).orElseThrow(), List.of());
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            doAnswer(call -> {
+                entered.countDown();
+                if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("retention read was not released");
+                if (readFails) throw new IllegalStateException("old owner read failed");
+                return Optional.of(snapshot);
+            }).when(stores.consumers()).retentionSnapshot(held.chain());
+            try {
+                org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+                assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                var reading = (CompletableFuture<?>) org.springframework.test.util.ReflectionTestUtils.getField(ownerOf(f, held), "retentionRead");
+                org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+                verify(stores.consumers(), times(1)).retentionSnapshot(held.chain());
+                held.run().stopCapture("flow", false);
+                var replacement = ownedShared(f);
+                release.countDown();
+                reading.get(3, TimeUnit.SECONDS);
+                verify(f.runtime, never()).retain(any(), anyString(), any(), any(), same(snapshot));
+                assertThat(replacement.run().captureFailure("flow")).isEmpty();
+                verify(replacement.tail(), never()).close();
+            } finally { release.countDown(); }
         }
     }
 

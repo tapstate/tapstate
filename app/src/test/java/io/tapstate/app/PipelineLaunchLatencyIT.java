@@ -182,7 +182,10 @@ class PipelineLaunchLatencyIT {
                     }
                 }
                 String origin = "http://localhost:" + ((WebServerApplicationContext) application).getWebServer().getPort();
-                try (var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+                var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application).getBean(PipelineCaptureCoordinator.class);
+                // Capture owners retain their SRS ports. Install the barrier before starting the first owner.
+                try (var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+                     var maintenance = blockMaintenance ? new PositionReadBarrier(captures) : null) {
                     var login = http.send(HttpRequest.newBuilder(URI.create(origin + "/auth/exchange?code=browser-code"))
                             .GET().build(), HttpResponse.BodyHandlers.ofString());
                     assertThat(login.statusCode()).isEqualTo(302);
@@ -199,7 +202,7 @@ class PipelineLaunchLatencyIT {
                     }
                     String running = "launch-" + (samples - 1);
                     var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
-                    if ((blockPriorObservation || restartPlanning) && !blockMaintenance) {
+                    if (blockPriorObservation || restartPlanning) {
                         request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
                                 .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
@@ -210,19 +213,12 @@ class PipelineLaunchLatencyIT {
                         sample.setAccessible(true);
                         sample.set(publisher, null);
                     }
-                    var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application)
-                            .getBean(PipelineCaptureCoordinator.class);
-                    try (var barrier = blockProof ? new PositionReadBarrier(NativeAppStorage.business(application)
+                    try (var otherBarrier = blockProof ? new PositionReadBarrier(NativeAppStorage.business(application)
                             .getBean(PipelineActuationOwnership.class), ((ThreeLayerStorePort) port).scope("launch-0"))
-                            : blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
-                            : new PositionReadBarrier(publisher,"launch-0") : null;
+                            : blockPriorObservation && !blockMaintenance ? new PositionReadBarrier(publisher,"launch-0") : null;
                          var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
-                        if (blockMaintenance) {
-                            // Capture owners retain their SRS ports at creation. Install the barrier first.
-                            request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
-                            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
-                                    .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
-                        }
+                        var barrier = maintenance == null ? otherBarrier : maintenance;
+                        if (maintenance != null) maintenance.armMaintenance.set(true);
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
                                 .as("the prior Pipeline must enter the selected observation, maintenance or proof barrier").isTrue();
                         var admin = raw.getDatabase("admin");
@@ -262,7 +258,12 @@ class PipelineLaunchLatencyIT {
                             if (!blockPriorObservation && !restartPlanning) {
                                 // Engine readiness may precede the asynchronous observation write.
                                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
-                                        .until(() -> diagnostics.slowPublication().isPresent());
+                                        .until(() -> diagnostics.slowPublication(running).isPresent());
+                                var publication = diagnostics.slowPublication(running).orElseThrow();
+                                System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION " + JsonWriter.write(publication));
+                                assertThat(((Number) publication.get("command_count")).intValue())
+                                        .as("one source with three tables must reuse its original progress across projections")
+                                        .isLessThanOrEqualTo(64);
                             }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
                     }
@@ -308,15 +309,6 @@ class PipelineLaunchLatencyIT {
                         assertNativeTarget(storage, running, 2L);
                         System.out.println("NATIVE_RESTART_TARGET_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested));
                     }
-                    if (!blockPriorObservation && !restartPlanning) {
-                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
-                                .until(() -> diagnostics.slowPublication().isPresent());
-                        var publication = diagnostics.slowPublication().orElseThrow();
-                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION " + JsonWriter.write(publication));
-                        assertThat(((Number) publication.get("command_count")).intValue())
-                                .as("one source with three tables must reuse its original progress across projections")
-                                .isLessThanOrEqualTo(64);
-                    }
                 }
             }
         }
@@ -338,37 +330,50 @@ class PipelineLaunchLatencyIT {
     private static final class DiagnosticRecording implements AutoCloseable {
         final ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
                 org.slf4j.LoggerFactory.getLogger(PipelineDiagnostics.LOGGER_NAME);
-        final Queue<Map<?, ?>> completed = new ConcurrentLinkedQueue<>();
+        final Map<Object, Map<?, ?>> samples = new ConcurrentHashMap<>();
+        final Queue<Map<?, ?>> publications = new ConcurrentLinkedQueue<>();
         final Queue<Map<?, ?>> claimIo = new ConcurrentLinkedQueue<>();
         final ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent> appender =
                 new ch.qos.logback.core.AppenderBase<>() {
                     @Override protected void append(ch.qos.logback.classic.spi.ILoggingEvent event) {
                         var record = (Map<?, ?>) JsonReader.parse(event.getFormattedMessage());
-                        if ("PIPELINE_PASS".equals(record.get("phase")) && "end".equals(record.get("edge")))
-                            completed.add(record);
+                        if ("end".equals(record.get("edge")) && Boolean.TRUE.equals(record.get("complete"))) {
+                            if ("PIPELINE_SAMPLE".equals(record.get("phase"))) samples.put(record.get("pass_id"), record);
+                            if ("PIPELINE_PUBLISH".equals(record.get("phase")) && record.containsKey("observation_sample_id"))
+                                publications.add(record);
+                        }
                         if ("mongo_claim_io_diag".equals(record.get("event"))) claimIo.add(record);
                     }
                 };
         DiagnosticRecording() { appender.setContext(logger.getLoggerContext()); appender.start(); logger.addAppender(appender); }
-        Optional<Map<String, Object>> slowPublication() {
-            for (var record : completed) {
-                var mongo = (Map<?, ?>) ((Map<?, ?>) record.get("mongo_by_phase")).get("pipeline_publish");
-                var phase = (Map<?, ?>) ((Map<?, ?>) record.get("phases")).get("pipeline_publish");
-                if (mongo != null && phase != null && Boolean.TRUE.equals(record.get("complete"))
-                        && ((Number) mongo.get("max_driver_ms")).doubleValue() >= 4500
-                        && ((Number) phase.get("inclusive_ms")).doubleValue() >= 4500) {
-                    return Optional.of(Map.of("pass_id", record.get("pass_id"), "pipeline_id", record.get("pipeline_id"),
-                            "phase", "PIPELINE_PUBLISH", "inclusive_ms", phase.get("inclusive_ms"),
-                            "max_driver_ms", mongo.get("max_driver_ms"), "command_count", mongo.get("started")));
-                }
+        Optional<Map<String, Object>> slowPublication(String pipeline) {
+            for (var write : publications) {
+                var sample = samples.get(write.get("observation_sample_id"));
+                if (sample == null || !pipeline.equals(sample.get("pipeline_id")) || !pipeline.equals(write.get("pipeline_id"))) continue;
+                var groups = (List<?>) write.get("mongo_groups");
+                var delayed = groups.stream().map(group -> (Map<?, ?>) group)
+                        .filter(group -> "pipeline_observation".equals(group.get("collection")) && "update".equals(group.get("command"))
+                                && ((Number) group.get("failures")).longValue() == 0
+                                && ((Number) group.get("completed")).longValue() > 0
+                                && ((Number) group.get("max_driver_ms")).doubleValue() >= 4500).findFirst();
+                if (delayed.isEmpty() || ((Number) write.get("elapsed_ms")).doubleValue() < 4500) continue;
+                int reads = commands(sample);
+                int writes = commands(write);
+                return Optional.of(Map.of("pipeline_id", pipeline, "sample_id", sample.get("pass_id"),
+                        "sample_commands", reads, "write_commands", writes, "command_count", reads + writes,
+                        "max_driver_ms", delayed.orElseThrow().get("max_driver_ms")));
             }
             return Optional.empty();
+        }
+        private static int commands(Map<?, ?> record) {
+            return ((Number) ((Map<?, ?>) record.get("mongo")).get("started")).intValue();
         }
         @Override public void close() { logger.detachAppender(appender); appender.stop(); }
     }
 
     /** Holds one real position supplier; all engine, capture and store work still follows production wiring. */
     private static final class PositionReadBarrier implements AutoCloseable {
+        final java.util.concurrent.atomic.AtomicBoolean armMaintenance = new java.util.concurrent.atomic.AtomicBoolean();
         final CountDownLatch entered = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final java.util.concurrent.atomic.AtomicBoolean blocked = new java.util.concurrent.atomic.AtomicBoolean();
@@ -436,21 +441,10 @@ class PipelineLaunchLatencyIT {
                 SrsStoreViews observed = new SrsStoreViews() {
                     public SrsStores srs(CacheBusinessScope scope, Runnable guard) {
                         var ports = delegate.srs(scope, guard);
-                        var chains = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
-                                new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> {
-                                    if (method.getName().equals("load") && Thread.currentThread().getName().startsWith("tapstate-capture-owner-")) {
-                                        blocked.set(true); entered.countDown();
-                                        try { release.await(); }
-                                        catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
-                                        finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
-                                    }
-                                    try { return method.invoke(ports.chains(), arguments); }
-                                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
-                                });
                         var consumers = (SrsConsumerStore) java.lang.reflect.Proxy.newProxyInstance(SrsConsumerStore.class.getClassLoader(),
                                 new Class<?>[]{SrsConsumerStore.class}, (proxy, method, arguments) -> {
-                                    if (method.getName().equals("retentionSnapshot")
-                                            && Thread.currentThread().getName().startsWith("tapstate-capture-owner-")) {
+                                    if (method.getName().equals("retentionSnapshot") && Thread.currentThread().getName().startsWith("tapstate-capture-owner-")
+                                            && armMaintenance.compareAndSet(true, false)) {
                                         blocked.set(true); entered.countDown();
                                         try { release.await(); }
                                         catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
@@ -459,7 +453,7 @@ class PipelineLaunchLatencyIT {
                                     try { return method.invoke(ports.consumers(), arguments); }
                                     catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
                                 });
-                        return new SrsStores(chains, ports.models(), ports.log(), consumers);
+                        return new SrsStores(ports.chains(), ports.models(), ports.log(), consumers);
                     }
                     public boolean supportsAdmittedCaptureStartup() { return delegate.supportsAdmittedCaptureStartup(); }
                     public <T> T withCaptureStartup(CacheBusinessScope scope, java.util.function.Supplier<T> step) {

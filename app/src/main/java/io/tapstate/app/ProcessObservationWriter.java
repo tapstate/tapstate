@@ -373,7 +373,11 @@ final class ProcessObservationWriter implements AutoCloseable {
     private void writeObservations(List<Stage> batch, List<History> history) {
         List<RuntimeException> results;
         try {
-            results = cache.writeObservations(batch.stream().map(Stage::write).toList());
+            var writes = batch.stream().map(Stage::write).toList();
+            // A shared batch has one Mongo cost and cannot be attributed to one sample.
+            var single = batch.size() == 1 ? batch.getFirst() : null;
+            results = single == null ? cache.writeObservations(writes) : PipelineDiagnostics.observationWrite(
+                    single.pipeline(), single.diagnosticSampleId, () -> cache.writeObservations(writes));
         } catch (RuntimeException failure) {
             results = java.util.Collections.nCopies(batch.size(), failure);
         }
@@ -533,6 +537,7 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     final class Stage {
+        String diagnosticSampleId;
         private final PipelineConvergencePass pass;
         private final WorkloadClaimFence claim;
         private final Runnable original;
