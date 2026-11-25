@@ -99,6 +99,44 @@ class StorageRootShutdownTest {
         });
     }
 
+    @Test void unpublishedCloseFailureStillClosesPublishedOwnersAndCanBeRetried() {
+        var root = root();
+        var runtime = mock(StorageRuntime.class);
+        var authentication = mock(StorageAuthentication.class);
+        var candidate = mock(StorageRuntime.class);
+        var candidateAuthentication = mock(StorageAuthentication.class);
+        ReflectionTestUtils.setField(root, "runtime", runtime);
+        ReflectionTestUtils.setField(root, "authentication", authentication);
+        ReflectionTestUtils.setField(root, "runtimes", (Function<MongoConfigurationDomain, StorageRuntime>) ignored -> candidate);
+        ReflectionTestUtils.setField(root, "authentications", (Function<MongoConfigurationDomain, StorageAuthentication>) ignored -> candidateAuthentication);
+        var publicationFailure = new IllegalStateException("before replacement publication");
+        var candidateFailure = new IllegalStateException("unpublished runtime close failed");
+        doThrow(publicationFailure).when(runtime).close();
+        doThrow(candidateFailure).when(candidate).close();
+        var endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                "mongodb://fixture/config", "config", null);
+
+        assertThat(catchThrowable(() -> root.installOnPremConfiguration(mock(MongoConfigurationDomain.class), endpoint)))
+                .isSameAs(publicationFailure).hasSuppressedException(candidateFailure);
+        clearInvocations(authentication, runtime);
+
+        assertThat(catchThrowable(root::close)).hasSuppressedException(candidateFailure);
+        verify(authentication).close();
+        verify(runtime).close(anyLong());
+        assertThat(shutdownLog.list).anySatisfy(event -> {
+            assertThat(event.getFormattedMessage()).contains("unpublished owner close");
+            assertThat(event.getThrowableProxy().getSuppressed())
+                    .anySatisfy(failure -> assertThat(failure.getMessage()).isEqualTo(candidateFailure.getMessage()));
+        });
+
+        doNothing().when(candidate).close();
+        root.close();
+        verify(candidate, times(3)).close();
+        verify(candidateAuthentication).close();
+        root.close();
+        verifyNoMoreInteractions(candidate, candidateAuthentication);
+    }
+
     private static StorageRoot root() {
         var mongo = new MongoProperties();
         mongo.setUri(null);

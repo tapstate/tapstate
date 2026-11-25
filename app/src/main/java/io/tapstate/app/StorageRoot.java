@@ -1096,6 +1096,7 @@ final class StorageRoot implements AutoCloseable {
     private void finishClose(long deadline) {
         ShutdownAwait.stage("storage coordinator drain", () -> drainCoordinators(deadline));
         ShutdownAwait.all(List.of(
+                () -> ShutdownAwait.stage("unpublished owner close", this::closeUnpublishedOwners),
                 () -> ShutdownAwait.stage("authentication close", authentication::close),
                 () -> ShutdownAwait.stage("storage runtime close", () -> runtime.close(deadline))));
         closed = true;
@@ -1110,6 +1111,9 @@ final class StorageRoot implements AutoCloseable {
                 () -> { if (activationWorker != null) ShutdownAwait.executor(activationWorker, deadline); },
                 () -> { if (recoveryWorker != null) ShutdownAwait.executor(recoveryWorker, deadline); }));
         if (initialization != null) initialization.close();
+    }
+
+    private void closeUnpublishedOwners() {
         var cleanup = StorageRuntime.unavailable();
         closeUnpublished(cleanup);
         if (!unpublished.isEmpty()) throw cleanup;
