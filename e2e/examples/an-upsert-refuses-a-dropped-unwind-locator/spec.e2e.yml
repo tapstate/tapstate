@@ -1,0 +1,13 @@
+# One parent would produce two rows with the same id after the projection removes the locator.
+name: an-upsert-refuses-a-dropped-unwind-locator
+setup:
+  connectors: [e2e_file]
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  discover: [src_file]
+pipeline: pipeline.tap.yml
+seed:
+  src_file.orders: { rows: 1 }
+steps:
+  - start
+  - await: { failure_code: TS0360035 }
+  - assert: { count: { tgt_file.orders: 0 } }
