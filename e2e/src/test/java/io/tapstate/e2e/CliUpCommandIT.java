@@ -6,14 +6,11 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The shipped CLI still exposes the one-shot workspace convergence command.
- *
- * <p>The full-screen workbench owns a bare launch, but it must not make scripts lose {@code up}: a
- * process invoking the command must reach its own command contract before any workspace or server is
- * needed. Launching the packaged CLI catches a missing command registration, which calling the command
- * class directly would not.
+ * The shipped CLI exposes one-shot workspace convergence and points session actions to the workbench
+ * Shell. Both cases launch the packaged CLI in separate processes, covering command registration,
+ * loaded message resources and process exit codes.
  */
-@DisplayName("the one-shot workspace convergence command remains available")
+@DisplayName("the one-shot CLI keeps command entry points and session recovery available")
 class CliUpCommandIT {
 
     @Test
@@ -26,4 +23,17 @@ class CliUpCommandIT {
                 .contains("preflight, apply sources, discover, apply workspace, start");
         assertThat(run.stderr()).isEmpty();
     }
+
+    @Test
+    void anInteractiveActionExplainsHowToOpenTheWorkbenchShell() {
+        CliOnce.Run run = CliOnce.run("login");
+
+        assertThat(run.exitCode()).as("the one-shot action must be refused").isEqualTo(3);
+        assertThat(run.stdout()).isEmpty();
+        assertThat(run.stderr())
+                .contains("error: TS0330023")
+                .contains("press F6 to open Shell")
+                .contains("enter `login` at the `tapstate>` prompt");
+    }
+
 }
