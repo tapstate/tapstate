@@ -1046,10 +1046,17 @@ class MongoCachePipelineRebuildsIT {
                     CanonicalHash.of(pipeline), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"), 0)));
             var pending = f.configuration.retirements().begin(request);
 
-            assertThat(intents.connectorBindings().loadCurrent("flow")).isEmpty();
+            var bindings = intents.connectorBindings();
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.config);
+            var key = new Document("_id", "flow");
+            mappings.updateOne(key, new Document("$set", new Document("connectorBindings", "damaged")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
+            mappings.updateOne(key, new Document("$unset", new Document("connectorBindings", "")));
             assertCode(() -> intents.compareAndSet(f.scope, revision + 1, desired), IoError.PIPELINE_INTENT_FENCED);
 
             f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business, ACTIVE).retire(pending, f.node));
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
         });
     }
 

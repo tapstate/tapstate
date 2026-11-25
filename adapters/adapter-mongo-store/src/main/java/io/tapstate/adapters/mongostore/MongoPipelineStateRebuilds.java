@@ -82,13 +82,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             try {
                 var annex=mapping.get("stateRebuild",Document.class);annexVersion(annex,false);
                 var original=intents.loadInTransaction(session,pipelineId).orElseThrow(MongoPipelineStateRebuilds::fenced);
-                var claim=annex.get("originalClaim",Document.class);
-                if(claim==null || !claim.keySet().equals(Set.of("clusterId","pipelineId","nodeId","bootId","claimGeneration","executionGeneration","topologyRevision"))
-                        || !(claim.get("claimGeneration") instanceof Long generation) || !(claim.get("executionGeneration") instanceof Long execution)
-                        || !(claim.get("topologyRevision") instanceof Long topology) || !(annex.get("originalStateEpoch") instanceof Long epoch))throw unreadable();
-                var fence=new WorkloadClaimFence(new WorkloadClaimKey(claim.getString("clusterId"),WorkloadClaimType.PIPELINE_ACTUATION,claim.getString("pipelineId")),
-                        new WorkloadOwner(claim.getString("nodeId"),claim.getString("bootId")),generation,execution,topology);
-                var request=new PipelineRebuildRequest(annex.getString("operationId"),original,fence,epoch,inputs,captured);
+                var request=new PipelineRebuildRequest(annex.getString("operationId"),original,pendingClaim(annex),
+                        pendingEpoch(annex),inputs,captured);
                 var retained=retained(request,confirmationHash(request),requireOriginal(session,request));
                 return java.util.Optional.of(retained);
             }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unreadable();}
@@ -429,11 +424,33 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                     || !scope.equals(MongoPipelinePreparationFacts.scope(annex.get("originalScope", Document.class)))
                     || !target.equals(MongoPipelinePreparationFacts.scope(annex.get("targetScope", Document.class)))
                     || !(annex.get("confirmationHash") instanceof String hash) || !hash.matches("[0-9a-f]{64}")) throw unreadable();
+            var claim = pendingClaim(annex);
+            if (!scope.clusterId().equals(claim.key().clusterId()) || !scope.pipelineId().equals(claim.key().resourceId())) throw unreadable();
+            pendingEpoch(annex);
             checkedId(annex.getString("preparationId"));
-            checkedId(annex.getString("previousPreparationId"));
+            var preparation = MongoPipelinePreparationFacts.decode(scope.pipelineId(), mapping, scope.clusterId());
+            if (preparation.phase() != PipelinePreparation.Phase.COMPLETE || !scope.equals(preparation.scope())
+                    || !checkedId(annex.getString("previousPreparationId")).equals(preparation.preparationId())) throw unreadable();
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) {
             throw unreadable();
         }
+    }
+
+    private static WorkloadClaimFence pendingClaim(Document annex) {
+        var claim = annex.get("originalClaim", Document.class);
+        if (claim == null || !claim.keySet().equals(Set.of("clusterId", "pipelineId", "nodeId", "bootId",
+                "claimGeneration", "executionGeneration", "topologyRevision"))
+                || !(claim.get("claimGeneration") instanceof Long generation)
+                || !(claim.get("executionGeneration") instanceof Long execution)
+                || !(claim.get("topologyRevision") instanceof Long topology)) throw unreadable();
+        return new WorkloadClaimFence(new WorkloadClaimKey(claim.getString("clusterId"), WorkloadClaimType.PIPELINE_ACTUATION,
+                claim.getString("pipelineId")), new WorkloadOwner(claim.getString("nodeId"), claim.getString("bootId")),
+                generation, execution, topology);
+    }
+
+    private static long pendingEpoch(Document annex) {
+        if (!(annex.get("originalStateEpoch") instanceof Long epoch) || epoch < 0 || epoch >= Long.MAX_VALUE - 1) throw unreadable();
+        return epoch;
     }
 
     private static String checkedId(String id) {
