@@ -6,6 +6,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * A bounded, in-memory {@link LogSink}. It keeps at most a fixed number of the most recent lines per
@@ -18,9 +19,11 @@ public final class RingBufferLogSink implements LogSink {
 
     private static final long UNSCOPED = 0;
 
-    private record Entry(long generation, LogLine line) {}
+    private record Entry(long generation, long sequence, LogLine line) {}
 
     private static final class Buffer {
+        final String cursorGeneration = UUID.randomUUID().toString();
+        long nextSequence = 1;
         final Deque<Entry> lines = new ArrayDeque<>();
         long firstGeneration;
         boolean mixed;
@@ -28,6 +31,7 @@ public final class RingBufferLogSink implements LogSink {
 
     private final int maxLinesPerPipeline;
     private final Map<String, Buffer> byPipeline;
+    private final Map<String, PipelineLogLevel> levels = new LinkedHashMap<>();
 
     /**
      * @param maxPipelines        the most pipelines to retain lines for; the least-recently-appended
@@ -64,6 +68,7 @@ public final class RingBufferLogSink implements LogSink {
     private void appendLine(String pipelineId, long generation, LogLine line) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(line, "line");
+        if (!level(pipelineId).accepts(line.level())) return;
         Buffer buffer = byPipeline.get(pipelineId);
         if (buffer != null && generation != UNSCOPED && generation < buffer.firstGeneration) {
             return;
@@ -71,7 +76,7 @@ public final class RingBufferLogSink implements LogSink {
         if (buffer == null) {
             buffer = new Buffer();
         }
-        var incoming = new Entry(generation, line);
+        var incoming = new Entry(generation, buffer.nextSequence++, line);
         if (!buffer.lines.isEmpty() && buffer.lines.getFirst().generation() != generation) buffer.mixed = true;
         buffer.lines.addLast(incoming);
         if (buffer.lines.size() > maxLinesPerPipeline && evictOldest(buffer) == incoming) return;
@@ -123,4 +128,52 @@ public final class RingBufferLogSink implements LogSink {
                 .map(Entry::line)
                 .toList();
     }
+    @Override
+    public synchronized void level(String pipelineId, PipelineLogLevel level) {
+        levels.put(Objects.requireNonNull(pipelineId, "pipelineId"), Objects.requireNonNull(level, "level"));
+    }
+
+    @Override
+    public synchronized PipelineLogLevel level(String pipelineId) {
+        return levels.getOrDefault(Objects.requireNonNull(pipelineId, "pipelineId"), PipelineLogLevel.INFO);
+    }
+
+    @Override
+    public synchronized LogPage page(String pipelineId, LogCursor after, int limit) {
+        return page(pipelineId, after, limit, Long.MIN_VALUE, Long.MAX_VALUE);
+    }
+
+    @Override
+    public synchronized LogPage page(String pipelineId, LogCursor after, int limit,
+            long firstGeneration, long lastGeneration) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (limit < 1) throw new IllegalArgumentException("limit must be positive");
+        if (firstGeneration > lastGeneration) throw new IllegalArgumentException("invalid log generation window");
+        if (firstGeneration > 0) tail(pipelineId, firstGeneration, lastGeneration);
+        Buffer buffer = byPipeline.get(pipelineId);
+        if (buffer == null || firstGeneration < buffer.firstGeneration && firstGeneration > 0) {
+            return new LogPage(List.of(), null, after != null);
+        }
+        var retained = buffer.lines.stream()
+                .filter(entry -> entry.generation() >= firstGeneration && entry.generation() <= lastGeneration)
+                .toList();
+        String cursorGeneration = buffer.cursorGeneration + ":" + firstGeneration;
+        boolean truncated = after != null && !cursorGeneration.equals(after.generation());
+        int from = 0;
+        if (after == null) {
+            from = Math.max(0, retained.size() - limit);
+        } else if (!truncated && !retained.isEmpty()) {
+            if (after.sequence() < retained.getFirst().sequence()) {
+                truncated = true;
+            } else {
+                while (from < retained.size() && retained.get(from).sequence() <= after.sequence()) from++;
+            }
+        }
+        int to = (int) Math.min((long) retained.size(), (long) from + limit);
+        var lines = retained.subList(from, to).stream().map(Entry::line).toList();
+        LogCursor next = to == 0 ? (truncated ? null : after)
+                : new LogCursor(cursorGeneration, retained.get(to - 1).sequence());
+        return new LogPage(lines, next, truncated);
+    }
+
 }

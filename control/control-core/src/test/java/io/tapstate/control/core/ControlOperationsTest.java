@@ -82,6 +82,7 @@ class ControlOperationsTest {
                         "pipeline.metrics",
                         "pipeline.snapshot",
                         "pipeline.logs",
+                        "pipeline.log-level",
                         "pipeline.metrics.history",
                         "pipeline.explain",
                         "pipeline.position",
@@ -177,6 +178,7 @@ class ControlOperationsTest {
                 "pipeline.start-checks")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
+        assertThat(registry.resolve("pipeline.log-level").scope()).isEqualTo(Scope.WRITE);
         for (String id : List.of("user.create", "user.passwd", "user.list", "token.create", "token.revoke", "token.list")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.ADMIN);
         }
@@ -204,6 +206,7 @@ class ControlOperationsTest {
                         "pipeline.update",
                         "pipeline.delete",
                         "pipeline.create",
+                        "pipeline.log-level",
                         "user.create",
                         "user.passwd",
                         "token.create",
@@ -252,13 +255,14 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context and Cloud-session provider selection are REST-only. The reveal
         // reservation stays unpublished until its dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(88);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(89);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
                 && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
                 && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")
                 && !op.id().startsWith("connector-center.")).allSatisfy(op ->
+
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
                 assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
