@@ -1,60 +1,86 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.logging.LogCursor;
+import io.tapstate.core.logging.LogPage;
 import io.tapstate.core.logging.LogSink;
-import io.tapstate.core.logging.LogLine;
-import io.tapstate.spi.store.PipelineStateMappings.LogWindow;
+import io.tapstate.core.logging.PipelineLogLevel;
 
-import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
+import io.tapstate.spi.store.PipelineStateMappings.LogWindow;
 
 /**
  * The pipeline logs read side. It tails the node-local log sink for one pipeline — the process's own
- * captured log output. Lines stay node-local; only the scoped read resolves the current lifetime
- * through configuration. A pipeline with no visible lines has a benign empty tail.
+ * captured log output, keyed by pipeline id. This is the read face that is not store-backed: it reads
+ * an in-process sink directly rather than the published observation doc, because logs are node-local
+ * and not fanned into a shared store. A read of a pipeline with no captured lines is a benign empty
+ * tail, never a coded error.
  */
 public final class PipelineLogQueryService {
 
-    private final Function<String, List<LogLine>> tail;
+    private final LogSink logs;
+
+    private final Function<String, Optional<LogWindow>> windows;
 
     public PipelineLogQueryService(LogSink logs) {
-        this(Objects.requireNonNull(logs, "logs")::tail);
+        this(logs, null);
     }
 
-    private PipelineLogQueryService(Function<String, List<LogLine>> tail) {
-        this.tail = tail;
+    private PipelineLogQueryService(LogSink logs, Function<String, Optional<LogWindow>> windows) {
+        this.logs = Objects.requireNonNull(logs, "logs");
+        this.windows = windows;
     }
 
     public static PipelineLogQueryService scoped(LogSink logs, Function<String, Optional<LogWindow>> windows) {
-        Objects.requireNonNull(logs, "logs");
-        Objects.requireNonNull(windows, "windows");
-        return new PipelineLogQueryService(id -> {
-            Optional<LogWindow> window = windows.apply(id);
-            for (int attempt = 0; attempt < 2 && window.isPresent(); attempt++) {
-                var original = window.orElseThrow();
-                var lines = logs.tail(id, original.firstGeneration(), original.lastGeneration());
-                window = windows.apply(id);
-                if (window.filter(original::equals).isPresent()) return lines;
-            }
-            return List.of();
-        });
+        return new PipelineLogQueryService(logs, Objects.requireNonNull(windows, "windows"));
     }
 
     /** The pipeline's most recent log lines, oldest to newest; empty when it has logged nothing here. */
     public PipelineLogs logs(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        return new PipelineLogs(pipelineId, tail.apply(pipelineId));
+        return logs(pipelineId, null, Integer.MAX_VALUE);
     }
 
     /** The pipeline's most recent {@code limit} lines, oldest to newest. */
     public PipelineLogs logs(String pipelineId, int limit) {
+        return logs(pipelineId, null, limit);
+    }
+
+    /**
+     * Reads the retained log lines strictly after {@code after}. A missing cursor returns the newest
+     * retained tail, while an expired cursor returns the oldest available page and marks it truncated.
+     */
+    public PipelineLogs logs(String pipelineId, LogCursor after, int limit) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be positive");
         }
-        List<LogLine> lines = tail.apply(pipelineId);
-        int from = Math.max(0, lines.size() - limit);
-        return new PipelineLogs(pipelineId, lines.subList(from, lines.size()));
+        LogPage page = page(pipelineId, after, limit);
+        return new PipelineLogs(pipelineId, page.lines(), page.nextCursor(), page.truncated());
     }
+
+    /** Changes the minimum severity retained for future node-local lines of one pipeline. */
+    public PipelineLogLevel level(String pipelineId, PipelineLogLevel level) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(level, "level");
+        logs.level(pipelineId, level);
+        return logs.level(pipelineId);
+    }
+
+    /** Returns the minimum severity retained for future node-local lines of one pipeline. */
+    public PipelineLogLevel level(String pipelineId) {
+        return logs.level(Objects.requireNonNull(pipelineId, "pipelineId"));
+    }
+    private LogPage page(String pipelineId, LogCursor after, int limit) {
+        if (windows == null) return logs.page(pipelineId, after, limit);
+        Optional<LogWindow> window = windows.apply(pipelineId);
+        for (int attempt = 0; attempt < 2 && window.isPresent(); attempt++) {
+            var original = window.orElseThrow();
+            LogPage page = logs.page(pipelineId, after, limit, original.firstGeneration(), original.lastGeneration());
+            window = windows.apply(pipelineId);
+            if (window.filter(original::equals).isPresent()) return page;
+        }
+        return new LogPage(java.util.List.of(), null, after != null);
+    }
+
 }
