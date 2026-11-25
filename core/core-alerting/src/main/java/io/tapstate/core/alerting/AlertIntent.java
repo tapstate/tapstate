@@ -195,8 +195,9 @@ public final class AlertIntent {
             }
             if (retention.deployment() == Deployment.CLOUD_MANAGED) {
                 AlertValidation.require(identity instanceof Business && route instanceof SystemRoute && target instanceof SdkTarget
-                        && identity.channelType().equals("cloud-sdk") && retry.maximumTotalAttempts() == 1,
-                        "cloudIntent", "not-a-single-sdk-event");
+                        && (identity.channelType().equals(AlertChannelPolicy.CLOUD_EVENTS.typeId())
+                                || identity.channelType().equals(AlertChannelPolicy.CLOUD_EMAIL.typeId()))
+                        && retry.maximumTotalAttempts() == 1, "cloudIntent", "not-a-single-sdk-delivery");
             } else {
                 AlertValidation.require(!(route instanceof SystemRoute)
                         && (identity instanceof Business ? target instanceof ReceiverTarget && route instanceof ConfiguredRoute
@@ -350,6 +351,8 @@ public final class AlertIntent {
                             "permitsStoppedAt", "must-retain-final-budget-consumption-time");
                 }
             }
+            String receiptSource = frozen.identity().channelType().equals(AlertChannelPolicy.CLOUD_EVENTS.typeId())
+                    ? "sdk-event-center" : "channel-protocol";
             int pending = 0;
             for (int index = 0; index < state.attempts().size(); index++) {
                 Attempt attempt = state.attempts().get(index); var permit = attempt.permit();
@@ -368,16 +371,15 @@ public final class AlertIntent {
                     AlertValidation.require(attempt.acceptedRecordedAt().isBefore(retained.resultUntil()), "acceptedAt", "outside-original-result-window");
                 }
                 if (attempt.receipt() != null) {
-                    AlertValidation.require(attempt.receipt().source().equals(frozen.retention().deployment() == Deployment.CLOUD_MANAGED
-                            ? "sdk-event-center" : "channel-protocol"), "receiptSource", "foreign-evidence-source");
+                    AlertValidation.require(attempt.receipt().source().equals(receiptSource),
+                            "receiptSource", "foreign-evidence-source");
                 }
                 if (attempt.endedAt() == null) { pending++; }
                 AlertValidation.require(retained.stoppedAt() == null || attempt.endedAt() != null
                         && !retained.stoppedAt().isBefore(attempt.endedAt()), "stoppedAt", "before-original-attempt-settlement");
                 AlertValidation.require(!permit.deadline().isAfter(retained.resultUntil()), "resultWindow", "lost-permit-protection");
                 if (attempt.outcome() == Outcome.ACCEPTED && frozen.retention().deployment() == Deployment.CLOUD_MANAGED) {
-                    AlertValidation.require(attempt.receipt() != null && attempt.receipt().source().equals("sdk-event-center"),
-                            "sdkReceipt", "missing-event-acceptance-evidence");
+                    AlertValidation.require(attempt.receipt() != null, "sdkReceipt", "missing-sdk-acceptance-evidence");
                 }
             }
             AlertValidation.require(state.attempts().stream().map(value -> value.permit().attemptId()).distinct().count() == state.attempts().size(),
@@ -401,12 +403,11 @@ public final class AlertIntent {
                     "acceptedAt", "does-not-match-accepted-evidence");
             AlertValidation.require(state.acceptedReceipt() == null || state.summary() == Outcome.ACCEPTED && state.acceptedReceipt().requestId() == null,
                     "acceptedReceipt", "invalid-retained-receipt");
-            AlertValidation.require(state.acceptedReceipt() == null || state.acceptedReceipt().source().equals(
-                    frozen.retention().deployment() == Deployment.CLOUD_MANAGED ? "sdk-event-center" : "channel-protocol"),
+            AlertValidation.require(state.acceptedReceipt() == null || state.acceptedReceipt().source().equals(receiptSource),
                     "acceptedReceipt", "foreign-retained-receipt-source");
             if (frozen.retention().deployment() == Deployment.CLOUD_MANAGED && state.summary() == Outcome.ACCEPTED) {
-                AlertValidation.require(state.acceptedReceipt() != null && state.acceptedReceipt().source().equals("sdk-event-center"),
-                        "acceptedReceipt", "missing-retained-sdk-event");
+                AlertValidation.require(state.acceptedReceipt() != null,
+                        "acceptedReceipt", "missing-retained-sdk-evidence");
             }
             if (state.acceptedReceipt() != null && state.detailsPrunedAt() == null) {
                 AlertValidation.require(state.attempts().stream().anyMatch(attempt -> attempt.receipt() != null

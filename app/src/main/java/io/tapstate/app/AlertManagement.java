@@ -72,8 +72,10 @@ final class AlertManagement implements AlertControlDispatcher {
             }
             case "alert.deliveries": {
                 fields(input,"cursor","limit","channel","result","id","key","episode");var id=optional(input,"id");if(id!=null)return projectDelivery(store.delivery(id,reads).orElseThrow(()->stale("delivery-not-found")),true,resolved,capabilityTypes);
-                var channel=optional(input,"channel");if(channel!=null&&!"cloud-sdk".equals(channel))resolved.channels().require(channel);
-                if(deployment==AlertChannelPolicy.Deployment.CLOUD_MANAGED&&channel!=null&&!channel.equals("cloud-sdk"))throw stale("managed-channel");
+                var channel=optional(input,"channel");
+                boolean managedChannel=AlertChannelPolicy.CLOUD_EVENTS.typeId().equals(channel)||AlertChannelPolicy.CLOUD_EMAIL.typeId().equals(channel);
+                if(channel!=null&&!managedChannel)resolved.channels().require(channel);
+                if(deployment==AlertChannelPolicy.Deployment.CLOUD_MANAGED&&channel!=null&&!managedChannel)throw stale("managed-channel");
                 var outcome=optional(input,"result");if(outcome!=null&&!Set.of("NOT_ATTEMPTED","NOT_ACCEPTED","UNKNOWN","ACCEPTED","WAITING_RETRY","QUEUED","IN_FLIGHT","PAUSED","CANCELLED","EXHAUSTED","EXPIRED").contains(outcome))throw invalid("result");var alarm=input.get("key")==null?null:key(text(input,"key"),scope);long episode=number(input,"episode",0);String filter=JsonWriter.write(java.util.Arrays.asList(channel,outcome,input.get("key"),episode));String token=optional(input,"cursor");String after=token==null?null:text(cursor(token,"deliveries:"+filter),"after");
                 var p=store.deliveries(after,limit,channel,null,reads);var rows=p.rows().stream().filter(r->alarm==null||r.value().frozen().members().stream().anyMatch(m->m.evaluation().key().equals(alarm)&&(episode==0||m.episode()==episode))).map(r->projectDelivery(r,false,resolved,capabilityTypes)).filter(r->outcome==null||outcome.equals(r.get("outcome"))||outcome.equals(r.get("displayState"))).toList();
                 return map("rows",rows,"isolated",p.isolatedRecords(),"nextCursor",p.nextId()==null?null:cursorToken("deliveries:"+filter,map("after",p.nextId())));
@@ -82,7 +84,9 @@ final class AlertManagement implements AlertControlDispatcher {
                 fields(input);var h=health.get();return map("deployment",deployment.name(),"degraded",h.degraded(),"closed",h.closed(),"rejected",h.rejected(),"code",h.code(),"parameters",h.parameters(),"queuedInputs",h.queuedInputs(),"coverage",resolved.catalog().types().stream().filter(t->resolved.providers().contains(t.providerId())).map(AlarmTypeCatalog.Type::id).toList(),"queuedBytes",h.queuedBytes(),"evaluationLagMillis",h.evaluationLagMillis(),"lastEvaluatedAt",instant(h.lastEvaluatedAt()),"maintenance",h.maintenance(),"cleanupAvailable",Boolean.TRUE.equals(h.maintenance().get("available")),"refreshedAt",instant(clock.instant()));
             }
             case "alert.configuration.list": {
-                fields(input,"kind","cursor","limit");var kind=value(AlertConfiguration.Kind.class,text(input,"kind"));author.external(kind);var p=store.definitions(kind,optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().filter(d->d.header().active()).map(AlertAuthoring::project).toList(),"nextCursor",p.nextId());
+                fields(input,"kind","cursor","limit");var kind=value(AlertConfiguration.Kind.class,text(input,"kind"));author.external(kind);var p=store.definitions(kind,optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().filter(d->d.header().active())
+                        .filter(d -> !(d instanceof AlertConfiguration.Rule rule) || !BuiltinAlarmTypes.retired(rule.typeId()))
+                        .map(AlertAuthoring::project).toList(),"nextCursor",p.nextId());
             }
             case "alert.configuration.save", "alert.configuration.retire":return AlertAuthoring.project(author.save(input,access,op.endsWith("retire")));
             case "alert.rule-preview":return AlertRulePreview.evaluate(input,scope,resolved.catalog(),deployment,caller.token().subject(),clock.instant());

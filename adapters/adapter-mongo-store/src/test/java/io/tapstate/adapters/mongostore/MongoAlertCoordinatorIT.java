@@ -267,6 +267,47 @@ class MongoAlertCoordinatorIT {
             assertThat(f.store.state(ended.snapshot().rule().key(),readAll()).orElseThrow().value().cleanupAt()).isNotNull();
         });
     }
+    @Test void legacyNodeAvailabilityHistoryCanEndWithoutLiveMemberEvidence() {
+        withStore(f -> {
+            String type = "cluster.node-unavailable";
+            var identity = new Identity(Kind.RULE, SCOPE, "legacy-node-rule", UUID_A);
+            var definition = new Rule(Header.create(identity, POLICY.deployment(), T, f.access.subject()),
+                    "Legacy Node Alarm", type, 1, new Resources(Set.of("cluster-node"), true, Set.of()),
+                    Map.of(), null, true, null).enrolled(null);
+            SystemCollections.ALERT_RULES.on(f.db).insertOne(MongoAlertConfigurationCodec.write(definition, 0));
+            var resource = new AlarmKey.Resource("cluster-node", "node-a", "original-boot");
+            var key = new AlarmKey(SCOPE, resource, type, identity.incarnation());
+            var rule = new AlertRule(key, 1, 1, "producer-a", Duration.ZERO, Duration.ZERO,
+                    Duration.ofSeconds(30), Duration.ofSeconds(5));
+            var signal = new AlertSignal(key, 1, 1, "producer-a", 1, T, AlertSignal.Condition.BAD, AlarmSeverity.MAJOR);
+            var firing = AlertLifecycle.evaluate(AlertSnapshot.initial(rule), signal, T).snapshot();
+            var episode = new AlertStateRecord.Episode(rule, firing.episode(), POLICY, AlertStateRecord.Diagnostics.empty(true), false);
+            var binding = new AlertIntent.Member(rule, 1, identity, 0);
+            var head = new AlertStateRecord.Head(firing, POLICY.deployment(), AlertOwnership.unclaimed(), null, false, episode, binding);
+            SystemCollections.ALERT_INSTANCES.on(f.db).insertOne(MongoAlertStateEnvelope.head(head, 1));
+            SystemCollections.ALERT_EPISODES.on(f.db).insertOne(MongoAlertStateEnvelope.episode(episode));
+
+            var current = f.store.evaluationSnapshot(null, 10);
+            assertThat(current.rules().rows()).isEmpty();
+            assertThat(current.rules().unavailableRules()).isEmpty();
+            assertThat(current.states().rows()).hasSize(1);
+            assertThat(f.store.evaluationStates(null, 10).rows()).hasSize(1);
+            var original = current.states().rows().getFirst();
+            f.time.set(T.plusSeconds(1));
+            var ended = AlertLifecycle.terminate(firing, AlertSnapshot.EndReason.DISABLED, f.time.get());
+            var history = new AlertStateRecord.Episode(rule, ended.snapshot().episode(), POLICY, episode.diagnostics(), false);
+            var retired = new AlertStateRecord.Head(ended.snapshot(), POLICY.deployment(), head.owner(),
+                    f.time.get(), false, history, binding);
+            var transition = new AlertStateRecord.Transition(ended.transitions().getFirst(), AlertSnapshot.EndReason.DISABLED,
+                    episode.diagnostics().status(), episode.diagnostics().latest(), POLICY);
+            var change = new StateChange(original.revision(), original.value(), retired, List.of(transition), null);
+            assertThat(f.store.commit(new Commit(CommitKind.END, change, List.of(), List.of()))).isEqualTo(Outcome.STAGED);
+            var result = f.store.state(key, readAll()).orElseThrow().value();
+            assertThat(result.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.DISABLED);
+            assertThat(result.episode().value().recoveredAt()).isNull();
+        });
+    }
+
     @Test void staleDisabledSnapshotCannotTerminateACurrentlyReenabledRule() {
         withStore(f -> {
             var facts = businessFacts(f); accept(f, facts);

@@ -93,6 +93,28 @@ class BuiltinResourceSignalsTest {
         observer.close();assertThat(observer.hasPendingReports()).isTrue();
         queued.get().run();queued.get().run();assertThat(observer.hasPendingReports()).isFalse();
     }
+    @Test void retryablePipelineRenewalConflictIsNotACacheAvailabilitySample() {
+        var runtime = mock(PipelineAlertRuntime.class);
+        var signals = new BuiltinResourceSignals(() -> runtime, () -> null,
+                new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "cache", 1), () -> {},
+                Clock.fixed(Instant.EPOCH, ZoneOffset.UTC));
+        var delegate = mock(WorkloadClaimStore.class);
+        var claim = mock(WorkloadClaim.class);
+        var ttl = Duration.ofSeconds(30);
+        var conflict = new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.WRITE_CONFLICT,
+                "Mongo Pipeline renewal WriteConflict code=112");
+        when(delegate.renew(claim, ttl)).thenThrow(conflict).thenReturn(Optional.of(claim));
+        var observed = ObservedWorkloadClaims.observe(delegate, signals::cacheOperation);
+
+        assertThatThrownBy(() -> observed.renew(claim, ttl)).isSameAs(conflict);
+        assertThat(observed.renew(claim, ttl)).contains(claim);
+
+        var input = org.mockito.ArgumentCaptor.forClass(AlertInput.Operational.class);
+        verify(runtime).cacheInput(any(), anyString(), any(), input.capture());
+        assertThat(input.getValue().succeeded()).isTrue();
+        assertThat(input.getValue().capability()).isEqualTo(OperationalEvidence.Capability.CACHE_WRITE);
+    }
+
     @Test void cacheSuccessSamplingKeepsBoundariesClockRollbackAndEveryFailureEdge(){
         var runtime=mock(PipelineAlertRuntime.class);var now=new java.util.concurrent.atomic.AtomicReference<>(Instant.EPOCH);
         var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}public Instant instant(){return now.get();}};

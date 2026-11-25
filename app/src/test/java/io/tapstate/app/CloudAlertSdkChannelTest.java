@@ -38,6 +38,7 @@ class CloudAlertSdkChannelTest {
     URI origin;
     java.util.concurrent.ExecutorService executor;
     Handler handler;
+    String endpoint = "events";
     interface Handler { void run(HttpExchange exchange, JsonNode request) throws Exception; }
     @BeforeEach void start() throws Exception {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -48,7 +49,7 @@ class CloudAlertSdkChannelTest {
             calls.incrementAndGet();
             try {
                 assertThat(exchange.getRequestMethod()).isEqualTo("POST");
-                assertThat(exchange.getRequestURI().toString()).isEqualTo("/v1/api/clusters/" + CLUSTER + "/events");
+                assertThat(exchange.getRequestURI().toString()).isEqualTo("/v1/api/clusters/" + CLUSTER + "/" + endpoint);
                 auth.set(exchange.getRequestHeaders().getFirst("Authorization"));
                 assertThat(exchange.getRequestHeaders().getFirst("Cookie")).isNull();
                 JsonNode request = JSON.readTree(exchange.getRequestBody()); body.set(request); handler.run(exchange, request);
@@ -113,6 +114,39 @@ class CloudAlertSdkChannelTest {
         assertThat(body.get().path("severity").asText()).isEqualTo("CRITICAL");
         assertThat(body.get().path("occurredAt").asText()).contains("2026-10-26");
         assertThat(body.get().path("payload").path("originalSeverity").asText()).isEqualTo("MAJOR");
+    }
+    @Test void directEmailOmitsTheRecipientAndRequiresItsOwnDeliveryReceipt() throws Exception {
+        endpoint = "notifications";
+        var destination = new NotificationChannel.Destination(new AlarmKey.Scope(ORG, CLUSTER),
+                AlertChannelPolicy.CLOUD_EMAIL.typeId(), "receiver-1", "target-1", "binding-1");
+        var message = new io.tapstate.adapters.alerting.NotificationRenderer.Snapshot(
+                1, "en", "Pipeline failure", "Failure details", "<p>Failure details</p>", new byte[0]);
+        var request = new NotificationChannel.Request(destination, NotificationChannel.Purpose.BUSINESS,
+                "delivery-1", "attempt-1", Instant.now().plusSeconds(10), "application/json",
+                CloudAlertNotificationWire.encode(message, "delivery-1"));
+        String delivery = "312345678901234567890123";
+        handler = (exchange, sent) -> reply(exchange, 200, JSON.writeValueAsString(java.util.Map.of(
+                "code", "ok", "opId", "email-request", "data", java.util.Map.of(
+                        "id", delivery, "orgId", ORG, "channel", "EMAIL",
+                        "recipient", "owner@example.test", "status", "PENDING"))));
+        try (var channel = new CloudAlertSdkChannel(AlertChannelPolicy.Deployment.CLOUD_MANAGED, destination, origin,
+                "fixture-token", ORG, new InetAddress[]{InetAddress.getLoopbackAddress()}, SSLContext.getDefault(),
+                Clock.systemUTC(), Duration.ofSeconds(3), true)) {
+            var result = channel.send(request);
+            assertThat(result.outcome()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);
+            assertThat(result.receipt()).isEqualTo(new NotificationChannel.Receipt(delivery, "email-request"));
+            assertThat(result.implementation()).isEqualTo("sdk-notification");
+            assertThat(channel.capability()).isEqualTo(AlertChannelPolicy.CLOUD_EMAIL);
+            assertThat(body.get()).isEqualTo(JSON.readTree(request.payload()));
+            assertThat(body.get().has("recipient")).isFalse();
+            assertThat(auth.get()).isEqualTo("Bearer fixture-token");
+
+            handler = (exchange, sent) -> reply(exchange, 200, receipt(sent));
+            var invalid = channel.send(request);
+            assertThat(invalid.outcome()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
+            assertThat(invalid.receipt()).isNull();
+        }
+        assertThat(calls).hasValue(2);
     }
     @Test void stableKeySeparatesRoundRecoveryBindingAndClusterWithoutMutableSubject() throws Exception {
         var d = binding();

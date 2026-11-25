@@ -180,7 +180,10 @@ class AlertNotificationPlannerIT {
             bad(f);p.tick();assertThat(intents(f)).hasSize(2);
         });
     }
-    static AlertStore sendingStore(AlertEvaluationHostIT.Fixture f){return f.configuration().alerts(f.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL),new AlertChannelPolicy.Capability("webhook",1,AlertChannelPolicy.Family.OP_EXTERNAL))),BuiltinAlarmTypes.catalog(),f.clock());}
+    static AlertStore sendingStore(AlertEvaluationHostIT.Fixture f){return f.configuration().alerts(f.storeHost().withChannels(
+            f.storeHost().deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED
+                    ? Set.of(AlertChannelPolicy.CLOUD_EVENTS,AlertChannelPolicy.CLOUD_EMAIL)
+                    : Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL),new AlertChannelPolicy.Capability("webhook",1,AlertChannelPolicy.Family.OP_EXTERNAL))),BuiltinAlarmTypes.catalog(),f.clock());}
     static AlertIntent.Record grant(AlertEvaluationHostIT.Fixture f,AlertStore.Stored<AlertIntent.Record> before){
         var record=before.value();var original=record.state();var now=f.clock().instant();
         var attempt=DeliveryAttempt.grant(record.frozen().identity().scope(),record.frozen().identity().deliveryId(),"attempt-1",1,1,"sender",record.frozen().retry(),record.frozen().createdAt(),record.frozen().deadline(),now).orElseThrow();
@@ -407,6 +410,105 @@ class AlertNotificationPlannerIT {
             try{var payload=new com.fasterxml.jackson.databind.ObjectMapper().readTree(rows.getFirst().value().state().payload().bytes());assertThat(payload.path("payload").path("episode").asLong()).isOne();assertThat(payload.path("payload").path("resourceId").asText()).isEqualTo("orders");assertThat(payload.path("severity").asText()).isEqualTo("CRITICAL");}catch(java.io.IOException bad){throw new AssertionError(bad);}
             p.tick();assertThat(intents(f)).hasSize(1);
         });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void cloudEventsKeepTheirTimingWhileDirectEmailWaitsForTheSameEpisode(boolean recoversQuickly) {
+        AlertEvaluationHostIT.withFixture(false, true, f -> {
+            var planner = new AlertNotificationPlanner(f.store(), f.clock(), "planner-a",
+                    java.net.URI.create("https://cloud.example.test"), ACTIVE);
+            f.evaluator().withPlanner(planner);
+            bad(f);
+            planner.tick();
+            var events = managedDeliveries(f);
+            assertThat(events).hasSize(1);
+            assertThat(events.getFirst().value().frozen().channel()).isEqualTo(AlertChannelPolicy.CLOUD_EVENTS);
+            acceptManagedDelivery(f, events.getFirst(), "cloud-event-1");
+
+            f.now().set(T.plusSeconds(59));
+            planner.tick();
+            assertThat(managedDeliveries(f)).hasSize(1);
+            if (!recoversQuickly) {
+                f.now().set(T.plusSeconds(60));
+                planner.tick();
+                var direct = managedDeliveries(f).stream()
+                        .filter(row -> row.value().frozen().channel().equals(AlertChannelPolicy.CLOUD_EMAIL))
+                        .findFirst().orElseThrow();
+                assertThat(direct.value().frozen().createdAt()).isEqualTo(T.plusSeconds(60));
+                assertThat(direct.value().frozen().retry().maximumTotalAttempts()).isOne();
+                acceptManagedDelivery(f, direct, "cloud-email-1");
+                f.now().set(T.plusSeconds(61));
+            }
+            recover(f);
+            planner.tick();
+            f.now().set(T.plusSeconds(120));
+            planner.tick();
+            var rows = managedDeliveries(f);
+            assertThat(rows.stream().filter(row -> row.value().frozen().channel().equals(AlertChannelPolicy.CLOUD_EVENTS)))
+                    .extracting(row -> ((AlertIntent.Business) row.value().frozen().identity()).key().notification().kind())
+                    .containsExactlyInAnyOrder(DeliveryKey.Kind.FAULT, DeliveryKey.Kind.RECOVERY);
+            var emailKinds = rows.stream().filter(row -> row.value().frozen().channel().equals(AlertChannelPolicy.CLOUD_EMAIL))
+                    .map(row -> ((AlertIntent.Business) row.value().frozen().identity()).key().notification().kind()).toList();
+            if (recoversQuickly) assertThat(emailKinds).isEmpty();
+            else assertThat(emailKinds).containsExactlyInAnyOrder(DeliveryKey.Kind.FAULT, DeliveryKey.Kind.RECOVERY);
+        });
+    }
+
+    @Test void aCloudSeverityOverrideToWarningKeepsTheEntireEpisodeLocal() {
+        AlertEvaluationHostIT.withFixture(false, true, f -> {
+            var planner = new AlertNotificationPlanner(f.store(), f.clock(), "planner-a",
+                    java.net.URI.create("https://cloud.example.test"), ACTIVE);
+            var original = f.rule();
+            var warning = new AlertConfiguration.Rule(original.header().next(T, "operator"), original.name(),
+                    original.typeId(), original.typeVersion(), original.resources(), original.parameters(),
+                    AlarmSeverity.WARNING, true, null);
+            var cloud = AlertStore.Access.cloud("operator", f.storeHost().scope().authorityId(), "ADMIN", ACTIVE, ACTIVE);
+            assertThat(f.store().saveDefinition(original, warning, cloud)).isEqualTo(AlertStore.Outcome.STAGED);
+            var current = (AlertConfiguration.Rule) f.store().definition(AlertConfiguration.Kind.RULE,
+                    warning.header().identity().id(), cloud).orElseThrow();
+            var binding = new AlertEvaluationHost.Binding(current, new AlarmKey.Resource("pipeline", "orders", "1"),
+                    "original-producer", 0, ACTIVE, () -> new AlertStore.EvaluationProof(f.intent(), ACTIVE));
+            f.evaluator().withPlanner(planner);
+            assertThat(f.evaluator().accept(binding, 1, new AlertInput.Conditions(T, AlertSignal.Condition.BAD, null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            f.now().set(T.plusSeconds(3601));
+            planner.tick();
+            assertThat(f.store().active(null, 10, f.reads()).total()).isOne();
+            assertThat(managedDeliveries(f)).isEmpty();
+            assertThat(f.evaluator().accept(binding, 2,
+                    new AlertInput.Conditions(f.clock().instant(), AlertSignal.Condition.GOOD, null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            planner.tick();
+            assertThat(f.store().state(binding.key(), f.reads()).orElseThrow().value().episode().value().endReason())
+                    .isEqualTo(AlertSnapshot.EndReason.RECOVERED);
+            assertThat(managedDeliveries(f)).isEmpty();
+        });
+    }
+
+    private static List<AlertStore.Stored<AlertIntent.Record>> managedDeliveries(AlertEvaluationHostIT.Fixture f) {
+        return f.store().deliveries(null, 100, null, null, f.reads()).rows();
+    }
+
+    private static void acceptManagedDelivery(AlertEvaluationHostIT.Fixture f, AlertStore.Stored<AlertIntent.Record> original,
+            String remoteId) {
+        var now = f.clock().instant();
+        var owned = AlertIntentControl.claim(original.value(), "sender", now, now.plusSeconds(30));
+        var granted = AlertDeliveryProgress.grant(owned, "sender", "attempt-1", now);
+        assertThat(sendingStore(f).commit(new AlertStore.Commit(AlertStore.CommitKind.PERMIT, null,
+                List.of(new AlertStore.IntentChange(original, granted)), List.of()))).isEqualTo(AlertStore.Outcome.STAGED);
+        var row = f.store().intent(granted.frozen().identity(), null).orElseThrow();
+        boolean event = granted.frozen().channel().equals(AlertChannelPolicy.CLOUD_EVENTS);
+        var result = AlertDeliveryProgress.result(row.value(), row.value().state().attempts().getFirst().permit(),
+                DeliveryEvidence.Outcome.ACCEPTED,
+                new AlertIntent.Protocol(AlertIntent.Phase.FINAL_RESPONSE, AlertIntent.Action.STOP, 200,
+                        event ? "sdk-event-center" : "sdk-notification", null),
+                new AlertIntent.Receipt(event ? "sdk-event-center" : "channel-protocol", remoteId, null),
+                f.clock().instant(), 0);
+        assertThat(f.store().commit(new AlertStore.Commit(AlertStore.CommitKind.RESULT, null,
+                List.of(new AlertStore.IntentChange(row, result)), List.of()))).isEqualTo(AlertStore.Outcome.STAGED);
+        assertThat(f.store().intent(granted.frozen().identity(), null).orElseThrow().value().state().acceptedReceipt().remoteId())
+                .isEqualTo(remoteId);
     }
 
     @Test void fullCapacityDoesNotBlockARealGoodInputOrItsOriginalRecoveryPlan() {

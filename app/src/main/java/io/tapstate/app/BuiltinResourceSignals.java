@@ -112,6 +112,7 @@ final class BuiltinResourceSignals {
         evidence.put(value.resource(),value);
     }
     void cacheOperation(boolean write,Throwable failure){
+        if (failure instanceof WorkloadClaimRenewalException renewal && renewal.isWriteConflict()) return;
         if(failure!=null&&(!(failure instanceof TapstateException e)||e.code()!=IoError.STORE_UNAVAILABLE&&e.code()!=IoError.STORE_UNAUTHORIZED))return;
         synchronized(cacheSampling){
             Instant now=clock.instant(),previous=write?lastHealthyCacheWrite:lastHealthyCacheRead;

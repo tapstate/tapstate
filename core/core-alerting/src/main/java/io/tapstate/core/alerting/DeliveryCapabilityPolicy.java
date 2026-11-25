@@ -58,7 +58,7 @@ public final class DeliveryCapabilityPolicy {
         if (header.recordVersion() != AlarmTypeCatalog.RECORD_FORMAT_VERSION && header.recordVersion() != 2 && header.recordVersion() != 3) {
             return decision(Disposition.ISOLATED, Reason.UNSUPPORTED_RECORD_VERSION);
         }
-        if(header.recordVersion()==3&&(header.channelType()==null||Set.of("email","webhook","cloud-sdk").contains(header.channelType()))) {
+        if(header.recordVersion()==3&&(header.channelType()==null||Set.of("email","webhook","cloud-sdk","cloud-sdk-email").contains(header.channelType()))) {
             return decision(Disposition.ISOLATED,Reason.UNSUPPORTED_RECORD_VERSION);
         }
         if (header.scope() == null || header.deliveryId() == null
