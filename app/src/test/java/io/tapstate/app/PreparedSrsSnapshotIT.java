@@ -39,6 +39,101 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class PreparedSrsSnapshotIT {
     @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Test void aFreshArrivalReceiptSkipsItsDuplicateReadAndStillPinsBeforeRows() throws Exception {
+        withFixture(f -> {
+            var runtime = f.domain.runtimeSrs(f.run.cacheScope(), () -> {});
+            SrsStoreViews views = (scope, guard) -> { assertThat(scope).isEqualTo(f.run.cacheScope()); guard.run(); return runtime; };
+            SrsConsumerProgress observed;
+            long sampleCommands;
+            try (var diagnostic = io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.open()) {
+                observed = runtime.consumers().progress(f.run.context()).orElseThrow();
+                sampleCommands = commands(diagnostic);
+            }
+            long ordinaryCommands;
+            try (var diagnostic = io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.open()) {
+                var ordinary = new SrsSnapshotPreparation(views, f.run, Map.of("t1", "ring-t1", "t2", "ring-t2"), 7, () -> {});
+                ordinaryCommands = commands(diagnostic);
+                ordinary.close();
+            }
+            System.out.println("SNAPSHOT_PROGRESS_BASE ordinary=" + ordinaryCommands + " sampled_progress=" + sampleCommands);
+            SrsSnapshotPreparation owner;
+            long reusedCommands;
+            try (var diagnostic = io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.open()) {
+                owner = sampledOwner(f, observed, views);
+                reusedCommands = commands(diagnostic);
+            }
+            System.out.println("SNAPSHOT_PROGRESS ordinary=" + ordinaryCommands + " supplied=" + reusedCommands + " saved=" + (ordinaryCommands - reusedCommands));
+            assertThat(sampleCommands).isPositive();
+            assertThat(ordinaryCommands - reusedCommands).isGreaterThanOrEqualTo(2);
+            var port = f.port().withSnapshotPreparation((request, seam, actual) -> {
+                assertThat(f.count("reads")).isZero();
+                f.publish(actual, false);
+                owner.prepare(request, seam, actual);
+                assertThat(f.stores.consumers().progress(f.run.context()).orElseThrow().snapshot()).isEqualTo(owner.accepted());
+                f.flag("pinned").set(true);
+            });
+            var loaded = new ArrayList<String>();
+            try (var load = SnapshotPhase.openPrepared(port, f.config(), owner)) {
+                load.read(row -> { throw new AssertionError("fixture is empty"); }, loaded::add);
+            }
+            assertThat(loaded).containsExactly("t1", "t2");
+            assertThat(f.count("earlyReads")).isZero();
+            assertThat(f.count("reads")).isEqualTo(2);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"progress", "membership", "expired", "owner"})
+    void aChangedSuppliedArrivalCannotReadRowsOrPublishItsPin(String change) throws Exception {
+        withFixture(f -> {
+            var runtime = f.domain.runtimeSrs(f.run.cacheScope(), () -> {});
+            SrsStoreViews views = (scope, guard) -> { guard.run(); return runtime; };
+            var observed = runtime.consumers().progress(f.run.context()).orElseThrow();
+            var owner = sampledOwner(f, observed, views);
+            if (change.equals("progress")) assertThat(f.stores.consumers().advanceReadSequence(f.run.context(),
+                    f.run.membershipRevision(), "t1", 1, f.run.originalClaim())).isTrue();
+            else if (change.equals("membership")) f.stores.consumers().attach(f.run.context(), f.run.membershipRevision(),
+                    Set.of("t1", "t2"), f.run.originalClaim()).orElseThrow();
+            else {
+                var claims = f.domain.workloadClaims(f.run.cacheScope());
+                var original = claims.read(f.run.originalClaim().key()).orElseThrow().claim();
+                if (change.equals("expired")) {
+                    assertThat(claims.renew(original, Duration.ofMillis(100))).isPresent();
+                    long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+                    while (claims.read(original.key()).orElseThrow().leased() && System.nanoTime() < deadline) Thread.sleep(10);
+                    assertThat(claims.read(original.key()).orElseThrow().leased()).isFalse();
+                } else {
+                    assertThat(claims.release(original)).isTrue();
+                    assertThat(claims.acquirePipeline(f.run.scope(), new WorkloadOwner("replacement-node", "replacement-boot"),
+                            original.topologyRevision(), Duration.ofMinutes(2)).acquired()).isTrue();
+                }
+            }
+            var port = f.port().withSnapshotPreparation((request, seam, actual) -> {
+                f.publish(actual, false);
+                owner.prepare(request, seam, actual);
+                f.flag("pinned").set(true);
+            });
+            assertThatThrownBy(() -> SnapshotPhase.openPrepared(port, f.config(), owner)).isInstanceOf(TapstateException.class);
+            assertThat(f.count("reads")).isZero();
+            assertThat(f.count("earlyReads")).isZero();
+        });
+    }
+
+    private static long commands(io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope scope) {
+        return ((Number) ((Map<?, ?>) scope.snapshot().get("mongo")).get("started")).longValue();
+    }
+
+    private static SrsSnapshotPreparation sampledOwner(Fixture f, SrsConsumerProgress observed, SrsStoreViews views) throws Exception {
+        var constructor = SrsSnapshotPreparation.class.getDeclaredConstructor(SrsStoreViews.class, SrsConsumerRun.class,
+                Map.class, long.class, Runnable.class, SrsFreshFullPreparation.class, Instant.class, SrsConsumerProgress.class);
+        constructor.setAccessible(true);
+        try { return constructor.newInstance(views, f.run, Map.of("t1", "ring-t1", "t2", "ring-t2"),
+                7, (Runnable) () -> {}, null, Instant.EPOCH, observed); }
+        catch (java.lang.reflect.InvocationTargetException failure) {
+            if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+            throw failure;
+        }
+    }
+
     @Test void exactSessionModelsAndConsumerPinCommitBeforeTheConnectorReadsEitherTable() throws Exception {
         withFixture(f -> {
             var owner = f.owner(); var calls = new AtomicInteger(); var sampled = new AtomicReference<String>(); var port = f.port().withSnapshotPreparation((request,seam,actual) -> {

@@ -20,6 +20,7 @@ import java.util.Set;
 
 /** Per-step history and pin retained by one original Pipeline state generation and execution claim. */
 final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
+    private static final com.mongodb.client.model.Collation EXACT_KEYS = com.mongodb.client.model.Collation.builder().locale("simple").build();
     private final MongoCachePipelineAccess access;
     private final MongoCollection<Document> rows;
 
@@ -114,25 +115,13 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
 
     private void writeBatch(String pipelineId, List<Change> batch, boolean pinLatest) {
         access.publicationModelsTransaction(session -> {
-            // A non-simple collection can resolve a key to an alias. Keep its original point semantics.
-            var collection = access.database.listCollections()
-                    .filter(new Document("name", SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())).first();
-            var options = collection == null ? null : collection.get("options", Document.class);
-            if (options != null && options.containsKey("collation")) {
-                for (var change : batch) {
-                    String key = key(pipelineId, change.stepId());
-                    var updated = applyChange(read(session, key), change.derivation());
-                    write(session, key, updated.versions(), selectedPin(updated, pinLatest));
-                }
-                return null;
-            }
             var pending = new LinkedHashMap<String, List<DerivedSchema>>();
             for (var change : batch) pending.computeIfAbsent(key(pipelineId, change.stepId()), ignored -> new ArrayList<>())
                     .add(change.derivation());
             var writes = new ArrayList<ReplaceOneModel<Document>>();
             long writeBytes = 0;
             try (var cursor = rows.find(session, new Document("_id", new Document("$in", List.copyOf(pending.keySet()))))
-                    .batchSize(32).iterator()) {
+                    .collation(EXACT_KEYS).batchSize(32).iterator()) {
                 while (cursor.hasNext()) {
                     var row = cursor.next();
                     String key = row.getString("_id");
@@ -166,7 +155,7 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
             writes.clear();
             used = 0;
         }
-        writes.add(new ReplaceOneModel<>(new Document("_id", key), replacement, new ReplaceOptions().upsert(true)));
+        writes.add(new ReplaceOneModel<>(new Document("_id", key), replacement, new ReplaceOptions().collation(EXACT_KEYS).upsert(true)));
         return used + size;
     }
 

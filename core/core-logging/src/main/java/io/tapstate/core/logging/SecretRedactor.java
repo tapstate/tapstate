@@ -29,18 +29,24 @@ public final class SecretRedactor {
     /** Replaces every secret associated with {@code owner}. Blank values are ignored. */
     public synchronized void replace(String owner, Collection<String> values) {
         Objects.requireNonNull(owner, "owner");
-        Objects.requireNonNull(values, "values");
-        List<String> normalized = values.stream()
-                .filter(Objects::nonNull)
-                .filter(value -> !value.isBlank())
-                .distinct()
-                .toList();
+        List<String> normalized = normalize(values);
+        if (normalized.equals(valuesByOwner.getOrDefault(owner, List.of()))) return;
         if (normalized.isEmpty()) {
             valuesByOwner.remove(owner);
         } else {
             valuesByOwner.put(owner, normalized);
         }
         rebuildSnapshot();
+    }
+
+    /** Whether this observation agrees with the current registration for the same owner. */
+    public synchronized boolean matches(String owner, Collection<String> values) {
+        return normalize(values).equals(valuesByOwner.getOrDefault(Objects.requireNonNull(owner), List.of()));
+    }
+
+    private static List<String> normalize(Collection<String> values) {
+        return Objects.requireNonNull(values, "values").stream().filter(Objects::nonNull)
+                .filter(value -> !value.isBlank()).distinct().toList();
     }
 
     /** Removes every secret associated with {@code owner}. */

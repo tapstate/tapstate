@@ -348,7 +348,10 @@ def workflow_recipe(text, capture=True):
     selected = [step for step in steps if step[1] == STEP]
     if len(selected) != 1:
         return False
-    match = re.fullmatch(r'        run: \|\n(?P<commands>(?:          [^\n]+\n?)+)', selected[0]['body'])
+    # This exact routing guard leaves executed full-CI captures under the same
+    # source/log/receipt checks. All other conditional recipes remain unknown.
+    match = re.fullmatch(r"(?:        if: needs\.shard-plan\.outputs\.docs-only != 'true'\n)?"
+                         r'        run: \|\n(?P<commands>(?:          [^\n]+\n?)+)', selected[0]['body'])
     if match is None:
         return False
     commands = [line.removeprefix('          ') for line in match['commands'].splitlines()]

@@ -59,7 +59,10 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
     @Override public Opening opening() {
         Opening batch = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed
                 ? indexed.opening() : (member, local) -> delegate.get();
-        return (member, local) -> open(batch, member, local);
+        return new Opening() {
+            public SinkWriter open(int member, int local) throws Exception { return FencedSinkWriterFactory.this.open(batch, member, local); }
+            public int maximumConcurrentRemainingOpens() { return batch.maximumConcurrentRemainingOpens(); }
+        };
     }
 
     private SinkWriter open(Opening opening, int memberIndex, int localIndex) throws Exception {

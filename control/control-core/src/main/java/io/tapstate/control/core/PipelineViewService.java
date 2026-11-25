@@ -60,7 +60,10 @@ public final class PipelineViewService {
         var statuses = observations == null ? Map.<String, PipelineStatus>of()
                 : observations.findStatuses(page.stream().map(stored -> stored.resource().id()).toList());
         var sources = new java.util.HashMap<String, Optional<StoredResource>>();
-        return page.stream().map(stored -> view(stored, statuses.get(stored.resource().id()), sources)).toList();
+        var outputResources = new java.util.HashMap<String, Optional<Resource>>();
+        var outputs = outputNames == null ? null : outputNames.forArtifactPage(id -> outputResources
+                .computeIfAbsent(id, key -> artifacts.getResource(key).map(StoredResource::resource)));
+        return page.stream().map(stored -> view(stored, statuses.get(stored.resource().id()), sources, outputs)).toList();
     }
 
     /** Returns the typed Pipeline view when the id resolves to a stored Pipeline. */
@@ -91,9 +94,14 @@ public final class PipelineViewService {
     }
 
     private PipelineView view(StoredResource stored, PipelineStatus status, Map<String, Optional<StoredResource>> sources) {
+        return view(stored, status, sources, outputNames == null ? null : outputNames::resolve);
+    }
+
+    private PipelineView view(StoredResource stored, PipelineStatus status, Map<String, Optional<StoredResource>> sources,
+            java.util.function.Function<PipelineResource, PipelineOutputNames.Result> outputs) {
         PipelineResource pipeline = pipeline(stored.resource());
         var view = representation.toView(pipeline, stored.contentHash(), sourceSummaries(pipeline, sources), status);
-        return outputNames == null ? view : view.withOutputTargets(outputNames.resolve(pipeline));
+        return outputs == null ? view : view.withOutputTargets(outputs.apply(pipeline));
     }
 
     private List<PipelineSourceSummary> sourceSummaries(PipelineResource pipeline, Map<String, Optional<StoredResource>> sources) {

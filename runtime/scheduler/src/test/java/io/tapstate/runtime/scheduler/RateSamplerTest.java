@@ -96,6 +96,33 @@ class RateSamplerTest {
         return new io.tapstate.spi.store.PipelineIntentScope("cluster", 1, "cache", "orders", generation);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void anEnqueuedOrDiscardedPreparedSampleDoesNotPretendTheActiveAppendFinished(boolean forget) throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);var release = new java.util.concurrent.CountDownLatch(1);
+        var writes = new java.util.concurrent.atomic.AtomicInteger();
+        var history = new RecordingHistory() {
+            @Override public void append(RateSample sample) {
+                entered.countDown();
+                try { assertThat(release.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) { throw new AssertionError(interrupted); }
+                writes.incrementAndGet();
+            }
+        };
+        var sampler = new RateSampler(history, Duration.ofSeconds(1));
+        try (var caller = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var first = caller.submit(() -> sampler.offerPrepared(RateSampler.sampleOf(moving(T0, 1)), scope(1), history));
+            assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            sampler.offerPrepared(RateSampler.sampleOf(moving(T0.plusSeconds(2), 2)), scope(1), history);
+            assertThat(writes).hasValue(0);
+            if (forget) sampler.forgetPipelinesOutside(List.of());
+            assertThat(sampler.idle(scope(1))).isFalse();assertThat(sampler.idle(scope(2))).isFalse();
+            release.countDown();first.get(2, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(sampler.idle(scope(1))).isTrue();
+            assertThat(writes).hasValue(forget ? 1 : 2);
+        } finally { release.countDown(); }
+    }
+
     @Test void currentScopeCadenceDoesNotRetainEveryPastGenerationOfAStillLivePipeline() throws Exception {
         var history = new RecordingHistory(); var sampler = new RateSampler(history, Duration.ofSeconds(60));
         for (int i = 1; i <= 100; i++) sampler.offer(moving(T0.plusSeconds(i), i), scope(i), history);

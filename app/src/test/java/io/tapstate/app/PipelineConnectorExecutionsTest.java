@@ -286,6 +286,7 @@ class PipelineConnectorExecutionsTest {
         Fixture() {
             when(intents.guardedBy(ACTIVE)).thenReturn(intents);
             when(intents.connectorBindings()).thenReturn(bindings);
+            when(intents.executionBindings(SCOPE)).thenCallRealMethod();
             when(notes.guardedBy(ACTIVE)).thenReturn(notes);
             when(notes.open(any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0), 1));
             when(connectors.withArtifactRetention(any())).thenCallRealMethod();

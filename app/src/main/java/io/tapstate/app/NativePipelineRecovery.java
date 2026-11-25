@@ -70,17 +70,12 @@ final class NativePipelineRecovery {
     }
     StoreBackedDagSource.CapturedStartGuard capturedStartGuard() {
         return new StoreBackedDagSource.CapturedStartGuard() {
-            @Override public Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
+            @Override public Inspection inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
                 return inspectCaptured(pass,snapshot,models);
             }
             @Override public void retireCoveredKeyMoves(PipelineConvergencePass pass) {
                 requireAvailable();
                 retireCovered(pass);
-            }
-            @Override public SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
-                requireAvailable();pass.requirePipeline(pass.scope().pipelineId());
-                var retained=captures.retainedPlanningModels(pass,snapshot,models);
-                requireAvailable();return retained;
             }
         };
     }
@@ -95,17 +90,36 @@ final class NativePipelineRecovery {
                 && KeyMoveRecovery.retire(windows, window, sources, () -> pass.requirePipeline(id));
     }
 
-    Map<String,String> inspectCaptured(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
+    StoreBackedDagSource.CapturedStartGuard.Inspection inspectCaptured(
+            PipelineConvergencePass pass, ReadOnlyArtifactSnapshot snapshot, SourceModelSnapshot models) {
         requireAvailable();String id=pass.scope().pipelineId();pass.requirePipeline(id);
         var authored=StoredArtifacts.requirePipeline(snapshot,id);
         var pipeline=PipelineInlining.inline(authored,snapshot);
         var sources=new LinkedHashMap<String,SourceResource>();
         for(String source:pipeline.sourceIds())sources.put(source,StoredArtifacts.requireSource(snapshot,source));
-        preparer.verifyRetainedSources(pass.scope(),models.preparationInputs(pass.scope(),authored,pipeline,sources));
+        var scope = pass.scope();
+        var inputs = models.preparationInputs(scope, authored, pipeline, sources);
+        Optional<PipelineCacheRecovery> summary;
+        try {
+            summary = configuration.cacheRecoveries().readForCaptureStartup(id);
+        } catch (RuntimeException failure) {
+            // Report the source refusal first, even when CONFIG cannot choose the startup branch.
+            preparer.verifyRetainedSources(scope, inputs);
+            throw failure;
+        }
+        if (summary.isEmpty()) {
+            requireAvailable();
+            pass.requirePipeline(id);
+            var original = pass.claim();
+            var retained = captures.retainedPlanningModels(pass, snapshot, models,
+                    guard -> preparer.verifyRetainedSourcesAndCheckSinkModels(scope, inputs, original, guard));
+            requireAvailable();
+            if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
+            return new StoreBackedDagSource.CapturedStartGuard.Inspection(Map.of(), retained);
+        }
+        preparer.verifyRetainedSources(scope, inputs);
         if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
-        var summary=configuration.cacheRecoveries().read(id);
-        if(summary.isEmpty())return Map.of();
-        if(!summary.orElseThrow().targetScope().equals(pass.scope()))throw fenced();
+        if(!summary.orElseThrow().targetScope().equals(scope))throw fenced();
         var contexts=new LinkedHashMap<String,SourceResource>();
         for(var ref:pipeline.sources())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),
                 io.tapstate.core.model.PipelineSourceConfig.effective(ref,sources.get(ref.id())));
@@ -132,7 +146,8 @@ final class NativePipelineRecovery {
             var inspected=new PipelineRecoveryInspector(configuration,store,pinned,this::requireAvailable).inspectCaptured(auth,plan.manifest().selection(),snapshot,models);
             requireSame(plan,inspected);configuration.cacheRecoveries().authorizeFull(plan,id).requireActive();
         }
-        pass.requirePipeline(id);return Map.copyOf(hashes);
+        pass.requirePipeline(id);
+        return new StoreBackedDagSource.CapturedStartGuard.Inspection(Map.copyOf(hashes), models);
     }
     private ConnectorProvisioner fixed(Map<String,String> hashes) {
         var captured=Map.copyOf(hashes);

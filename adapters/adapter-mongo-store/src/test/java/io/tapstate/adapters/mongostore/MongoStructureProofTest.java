@@ -25,6 +25,7 @@ class MongoStructureProofTest {
     @Test void aCheckpointReadFailureInvalidatesTheCachedStructure() {
         var client = mock(MongoClient.class);
         var database = mock(MongoDatabase.class);
+        when(client.getClusterDescription()).thenReturn(mock(ClusterDescription.class));
         when(client.startSession()).thenThrow(new MongoTimeoutException("cache unavailable"));
         var access = new MongoCachePipelineAccess(client, database, PIPELINE, null, () -> {});
         var proof = new MongoStructureProof(() -> 0L);

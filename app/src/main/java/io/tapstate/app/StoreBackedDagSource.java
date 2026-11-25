@@ -151,12 +151,10 @@ final class StoreBackedDagSource implements DagSource {
     private static final String LOCAL_MEMBER = "local";
     private final ParallelismBudget parallelismBudget;
     interface CapturedStartGuard {
-        Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models);
-        default SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models) {
-            return models;
-        }
+        record Inspection(Map<String, String> connectorHashes, SourceModelSnapshot models) {}
+        Inspection inspect(PipelineConvergencePass pass, ReadOnlyArtifactSnapshot artifacts, SourceModelSnapshot models);
         default void retireCoveredKeyMoves(PipelineConvergencePass pass) {}
-        CapturedStartGuard NONE=(pass,artifacts,models) -> Map.of();
+        CapturedStartGuard NONE = (pass, artifacts, models) -> new Inspection(Map.of(), models);
     }
     @Override public void retireCoveredKeyMoves(PipelineConvergencePass pass) {
         capturedStartGuard.retireCoveredKeyMoves(pass);
@@ -244,33 +242,47 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
+        return prepareStart(pass, defaultDatabase, (connectors, hashes) -> {});
+    }
+
+    @Override
+    public StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase,
+            java.util.function.BiConsumer<Set<String>, Map<String, String>> connectorInputs) {
         Objects.requireNonNull(pass, "pass");
+        Objects.requireNonNull(connectorInputs, "connectorInputs");
         String pipelineId = pass.scope().pipelineId();
         pass.requirePipeline(pipelineId);
-        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(artifacts());
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.captureForStart(artifacts(), pipelineId);
         PipelineResource original = StoredArtifacts.requirePipeline(snapshot, pipelineId);
         if (!io.tapstate.core.model.canonical.CanonicalHash.of(original).equals(pass.intent().desired().revision()))
             throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
-        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas(),pass);
+        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas(), pass, connectorInputs);
         pass.requirePipeline(pipelineId);
         return prepared;
     }
 
     private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot, String pipelineId, String defaultDatabase,
             io.tapstate.spi.store.DerivedSchemaStore records) {
-        return prepareCapturedStart(snapshot,pipelineId,defaultDatabase,records,null);
+        return prepareCapturedStart(snapshot, pipelineId, defaultDatabase, records, null, (connectors, hashes) -> {});
     }
     private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot,String pipelineId,String defaultDatabase,
-            io.tapstate.spi.store.DerivedSchemaStore records,PipelineConvergencePass pass) {
+            io.tapstate.spi.store.DerivedSchemaStore records, PipelineConvergencePass pass,
+            java.util.function.BiConsumer<Set<String>, Map<String, String>> connectorInputs) {
         PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
-        SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
-        Map<String,String> confirmedHashes=pass==null?Map.of():capturedStartGuard.inspect(pass,snapshot,models);
-        if(pass!=null)models=capturedStartGuard.planningModels(pass,snapshot,models);
+        var schemas = pass != null && storePort instanceof ThreeLayerStorePort nativeStore
+                ? nativeStore.startSchemas() : storePort.schemas();
+        SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId, sources, schemas);
+        var inspection = pass == null
+                ? new CapturedStartGuard.Inspection(Map.of(), models)
+                : capturedStartGuard.inspect(pass, snapshot, models);
+        models = inspection.models();
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
                 requireMarkedStore, members, parallelismBudget, records, models::modelForBinding, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
         captured.validateStart(pipelineId);
+        Map<String, String> sinkConnectors = captured.sinkConnectors(pipelineId);
+        connectorInputs.accept(Set.copyOf(sinkConnectors.values()), inspection.connectorHashes());
         PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
         NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
         Set<OperatorStateLocation> locations = operators == null ? captured.stateLocations(pipelineId,defaultDatabase) : Set.of();
@@ -279,8 +291,8 @@ final class StoreBackedDagSource implements DagSource {
         boolean freshFullLoad = pass == null && captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
-                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),confirmedHashes,
+                () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), sinkConnectors,
+                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),inspection.connectorHashes(),
                 pass == null ? List.of() : captured.connectorNodes(pipeline, models));
     }
 
@@ -310,8 +322,11 @@ final class StoreBackedDagSource implements DagSource {
         return List.copyOf(nodes);
     }
 
-    StoreBackedDagSource withConnectorExecutions(PipelineConnectorExecutions executions) {
-        if (sinkWriterBinder instanceof PdkSinkWriterBinder binder) binder.connectorExecutions = executions;
+    StoreBackedDagSource withRuntimeBindings(PipelineConnectorExecutions executions, String defaultSourceId) {
+        if (sinkWriterBinder instanceof PdkSinkWriterBinder binder) {
+            binder.connectorExecutions = executions;
+            binder.defaultSourceId = Objects.requireNonNull(defaultSourceId);
+        }
         return this;
     }
 
@@ -5353,6 +5368,11 @@ final class StoreBackedDagSource implements DagSource {
         private final java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned;
         private final ArtifactStore artifacts;
         private PipelineConnectorExecutions connectorExecutions;
+        private String defaultSourceId;
+        private Optional<io.tapstate.spi.store.SourceBindingSnapshot> defaultSourceBinding() {
+            return defaultSourceId == null ? artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBindingForSinkStartup)
+                    : artifacts.sourceBindingForSinkStartup(defaultSourceId);
+        }
         PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;this.artifacts=null;}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this(notes,provisioner,ignored -> false);}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this(notes,provisioner,recoveryPinned,null);}
@@ -5366,7 +5386,7 @@ final class StoreBackedDagSource implements DagSource {
                     connectorExecutions == null ? null : connectorExecutions.selection(original.scope(), requireActive)
                             .binding(sink.config().node().nodeId(), sink.purpose()));
             if(artifacts!=null) {
-                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
+                var identity=defaultSourceBinding()
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
                 if(identity.isPresent())run=run.withSource(identity.orElseThrow());
             }
@@ -5394,7 +5414,7 @@ final class StoreBackedDagSource implements DagSource {
                     connectorExecutions == null ? null : connectorExecutions.selection(original.scope(), requireActive)
                             .binding(sink.config().node().nodeId(), sink.purpose()));
             if(artifacts!=null) {
-                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
+                var identity=defaultSourceBinding()
                         .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
                 if(identity.isPresent())run=run.withSource(identity.orElseThrow());
             }
