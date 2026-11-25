@@ -207,7 +207,8 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
         var back = renamed("C2", "C1").withOrder(at(MOVED_AT + 1));
         var dispatch = new RootMoveDispatcher(TOPOLOGY.assembler(), NestSettings.defaults(), NestClock.SYSTEM, null, null);
         var routed = new TestOutbox(new int[] {32, 32}, 32);
-        dispatch.init(routed, new TestProcessorContext().setHazelcastInstance(member));
+        dispatch.withRootHandoverTransport(member);
+        dispatch.init(routed, new TestProcessorContext());
         var separate = customer(300, "unrelated");
         dispatch.process(0, new TestInbox(List.of(outward, back, separate)));
         List<Object> emitted = new ArrayList<>();
@@ -291,7 +292,8 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
         var out = new TestOutbox(1);
         var processor = new RootMoveDispatcher(TOPOLOGY.assembler(), NestSettings.defaults(), NestClock.SYSTEM,
                 AXES, Map.of(0, List.of(CUSTOMERS)));
-        processor.init(out, new TestProcessorContext().setHazelcastInstance(member));
+        processor.withRootHandoverTransport(member);
+        processor.init(out, new TestProcessorContext());
         var move = renamed("C1", "C2");
         var follow = customer(MOVED_AT + 1, "C1");
         var inbox = new TestInbox(List.of(move, follow));
@@ -330,7 +332,8 @@ class ARootMoveInFlightKeepsTheFrontierBelowItTest {
     private RootMoveDispatcher dispatcher(TestOutbox out) throws Exception {
         var dispatcher = new RootMoveDispatcher(TOPOLOGY.assembler(), NestSettings.defaults(), NestClock.SYSTEM,
                 null, null);
-        dispatcher.init(out, new TestProcessorContext().setHazelcastInstance(member));
+        dispatcher.withRootHandoverTransport(member);
+        dispatcher.init(out, new TestProcessorContext());
         return dispatcher;
     }
 

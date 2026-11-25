@@ -168,6 +168,10 @@
     "solution": "Replace the Source through its supported lifecycle after preserving required state. Do not reset its identity or counters in place."
   },
   "TS0480042": {
+    "message": "The commit outcome for pipeline '{pipeline}' could not be confirmed.",
+    "solution": "Read the current pipeline definition and draft to verify whether the original change took effect before retrying."
+  },
+  "TS0480043": {
     "message": "Pipeline '{pipeline}' stopped before replay because a primary-key change may have reached its target.",
     "solution": "Check the old and new keys and the saved source position before resuming from a verified baseline."
   }

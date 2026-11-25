@@ -22,7 +22,8 @@ import java.util.function.Supplier;
  * {@code io.document-too-large}, whether the driver refused it or the endpoint did; any other driver
  * explicitly confirmed quota refusal maps to {@code io.store-quota-exceeded}; another driver
  * failure maps to {@code io.store-unavailable}
- * carrying only a safe driver type and numeric code. Driver messages and causes may contain
+ * carrying only a safe driver type and numeric code. An unconfirmed pipeline publication has
+ * its own diagnostic so callers can verify the outcome before retrying. Driver messages and causes may contain
  * connection credentials or document values and never cross this boundary. A non-driver throwable
  * — a coded reconstruction failure ({@code io.document-unreadable}) or a bare invariant crash —
  * passes straight through, never relabelled as a driver failure.
@@ -93,6 +94,11 @@ final class StoreIo {
         }
         if (quotaExceeded(e)) return new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
         return new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", detail(e)), null);
+    }
+
+    /** Reports an exhausted pipeline commit retry without exposing the driver failure. */
+    static TapstateException pipelineCommitOutcomeUnknown(String pipelineId) {
+        return new TapstateException(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN, Map.of("pipeline", pipelineId), null);
     }
 
     /** Inspect only structured server errors; no server message, response document or cause leaves this adapter. */
