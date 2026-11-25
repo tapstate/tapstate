@@ -126,7 +126,7 @@ class RingDependencyRulesTest {
     }
 
     @Test
-    @DisplayName("R6: cli depends only on the core ring + the shared message catalog")
+    @DisplayName("R6: CLI uses the core ring, client, catalog and terminal libraries")
     void r6_cliOnlyDependsOnCoreRing() {
         classes().that().resideInAPackage("io.tapstate.cli..")
                 .should().onlyDependOnClassesThat().resideInAnyPackage(
@@ -138,7 +138,8 @@ class RingDependencyRulesTest {
                         "io.tapstate.messages..",
                         // the CLI's own facade libraries
                         "picocli..",
-                        "org.jline..")
+                        "org.jline..",
+                        "dev.tamboui..")
                 .allowEmptyShould(true)
                 .because("the CLI talks to services through the framework-free HTTP client only; it "
                         + "must have no dependency on control services or runtime modules; the message catalog is "

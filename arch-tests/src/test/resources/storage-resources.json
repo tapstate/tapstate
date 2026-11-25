@@ -4236,11 +4236,13 @@
       "writers": [
         "io.tapstate.cli.WorkspaceWrite",
         "io.tapstate.cli.NewCmd",
+        "io.tapstate.cli.Repl",
         "io.tapstate.cli.ServerBinding"
       ],
       "readers": [
         "io.tapstate.cli.WorkspaceWrite",
         "io.tapstate.cli.NewCmd",
+        "io.tapstate.cli.Repl",
         "io.tapstate.cli.ServerBinding"
       ],
       "recovery": "user-files",
