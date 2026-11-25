@@ -13,6 +13,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -22,7 +24,42 @@ import static org.mockito.Mockito.*;
 
 class NativeBusinessShutdownTest {
     @Test
-    void workerTimeoutStillClosesTheMemberAndPreservesTheFailure() throws InterruptedException {
+    void retryAttemptsMemberStopAgainAfterAStopFailure() {
+        var root = mock(StorageRoot.class, RETURNS_DEEP_STUBS);
+        try (var child = new GenericApplicationContext()) {
+            var owner = new NativeBusinessContext(root, null, child);
+            var member = mock(HazelcastInstance.class);
+            var lifecycle = mock(LifecycleService.class);
+            var running = new AtomicBoolean(true);
+            when(member.getLifecycleService()).thenReturn(lifecycle);
+            when(lifecycle.isRunning()).thenAnswer(call -> running.get());
+            doThrow(new IllegalStateException("first member stop failed"))
+                    .doAnswer(call -> { running.set(false); return null; }).when(member).shutdown();
+            var periodic = mock(PeriodicObservations.class);
+            var drainFailure = StorageRuntime.unavailable();
+            doThrow(drainFailure).when(periodic).awaitStopped(anyLong());
+            child.getBeanFactory().registerSingleton("hazelcastMember", member);
+            child.getBeanFactory().registerSingleton("periodicObservations", periodic);
+            child.refresh();
+            ReflectionTestUtils.setField(owner, "context", child);
+            var storage = mock(NativeMemberStorage.class);
+            ReflectionTestUtils.setField(owner, "memberStorage", storage);
+
+            assertThat(catchThrowable(owner::close)).isSameAs(drainFailure);
+            assertThat(running).isTrue();
+            assertThat(catchThrowable(owner::close)).isSameAs(drainFailure);
+            assertThat(running).isFalse();
+            verify(member, times(2)).shutdown();
+            verify(storage, never()).close();
+            doNothing().when(periodic).awaitStopped(anyLong());
+            owner.close();
+            verify(storage).close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedWorkerDrainStillClosesTheMemberAndPreservesTheFailure(boolean drainError) throws InterruptedException {
         var root = mock(StorageRoot.class, RETURNS_DEEP_STUBS);
         var worker = Executors.newSingleThreadExecutor();
         var release = new CountDownLatch(1);
@@ -48,12 +85,18 @@ class NativeBusinessShutdownTest {
             startup.handOff(member);
             var periodic = mock(PeriodicObservations.class);
             doAnswer(call -> { worker.shutdown(); return null; }).when(periodic).close();
-            var failure = new AtomicReference<RuntimeException>();
+            var failure = new AtomicReference<Throwable>();
+            var error = new AssertionError("worker settlement failed");
             doAnswer(call -> {
                 try {
                     ShutdownAwait.executor(worker, call.getArgument(0));
                     return null;
                 } catch (RuntimeException timeout) {
+                    if (drainError) {
+                        error.addSuppressed(timeout);
+                        failure.set(error);
+                        throw error;
+                    }
                     failure.set(timeout);
                     throw timeout;
                 }
@@ -79,7 +122,7 @@ class NativeBusinessShutdownTest {
             assertThat(claims.read(key).orElseThrow().leased()).isFalse();
 
             var retry = catchThrowable(() -> ShutdownAwait.within(Duration.ofMillis(250), owner::close));
-            assertThat(retry).isNotNull().isSameAs(failure.get()).isNotSameAs(thrown);
+            assertThat(retry).isNotNull().isSameAs(failure.get());
             release.countDown();
             assertThat(worker.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
             owner.close();

@@ -1084,17 +1084,34 @@ final class StorageRoot implements AutoCloseable {
             if (activation != null) activation.completeExceptionally(StorageRuntime.unavailable());
             if (activationWorker != null) activationWorker.shutdown();
         }
-        shutdown.complete(deadline, () -> {
-            replacements.await(deadline);
-            if (recoveryWorker != null) recoveryWorker.shutdown();
-            if (authenticationWorker != null) ShutdownAwait.executor(authenticationWorker, deadline);
-            if (activationWorker != null) ShutdownAwait.executor(activationWorker, deadline);
-            if (recoveryWorker != null) ShutdownAwait.executor(recoveryWorker, deadline);
-            if (initialization != null) initialization.close();
-            var cleanup=StorageRuntime.unavailable();closeUnpublished(cleanup);
-            if(!unpublished.isEmpty())throw cleanup;
-            authentication.close();runtime.close(deadline);
-            closed = true;java.util.Arrays.fill(authenticationKey, (byte)0);
-        });
+        boolean completed = false;
+        try {
+            ShutdownAwait.stage("storage root close", () -> shutdown.complete(deadline, () -> finishClose(deadline)));
+            completed = true;
+        } finally {
+            if (!completed) runtime.stopPublishedMemberAfterFailedClose();
+        }
+    }
+
+    private void finishClose(long deadline) {
+        ShutdownAwait.stage("storage coordinator drain", () -> drainCoordinators(deadline));
+        ShutdownAwait.all(List.of(
+                () -> ShutdownAwait.stage("authentication close", authentication::close),
+                () -> ShutdownAwait.stage("storage runtime close", () -> runtime.close(deadline))));
+        closed = true;
+        java.util.Arrays.fill(authenticationKey, (byte) 0);
+    }
+
+    private void drainCoordinators(long deadline) {
+        if (recoveryWorker != null) recoveryWorker.shutdown();
+        ShutdownAwait.all(List.of(
+                () -> replacements.await(deadline),
+                () -> { if (authenticationWorker != null) ShutdownAwait.executor(authenticationWorker, deadline); },
+                () -> { if (activationWorker != null) ShutdownAwait.executor(activationWorker, deadline); },
+                () -> { if (recoveryWorker != null) ShutdownAwait.executor(recoveryWorker, deadline); }));
+        if (initialization != null) initialization.close();
+        var cleanup = StorageRuntime.unavailable();
+        closeUnpublished(cleanup);
+        if (!unpublished.isEmpty()) throw cleanup;
     }
 }

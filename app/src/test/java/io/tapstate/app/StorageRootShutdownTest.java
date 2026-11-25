@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -8,12 +9,103 @@ import java.util.function.Function;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.spi.store.StorageBinding;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.slf4j.LoggerFactory;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageRootShutdownTest {
+    private final Logger logger = (Logger) LoggerFactory.getLogger(ShutdownAwait.class);
+    private final ListAppender<ILoggingEvent> shutdownLog = new ListAppender<>();
+
+    @BeforeEach void captureLog() {
+        shutdownLog.start();
+        logger.addAppender(shutdownLog);
+    }
+
+    @AfterEach void releaseLog() {
+        logger.detachAppender(shutdownLog);
+        shutdownLog.stop();
+    }
+
+    @Test void blockedAuthenticationWorkerStillAllowsMemberStopWithoutClosingItsResources() throws Exception {
+        var root = root();
+        var runtime = mock(StorageRuntime.class);
+        var authentication = mock(StorageAuthentication.class);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var worker = Executors.newSingleThreadExecutor();
+        ReflectionTestUtils.setField(root, "runtime", runtime);
+        ReflectionTestUtils.setField(root, "authentication", authentication);
+        ReflectionTestUtils.setField(root, "authenticationWorker", worker);
+        worker.submit(() -> { entered.countDown(); release.await(); return null; });
+        try {
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(catchThrowable(() -> ShutdownAwait.within(Duration.ofMillis(200), root::close)))
+                    .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            verify(runtime).stopPublishedMemberAfterFailedClose();
+            verify(runtime, never()).close(anyLong());
+            verify(authentication, never()).close();
+            assertThat(shutdownLog.list).anySatisfy(event -> {
+                assertThat(event.getFormattedMessage()).contains("storage coordinator drain");
+                assertThat(event.getThrowableProxy().getMessage()).contains("TS0210030");
+            });
+        } finally {
+            release.countDown();
+            worker.shutdownNow();
+        }
+        assertThat(worker.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
+        root.close();
+        verify(authentication).close();
+        verify(runtime).close(anyLong());
+    }
+
+    @Test void anAlreadyExpiredDeadlineStillAttemptsMemberStop() {
+        var root = root();
+        var runtime = mock(StorageRuntime.class);
+        var authentication = mock(StorageAuthentication.class);
+        ReflectionTestUtils.setField(root, "runtime", runtime);
+        ReflectionTestUtils.setField(root, "authentication", authentication);
+
+        assertThat(catchThrowable(() -> ShutdownAwait.within(Duration.ZERO, root::close)))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        verify(runtime).stopPublishedMemberAfterFailedClose();
+        verify(runtime, never()).close(anyLong());
+        verify(authentication, never()).close();
+
+        root.close();
+    }
+
+    @Test void authenticationCloseFailureStillClosesTheRuntime() {
+        var root = root();
+        var runtime = mock(StorageRuntime.class);
+        var authentication = mock(StorageAuthentication.class);
+        ReflectionTestUtils.setField(root, "runtime", runtime);
+        ReflectionTestUtils.setField(root, "authentication", authentication);
+        var failure = new IllegalStateException("authentication close failed");
+        doThrow(failure).when(authentication).close();
+
+        assertThat(catchThrowable(root::close)).isSameAs(failure);
+        verify(runtime).close(anyLong());
+        assertThat(shutdownLog.list).anySatisfy(event -> {
+            assertThat(event.getFormattedMessage()).contains("authentication close");
+            assertThat(event.getThrowableProxy().getMessage()).contains("authentication close failed");
+        });
+    }
+
+    private static StorageRoot root() {
+        var mongo = new MongoProperties();
+        mongo.setUri(null);
+        return new StorageRoot(mongo, CloudRuntimeSettings.resolve(new CloudProperties()), null, BootId.fresh(),
+                new MetricsHistoryProperties(), new RandomTokenSecrets(), Clock.systemUTC(), new byte[32]);
+    }
+
     @Test void closingCannotPublishAnInstallerSuccessorWhichWasStillBeingConstructed() throws Exception {
         var mongo=new MongoProperties();mongo.setUri(null);
         var root=new StorageRoot(mongo,CloudRuntimeSettings.resolve(new CloudProperties()),null,BootId.fresh(),

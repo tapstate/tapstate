@@ -48,6 +48,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private final java.util.concurrent.atomic.AtomicReference<PipelineAlertRuntime> alertRuntime = new java.util.concurrent.atomic.AtomicReference<>();
     private final ShutdownAwait shutdown = new ShutdownAwait();
     private ShutdownOwners shutdownOwners;
+    private final java.util.concurrent.atomic.AtomicReference<MemberStop> memberStop = new java.util.concurrent.atomic.AtomicReference<>();
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicReference<Thread> initialTestCaller = new java.util.concurrent.atomic.AtomicReference<>();
@@ -300,23 +301,59 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             if (context != null) shutdownOwners = owners;
         }
 
+        boolean drained = false;
         try {
-            drainWorkers(owners, deadline);
-        } catch (RuntimeException failure) {
-            // Keep worker resources open for retry, but stop the old member and end its session.
-            var member = owners.member();
-            if (member != null) {
-                try {
-                    stopMember(member, owners.lease());
-                } catch (RuntimeException cleanup) {
-                    if (cleanup != failure) failure.addSuppressed(cleanup);
-                }
-            }
-            throw failure;
+            var retained = owners;
+            ShutdownAwait.stage("business worker drain", () -> drainWorkers(retained, deadline));
+            drained = true;
+        } finally {
+            if (!drained) stopMemberAfterFailedClose(owners);
         }
 
+        if (memberStop.get() != null) {
+            var stopping = startMemberStop(owners);
+            ShutdownAwait.future(stopping.result(), Math.min(deadline, stopping.deadline()));
+        }
         closeWorkerResources(owners.member(), retrying);
         shutdownOwners = null;
+    }
+
+    void stopMemberAfterFailedClose() {
+        stopMemberAfterFailedClose(ShutdownOwners.capture(context));
+    }
+
+    private void stopMemberAfterFailedClose(ShutdownOwners owners) {
+        if (owners.member() == null) return;
+        try {
+            var stop = startMemberStop(owners);
+            ShutdownAwait.future(stop.result().handle((ignored, failure) -> null), stop.deadline());
+        } catch (RuntimeException failed) {
+            // The fallback must never replace the worker failure or close resources used by live workers.
+            org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).warn("Member stop during failed shutdown did not complete", failed);
+        }
+    }
+
+    private MemberStop startMemberStop(ShutdownOwners owners) {
+        var stop = memberStop.updateAndGet(previous ->
+                previous == null || previous.result().isCompletedExceptionally() ? new MemberStop() : previous);
+        stop.start(owners);
+        return stop;
+    }
+
+    private record MemberStop(java.util.concurrent.CompletableFuture<Void> result, AtomicBoolean started, long deadline) {
+        MemberStop() {
+            this(new java.util.concurrent.CompletableFuture<>(), new AtomicBoolean(),
+                    System.nanoTime() + Duration.ofSeconds(7).toNanos());
+        }
+
+        void start(ShutdownOwners owners) {
+            if (started.compareAndSet(false, true)) {
+                result.completeAsync(() -> {
+                    ShutdownAwait.stage("member and node-session close", () -> stopMember(owners.member(), owners.lease()));
+                    return null;
+                }, Thread::startVirtualThread);
+            }
+        }
     }
 
     private void drainWorkers(ShutdownOwners owners, long deadline) {
