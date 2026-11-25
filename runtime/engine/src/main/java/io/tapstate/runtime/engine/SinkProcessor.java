@@ -30,7 +30,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.LongSupplier;
-import java.util.function.Predicate;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
@@ -165,15 +164,13 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // When each queued stream's oldest row was taken in, by the clock the wait is measured against.
     private final Map<String, Long> waitingSince = new LinkedHashMap<>();
     private int queuedRows;
-    private final KeyMoveSinkWriter moveWriter;
     private Map<String, SinkTarget> nativeTargets = Map.of();
     private QueuedMove queuedMove;
     private boolean laneCoordination;
     private java.util.function.Consumer<SinkLaneAcks.Ticket> laneAcknowledgments;
     private Held<SinkLaneCommand.Fence> queuedFence;
 
-    private record QueuedMove(long order, Envelope row, KeyMoveHandoffs.Receipt receipt, List<Envelope> batch,
-            Predicate<Envelope> admit) {}
+    private record QueuedMove(long order, Envelope row, SinkLaneAcks.Ticket reply) {}
 
     // The number the next row taken in gets. A word or a bound taken in waits for every row numbered below it.
     private long nextOrder;
@@ -269,9 +266,6 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         this.writerOf = writerOf;
         this.totalOne = totalOne;
         this.writer = Objects.requireNonNull(writer, "writer");
-        this.moveWriter = writer instanceof KeyMoveSinkWriter ordered ? ordered : null;
-        if (moveWriter != null && maxInFlight != 1)
-            throw new IllegalArgumentException("key moves require an ordered writer");
         this.suppliedGauge = Objects.requireNonNull(gauge, "gauge");
         this.gauge = this.suppliedGauge;
         this.supplied = Objects.requireNonNull(delivery, "delivery");
@@ -515,14 +509,6 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 enqueue((Envelope) item);
             }
         }
-        if (queuedMove != null && queuedMove.receipt() != null && moveWriter != null) {
-            while (queuedRows + queuedMove.batch().size() < maxBatchSize && inbox.peek() instanceof Envelope next
-                    && next.src().equals(queuedMove.row().src()) && moveWriter.receiptFor(next) == null
-                    && !nativeMove(next) && queuedMove.admit().test(next)) {
-                queuedMove.batch().add((Envelope) inbox.poll());
-                nextOrder++;
-            }
-        }
         if (frontier != null) {
             // A word taken in behind rows that have all landed already has nothing to wait for.
             releaseHeld();
@@ -536,13 +522,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             return;
         }
         var move = (SinkLaneCommand.Move) command;
-        var receipt = new KeyMoveHandoffs.Receipt() {
-            @Override public void queued() {
-                // The router owns admission and is waiting for the target write acknowledgment.
-            }
-            @Override public void written() { laneAcknowledgments.accept(move.reply()); }
-        };
-        queuedMove = new QueuedMove(nextOrder++, move.row(), receipt, List.of(move.row()), ignored -> false);
+        queuedMove = new QueuedMove(nextOrder++, move.row(), move.reply());
     }
 
     SinkProcessor withLaneCoordination() {
@@ -556,18 +536,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     private void enqueue(Envelope row) {
-        if (moveWriter != null) {
-            KeyMoveHandoffs.Receipt receipt = moveWriter.receiptFor(row);
-            if (receipt != null) {
-                queuedMove = reserveMove(row, receipt, moveWriter);
-                receipt.queued();
-                return;
-            }
-        }
         if (nativeMove(row)) {
             // A bulk writer may reorder its input. Submit the native update by itself and
             // require its acceptance before an old-key replacement can enter the target.
-            queuedMove = new QueuedMove(nextOrder++, row, null, List.of(row), ignored -> false);
+            queuedMove = new QueuedMove(nextOrder++, row, null);
             return;
         }
         ArrayDeque<Queued> queue = queued.get(row.src());
@@ -589,33 +561,6 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     SinkProcessor withNativeTargets(Map<String, SinkTarget> targets) {
         nativeTargets = targets;
         return this;
-    }
-
-    private QueuedMove reserveMove(Envelope row, KeyMoveHandoffs.Receipt receipt, KeyMoveSinkWriter writer) {
-        long firstOrder = nextOrder++;
-        var batch = new ArrayList<Envelope>();
-        var earlier = queued.get(row.src());
-        Predicate<Envelope> admit = writer.batchAdmission(row);
-        if (queued.size() == 1 && earlier != null) {
-            boolean share = true;
-            for (Queued item : earlier) {
-                if (!admit.test(item.row())) {
-                    share = false;
-                    break;
-                }
-            }
-            if (share) {
-                firstOrder = earlier.getFirst().order();
-                for (Queued item : earlier) batch.add(item.row());
-                queued.remove(row.src());
-                queuedRows -= earlier.size();
-                waitingSince.remove(row.src());
-            } else {
-                admit = writer.batchAdmission(row);
-            }
-        }
-        batch.add(row);
-        return new QueuedMove(firstOrder, row, receipt, batch, admit);
     }
 
     /** Holds {@code positions} until every row taken in before them has landed. */
@@ -646,10 +591,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         while (inFlight.size() < maxInFlight) {
             if (queuedMove != null && queued.isEmpty()) {
                 if (!inFlight.isEmpty()) return wrote;
-                if (queuedMove.receipt() != null && !queuedMove.receipt().mayWrite()) return wrote;
-                var batch = queuedMove.batch();
+                var batch = List.of(queuedMove.row());
                 inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
-                        queuedMove.order(), queuedMove.receipt(), batch.size()));
+                        queuedMove.order(), queuedMove.reply(), batch.size()));
                 queuedMove = null;
                 return true;
             }
@@ -740,7 +684,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             batch.delivered().rows().forEach((table, byOp) -> inFlightByTable.merge(
                     table, byOp.values().stream().mapToLong(Long::longValue).sum(), Long::sum));
         }
-        if (queuedMove != null) queuedByStream.merge(queuedMove.row().src(), (long) queuedMove.batch().size(), Long::sum);
+        if (queuedMove != null) queuedByStream.merge(queuedMove.row().src(), 1L, Long::sum);
         delivery.waiting(queuedByStream, inFlightByTable);
     }
 
@@ -925,7 +869,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                     throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
                             Map.of("expected", batch.expectedWrites(), "accepted", result.written()), null);
                 }
-                if (batch.receipt() != null) batch.receipt().written();
+                if (batch.reply() != null) laneAcknowledgments.accept(batch.reply());
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
@@ -1058,7 +1002,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
     private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
-            DeliveredRows delivered, long firstOrder, KeyMoveHandoffs.Receipt receipt, int expectedWrites) {
+            DeliveredRows delivered, long firstOrder, SinkLaneAcks.Ticket reply, int expectedWrites) {
     }
 
     /** A row taken in and not yet handed to the writer, with the number it was taken in under. */

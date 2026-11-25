@@ -15,8 +15,6 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -24,7 +22,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Predicate;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -205,123 +202,6 @@ class ASinkBatchesByCountOrByTimeTest {
     }
 
     @Test
-    void aMoveReservesItsPlaceWhileThePreviousBatchIsStillWriting() throws Exception {
-        var writer = new MoveWriter();
-        SinkProcessor sink = sink(writer, null, null, 32, WAIT_MILLIS);
-        var input = inbox(row("orders", 1), row("orders", 2), row("orders", 3),
-                row("orders", 4), row("orders", 5));
-        sink.process(0, input);
-        assertThat(writer.notices).containsExactly("queued");
-        assertThat(writer.batches).containsExactly(List.of(1, 2));
-
-        writer.completeAll();
-        sink.tryProcess();
-        sink.process(0, input);
-        assertThat(writer.batches).containsExactly(List.of(1, 2), List.of(3));
-        assertThat(writer.notices).containsExactly("queued");
-
-        writer.completeAll();
-        elapse(WAIT_MILLIS);
-        sink.tryProcess();
-        assertThat(writer.notices).containsExactly("queued", "written");
-        assertThat(writer.batches).containsExactly(List.of(1, 2), List.of(3), List.of(4, 5));
-    }
-
-    @Test
-    void aReservedEffectSharesItsBatchOnlyWithProvenIndependentRows() throws Exception {
-        var writer = new IndependentWriter();
-        SinkProcessor sink = sink(writer, null, null, 32, WAIT_MILLIS);
-        var input = inbox(row("orders", 1), row("orders", 3), row("orders", 2),
-                row("orders", 3), row("orders", 4));
-        sink.process(0, input);
-        assertThat(writer.batches).containsExactly(List.of(1, 3, 2));
-        assertThat(writer.notices).containsExactly("queued", "queued");
-        writer.pending.getFirst().complete(new WriteResult(3));
-        sink.tryProcess();
-        assertThat(writer.batches).containsExactly(List.of(1, 3, 2), List.of(3, 4));
-        assertThat(writer.notices).containsExactly("queued", "queued", "written");
-        writer.pending.getLast().complete(new WriteResult(1));
-        assertThatThrownBy(sink::tryProcess).isInstanceOf(RuntimeException.class);
-        assertThat(writer.notices).containsExactly("queued", "queued", "written");
-    }
-
-    @Test
-    void twoOrdinaryWritesAcrossAReservationCannotBeReorderedInOneBulk() throws Exception {
-        var revisions = new HashMap<Object, Object>();
-        var writer = new IndependentWriter() {
-            @Override
-            public CompletionStage<WriteResult> write(List<Envelope> rows) {
-                return super.write(rows).thenApply(result -> {
-                    for (Envelope row : rows.reversed()) {
-                        revisions.put(row.after().get("id"), row.after().get("revision"));
-                    }
-                    return result;
-                });
-            }
-        };
-        SinkProcessor sink = sink(writer, null, null, 32, 0);
-        var before = Envelope.insert(1, "orders", Map.of("id", 2, "revision", 1), null);
-        var after = Envelope.insert(3, "orders", Map.of("id", 2, "revision", 2), null);
-        sink.process(0, inbox(before, row("orders", 3), after));
-        writer.pending.getFirst().complete(new WriteResult(writer.batches.getFirst().size()));
-        sink.tryProcess();
-        writer.completeAll();
-        sink.tryProcess();
-        assertThat(revisions.get(2)).isEqualTo(2);
-        assertThat(writer.batches).containsExactly(List.of(2, 3), List.of(2));
-    }
-
-    @Test
-    void consecutiveMovesOnDifferentKeysEachReceiveTheirOwnAcknowledgement() throws Exception {
-        var writer = new IndependentWriter() {
-            @Override
-            public KeyMoveHandoffs.Receipt receiptFor(Envelope row) {
-                Object id = row.after().get("id");
-                return new KeyMoveHandoffs.Receipt() {
-                    public void queued() { notices.add("queued " + id); }
-                    public void written() { notices.add("written " + id); }
-                };
-            }
-        };
-        var sink = sink(writer, null, null, 32, 0);
-        sink.process(0, inbox(row("orders", 3), row("orders", 4)));
-        assertThat(writer.notices).containsExactly("queued 3", "queued 4");
-        writer.completeAll();
-        sink.tryProcess();
-        assertThat(writer.notices).containsExactly("queued 3", "queued 4", "written 3");
-        writer.completeAll();
-        sink.tryProcess();
-        assertThat(writer.notices).containsExactly("queued 3", "queued 4", "written 3", "written 4");
-    }
-
-    @Test
-    void aSecondWriterCanQueueTheNextMoveButMustWaitForBothEarlierWrites() throws Exception {
-        var sequence = new KeyMoveHandoffs<String>(32);
-        var first = sequence.tryRegister("A", "B");
-        first.departure().queued();
-        first.arrival().queued();
-        var next = sequence.tryRegister("B", "A");
-        var independent = sequence.tryRegister("C", "C");
-        assertThat(next.ready().toCompletableFuture()).isCompleted();
-
-        var hotWriter = taking(next.arrival());
-        var coldWriter = taking(independent.arrival());
-        var hot = sink(hotWriter, null, null, 32, 0);
-        var cold = sink(coldWriter, null, null, 32, 0);
-        hot.process(0, inbox(row("orders", 3)));
-        cold.process(0, inbox(row("orders", 4)));
-        assertThat(coldWriter.batches).containsExactly(List.of(4));
-        assertThat(hotWriter.batches).isEmpty();
-
-        first.departure().written();
-        hot.tryProcess();
-        assertThat(hotWriter.batches).isEmpty();
-        first.arrival().written();
-        hot.tryProcess();
-        assertThat(hotWriter.batches).containsExactly(List.of(3));
-    }
-
-    @Test
     void aNativeWriterMustConfirmTheMoveBeforeSubmittingOldKeyReuse() throws Exception {
         var writer = new ManualWriter();
         var ack = new RecordingAck();
@@ -426,18 +306,29 @@ class ASinkBatchesByCountOrByTimeTest {
     }
 
     @Test
-    void anUnconfirmedLaneMoveCannotReturnItsReceipt() throws Exception {
-        var writer = new ManualWriter();
-        var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
-        var sink = sink(writer, null, null, 32, 20)
-                .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
-        var move = Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 2), null);
-        sink.process(0, inbox(new SinkLaneCommand.Move("new", move, laneTicket(2))));
-        writer.pending.getFirst().complete(new WriteResult(0));
-
-        assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(TapstateException.class,
-                error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
-        assertThat(confirmed).isEmpty();
+    void aFailedOrUnconfirmedLaneMoveKeepsItsFollowerAndSourcePositionHeld() throws Exception {
+        for (boolean disconnected : List.of(true, false)) {
+            var writer = new ManualWriter();
+            var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
+            var ack = new RecordingAck();
+            var sink = sink(writer, ack, new ContiguousPrefix(AXES), 32, 20)
+                    .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
+            var move = Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 2), null)
+                    .withPosition(new ChainPosition(new SourceOrder(1, 2), "move"));
+            var input = inbox(new SinkLaneCommand.Move("new", move, laneTicket(2)), row("orders", 1));
+            sink.process(0, input);
+            if (disconnected) {
+                writer.pending.getFirst().completeExceptionally(new IllegalStateException("disconnected"));
+                assertThatThrownBy(sink::tryProcess).hasMessage("disconnected");
+            } else {
+                writer.pending.getFirst().complete(new WriteResult(0));
+                assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+            }
+            assertThat(confirmed).isEmpty();
+            assertThat(ack.calls).isEmpty();
+            assertThat(writer.batches).containsExactly(List.of(2));
+        }
     }
 
     private static SinkLaneAcks.Ticket laneTicket(long sequence) {
@@ -468,60 +359,6 @@ class ASinkBatchesByCountOrByTimeTest {
         assertThat(batches).hasSize(1);
         assertThat(batches.getFirst()).extracting(Envelope::op).containsExactly(Op.INSERT, Op.DDL, Op.INSERT);
         assertThat(confirmed).containsExactly(ticket);
-    }
-
-    private static MoveWriter taking(KeyMoveHandoffs.Receipt receipt) {
-        return new MoveWriter() {
-            @Override
-            public KeyMoveHandoffs.Receipt receiptFor(Envelope row) {
-                return receipt;
-            }
-        };
-    }
-
-    private static class IndependentWriter extends MoveWriter {
-        @Override
-        public Predicate<Envelope> batchAdmission(Envelope reserved) {
-            var keys = new HashSet<Object>();
-            keys.add(reserved.after().get("id"));
-            return other -> keys.add(other.after().get("id"));
-        }
-    }
-
-    @Test
-    void aFailedOrUnconfirmedEffectDoesNotReleaseAWriteReceipt() throws Exception {
-        for (boolean failed : List.of(true, false)) {
-            var writer = new MoveWriter();
-            SinkProcessor sink = sink(writer, null, null, 32, 0);
-            sink.process(0, inbox(row("orders", 3), row("orders", 4)));
-            if (failed) {
-                writer.pending.getFirst().completeExceptionally(new IllegalStateException("disconnected"));
-            } else {
-                writer.pending.getFirst().complete(new WriteResult(0));
-            }
-            if (failed) {
-                assertThatThrownBy(sink::tryProcess).hasMessage("disconnected");
-            } else {
-                assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(
-                        TapstateException.class,
-                        error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
-            }
-            assertThat(writer.notices).containsExactly("queued");
-            assertThat(writer.batches).containsExactly(List.of(3));
-        }
-    }
-
-    private static class MoveWriter extends ManualWriter implements KeyMoveSinkWriter {
-        final List<String> notices = new ArrayList<>();
-
-        @Override
-        public KeyMoveHandoffs.Receipt receiptFor(Envelope row) {
-            if (!Integer.valueOf(3).equals(row.after().get("id"))) return null;
-            return new KeyMoveHandoffs.Receipt() {
-                public void queued() { notices.add("queued"); }
-                public void written() { notices.add("written"); }
-            };
-        }
     }
 
     private SinkProcessor sink(SinkWriter writer, SinkAck ack, SinkFrontier frontier, int maxRecords,
