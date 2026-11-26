@@ -220,7 +220,8 @@ final class PdkValidationCodecs {
         // The pinned SPI has no explicit not-applicable sentinel for a custom null result. Do not
         // invent a fallback convention. A non-null wrapper with a null payload is a distinct result.
         if (converted == null || converted instanceof TapRawValue) throw unavailable(field);
-        if (bsonDecimals && origin == Origin.CUSTOM && converted.getClass() == TapNumberValue.class
+        if (bsonDecimals && modelType instanceof TapNumber
+                && origin == Origin.CUSTOM && converted.getClass() == TapNumberValue.class
                 && PdkBsonDecimal.isNative(value)) {
             var exact = PdkBsonDecimal.fromNarrowed(value, converted.getValue());
             if (exact != null) return new Selected(exact, origin, binding);

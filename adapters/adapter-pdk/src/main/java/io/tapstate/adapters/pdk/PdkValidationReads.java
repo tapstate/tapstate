@@ -258,6 +258,10 @@ public final class PdkValidationReads {
 
     public static long decodingWorkBytes(ValidationValues.Limits rowLimits){return PdkValidationRows.workReservationBytes(rowLimits);}
 
+    public static boolean supportsNativeObjectIds(ConnectorRef artifact) {
+        return PdkBsonDecimal.usesBsonModel(artifact.className());
+    }
+
     private static PdkValidationCursor.Decoder decoder(TapTable model, PdkValidationCodecs codecs,
             ConnectorRef artifact, String configurationHash, Binding expected,
             List<ValidationKeyBinding.Component> keys, ValidationValues.Limits rowLimits, boolean requireTextModel) {
@@ -273,7 +277,7 @@ public final class PdkValidationReads {
                 portableTextFields.add(field);
                 continue;
             }
-            boolean nativeId=PdkBsonDecimal.usesBsonModel(artifact.className())&&actual.getDataType()!=null
+            boolean nativeId=supportsNativeObjectIds(artifact)&&actual.getDataType()!=null
                     &&actual.getDataType().replace("_","").equalsIgnoreCase("OBJECTID");
             boolean idDomain=component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("object-id"));
             if(nativeId!=idDomain)

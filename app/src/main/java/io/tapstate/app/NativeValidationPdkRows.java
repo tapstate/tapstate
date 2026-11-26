@@ -235,7 +235,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             require();guard.run();var table=current;if(table==null||table.index()!=index)throw invalid("tableSequence");
             var mapping=declarations.get(index).mapping();
             var generated=ValidationFieldCheck.generatedId(observation.run(),mapping.mappingId(),mapping.outputId(),
-                    artifacts.get(mapping.target().sourceId()).className().equals("io.tapdata.mongodb.MongodbConnector"),
+                    PdkValidationReads.supportsNativeObjectIds(artifacts.get(mapping.target().sourceId())),
                     table.source().model().fields().stream().anyMatch(field->field.name().equals("_id")),
                     java.util.stream.Stream.concat(table.keys().source().stream(),table.keys().target().stream())
                             .anyMatch(component->component.path().getFirst().equals("_id")),

@@ -140,6 +140,9 @@ class PdkValidationCodecsTest {
         var model = new TapNumber().scale(1000);
 
         assertThat(mongo.exactNumber("amount", mongo.select("amount", nativeValue, model))).isEqualTo(expected);
+        assertThatThrownBy(() -> mongo.exactNumber("amount", mongo.select("amount", nativeValue, null)))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ValidationError.CODEC_VALUE_UNAVAILABLE));
         assertThatThrownBy(() -> unproven.exactNumber("amount", unproven.select("amount", nativeValue, model)))
                 .isInstanceOf(TapstateException.class);
         for (var special : List.of(Decimal128.NaN, Decimal128.POSITIVE_INFINITY, Decimal128.NEGATIVE_ZERO)) {

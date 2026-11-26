@@ -140,11 +140,18 @@ class NativeValidationRelationalApiIT {
                     assertThat(saved).containsEntry("outcome", "APPLIED");
                     var task = get(http, read, taskPath);
                     assertThat(task).containsEntry("revision", "1").containsEntry("taskGeneration", saved.get("taskGeneration"));
+                    assertThat(collection.find().first()).containsKey("_id");
+                    var cleanRun = Map.of("context", task.get("context"), "pipeline", "balance_flow",
+                            "task", "balance", "taskGeneration", task.get("taskGeneration"), "revision", task.get("revision"),
+                            "sequence", "1", "command", UUID.randomUUID().toString());
+                    assertThat(run(http, write, read, cleanRun))
+                            .containsEntry("result", "COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount", "0");
                     assertThat(collection.updateOne(new Document("c_id", 1), new Document("$set",
                             new Document("c_balance", new Decimal128(new BigDecimal("-11.00"))))).getModifiedCount()).isEqualTo(1);
-                    var report = run(http, write, read, Map.of("context", task.get("context"), "pipeline", "balance_flow",
-                            "task", "balance", "taskGeneration", task.get("taskGeneration"), "revision", task.get("revision"),
-                            "sequence", "1", "command", UUID.randomUUID().toString()));
+                    var driftRun = new LinkedHashMap<>(cleanRun);
+                    driftRun.put("sequence", "2");
+                    driftRun.put("command", UUID.randomUUID().toString());
+                    var report = run(http, write, read, driftRun);
                     assertThat(report).containsEntry("result", "COMPLETE_WITH_OBSERVATIONS").containsEntry("rootCount", "1");
                     var reference = (Map<?, ?>) report.get("reference");
                     String rootsPath = taskPath + "/reports/" + reference.get("run") + "/roots";
@@ -153,7 +160,7 @@ class NativeValidationRelationalApiIT {
                     assertThat((List<Map>) roots.get("items")).singleElement().satisfies(root -> {
                         var detail = get(http, read, rootsPath + "/" + root.get("id") + query);
                         var observation = (Map<?, ?>) detail.get("observation");
-                        assertThat((List<Map>) reportField(observation, "samples").get("value")).anySatisfy(sample -> {
+                        assertThat((List<Map>) reportField(observation, "samples").get("value")).singleElement().satisfies(sample -> {
                             var finding = reportField(sample, "finding");
                             assertThat(reportField(finding, "kind").get("value")).isEqualTo("TARGET_VALUE");
                             var path = reportField(reportField(finding, "location"), "fieldPath");
