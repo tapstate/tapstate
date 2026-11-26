@@ -89,22 +89,6 @@ if endpoint == "graphql":
         answer({"data": {"updateProjectV2ItemFieldValue": {
             "projectV2Item": {"id": item["id"]}
         }}})
-    if "deleteProjectV2Item" in query:
-        assert params["project"] == "PVT8"
-        issue = next(key for key, value in state["items"].items() if value["id"] == params["item"])
-        del state["items"][issue]
-        answer({"data": {"deleteProjectV2Item": {"deletedItemId": params["item"]}}})
-    if "items(first:100" in query:
-        nodes = []
-        for issue_id, item in state["items"].items():
-            issue = state["issues"][issue_id]
-            nodes.append({"id": item["id"], "content": {
-                "repository": {"nameWithOwner": "tapstate/tapstate"},
-                "milestone": issue.get("milestone")
-            }})
-        answer({"data": {"organization": {"projectV2": {"items": {
-            "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}
-        }}}}})
     raise AssertionError("Unhandled GraphQL call: " + query)
 
 if endpoint == "orgs/tapstate/projectsV2/8/fields":
@@ -165,7 +149,7 @@ def run():
         week12 = {"number": 7, "state": "open", "title": "Week 12 — Paid pilot"}
         state_file.write_text(json.dumps({
             "views": [{"id": "VIEW-2", "name": "Week 4 Board",
-                       "layout":"BOARD_LAYOUT", "filter": 'milestone:"Week 4 — MVP lifecycle"'}],
+                       "layout":"BOARD_LAYOUT", "filter": 'milestone:"Week 4 — MVP lifecycle" is:issue'}],
             "items": {"ISSUE-576": {"id": "ITEM-ISSUE-576", "status": "PROGRESS"},
                       "ISSUE-999": {"id": "ITEM-ISSUE-999", "status": "TODO"}},
             "milestones": [week4, week8, week12],
@@ -200,7 +184,14 @@ def run():
         assert len(state["views"]) == 1
         assert state["views"][0]["id"] == "VIEW-2"
         assert state["views"][0]["name"] == "Week 4 Board"
-        assert state["views"][0]["filter"] == 'milestone:"Week 4 — MVP lifecycle"'
+        assert state["views"][0]["filter"] == 'milestone:"Week 4 — MVP lifecycle" is:issue'
+
+        old_week4_title = week4["title"]
+        week4 = dict(week4, title="Week 4 revised")
+        state = invoke("milestone", {"action": "edited", "milestone": week4,
+                                      "changes": {"title": {"from": old_week4_title}}})
+        assert state["views"] == [{"id": "VIEW-2", "name": "Week 4 Board", "layout": "BOARD_LAYOUT",
+                                  "filter": 'milestone:"Week 4 revised" is:issue'}]
 
         state = invoke("milestone", {"milestone": week8})
         state = invoke("milestone", {"milestone": week8})
@@ -234,8 +225,12 @@ def run():
         stale = issue(900, week8, state="closed")
         state = invoke("issues", {"issue": stale}, refresh_issue=False)
         assert state["items"]["ISSUE-900"]["status"] == "PROGRESS", "old events must read current issue state"
-        state = invoke("issues", {"issue": issue(900, None)})
-        assert "ISSUE-900" not in state["items"]
+        state = invoke("issues", {"action": "demilestoned", "issue": issue(900, None)})
+        assert state["items"]["ISSUE-900"]["status"] == "PROGRESS"
+        for action in ("labeled", "unlabeled", "closed", "reopened"):
+            state = invoke("issues", {"action": action,
+                                      "issue": issue(999, None, labels=["runtime-bug"])})
+            assert state["items"]["ISSUE-999"] == {"id": "ITEM-ISSUE-999", "status": "TODO"}
 
         result = subprocess.run([str(SCRIPT), "--reconcile"], env=env, capture_output=True,
                                 text=True, check=False)
@@ -244,7 +239,8 @@ def run():
         assert any(view["name"] == week12["title"] for view in state["views"])
         assert state["items"]["ISSUE-901"]["status"] == "DONE"
         assert state["items"]["ISSUE-576"]["status"] == "PROGRESS"
-        assert "ISSUE-999" not in state["items"], "reconcile must remove stale items"
+        assert "ISSUE-900" in state["items"], "reconcile must retain demilestoned items"
+        assert "ISSUE-999" in state["items"], "reconcile must retain unrelated label-board items"
         assert sum(view["name"] == "Week 4 Board" for view in state["views"]) == 1
         assert all(view["name"] != "Retired" for view in state["views"])
         failure = subprocess.run([str(SCRIPT), "--reconcile"],

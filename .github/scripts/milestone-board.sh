@@ -62,37 +62,54 @@ project_views() {
     }' | jq '[.[].data.organization.projectV2.views.nodes[] | select(.layout == "BOARD_LAYOUT")]'
 }
 
+matching_views() {
+  jq --arg desired "$(filter_for "$1")" --arg legacy "$(legacy_filter_for "$1")" '
+    [.[] | select((.filter // "" | sub(" +is:issue *$"; "")) as $scope
+      | $scope == $desired or $scope == $legacy)]'
+}
+
 ensured_view_title=''
 ensure_view() {
-  local title=$1 previous=${2:-} desired legacy previous_filter views view_id body status_rest_id
+  local title=$1 previous=${2:-} desired views matches view_id view_name previous_filter new_filter body status_rest_id
   [[ $title != "$ensured_view_title" || -n $previous ]] || return 0
   desired=$(filter_for "$title")
-  legacy=$(legacy_filter_for "$title")
-  previous_filter=''
-  if [[ -n $previous ]]; then
-    previous_filter=$(filter_for "$previous")
-  fi
   views=$(project_views)
-  # Reuse an existing board for this exact scope without renaming a manually titled view.
-  if jq -e --arg desired "$desired" --arg legacy "$legacy" \
-      'any(.[]; .filter == $desired or .filter == $legacy)' <<<"$views" >/dev/null; then
+  # A manually titled board with the same milestone scope already serves this milestone.
+  if [[ $(matching_views "$title" <<<"$views" | jq 'length') -gt 0 ]]; then
     ensured_view_title=$title
     return
   fi
-  # Only a rename webhook links the old and new names. Restrict updates to one exact match.
-  view_id=$(jq -r --arg old "$previous" --arg previous "$previous_filter" \
-    '[.[] | select($old != "" and .name == $old and .filter == $previous)]
-     | if length == 1 then .[0].id else empty end' <<<"$views")
-  if [[ -n $view_id ]]; then
-    gh api graphql -f view="$view_id" -f name="$title" -f filter="$desired" -f query='
-      mutation($view:ID!, $name:String!, $filter:String!) {
-        updateProjectV2View(input:{viewId:$view, name:$name, filter:$filter}) {
-          projectV2View { id }
-        }
-      }' >/dev/null
-    note "updated view: $title"
-    ensured_view_title=$title
-    return
+
+  if [[ -n $previous ]]; then
+    matches=$(matching_views "$previous" <<<"$views")
+    case $(jq 'length' <<<"$matches") in
+      0) ;;
+      1)
+        view_id=$(jq -r '.[0].id' <<<"$matches")
+        view_name=$(jq -r '.[0].name' <<<"$matches")
+        previous_filter=$(jq -r '.[0].filter' <<<"$matches")
+        new_filter=$desired
+        if [[ $previous_filter != repo:* ]]; then
+          new_filter=$(legacy_filter_for "$title")
+        fi
+        if [[ $previous_filter =~ [[:space:]]is:issue[[:space:]]*$ ]]; then
+          new_filter+=' is:issue'
+        fi
+        gh api graphql -f view="$view_id" -f name="$view_name" -f filter="$new_filter" -f query='
+          mutation($view:ID!, $name:String!, $filter:String!) {
+            updateProjectV2View(input:{viewId:$view, name:$name, filter:$filter}) {
+              projectV2View { id }
+            }
+          }' >/dev/null
+        note "updated view scope: $title"
+        ensured_view_title=$title
+        return
+        ;;
+      *)
+        note "multiple views match the previous milestone '$previous'; leaving them for a maintainer"
+        return
+        ;;
+    esac
   fi
 
   status_rest_id=$(gh api --paginate "orgs/$owner/projectsV2/$project_number/fields" \
@@ -116,17 +133,6 @@ project_item_for_issue() {
       } }
     }' | jq -r --arg project "$project_id" \
       '[.[].data.node.projectItems.nodes[] | select(.project.id == $project)][0].id // empty'
-}
-
-remove_issue() {
-  local issue_id=$1 item_id
-  item_id=$(project_item_for_issue "$issue_id")
-  [[ -n $item_id ]] || return 0
-  gh api graphql -f project="$project_id" -f item="$item_id" -f query='
-    mutation($project:ID!, $item:ID!) {
-      deleteProjectV2Item(input:{projectId:$project, itemId:$item}) { deletedItemId }
-    }' >/dev/null
-  note "removed item $item_id"
 }
 
 set_status() {
@@ -155,10 +161,9 @@ upsert_issue() {
   number=$(jq -r '.number // empty' <<<"$issue")
   [[ -n $issue_id && -n $number ]] || die 'issue payload lacks node_id or number'
   title=$(jq -r '.milestone.title // empty' <<<"$issue")
-  if [[ -z $title ]]; then
-    remove_issue "$issue_id"
-    return
-  fi
+  # Shared projects also use label-filtered views. Milestone membership determines
+  # visibility in the milestone view, so removing it needs no Project item deletion.
+  [[ -n $title ]] || return 0
   state=$(jq -r --arg label "$progress_label" '
     if .state == "closed" then "Done"
     elif any(.labels[]?; .name == $label) then "In Progress"
@@ -198,7 +203,7 @@ upsert_issue() {
 }
 
 reconcile() {
-  local milestone_lines milestone encoded title number issue_lines issue_encoded issue cursor page stale_ids item_id
+  local milestone_lines milestone encoded title number issue_lines issue_encoded issue
   milestone_lines=$(gh api --paginate "repos/$repo/milestones?state=all&per_page=100" \
     --jq '.[] | @base64') || die 'cannot list milestones'
   while IFS= read -r encoded; do
@@ -218,44 +223,6 @@ reconcile() {
     done <<<"$issue_lines"
   done <<<"$milestone_lines"
 
-  # Repair items whose milestone was removed while the event workflow was unavailable.
-  cursor=''
-  stale_ids=''
-  while :; do
-    if [[ -n $cursor ]]; then
-      page=$(gh api graphql -f owner="$owner" -F number="$project_number" -f after="$cursor" -f query='
-        query($owner:String!, $number:Int!, $after:String) {
-          organization(login:$owner) { projectV2(number:$number) {
-            items(first:100, after:$after) { nodes { id content {
-              ... on Issue { milestone { title } repository { nameWithOwner } }
-            } } pageInfo { hasNextPage endCursor } }
-          } }
-        }')
-    else
-      page=$(gh api graphql -f owner="$owner" -F number="$project_number" -f query='
-        query($owner:String!, $number:Int!, $after:String) {
-          organization(login:$owner) { projectV2(number:$number) {
-            items(first:100, after:$after) { nodes { id content {
-              ... on Issue { milestone { title } repository { nameWithOwner } }
-            } } pageInfo { hasNextPage endCursor } }
-          } }
-        }')
-    fi
-    stale_ids+=$(jq -r --arg repo "$repo" '.data.organization.projectV2.items.nodes[]
-      | select(.content.repository.nameWithOwner == $repo and .content.milestone == null)
-      | .id' <<<"$page")$'\n'
-    [[ $(jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage' <<<"$page") == true ]] || break
-    cursor=$(jq -r '.data.organization.projectV2.items.pageInfo.endCursor' <<<"$page")
-    [[ -n $cursor && $cursor != null ]] || die 'project pagination returned no cursor'
-  done
-  while IFS= read -r item_id; do
-    [[ -n $item_id ]] || continue
-    gh api graphql -f project="$project_id" -f item="$item_id" -f query='
-      mutation($project:ID!, $item:ID!) {
-        deleteProjectV2Item(input:{projectId:$project, itemId:$item}) { deletedItemId }
-      }' >/dev/null
-    note "removed stale item $item_id"
-  done <<<"$stale_ids"
 }
 
 if [[ ${1:-} == --reconcile ]]; then
