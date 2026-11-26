@@ -5,7 +5,7 @@ from statistics import median
 
 
 FAILED_STATUSES = {"failed", "measurement-incomplete", "invalid", "out-of-memory"}
-INCOMPARABLE = {"environment-mismatch", "incompatible"}
+INCOMPARABLE = {"environment-mismatch", "incompatible", "zero-reference-no-absolute-rule"}
 
 
 def case_verdicts(results, baseline):
@@ -74,18 +74,22 @@ def classify(samples, rule):
     variation = max(observed) - min(observed)
     change = (current - reference) * direction
     minimum = max(rule["minimum_absolute"], rule["baseline_noise"])
-    def meets_ratio(delta, threshold):
-        return delta / reference >= threshold if reference else delta > 0
+    absolute = rule.get("zero_reference")
+
+    def meets_threshold(delta, level):
+        if reference:
+            return delta / reference >= rule[f"{level}_ratio"]
+        return delta >= absolute[f"{level}_absolute"] if absolute else delta > 0
 
     supporting = sum(
-        meets_ratio((value - reference) * direction, rule["suspect_ratio"])
+        meets_threshold((value - reference) * direction, "suspect")
         and (value - reference) * direction > minimum
         for value in observed
     )
     status = "normal"
-    if meets_ratio(change, rule["observe_ratio"]):
+    if meets_threshold(change, "observe"):
         status = "observe"
-    if (meets_ratio(change, rule["suspect_ratio"]) and change > minimum
+    if (meets_threshold(change, "suspect") and change > minimum
             and supporting >= rule["minimum_repeats"]):
         status = "suspected-regression"
     return {

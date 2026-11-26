@@ -135,9 +135,10 @@ final class CountingJoinStores implements JoinStores {
     }
 
     @Override
-    public void removeDimensionRow(String source, String dimensionKey) {
+    public boolean removeDimensionRow(String source, String dimensionKey, List<String> identityColumns,
+            String expectedIdentity) {
         writes++;
-        held.removeDimensionRow(source, dimensionKey);
+        return held.removeDimensionRow(source, dimensionKey, identityColumns, expectedIdentity);
     }
 
     @Override

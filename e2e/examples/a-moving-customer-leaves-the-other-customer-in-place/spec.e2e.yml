@@ -1,0 +1,31 @@
+name: a-moving-customer-leaves-the-other-customer-in-place
+setup:
+  databases:
+    shop: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  managed_target: views.tap.yml
+  apply: [shop_db.tap.yml, join_pipeline.tap.yml]
+  discover: [shop_db]
+pipeline: join_pipeline.tap.yml
+seed:
+  shop_db.customers:
+    values:
+      - { id: 11, match_ref: 1, name: returning }
+  shop_db.orders:
+    values:
+      - { id: 20, customer_ref: 1 }
+      - { id: 21, customer_ref: 702 }
+steps:
+  - start
+  - await: { doc: { views.order_state: { where: { order_id: 20 }, expect: { customer_name: returning } } } }
+  # A second source row now occupies the old match key.
+  - cdc: { shop_db.customers: { insert: { values: [ { id: 10, match_ref: 1, name: grace } ] } } }
+  - await: { doc: { views.order_state: { where: { order_id: 20 }, expect: { customer_name: grace } } } }
+  - cdc: { shop_db.customers: { update: { where: { id: 11 }, set: { match_ref: 702 } } } }
+  - await: { doc: { views.order_state: { where: { order_id: 21 }, expect: { customer_name: returning } } } }
+  # This lookup starts after the move reached the target, so it reads the current old-key state.
+  - cdc: { shop_db.orders: { insert: { values: [ { id: 22, customer_ref: 1 } ] } } }
+  - await: { doc: { views.order_state: { where: { order_id: 22 }, expect: { customer_name: grace } } } }
+  - assert: { doc: { views.order_state: { where: { order_id: 20 }, expect: { customer_name: grace } } } }
+  - assert: { count: { views.order_state: 3 } }

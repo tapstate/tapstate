@@ -323,12 +323,21 @@ class ScopedPipelineCaptureCoordinatorTest {
             assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
         }
     }
-    @Test void aRetiredOrSnapshotOnlySessionCannotSupplyACdcValidationRoute(){
-        try(var f=new Fixture()){
-            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
-            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
-            run.stopCapture("flow",false);
-            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+    @Test void aRetiredOrSnapshotOnlySessionCannotSupplyACdcValidationRoute() throws Exception {
+        try (var f = new Fixture()) {
+            var physical = new AtomicReference<CaptureRun>();
+            doAnswer(call -> {
+                var started = (CaptureRun) call.callRealMethod();
+                physical.set(started);
+                return started;
+            }).when(f.runtime).beginSnapshotOnly(any(), anyLong(), any(), any(), any());
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            assertThatThrownBy(() -> run.validationRoute("input", "orders")).isInstanceOf(TapstateException.class);
+            assertThat(physical.get().awaitLoaded(Duration.ofSeconds(3))).isTrue();
+            assertThat(physical.get().failure()).isEmpty();
+            run.stopCapture("flow", false);
+            assertThatThrownBy(() -> run.validationRoute("input", "orders")).isInstanceOf(TapstateException.class);
         }
     }
     private static final CacheBusinessScope BUSINESS=new CacheBusinessScope("cluster",1,"cache");
