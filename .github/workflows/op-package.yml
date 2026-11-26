@@ -190,7 +190,7 @@ jobs:
           PLATFORM: ${{ inputs.platform }}
           CONNECTOR_MODE: ${{ inputs.selection_mode }}
           TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS: "1"
-          TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "300"
+          TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
           TAPSTATE_OP_SELECTION_TIMEOUT_SECONDS: "600"
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           WEB_SHA: ${{ steps.web.outputs.sha }}
