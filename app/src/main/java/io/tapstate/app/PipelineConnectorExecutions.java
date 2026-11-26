@@ -94,12 +94,11 @@ final class PipelineConnectorExecutions {
     Selection selection(PipelineIntentScope scope, Runnable guard) {
         if (!(connectors instanceof LocalConnectorArtifacts)) return Selection.EMPTY;
         var port = intents.guardedBy(guard);
-        var state = port.connectorBindings().load(scope).orElse(null);
-        if (state == null) return Selection.EMPTY;
+        var reading = port.executionBindings(scope).orElse(null);
+        if (reading == null) return Selection.EMPTY;
+        var state = reading.bindings();
         var pending = state.handoff();
-        var intent = port.load(scope.pipelineId()).orElseThrow(PipelineConnectorExecutions::fenced);
-        if (!scope.equals(intent.scope())) throw fenced();
-        if (pending != null && pending.phase() == Phase.PREPARED && pending.intentRevision() == intent.intentRevision())
+        if (pending != null && pending.phase() == Phase.PREPARED && pending.intentRevision() == reading.intentRevision())
             return new Selection(pending.intentRevision(), pending.candidates(), state.effective());
         return new Selection(state.effectiveIntentRevision(), state.effective(), List.of());
     }

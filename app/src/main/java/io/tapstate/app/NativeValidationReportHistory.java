@@ -28,6 +28,7 @@ final class NativeValidationReportHistory implements AutoCloseable {
     private final ScheduledFuture<?> polling;
     private volatile boolean closed;
     private long nextAttempt;
+    private Long emptyRevision;
     private String pipeline,afterPipeline,afterTask;
     NativeValidationReportHistory(MongoConfigurationDomain configuration,MongoCacheDomain cache,CacheBusinessScope scope,
             Supplier<WorkloadClaimFence> node,Runnable active,ValidationMemberResources.Member resources,
@@ -46,10 +47,21 @@ final class NativeValidationReportHistory implements AutoCloseable {
     /** One saved task per pass, including after a refused original; no failed Pipeline can starve later Pipelines. */
     synchronized void scan(){
         requireActive();try(var frame=resources.admitMaintenanceMetadata()){
-            var tasks=configuration.pollingValidationTasks(this::requireActive);
+            Long revision = null;
+            if (pipeline == null && afterPipeline == null) {
+                revision = configuration.validationDiscoveryRevision();
+                if (revision.equals(emptyRevision)) return;
+            }
+            var tasks = configuration.pollingValidationTasks(this::requireActive);
             if(pipeline==null){
-                var next=tasks.pipelines(afterPipeline,1);if(next.isEmpty()){afterPipeline=null;return;}
-                pipeline=next.getFirst();afterTask=null;
+                var next=tasks.pipelines(afterPipeline,1);
+                if(next.isEmpty()){
+                    // Only an empty inventory can sleep until authoring changes. Existing tasks
+                    // still need periodic retention as time advances without a CONFIG write.
+                    if (revision != null && revision == configuration.validationDiscoveryRevision()) emptyRevision = revision;
+                    afterPipeline=null;return;
+                }
+                emptyRevision=null;pipeline=next.getFirst();afterTask=null;
             }
             var current=pipeline;final List<String> ids;
             try{ids=tasks.taskIds(current,afterTask,1);}

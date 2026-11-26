@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Next version from main's release history. Branch images receive a source-specific dev tag."
+        description: "Next version from main's release history. Publishes the shared dev tag and registers it in Cloud."
         type: choice
         options: [minor, patch, major]
         required: true
@@ -266,7 +266,7 @@ jobs:
         run: |
           {
             echo "Validate the dev image above in Cloud dev, using its digest reference."
-            echo "A repeated dev version may retain an older catalog record; verify the running image digest."
+            echo "Confirm that a new Cluster runs the digest verified in the catalog registration receipt."
             echo "Then review the draft release and use Review deployments to Approve or Reject this run."
             echo "Reject stops the release; the dev image and catalog entry remain available for diagnosis."
           } >> "$GITHUB_STEP_SUMMARY"

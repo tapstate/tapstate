@@ -97,6 +97,13 @@ final class ExecutionAuthorization implements AutoCloseable {
     private final ScheduledExecutorService refresher;
     private final ThreadPoolExecutor proofReaders;
     private final Map<ReadKey, ScopedProof> scopedProofs = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicReference<Predicate<ExecutionFence>> localWriterLease =
+            new java.util.concurrent.atomic.AtomicReference<>(fence -> false);
+
+    /** Single-node OP can reuse the same member's already-acknowledged original renewal. */
+    void useLocalWriterLease(Predicate<ExecutionFence> lease) {
+        localWriterLease.set(Objects.requireNonNull(lease, "lease"));
+    }
 
     private record ProofResult(Entry entry, boolean denied) {}
 
@@ -361,16 +368,17 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (proof == null) throw writerRefused(fence);
         proof.lastUsed = System.nanoTime();
         var entry = requireWriterLease(fence, proof);
-        if (nanoTime.getAsLong() - entry.deadlineNanos() >= 0)
-            throw new WriterProofUnavailable(proof, entry.leaseDeadlineNanos());
+        long now = nanoTime.getAsLong();
+        if (now - entry.deadlineNanos() < 0 || localWriterLease.get().test(fence)) return;
+        if (now - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);
+        throw new WriterProofUnavailable(proof, entry.leaseDeadlineNanos());
     }
 
     private Entry requireWriterLease(ExecutionFence fence, ScopedProof proof) {
         var result = proof.result;
         var entry = result.entry();
         if (!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean() || result.denied()
-                || entry == null || !matches(entry.claim(), fence)
-                || nanoTime.getAsLong() - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);
+                || entry == null || !matches(entry.claim(), fence)) throw writerRefused(fence);
         return entry;
     }
 
@@ -393,10 +401,13 @@ final class ExecutionAuthorization implements AutoCloseable {
                 TimeUnit.NANOSECONDS.toMillis(unavailable.leaseDeadline - nanoTime.getAsLong()), proof.readFailure);
         synchronized (proof) {
             while (true) {
-                long left = unavailable.leaseDeadline - nanoTime.getAsLong();
-                if (left <= 0 || scopedProofs.get(key) != proof) throw writerRefused(fence);
+                if (scopedProofs.get(key) != proof) throw writerRefused(fence);
                 var entry = requireWriterLease(fence, proof);
-                if (nanoTime.getAsLong() - entry.deadlineNanos() < 0) break;
+                if (localWriterLease.get().test(fence)) break;
+                long now = nanoTime.getAsLong();
+                long left = unavailable.leaseDeadline - now;
+                if (left <= 0 || now - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);
+                if (now - entry.deadlineNanos() < 0) break;
                 proof.lastUsed = System.nanoTime();
                 requestScopedProof(key, proof, false);
                 try {
@@ -547,8 +558,9 @@ final class ExecutionAuthorization implements AutoCloseable {
                 if (liveMatch(result, matches)) return entry;
                 if (entry != null && !precedes.test(entry)
                         && (result.denied() || !matches.test(entry))) return null;
-                // A completed read that cannot prove the requested fence is already an answer.
-                if (proof.revision != initialRevision) return null;
+                // A matching proof spent in flight still needs a fresh reading within this wait.
+                if (proof.revision != initialRevision
+                        && (entry == null || result.denied() || !matches.test(entry))) return null;
                 if (entry == null && result.denied() && proof.readFailure != null
                         && System.nanoTime() - proof.nextRead < 0) return null;
 

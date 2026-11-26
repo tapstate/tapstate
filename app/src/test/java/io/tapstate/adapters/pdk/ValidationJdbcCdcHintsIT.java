@@ -44,6 +44,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -116,11 +118,22 @@ class ValidationJdbcCdcHintsIT {
                             new Change(DELETE, key(FIRST + 1), null));
             var failures = new ValidationFailureLatch();
             var extractor = extractor();
+            var duringSettlement = new ThreadLocal<Runnable>();
+            var mysqlInsertDelivered = new CountDownLatch(1);
+            var mysqlChangesDelivered = new CountDownLatch(1);
             try (var queue = new ValidationCandidateQueue(run,
                         new ValidationCandidateQueue.Limits(8, 65536, 64, 2, 0, Duration.ofSeconds(60).toNanos()), System::nanoTime);
                  var inbox = new ValidationRootHintInbox(queue, List.of(sender), new ValidationRootHintInbox.Limits(1, 65536, 32, 65536));
                  var outbox = new ValidationRootHintOutbox(run, sender, new ValidationRootHintOutbox.Limits(16, 262144, 32, 65536,
-                        2, Duration.ofMillis(10).toNanos(), Duration.ofSeconds(60).toNanos()), System::nanoTime);
+                        2, Duration.ofMillis(10).toNanos(), Duration.ofSeconds(60).toNanos()), () -> {
+                            // Pause the settlement thread while it holds the outbox lock, as a scheduler can.
+                            var overlap = duringSettlement.get();
+                            if (overlap != null) {
+                                duringSettlement.remove();
+                                overlap.run();
+                            }
+                            return System.nanoTime();
+                        });
                  var observations = new ValidationCaptureObservations("fixture", "capture", "boot",
                          new ValidationCaptureObservations.Limits(1, new ValidationCaptureHintRegistry.Limits(1, 65536,
                                  new ValidationCaptureHintTap.Limits(32, 1, 65536))))) {
@@ -132,7 +145,10 @@ class ValidationJdbcCdcHintsIT {
                                 if (event.op() == Op.DDL) continue;
                                 assertThat(event.src()).isEqualTo(TABLE);
                                 assertThat(event.op()).isIn(Op.INSERT, Op.UPDATE, Op.DELETE);
-                                if (count.incrementAndGet() > 8) throw new AssertionError("unexpected fixture event count");
+                                int seen = count.incrementAndGet();
+                                if (seen > 8) throw new AssertionError("unexpected fixture event count");
+                                if (mysql && seen == 1) mysqlInsertDelivered.countDown();
+                                if (mysql && seen == expected.size()) mysqlChangesDelivered.countDown();
                             }
                         } catch (RuntimeException | Error failure) { failures.record(failure); }
                     }
@@ -149,14 +165,19 @@ class ValidationJdbcCdcHintsIT {
                     String originalReader = readerIdentity(source, mysql);
                     var registration = observations.register(captureContext, new ValidationCaptureHintTap.Binding(outbox, extractor::extract));
                     assertThat(readerIdentity(source, mysql)).isEqualTo(originalReader);
-                    sql(source, mysql, "INSERT INTO " + TABLE + " VALUES (" + FIRST + ", 'inserted'); "
-                            + "UPDATE " + TABLE + " SET value='same-key' WHERE id=" + FIRST + "; "
+                    String insert = "INSERT INTO " + TABLE + " VALUES (" + FIRST + ", 'inserted'); ";
+                    String updatesAndDelete = "UPDATE " + TABLE + " SET value='same-key' WHERE id=" + FIRST + "; "
                             + "UPDATE " + TABLE + " SET id=" + (FIRST + 1) + " WHERE id=" + FIRST + "; "
-                            + "DELETE FROM " + TABLE + " WHERE id=" + (FIRST + 1) + ";");
+                            + "DELETE FROM " + TABLE + " WHERE id=" + (FIRST + 1) + ";";
+                    sql(source, mysql, mysql ? insert : insert + updatesAndDelete);
+                    if (mysql) {
+                        assertThat(mysqlInsertDelivered.await(20, TimeUnit.SECONDS)).as("initial MySQL insert delivered").isTrue();
+                    }
+                    Runnable overlap = mysql ? () -> writeDuringSettlement(source, updatesAndDelete, mysqlChangesDelivered) : null;
                     long deadline = System.nanoTime() + Duration.ofSeconds(45).toNanos();
                     do {
                         assertHealthy(failures, outbox, inbox);
-                        pump(outbox, inbox, delivered, deliveryShapes);
+                        pump(outbox, inbox, delivered, deliveryShapes, duringSettlement, delivered.isEmpty() ? overlap : null);
                         if (delivered.size() == expected.size() && outbox.snapshot().packets() == 0) break;
                         Thread.sleep(20);
                     } while (System.nanoTime() < deadline);
@@ -207,16 +228,40 @@ class ValidationJdbcCdcHintsIT {
         }
     }
 
+    private static void writeDuringSettlement(GenericContainer<?> source, String statements, CountDownLatch delivered) {
+        try {
+            sql(source, true, statements);
+            // The original listener observes these rows after the capture tap has offered their hints.
+            assertThat(delivered.await(20, TimeUnit.SECONDS)).as("MySQL changes delivered during settlement").isTrue();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(failure);
+        } catch (Exception failure) {
+            throw new AssertionError(failure);
+        }
+    }
+
     private static void pump(ValidationRootHintOutbox outbox, ValidationRootHintInbox inbox, List<Change> delivered,
-                             List<List<ValidationRootHintBatch.ChangeKind>> shapes) {
+                             List<List<ValidationRootHintBatch.ChangeKind>> shapes, ThreadLocal<Runnable> duringSettlement,
+                             Runnable overlap) {
         var next = outbox.poll();
         if (next.isEmpty()) return;
         var lease = next.orElseThrow();
         var receipt = inbox.tryAccept(lease.batch());
-        assertThat(outbox.settle(lease, receipt)).isEqualTo(ValidationRootHintOutbox.Settlement.ACCEPTED);
+        ValidationRootHintOutbox.Settlement settlement;
+        if (overlap != null) duringSettlement.set(overlap);
+        try {
+            settlement = outbox.settle(lease, receipt);
+        } finally {
+            duringSettlement.remove();
+        }
+        var shape = lease.batch().changes().stream().map(Change::kind).toList();
+        assertThat(settlement).as("hint packet %s shape=%s receipt=%s outboxFailure=%s inboxFailure=%s",
+                lease.batch().sequence(), shape, receipt.disposition(), outbox.failure().orElse(null), inbox.snapshot().failure())
+                .isEqualTo(ValidationRootHintOutbox.Settlement.ACCEPTED);
         assertThat(delivered.size() + lease.batch().changes().size()).isLessThanOrEqualTo(8);
         delivered.addAll(lease.batch().changes());
-        shapes.add(lease.batch().changes().stream().map(Change::kind).toList());
+        shapes.add(shape);
     }
     private static void assertHealthy(ValidationFailureLatch failures, ValidationRootHintOutbox outbox, ValidationRootHintInbox inbox) {
         assertThat(failures.get()).isNull(); assertThat(outbox.failure()).isEmpty(); assertThat(inbox.snapshot().failure()).isNull();

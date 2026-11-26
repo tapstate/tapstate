@@ -142,8 +142,10 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             for (var consumer : retained.consumers()) {
                 recordRetentionFloors(floors, retained.chain(), consumer.membership(), consumer.ringDoneThrough());
             }
-        } else if (!readRetentionFloors(stores, chainId, floors)) {
-            return;
+        } else {
+            var confirmed = stores.consumers().retentionFloors(chainId, stores.chains());
+            if (confirmed.isEmpty()) return;
+            floors.putAll(confirmed.orElseThrow());
         }
         for(var entry:floors.entrySet())if(entry.getValue()>=0) {
             fixed.run();String ring=SrsRingbuffer.ringName(chainId,entry.getKey());
@@ -151,19 +153,6 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             if(entry.getValue()>trimmed) {stores.log().trim(ring,entry.getValue(),originalCapture);fixed.run();}
         }
         stores.models().reclaim(chainId,originalCapture);fixed.run();
-    }
-
-    private static boolean readRetentionFloors(SrsStores stores, String chainId, Map<String, Long> floors) {
-        var chain = stores.chains().load(chainId).orElseThrow(() ->
-                new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chainId), null));
-        for (var member : stores.consumers().attached(chainId).consumers()) {
-            if (Collections.disjoint(member.tables(), chain.servingTables())) continue;
-            var held = stores.consumers().progress(member.context());
-            // An intervening detach or replacement abandons the separate-read pass.
-            if (held.isEmpty() || held.orElseThrow().membershipRevision() != member.revision()) return false;
-            recordRetentionFloors(floors, chain, member, held.orElseThrow().ringDoneThrough());
-        }
-        return true;
     }
 
     private static void recordRetentionFloors(Map<String, Long> floors, SrsChainState chain,
@@ -187,15 +176,30 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive) {
         return beginSnapshot(run, config, firstSnapshotEpoch, ports, handoff, requireActive, null, java.time.Instant.EPOCH, ignored -> {});
     }
-    // The returned run/background owns the load; failed startup closes it or retains the original cleanup owner.
-    @SuppressWarnings("java:S2095")
+    /** Continues the exact post-tail consumer receipt; the original revision still governs pin publication. */
+    public synchronized CaptureRun resumeSnapshot(SrsConsumerRun run,CaptureConfig config,long firstSnapshotEpoch,
+            Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive,
+            SrsConsumerProgress retained) {
+        return beginSnapshot(run, config, firstSnapshotEpoch, ports, handoff, requireActive,
+                null, java.time.Instant.EPOCH, ignored -> {}, Objects.requireNonNull(retained, "retained"));
+    }
+
     public synchronized CaptureRun beginSnapshot(SrsConsumerRun run,CaptureConfig config,long firstSnapshotEpoch,
             Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive,
             SrsFreshFullPreparation freshFull, java.time.Instant preparedAt, java.util.function.Consumer<SrsFreshFullReceipt> beforeRows) {
+        return beginSnapshot(run, config, firstSnapshotEpoch, ports, handoff, requireActive, freshFull, preparedAt, beforeRows, null);
+    }
+
+    // The returned run/background owns the load; failed startup closes it or retains the original cleanup owner.
+    @SuppressWarnings("java:S2095")
+    private CaptureRun beginSnapshot(SrsConsumerRun run,CaptureConfig config,long firstSnapshotEpoch,
+            Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive,
+            SrsFreshFullPreparation freshFull, java.time.Instant preparedAt, java.util.function.Consumer<SrsFreshFullReceipt> beforeRows,
+            SrsConsumerProgress retained) {
         Runnable fixed = guard(requireActive); fixed.run();
         var rings = new TreeMap<String,String>();
         for (String table : config.streams()) rings.put(table,SrsRingbuffer.ringName(run.miningChainId(),table));
-        var preparation = new SrsSnapshotPreparation(views,run,rings,firstSnapshotEpoch,fixed,freshFull,preparedAt);
+        var preparation = new SrsSnapshotPreparation(views,run,rings,firstSnapshotEpoch,fixed,freshFull,preparedAt,retained);
         SnapshotPhase.Load load = null; CaptureRun provisional = null;
         try {
             load = SnapshotPhase.openPrepared(Objects.requireNonNull(ports.apply(preparation),"prepared snapshot port"),config,preparation,session -> retainSession(session,requireActive));

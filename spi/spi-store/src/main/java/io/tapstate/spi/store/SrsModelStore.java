@@ -37,6 +37,39 @@ public interface SrsModelStore {
         return publishInitial(key, ring, observed, originalCapture);
     }
 
+    /** One source session's fixed initial observations; each key remains in its original capture context. */
+    record InitialObservation(String ring, SourceTable table) {
+        public InitialObservation {
+            java.util.Objects.requireNonNull(ring, "ring");
+            java.util.Objects.requireNonNull(table, "table");
+        }
+    }
+
+    /** Exact baseline bodies read together when the adapter supports a coherent snapshot. */
+    default Map<SrsModelKey, SrsModel> requireAll(java.util.Set<SrsModelKey> keys) {
+        var result = new java.util.LinkedHashMap<SrsModelKey, SrsModel>();
+        for (var key : java.util.Set.copyOf(keys)) result.put(key, require(key));
+        return Map.copyOf(result);
+    }
+
+    /**
+     * Publishes one session's observations after the caller has compared every original baseline.
+     * A native implementation freezes proposals before its publication transaction can retry.
+     * Results are usable only after the entire call succeeds; no callback-local state is exposed.
+     */
+    default Map<SrsModelKey, SrsModel> publishObservedInitials(Map<SrsModelKey, InitialObservation> observations,
+            WorkloadClaimFence originalCapture, SourceModelComparison comparison) {
+        var result = new java.util.LinkedHashMap<SrsModelKey, SrsModel>();
+        for (var entry : Map.copyOf(observations).entrySet()) {
+            var observation = entry.getValue();
+            var saved = comparison == SourceModelComparison.DECLARED_STRUCTURE
+                    ? publishInitial(entry.getKey(), observation.ring(), observation.table(), originalCapture)
+                    : publishObservedInitial(entry.getKey(), observation.ring(), observation.table(), originalCapture, comparison);
+            result.put(entry.getKey(), saved);
+        }
+        return Map.copyOf(result);
+    }
+
     /** Each table/capture starts at actual version zero and advances by one; identical captured retries are safe. */
     SrsModel publish(SrsModel model, WorkloadClaimFence captureFence);
 

@@ -3,6 +3,7 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.tuple;
 
 import com.hazelcast.function.SupplierEx;
@@ -469,6 +470,32 @@ class StoreBackedDagSourceTargetModelTest {
                     .containsExactly(
                             tuple("id", true), tuple("item_no", true), tuple("items", false));
         });
+    }
+
+    @Test
+    void anUpsertSyncRefusesADroppedUnwindLocator() {
+        InMemoryStorePort store = seededPipeline();
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("explode", FromClause.list(FromRef.literal("orders_src")),
+                                new TransformBody.Unwind("items", "item_no", null, null, null), null),
+                        Step.inline("project", FromClause.list(FromRef.literal("explode")),
+                                new TransformBody.MapProjection(Map.of("item_no",
+                                        io.tapstate.core.model.FieldRule.drop())), null)),
+                null, new ServeBlock.Inline(null, FromRef.literal("project"),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null),
+                null, null));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders",
+                List.of(new SourceField("id", "INT"), new SourceField("items", "JSON")),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        Throwable refusal = catchThrowable(() -> new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p"));
+
+        assertThat(refusal).as("upsert must refuse the dropped Unwind locator (published primary keys %s)",
+                        bound.stream().map(target -> target.fields().stream().filter(TargetField::primaryKey)
+                                .map(TargetField::name).toList()).toList())
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ActuationError.SYNC_OUTPUT_IDENTITY_UNRESOLVED));
     }
 
     @Test

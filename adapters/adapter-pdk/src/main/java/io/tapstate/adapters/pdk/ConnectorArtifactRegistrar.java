@@ -54,6 +54,7 @@ import java.util.function.Supplier;
  * registered connector without a row.
  */
 public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
+    private static final String ARTIFACT_PARAMETER = "artifact";
     private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ConnectorArtifactRegistrar.class);
 
     /**
@@ -136,7 +137,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
 
     /** Registers the artifact at {@code artifact} if its content hash is not already registered. */
     public RegistrationOutcome register(Path artifact, RegistrationSource source) {
-        Objects.requireNonNull(artifact, "artifact");
+        Objects.requireNonNull(artifact, ARTIFACT_PARAMETER);
         Objects.requireNonNull(source, "source");
         long scanStarted = System.nanoTime();
         IntrospectedConnector introspected = introspector.introspect(List.of(artifact));
@@ -233,7 +234,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
      */
     @Override
     public RegistrationOutcome register(byte[] artifact, RegistrationSource source) {
-        Objects.requireNonNull(artifact, "artifact");
+        Objects.requireNonNull(artifact, ARTIFACT_PARAMETER);
         Objects.requireNonNull(source, "source");
         Path staged = stage(artifact);
         try {
@@ -400,7 +401,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     private static TapstateException specInvalid(
             IntrospectedConnector introspected, Path artifact, String detail, Throwable cause) {
         return new TapstateException(ConnectorError.SPEC_INVALID,
-                Map.of("artifact", artifact.getFileName().toString(),
+                Map.of(ARTIFACT_PARAMETER, artifact.getFileName().toString(),
                         "spec", introspected.specPath(),
                         "detail", detail),
                 cause);
@@ -410,13 +411,17 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         try (var bytes = Files.newInputStream(artifact)) {
             return ContentHash.of(bytes);
         } catch (IOException failure) {
-            throw artifactUnreadable(artifact);
+            throw artifactUnreadable(artifact, failure);
         }
     }
 
     static TapstateException artifactUnreadable(Path artifact) {
+        return artifactUnreadable(artifact, null);
+    }
+
+    static TapstateException artifactUnreadable(Path artifact, IOException cause) {
         return new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
-                Map.of("artifact", artifact.getFileName().toString()), null);
+                Map.of(ARTIFACT_PARAMETER, artifact.getFileName().toString()), cause);
     }
 
     private static void phase(String connectorId, String phase, long started) {

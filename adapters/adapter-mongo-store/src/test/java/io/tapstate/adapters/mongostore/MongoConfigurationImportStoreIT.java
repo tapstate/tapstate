@@ -390,14 +390,35 @@ class MongoConfigurationImportStoreIT {
             assertThat(domain.artifacts().get(SOURCE.id())).isEmpty();
         });
     }
-    @Test void missingIndexOrOperationFieldsAreNotRebuiltByAnOrdinaryRequest() {
-        withConfiguration(StorageBinding.Mode.OP,(domain,db) -> {
-            var imports = domain.imports(); var scope = scope(domain,StorageBinding.Mode.OP); var ticket = imports.preflight(scope,small()).ticket();
-            SystemCollections.CONFIGURATION_IMPORTS.on(db).updateOne(new Document("_id",ticket.id()),new Document("$unset",new Document("activeSlot",1)));
-            assertThatThrownBy(() -> imports.find(scope,ticket.id())).isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
-            SystemCollections.CONFIGURATION_IMPORTS.on(db).dropIndex("configuration_import_active_slot");
-            assertThatThrownBy(() -> imports.preflight(scope,small())).isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
-            assertThat(SystemCollections.CONFIGURATION_IMPORTS.on(db).listIndexes().into(new ArrayList<>())).noneMatch(index -> "configuration_import_active_slot".equals(index.get("name")));
+    @Test void ordinaryImportDoesNotAuditItsCatalogAndStillRejectsMalformedRows() {
+        withConfiguration(StorageBinding.Mode.OP, (domain, db) -> {
+            var imports = domain.imports();
+            var scope = scope(domain, StorageBinding.Mode.OP);
+            var rows = SystemCollections.CONFIGURATION_IMPORTS.on(db);
+            String index = "configuration_import_active_slot";
+            rows.dropIndex(index);
+            var sourceIndex = SystemCollections.SOURCES.indexes().getFirst();
+            SystemCollections.SOURCES.on(db).dropIndex(sourceIndex.indexName());
+            ConfigurationImportStore.Status opened;
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                opened = imports.preflight(scope, small());
+                assertThat(imports.find(scope, opened.ticket().id())).contains(opened);
+                var snapshot = diagnostics.snapshot();
+                assertThat(snapshot).containsEntry("complete", true);
+                assertThat((List<?>) snapshot.get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
+            assertThat(domain.inspectStructure(new MongoReadBudget(java.time.Duration.ofSeconds(5))))
+                    .anySatisfy(difference -> {
+                        assertThat(difference.index()).isEqualTo(index);
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                        assertThat(difference.repairCommand()).isNull();
+                    });
+            rows.updateOne(new Document("_id", opened.ticket().id()), new Document("$unset", new Document("activeSlot", 1)));
+            assertThatThrownBy(() -> imports.find(scope, opened.ticket().id()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(rows.listIndexes().into(new ArrayList<>()))
+                    .noneMatch(row -> index.equals(row.get("name")));
         });
     }
     @Test void boundDefaultTargetIsAReadOnlyHashCheckedDependencyOfTheFinalPipeline() {

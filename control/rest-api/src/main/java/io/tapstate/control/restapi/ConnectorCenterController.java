@@ -87,7 +87,7 @@ final class ConnectorCenterController {
         try {
             return installation(service.upload(request.getInputStream(), request.getContentLengthLong(), expectedConnectorId, principal));
         } catch (IOException unreadable) {
-            throw MalformedRequest.rejecting("the connector artifact could not be read", null);
+            throw MalformedRequest.rejecting("the connector artifact could not be read", unreadable);
         }
     }
 
