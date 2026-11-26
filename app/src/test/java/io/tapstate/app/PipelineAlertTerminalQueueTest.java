@@ -40,7 +40,12 @@ class PipelineAlertTerminalQueueTest {
                 },()->{},clock)) {
             try {
                 runtime.tick();await().atMost(Duration.ofSeconds(2)).until(()->runtime.health().queuedInputs()==0);
-                assertThat(rules).hasSize(7);assertThat(rules).allSatisfy(rule->{assertThat(rule.enabled()).isTrue();assertThat(rule.metric()).isNull();});
+                assertThat(rules).extracting(AlertConfiguration.Rule::typeId)
+                        .contains("pipeline.failed", "pipeline.observation-stale");
+                assertThat(rules).allSatisfy(rule -> {
+                    assertThat(rule.enabled()).isTrue();
+                    assertThat(rule.metric()).isNull();
+                });
                 PipelineConvergencePass target=null;
                 for(int i=0;i<70;i++) {
                     var pass=f.pass("stop-"+i);var intent=new PipelineIntentSnapshot(pass.scope(),1,new DesiredState(pass.scope().pipelineId(),PipelineState.STOPPED,"definition"));

@@ -120,7 +120,7 @@ final class BuiltinResourceSignals {
         evidence.put(value.resource(),value);
     }
     void cacheOperation(boolean write,Throwable failure){
-        if(failure!=null&&(!(failure instanceof TapstateException e)||e.code()!=IoError.STORE_UNAVAILABLE&&e.code()!=IoError.STORE_UNAUTHORIZED))return;
+        if (!sampleCacheOperation(failure)) return;
         synchronized(cacheSampling){
             Instant now=clock.instant(),previous=write?lastHealthyCacheWrite:lastHealthyCacheRead;
             // Keep periodic health without letting ordinary claim traffic consume the alert queue.
@@ -133,6 +133,12 @@ final class BuiltinResourceSignals {
             // This records attempted publication only; all failures and the next success remain immediate.
             if(write)lastHealthyCacheWrite=failure==null?now:null;else lastHealthyCacheRead=failure==null?now:null;
         }
+    }
+    private static boolean sampleCacheOperation(Throwable failure) {
+        if (failure == null) return true;
+        if (failure instanceof WorkloadClaimRenewalException renewal && renewal.isWriteConflict()) return false;
+        return failure instanceof TapstateException error
+                && (error.code() == IoError.STORE_UNAVAILABLE || error.code() == IoError.STORE_UNAUTHORIZED);
     }
     static boolean connectionFailure(Throwable failure){
         var seen=Collections.newSetFromMap(new IdentityHashMap<Throwable,Boolean>());
