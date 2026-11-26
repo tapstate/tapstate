@@ -4,8 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.StringReference;
+import com.sun.jdi.VMDisconnectedException;
+import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
@@ -22,11 +25,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -91,7 +91,9 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                     MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
                             new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)));
                     MongoCacheDomain cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
-                            Duration.ofSeconds(5), "placement-witness")) {
+                            Duration.ofSeconds(5), "placement-witness");
+                    var firstClaims = new ClaimBreakpoint(cluster.processCarrying(TwoMemberCluster.NODE_A));
+                    var secondClaims = new ClaimBreakpoint(cluster.processCarrying(TwoMemberCluster.NODE_B))) {
                 var claims = cache.workloadClaims(configuration.bindings().cachePreparation().orElseThrow().businessScope());
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
@@ -99,11 +101,8 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 control.discoverSchema(SOURCE_ID, CONNECTOR, Map.of("uri", sourceUri));
 
                 String first = pipelineId(1);
-                EndpointAddress firstTarget = withClaimsHeld(cluster.processCarrying(TwoMemberCluster.NODE_B), Set.of(first), () -> {
-                    var target = startPipelineInto(control, 1, sourceUri, run);
-                    awaitController(control, first, TwoMemberCluster.NODE_A);
-                    return target;
-                });
+                EndpointAddress firstTarget = startWithContestedClaim(control, TwoMemberCluster.NODE_A, firstClaims, secondClaims,
+                        1, sourceUri, run);
                 Await.until("the first pipeline's load to cross",
                         () -> mongo.count(firstTarget, TABLE) >= SEEDED_ROWS,
                         () -> "rows at the first target = " + mongo.count(firstTarget, TABLE));
@@ -120,16 +119,13 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 Placement firstPlacement = tracePlacement(configuration, claims, control, cluster, storage,
                         first, holder, TwoMemberCluster.NODE_A);
                 candidates.add(first, firstPlacement.driver(), firstPlacement.trace());
-                var remoteTargets = withClaimsHeld(cluster.processCarrying(holder),
-                        Set.of(pipelineId(2), pipelineId(3)), () -> {
-                            var targets = new LinkedHashMap<String, EndpointAddress>();
-                            for (int n = 2; n <= PIPELINES; n++) {
-                                String pipeline = pipelineId(n);
-                                targets.put(pipeline, startPipelineInto(remote, n, sourceUri, run));
-                                awaitController(remote, pipeline, remoteMember);
-                            }
-                            return targets;
-                        });
+                ClaimBreakpoint holderClaims = holder.equals(TwoMemberCluster.NODE_A) ? firstClaims : secondClaims;
+                ClaimBreakpoint remoteClaims = holderClaims == firstClaims ? secondClaims : firstClaims;
+                var remoteTargets = new LinkedHashMap<String, EndpointAddress>();
+                for (int n = 2; n <= PIPELINES; n++) {
+                    remoteTargets.put(pipelineId(n),
+                            startWithContestedClaim(remote, remoteMember, remoteClaims, holderClaims, n, sourceUri, run));
+                }
                 for (var remoteTarget : remoteTargets.entrySet()) {
                     String pipeline = remoteTarget.getKey();
                     EndpointAddress target = remoteTarget.getValue();
@@ -220,47 +216,106 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 () -> "controller=" + control.pipelineControllerOf(pipeline));
     }
 
-    private static <T> T withClaimsHeld(RealProcessServer contender, Set<String> pipelines, Callable<T> start)
-            throws Exception {
-        var vm = contender.attachDebugger();
-        var held = new ArrayList<EventSet>();
+    private static EndpointAddress startWithContestedClaim(ControlPlane control, String owner,
+            ClaimBreakpoint ownerClaim, ClaimBreakpoint contenderClaim, int number, String sourceUri, String run) throws Exception {
+        String pipeline = pipelineId(number);
         try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
-            var store = vm.classesByName("io.tapstate.adapters.mongostore.MongoCacheWorkloadClaimStore").getFirst();
-            var method = store.methodsByName("acquirePipeline").getFirst();
-            var request = vm.eventRequestManager().createBreakpointRequest(method.location());
-            request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-            request.enable();
-            var result = workers.submit(start);
+            contenderClaim.arm();
+            ownerClaim.arm();
+            var result = workers.submit(() -> {
+                var target = startPipelineInto(control, number, sourceUri, run);
+                awaitController(control, pipeline, owner);
+                return target;
+            });
             long deadline = System.nanoTime() + Duration.ofSeconds(120).toNanos();
             try {
                 while (!result.isDone() && System.nanoTime() < deadline) {
-                    var events = vm.eventQueue().remove(100);
-                    if (events == null) continue;
-                    if (events.stream().anyMatch(event -> event instanceof BreakpointEvent hit
-                            && request.equals(hit.request()) && targets(hit, pipelines))) {
-                        held.add(events);
-                    } else {
-                        events.resume();
-                    }
+                    contenderClaim.observeAndHold(pipeline);
+                    ownerClaim.observeAndHold(pipeline);
+                    // Give the selected member a turn only while its competitor is suspended.
+                    if (contenderClaim.observed) ownerClaim.releaseHeld();
                 }
-                return result.get(1, TimeUnit.SECONDS);
+                if (result.isDone()) {
+                    EndpointAddress target = result.get();
+                    assertThat(contenderClaim.observed).as("a competing Mongo claim for %s was held", pipeline).isTrue();
+                    assertThat(ownerClaim.observed).as("the selected Mongo claim for %s was observed", pipeline).isTrue();
+                    return target;
+                }
+                throw new AssertionError("Claim scheduling timed out for " + pipeline
+                        + "; competing attempt observed=" + contenderClaim.observed
+                        + "; selected attempt observed=" + ownerClaim.observed);
             } finally {
-                request.disable();
-                held.forEach(EventSet::resume);
                 result.cancel(true);
+                try {
+                    ownerClaim.disarm();
+                } finally {
+                    contenderClaim.disarm();
+                }
             }
-        } finally {
-            vm.dispose();
         }
     }
 
-    private static boolean targets(BreakpointEvent hit, Set<String> pipelines) {
-        try {
-            var scope = (ObjectReference) hit.thread().frame(0).getArgumentValues().getFirst();
-            return scope.getValue(scope.referenceType().fieldByName("pipelineId")) instanceof StringReference id
-                    && pipelines.contains(id.value());
-        } catch (com.sun.jdi.IncompatibleThreadStateException failure) {
-            throw new AssertionError("The claim breakpoint did not suspend its worker", failure);
+    private static final class ClaimBreakpoint implements AutoCloseable {
+        private final VirtualMachine vm;
+        private final BreakpointRequest request;
+        private final List<EventSet> held = new ArrayList<>();
+        private boolean observed;
+
+        ClaimBreakpoint(RealProcessServer process) throws Exception {
+            vm = process.attachDebugger();
+            try {
+                var store = vm.classesByName("io.tapstate.adapters.mongostore.MongoCacheWorkloadClaimStore").getFirst();
+                var method = store.methodsByName("acquirePipeline").getFirst();
+                request = vm.eventRequestManager().createBreakpointRequest(method.location());
+                request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            } catch (Exception | Error failure) {
+                vm.dispose();
+                throw failure;
+            }
+        }
+
+        void arm() {
+            observed = false;
+            request.enable();
+        }
+
+        void observeAndHold(String pipeline) throws InterruptedException {
+            var events = vm.eventQueue().remove(50);
+            if (events == null) return;
+            if (events.stream().anyMatch(event -> event instanceof BreakpointEvent hit
+                    && request.equals(hit.request()) && pipeline.equals(pipelineOf(hit)))) {
+                observed = true;
+                held.add(events);
+            } else {
+                events.resume();
+            }
+        }
+
+        void releaseHeld() {
+            held.forEach(EventSet::resume);
+            held.clear();
+        }
+
+        void disarm() {
+            request.disable();
+            releaseHeld();
+        }
+
+        @Override public void close() {
+            try {
+                vm.dispose();
+            } catch (VMDisconnectedException closed) {
+                // This witness intentionally kills the capture holder before the debugger scope ends.
+            }
+        }
+
+        private static String pipelineOf(BreakpointEvent hit) {
+            try {
+                var scope = (ObjectReference) hit.thread().frame(0).getArgumentValues().getFirst();
+                return ((StringReference) scope.getValue(scope.referenceType().fieldByName("pipelineId"))).value();
+            } catch (com.sun.jdi.IncompatibleThreadStateException failure) {
+                throw new AssertionError("The claim breakpoint did not suspend its worker", failure);
+            }
         }
     }
 
