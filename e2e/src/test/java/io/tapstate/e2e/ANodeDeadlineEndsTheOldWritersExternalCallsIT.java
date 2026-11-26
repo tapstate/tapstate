@@ -42,6 +42,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
             var topology = new MongoRenewedTopology(storage.clusterId());
             try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
                 var control = ControlPlane.direct(server.baseUrl());
+                storage.loginAndAwaitBusiness(control);
                 var child = businessContext(server);
                 var member = child.getBean(HazelcastInstance.class);
                 commitRenewedTopology(storage, topology, server, member, control);
@@ -135,7 +136,6 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         assertThat(original.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
         try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
             assertThat(peer.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.PEER));
-            storage.loginAndAwaitBusiness(control);
             storage.loginAndAwaitBusiness(ControlPlane.direct(peer.baseUrl()));
             Await.until("the real two-member topology to form", BOUND,
                     () -> member.getCluster().getMembers().size() == 2,
