@@ -7,14 +7,15 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.testsupport.RequiresDocker;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,7 +52,9 @@ class ThreeLayerCacheReconstructionIT {
         NativeMongoStorageFixture.prepare(configUri, new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                 CACHE.getReplicaSetUrl(cacheDb), cacheDb, null), DATA.getReplicaSetUrl(targetDb), cluster);
         byte[] originalJar = ConnectorJars.bytesFor("mongodb");
-        String originalHash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(originalJar));
+        String originalHash = ContentHash.of(originalJar);
+        Path firstPlugins = work.resolve("first-plugins");
+        Path replacementPlugins = work.resolve("replacement-plugins");
         try (var configClient = MongoClients.create(CONFIG.getReplicaSetUrl());
                 var cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
                 var dataClient = MongoClients.create(DATA.getReplicaSetUrl())) {
@@ -63,7 +66,7 @@ class ThreeLayerCacheReconstructionIT {
                     row(200).append("customer_id", 2L).append("qty", 4L)));
             source.getCollection("order_items").insertMany(List.of(row(11).append("order_id", 100L).append("sku", "first"),
                     row(12).append("order_id", 100L).append("sku", "second"), row(21).append("order_id", 200L).append("sku", "third")));
-            var first = start(configUri, cluster);
+            var first = start(configUri, cluster, firstPlugins);
             try (first) {
                 var control = login(first); control.registerConnector("mongodb", originalJar);
                 var resources = resources(sourceUri);
@@ -72,12 +75,11 @@ class ThreeLayerCacheReconstructionIT {
                 control.discoverSchema("input", "mongodb", Map.of("isUri", true, "uri", sourceUri));
                 for (String pipeline : PIPELINES) { control.lifecycle(pipeline, LifecycleVerb.START); completed(control, pipeline); }
                 awaitResults(source, target);
-                assertThat(cache.getCollection("connector_artifacts.files").find().first()).isNotNull();
                 assertThat(cache.getCollection("source_schemas").countDocuments()).isPositive();
                 assertThat(cache.getCollection("derived_schemas").countDocuments()).isPositive();
                 assertThat(cache.getCollection("nest_state").countDocuments()).isPositive();
                 assertThat(cache.getCollection("join_facts").countDocuments()).isPositive();
-                assertJarHash(cache, originalHash);
+                assertJarHash(firstPlugins, originalHash);
             }
             assertThat(first.isAlive()).as("all original members exit before this fixture's destructive fault").isFalse();
             var authority = configurationAuthority(configuration);
@@ -89,10 +91,11 @@ class ThreeLayerCacheReconstructionIT {
             source.getCollection("order_items").insertOne(row(22).append("order_id", 200L).append("sku", "new"));
             target.getCollection("orders").insertOne(row(999).append("qty", -1L));
             target.getCollection("joined_orders").insertOne(row(999).append("order_id", 999L).append("customer_name", "stale"));
-            try (var replacement = start(configUri, cluster)) {
+            try (var replacement = start(configUri, cluster, replacementPlugins)) {
                 var control = login(replacement);
                 assertThat(cache.getCollection("pipeline_state").countDocuments()).isZero();
-                assertThat(cache.getCollection("connector_artifacts.files").countDocuments()).isZero();
+                assertJarHash(firstPlugins, originalHash);
+                assertThat(replacementPlugins.resolve(originalHash + ".jar")).doesNotExist();
                 var plan = recovery(control, "plan", Map.of("scope", "CLUSTER", "pipelineIds", List.of()));
                 assertThat(plan.get("affectedPipelineIds")).isEqualTo(PIPELINES);
                 confirm(control, plan); recoveryComplete(control, plan);
@@ -103,7 +106,7 @@ class ThreeLayerCacheReconstructionIT {
                 }
                 assertThat(cache.getCollection("nest_state").countDocuments()).isZero();
                 assertThat(cache.getCollection("join_facts").countDocuments()).isZero();
-                control.registerConnector("mongodb", originalJar); assertJarHash(cache, originalHash);
+                control.registerConnector("mongodb", originalJar); assertJarHash(replacementPlugins, originalHash);
                 control.discoverSchema("input", "mongodb", Map.of("isUri", true, "uri", sourceUri));
                 String predecessor = (String) plan.get("operationId");
                 for (String pipeline : PIPELINES) {
@@ -120,14 +123,14 @@ class ThreeLayerCacheReconstructionIT {
                 assertThat(cache.getCollection("derived_schemas").countDocuments()).isPositive();
                 assertThat(cache.getCollection("nest_state").countDocuments()).isPositive();
                 assertThat(cache.getCollection("join_facts").countDocuments()).isPositive();
-                assertJarHash(cache, originalHash);
+                assertJarHash(replacementPlugins, originalHash);
                 assertThat(configurationAuthority(configuration)).isEqualTo(authority);
             }
         }
     }
 
-    private RealProcessServer start(String configUri, String cluster) {
-        return RealProcessServer.startPrepared(configUri, "127.0.0.1", port -> List.of(
+    private RealProcessServer start(String configUri, String cluster, Path plugins) {
+        return RealProcessServer.startPrepared(configUri, "127.0.0.1", plugins, port -> List.of(
                 "--tapstate.cluster.id=" + cluster, "--tapstate.cluster.node-id=reconstruction-node",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));
@@ -158,11 +161,12 @@ class ThreeLayerCacheReconstructionIT {
                 () -> "COMPLETE".equals(recovery(control, "status", Map.of("operationId", plan.get("operationId"))).get("phase")),
                 () -> recovery(control, "status", Map.of("operationId", plan.get("operationId"))).toString());
     }
-    private static void assertJarHash(MongoDatabase cache, String hash) {
-        var files = cache.getCollection("connector_artifacts.files").find().into(new ArrayList<>());
-        assertThat(files).hasSize(1);
-        assertThat(files.getFirst().get("metadata", Document.class)).containsEntry("contentHash", hash);
-        assertThat(cache.getCollection("connector_artifacts.chunks").countDocuments()).isPositive();
+    private static void assertJarHash(Path plugins, String hash) throws IOException {
+        Path installed = plugins.resolve(hash + ".jar");
+        assertThat(installed).isRegularFile();
+        try (var input = Files.newInputStream(installed)) {
+            assertThat(ContentHash.of(input)).isEqualTo(hash);
+        }
     }
     private static Document row(long id) { return new Document("_id", id).append("id", id); }
     private static Map<String, List<Document>> configurationAuthority(MongoDatabase configuration) {

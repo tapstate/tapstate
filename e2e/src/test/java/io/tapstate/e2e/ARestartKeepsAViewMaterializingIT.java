@@ -67,7 +67,7 @@ class ARestartKeepsAViewMaterializingIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seedOneRow(mysql);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             EndpointAddress views = EndpointAddress.uri(storage.masterUri());
             try (ServerHandle first = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());

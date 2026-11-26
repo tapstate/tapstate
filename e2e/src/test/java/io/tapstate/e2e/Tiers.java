@@ -33,7 +33,8 @@ enum Tiers {
         return switch (this) {
             case IN_PROCESS -> InProcessServer.startPrepared(storage, retainedPlugins == null ? List.of()
                     : List.of("--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + retainedPlugins));
-            case REAL_PROCESS -> RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", retainedPlugins,
+            case REAL_PROCESS -> RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
+                    retainedPlugins == null ? storage.connectorDirectory() : retainedPlugins,
                     port -> List.of("--tapstate.cluster.id=" + storage.clusterId(),
                             "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
         };

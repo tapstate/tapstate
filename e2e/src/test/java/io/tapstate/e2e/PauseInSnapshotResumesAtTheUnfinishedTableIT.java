@@ -115,7 +115,7 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
 
         byte[] jar = Files.readAllBytes(E2eConnectorJar.buildInto(connectorJars));
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create();
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory();
                 NativeSrsDocuments documents = new NativeSrsDocuments(storage)) {
             Map<String, Long> confirmingRunReads;
             long originalGeneration;

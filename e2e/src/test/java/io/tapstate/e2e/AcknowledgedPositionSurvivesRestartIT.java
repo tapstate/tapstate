@@ -61,7 +61,7 @@ class AcknowledgedPositionSurvivesRestartIT {
         Map<String, Object> source = SharedPostgres.settings("ack_restart_src");
         createTable(source);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create();
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory();
                 NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
             String targetUri = frozenTarget.uriForThisHost("ack_restart_target");
             String lastInside;

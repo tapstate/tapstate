@@ -57,7 +57,7 @@ class RealMysqlToMongoSharedPositionIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
         byte[] minted;
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storage); StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);

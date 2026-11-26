@@ -22,7 +22,7 @@ class MongoSampledDocumentRestartIT {
 
     @Test void offlineSampleChangesAndLaterMixedValuesSurviveRepeatedRetainedRestarts() {
         DockerGate.require(); RealConnectorGate.require("mongodb");
-        try (var mongo = mongo(); var storage = PreparedNativeStore.createOn(mongo);
+        try (var mongo = mongo(); var storage = PreparedNativeStore.createOn(mongo).retainingConnectorDirectory();
                 var client = MongoClients.create(mongo.getReplicaSetUrl("input"))) {
             String input = mongo.getReplicaSetUrl("input");
             String output = mongo.getReplicaSetUrl("output");
@@ -76,7 +76,7 @@ class MongoSampledDocumentRestartIT {
     @ParameterizedTest @ValueSource(booleans={false,true})
     void originalTargetPreparationIsNotReplacedByAnotherSample(boolean cdcOnly) {
         DockerGate.require(); RealConnectorGate.require("mongodb");
-        try (var mongo=mongo();var storage=PreparedNativeStore.createOn(mongo);
+        try (var mongo=mongo();var storage=PreparedNativeStore.createOn(mongo).retainingConnectorDirectory();
                 var client=MongoClients.create(mongo.getReplicaSetUrl("input"))) {
             String input=mongo.getReplicaSetUrl("input"),output=mongo.getReplicaSetUrl("output");
             var source=client.getDatabase("input").getCollection("orders");

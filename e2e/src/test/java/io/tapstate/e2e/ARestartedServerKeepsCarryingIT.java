@@ -59,7 +59,7 @@ class ARestartedServerKeepsCarryingIT {
     @EnumSource(Tiers.class)
     void aChangeMadeAfterTheServerIsRestartedStillReachesTheTarget(Tiers tier) throws Exception {
         Path directory = Files.createTempDirectory("restarted-server-keeps-carrying");
-        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             RunningPipeline running;
             long carriedBeforeTheRestart;
             try (ServerHandle first = tier.launch(storage)) {

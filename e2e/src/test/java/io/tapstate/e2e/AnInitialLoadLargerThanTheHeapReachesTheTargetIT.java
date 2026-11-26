@@ -81,7 +81,7 @@ class AnInitialLoadLargerThanTheHeapReachesTheTargetIT {
         // one under test. Uploading a connector holds its jar several times over on the way in, which a heap
         // this small cannot afford either: a limit of its own, found in the first run of this case, and not
         // the one this case is about.
-        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             try (ServerHandle preparing = Tiers.REAL_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(preparing.baseUrl());
                 storage.loginAndAwaitBusiness(control);
@@ -98,6 +98,7 @@ class AnInitialLoadLargerThanTheHeapReachesTheTargetIT {
             }
 
             try (RealProcessServer server = RealProcessServer.startPreparedInJvm(storage.configurationUri(), SMALL_HEAP,
+                        storage.connectorDirectory(),
                         port -> List.of("--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0",
                                 "--tapstate.hz.jet.cooperative-thread-count=2"));
                     MongoEndpoints mongo = new MongoEndpoints()) {

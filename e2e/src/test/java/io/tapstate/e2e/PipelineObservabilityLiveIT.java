@@ -110,7 +110,7 @@ class PipelineObservabilityLiveIT {
             try (CuttableLink targetLink = CuttableLink.open(targetLinkPort, targetAddress.getHost(),
                     targetAddress.getPort() < 0 ? 27017 : targetAddress.getPort(),
                     Map.of("target", new int[] {0, 65535}));
-                    PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD)) {
+                    PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD).retainingConnectorDirectory()) {
                 try {
                     first = start(storage, serverSettings);
                     ControlPlane control = new ControlPlane(first.baseUrl());
@@ -225,7 +225,7 @@ class PipelineObservabilityLiveIT {
     }
 
     private static RealProcessServer start(PreparedNativeStore storage, List<String> settings) {
-        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", port -> {
+        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", storage.connectorDirectory(), port -> {
             var arguments = new ArrayList<>(settings);
             arguments.add("--tapstate.cluster.id=" + storage.clusterId());
             arguments.add("--tapstate.hz.member-port=0");

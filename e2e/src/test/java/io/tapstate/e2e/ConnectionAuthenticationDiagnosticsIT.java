@@ -181,7 +181,7 @@ class ConnectionAuthenticationDiagnosticsIT {
     }
 
     private static Map<?, ?> failedAuthentication(String connector, Map<String, Object> settings, Path home) throws Exception {
-        try (var store = PreparedNativeStore.create()) {
+        try (var store = PreparedNativeStore.create().retainingConnectorDirectory()) {
             String valid = "valid_" + connector;
             Object legacy;
             try (var server = Tiers.IN_PROCESS.launch(store)) {

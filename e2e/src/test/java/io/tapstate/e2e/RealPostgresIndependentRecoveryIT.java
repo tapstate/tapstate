@@ -178,7 +178,7 @@ class RealPostgresIndependentRecoveryIT {
         }
         EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
         EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
-        try (PreparedNativeStore storage = PreparedNativeStore.create();
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory();
                 MongoClient reader = MongoClients.create(storage.cacheUri());
                 MongoEndpoints targets = new MongoEndpoints();
                 Connection writer = SharedPostgres.connect(postgres);

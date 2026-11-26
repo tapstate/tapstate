@@ -73,6 +73,7 @@ class AtlasPdkRoutingIT {
              AutoCloseable sourceCleanup = () -> source.getDatabase(sourceDatabase).drop();
              NativeSrsDocuments documents = new NativeSrsDocuments(prepared);
              AtlasRuntime runtime = new AtlasRuntime(mode, prepared)) {
+            prepared.retainingConnectorDirectory();
             MongoCollection<Document> sourceRows = source.getDatabase(sourceDatabase).getCollection(TABLE);
             MongoCollection<Document> targetRows = target.database().getCollection(TABLE);
             MongoDatabase raw = metadata.getDatabase(prepared.cacheDatabase());

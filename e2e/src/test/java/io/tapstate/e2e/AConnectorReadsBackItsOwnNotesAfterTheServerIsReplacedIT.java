@@ -107,7 +107,7 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
         FileEndpoints files = new FileEndpoints();
         files.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory();
                 NativeSrsDocuments documents = new NativeSrsDocuments(storage)) {
             byte[] minted;
             try (ServerHandle first = tier.launch(storage)) {

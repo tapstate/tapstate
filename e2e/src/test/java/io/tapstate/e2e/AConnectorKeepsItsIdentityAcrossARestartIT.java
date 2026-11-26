@@ -73,7 +73,7 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
 
         byte[] minted;
         String namespace;
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle first = tier.launch(storage);
                     StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
                 ControlPlane control = new ControlPlane(first.baseUrl());

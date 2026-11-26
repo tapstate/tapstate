@@ -65,7 +65,7 @@ class ThreeLayerRestartContinuationIT {
             mongo.seed(source, TABLE, SeedRows.generated(8));
             String acknowledged;
             Map<Long, Long> beforeShutdown;
-            var first = start(configUri, cluster);
+            var first = start(configUri, cluster, work.resolve("plugins"));
             try (first) {
                 var control = login(first);
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -93,7 +93,7 @@ class ThreeLayerRestartContinuationIT {
             mongo.delete(source, TABLE, Map.of("id", 3L));
             mongo.insert(source, TABLE, List.of(Map.of("id", 9L, "seq", 90L)));
             assertThat(rows(mongo, target)).as("the old process has exited before downtime changes").isEqualTo(beforeShutdown);
-            try (var replacement = start(configUri, cluster)) {
+            try (var replacement = start(configUri, cluster, work.resolve("plugins"))) {
                 var control = login(replacement);
                 Await.until("the retained running intent to resume", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
@@ -220,7 +220,7 @@ class ThreeLayerRestartContinuationIT {
             Map<Long,Long> stoppedRows;long stoppedExecution;
             boolean paused=false,configurationPaused=false;
             try {
-                var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds);
+                var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds,work.resolve("cloud-plugins"));
                 try(first) {
                     var control=cloudLogin(first);
                     var resources=resources(sourceUri,false,targetId);
@@ -258,7 +258,7 @@ class ThreeLayerRestartContinuationIT {
                 }
                 assertThat(first.isAlive()).isFalse();
                 var replacementBoundary=java.time.Instant.now();
-                try(var blocked=RealProcessServer.startCloudFixture(configUri,cluster,seeds)) {
+                try(var blocked=RealProcessServer.startCloudFixture(configUri,cluster,seeds,work.resolve("cloud-plugins"))) {
                     var entry=http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
                             .timeout(Duration.ofSeconds(30)).GET().build(),java.net.http.HttpResponse.BodyHandlers.ofString());
                     assertThat(entry.statusCode()).isEqualTo(200);assertThat(Document.parse(entry.body())).containsEntry("entry","UNAVAILABLE");
@@ -368,7 +368,7 @@ class ThreeLayerRestartContinuationIT {
             Document originalChain;
             boolean paused = false;
             try {
-                var first = start(configUri, cluster);
+                var first = start(configUri, cluster, together ? work.resolve("plugins") : null);
                 try (first) {
                     var control = login(first);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -414,7 +414,7 @@ class ThreeLayerRestartContinuationIT {
                     assertThat(configuration.getCollection("operator_generations").find(new Document("_id", PIPELINE)).first())
                             .containsEntry("stateGeneration", 1L);
                 };
-                try (var blocked = start(configUri, cluster)) {
+                try (var blocked = start(configUri, cluster, together ? work.resolve("plugins") : null)) {
                     var entry = http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
                             .timeout(Duration.ofSeconds(30)).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
                     assertThat(entry.statusCode()).isEqualTo(200);
@@ -438,7 +438,7 @@ class ThreeLayerRestartContinuationIT {
                     if (!together) verifyResume.accept(blocked);
                 }
                 // A process that could not load CONFIG has no authenticated local context to retry.
-                if (together) try (var restored = start(configUri, cluster)) { verifyResume.accept(restored); }
+                if (together) try (var restored = start(configUri, cluster, work.resolve("plugins"))) { verifyResume.accept(restored); }
             } finally {
                 if (paused) CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();
             }
@@ -529,7 +529,11 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private RealProcessServer start(String configUri, String cluster) {
-        return RealProcessServer.startPrepared(configUri, "127.0.0.1", port -> List.of(
+        return start(configUri, cluster, null);
+    }
+
+    private RealProcessServer start(String configUri, String cluster, Path stagingDirectory) {
+        return RealProcessServer.startPrepared(configUri, "127.0.0.1", stagingDirectory, port -> List.of(
                 "--tapstate.cluster.id=" + cluster, "--tapstate.cluster.node-id=restart-node",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));

@@ -117,7 +117,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     void theSameInstallationRetainsAWaitingChildAcrossAStoppingServer() throws Exception {
         var source = SharedMySql.settings("nest_continuation_source");
         seedChildWaitingForParent(source);
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             PipelineIntentScope original;
             try (ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = start(server, storage, source);
@@ -210,7 +210,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     void requiredDeadLettersRemainInConfigurationUntilTheirOriginalPipelineIsRetired() throws Exception {
         var source = SharedMySql.settings("nest_required_diagnostic_source");
         seedChildWaitingForParent(source);
-        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             RequiredDeadLetterContext context;
             RequiredDeadLetterFact fact;
             try (ServerHandle server = Tiers.IN_PROCESS.launch(storage);

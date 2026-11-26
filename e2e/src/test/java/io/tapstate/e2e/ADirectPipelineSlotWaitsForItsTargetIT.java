@@ -65,7 +65,7 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
         Map<String, Object> source = SharedPostgres.settings("direct_waits_src");
         createTable(source);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create();
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory();
                 NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
             String targetUri = frozenTarget.uriForThisHost("direct_waits_target");
             String lastInside;

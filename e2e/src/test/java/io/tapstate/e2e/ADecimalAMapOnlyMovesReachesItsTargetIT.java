@@ -46,7 +46,7 @@ class ADecimalAMapOnlyMovesReachesItsTargetIT {
         Path jar = E2eConnectorJar.buildInto(directory);
         Files.writeString(source.resolve(TABLE + ".csv"), "id,amount\n7,70.00\n");
         Path written = target.resolve(TABLE + ".csv");
-        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             try (ServerHandle first = InProcessServer.startPrepared(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);

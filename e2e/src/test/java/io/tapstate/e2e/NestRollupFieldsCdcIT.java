@@ -61,7 +61,7 @@ class NestRollupFieldsCdcIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String pipeline = "rollup_cdc_" + suffix;
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = start(server, storage, mysql, WALLET_TABLES, targetUri, pipeline,
                         walletPipeline(pipeline));
@@ -270,7 +270,7 @@ class NestRollupFieldsCdcIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String pipeline = "rollup_ref_" + suffix;
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = start(server, storage, mysql, WALLET_TABLES, targetUri, pipeline,
                         walletPipeline(pipeline));

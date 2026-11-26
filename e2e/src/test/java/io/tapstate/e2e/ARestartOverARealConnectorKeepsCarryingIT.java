@@ -68,7 +68,7 @@ class ARestartOverARealConnectorKeepsCarryingIT {
         String targetUri = SharedMongo.replicaSetUrl("restart_real_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle first = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);

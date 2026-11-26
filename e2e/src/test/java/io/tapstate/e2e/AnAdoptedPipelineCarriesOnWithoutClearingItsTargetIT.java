@@ -56,7 +56,7 @@ class AnAdoptedPipelineCarriesOnWithoutClearingItsTargetIT {
         FileEndpoints files = new FileEndpoints();
         files.seed(source, TABLE, SeedRows.generated(SEEDED));
 
-        try (files; PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             try (ServerHandle first = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);

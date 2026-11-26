@@ -44,7 +44,7 @@ class AComputedDecimalChoiceIsRefusedAtApplyIT {
         Path target = Files.createDirectory(directory.resolve("target"));
         Path jar = E2eConnectorJar.buildInto(directory);
         Files.writeString(source.resolve(TABLE + ".csv"), "id,a,b\n7,70.00,80.00\n");
-        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             try (ServerHandle first = InProcessServer.startPrepared(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);

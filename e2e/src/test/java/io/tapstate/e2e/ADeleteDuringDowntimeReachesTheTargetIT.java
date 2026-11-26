@@ -70,7 +70,7 @@ class ADeleteDuringDowntimeReachesTheTargetIT {
         String targetUri = SharedMongo.replicaSetUrl("downtime_delete_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
