@@ -156,6 +156,8 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "clearingStateKeepsOriginalRateSamplesUntilLogicalDeletionAndNeverDeletesFutureScopes"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "completionRejectsUnknownTargetBytesThatAppearedAfterPreparation"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "concurrentRecreationPublishesOneGenerationAndPreservesUnusedPredecessorHistory"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "connectorVersionsRemainReadableDuringRebuildAndRejectDamagedWitnesses"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "connectorVersionsRemainReadableDuringRetirement"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "corruptOriginalInventoryAndDamagedReplayAreNeverRepaired"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "deletingTheOriginBeforeARealBatchKeepsPendingModelsThroughGcAndAnotherConsumersOwnPreparation"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCachePipelineRebuildsIT", "method": "lossAfterTheActualCacheCheckpointWriteRollsBackTheWholeReplacement"},

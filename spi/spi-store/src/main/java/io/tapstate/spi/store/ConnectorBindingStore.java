@@ -7,6 +7,9 @@ import java.util.Optional;
 public interface ConnectorBindingStore {
     Optional<ConnectorRunBindings> load(PipelineIntentScope scope);
 
+    /** Reads current bindings for observation in one CONFIG snapshot, without requiring an active generation. */
+    Optional<ConnectorRunBindings> loadCurrent(String pipelineId);
+
     /** Reads only the exact predecessor retained by this target's controlled CACHE replacement. */
     default Optional<ConnectorRunBindings> previousForRecovery(PipelineIntentScope target) { return Optional.empty(); }
 
