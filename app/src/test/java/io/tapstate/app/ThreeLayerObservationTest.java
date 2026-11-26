@@ -186,10 +186,12 @@ class ThreeLayerObservationTest {
                 Optional.empty(), false, Optional.empty(), 2, Map.of(), false);
         var structure = new MongoConfigurationDomain.PipelineDisplayHeader(
                 f.mapping.get(), preparation, Optional.empty(), Optional.empty(), false);
+        var before = Map.of("pipeline", structure);
         var intent = new AtomicReference<>(completed);
-        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenAnswer(call -> Map.of("pipeline", intent.get()));
         when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
-                .thenReturn(Map.of("pipeline", structure));
+                .thenReturn(before);
+        when(f.configuration.pipelineDisplayHeadersAfterCache(ids, ids, before))
+                .thenAnswer(call -> Map.of("pipeline", intent.get()));
         var stopped = new Observation("pipeline", PipelineState.STOPPED, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
         when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(true))).thenAnswer(call -> {
             intent.set(clearing);
@@ -201,7 +203,7 @@ class ThreeLayerObservationTest {
         assertThat(result.desired()).isEqualTo(clearing.desired());
         assertThat(result.completedStopClear()).isFalse();
         assertThat(result.observation()).contains(stopped);
-        verify(f.configuration).pipelineDisplayHeaders(ids, true);
+        verify(f.configuration).pipelineDisplayHeadersAfterCache(ids, ids, before);
     }
 
     @Test void aRebuildThatOvertakesAnObservationReadCannotPublishTheOldGeneration() {

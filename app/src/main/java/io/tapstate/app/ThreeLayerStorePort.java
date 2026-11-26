@@ -454,9 +454,10 @@ final class ThreeLayerStorePort implements StorePort {
             return;
         }
         var cached = bound.cache().pipelineObservationBatch(scopes, this::active, includeIntents);
-        var afterIds = includeIntents ? page : scopes.stream().map(PipelineIntentScope::pipelineId).toList();
         // One intent read per page, after CACHE when a second CONFIG snapshot is needed.
-        var after = configuration.pipelineDisplayHeaders(afterIds, includeIntents);
+        var cacheIds = scopes.stream().map(PipelineIntentScope::pipelineId).toList();
+        var after = includeIntents ? configuration.pipelineDisplayHeadersAfterCache(page, cacheIds, before)
+                : configuration.pipelineDisplayHeaders(cacheIds, false);
         collectUnpreparedDisplayStates(includeIntents ? after : before, includeIntents, result);
         for (var entry : cached.entrySet()) {
             String id = entry.getKey();
