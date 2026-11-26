@@ -109,22 +109,7 @@ class RealDummyPipelineIT {
                     start dummy_op_failure
                     exit
                     """);
-            awaitState(control, failing, PipelineState.FAILED);
-            String failureCode = Await.answered("the Dummy capture failure code to be published",
-                    Duration.ofSeconds(10), () -> control.failureCode(failing));
-            assertThat(failureCode).isEqualTo(ConnectorError.CAPTURE_FAILED.code());
-            var response = control.sourceRequest("GET", "/api/pipelines/" + failing + "/logs", null, null, 200);
-            assertThat(response.body()).contains("bad-interval");
-            var log = (Map<?, ?>) JsonReader.parse(response.body());
-            var terminal = ((List<?>) log.get("lines")).stream()
-                    .map(row -> (Map<?, ?>) row)
-                    .filter(row -> String.valueOf(row.get("message")).startsWith("Pipeline " + failing + " entered FAILED ["))
-                    .toList();
-            assertThat(terminal).singleElement().satisfies(row -> {
-                assertThat(row.get("level")).isEqualTo("ERROR");
-                assertThat(row.get("message")).asString().contains("[" + failureCode + "]");
-                assertThat(((Map<?, ?>) row.get("diagnostic")).get("code")).isEqualTo(failureCode);
-            });
+            assertTerminalCaptureFailure(control, failing);
             cli(server, storage, "status " + failing + "\nexit\n");
 
             long afterFailure = recordsOut(control, cdc);
@@ -787,6 +772,27 @@ class RealDummyPipelineIT {
                 exit
                 """.formatted(id));
         assertThat(applied).contains("dummy_orders", "primaryKey", "serial", "created  pipeline  " + id);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void assertTerminalCaptureFailure(ControlPlane control, String pipelineId) {
+        awaitState(control, pipelineId, PipelineState.FAILED);
+        String failureCode = Await.answered("the Dummy capture failure code to be published",
+                Duration.ofSeconds(10), () -> control.failureCode(pipelineId));
+        assertThat(failureCode).isEqualTo(ConnectorError.CAPTURE_FAILED.code());
+        var response = control.sourceRequest("GET", "/api/pipelines/" + pipelineId + "/logs", null, null, 200);
+        assertThat(response.body()).contains("bad-interval");
+        var log = (Map<?, ?>) JsonReader.parse(response.body());
+        String terminalPrefix = "Pipeline " + pipelineId + " entered FAILED [";
+        var terminal = ((List<?>) log.get("lines")).stream()
+                .map(row -> (Map<String, Object>) row)
+                .filter(row -> String.valueOf(row.get("message")).startsWith(terminalPrefix))
+                .toList();
+        assertThat(terminal).singleElement().satisfies(row -> {
+            assertThat(row).containsEntry("level", "ERROR");
+            assertThat(row.get("message")).asString().contains("[" + failureCode + "]");
+            assertThat((Map<String, Object>) row.get("diagnostic")).containsEntry("code", failureCode);
+        });
     }
 
     private static void disableSnapshotRetry(ControlPlane control) {
