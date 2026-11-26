@@ -42,10 +42,8 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
             var topology = new MongoRenewedTopology(storage.clusterId());
             try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
                 var control = ControlPlane.direct(server.baseUrl());
-                storage.loginAndAwaitBusiness(control);
-                var child = businessContext(server);
+                var child = commitRenewedTopology(storage, topology, server, control);
                 var member = child.getBean(HazelcastInstance.class);
-                commitRenewedTopology(storage, topology, server, member, control);
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID,connector); control.apply(resources(source,target,holds,written,replies));
                 control.discoverSchema(SOURCE,E2eConnectorJar.CONNECTOR_ID,Map.of("uri",source.toString()));
                 control.lifecycle(PIPELINE,LifecycleVerb.START);
@@ -131,12 +129,18 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         }
     }
 
-    private static void commitRenewedTopology(PreparedNativeStore storage, MongoRenewedTopology topology,
-            InProcessServer original, HazelcastInstance member, ControlPlane control) {
+    private static ConfigurableApplicationContext commitRenewedTopology(PreparedNativeStore storage,
+            MongoRenewedTopology topology, InProcessServer original, ControlPlane control) throws Exception {
         assertThat(original.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
+        ConfigurableApplicationContext child;
+        HazelcastInstance member;
+        // The original cannot admit business until the peer joins the bootstrap topology.
         try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
             assertThat(peer.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.PEER));
+            storage.loginAndAwaitBusiness(control);
             storage.loginAndAwaitBusiness(ControlPlane.direct(peer.baseUrl()));
+            child = businessContext(original);
+            member = child.getBean(HazelcastInstance.class);
             Await.until("the real two-member topology to form", BOUND,
                     () -> member.getCluster().getMembers().size() == 2,
                     () -> member.getCluster().getMembers().toString());
@@ -147,6 +151,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         Await.until("the original member to be the only writer host", BOUND,
                 () -> member.getCluster().getMembers().size() == 1,
                 () -> member.getCluster().getMembers().toString());
+        return child;
     }
 
     private static void assertExpiredWriterCannotContinue(Holds holds, WriteWitness written, Path target,
