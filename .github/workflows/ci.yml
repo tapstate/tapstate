@@ -1114,6 +1114,7 @@ jobs:
         if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/roadmap-shipped-smoke.sh
       - name: Milestone board automation cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           shellcheck .github/scripts/milestone-board.sh
           python3 .github/scripts/milestone-board-smoke.py
