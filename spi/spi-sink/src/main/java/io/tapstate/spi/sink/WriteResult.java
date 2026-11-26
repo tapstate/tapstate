@@ -1,18 +1,24 @@
 package io.tapstate.spi.sink;
 
 /**
- * The outcome of a batch write: how many events from the batch the target accepted. An immutable
- * value.
+ * The outcome of a batch write.
  *
- * <p>{@code written} counts the events the target accepted for this batch — an event count, not a
- * count of rows physically changed (an upsert that overwrites an identical row still counts the
- * event). It is never negative.
+ * @param written the writer's reported write count, which can count physical changes
+ * @param acknowledgedRows confirmed row events, including accepted no-ops and excluding DDL
  */
-public record WriteResult(long written) {
+public record WriteResult(long written, long acknowledgedRows) {
+
+    /** For writers whose reported count already counts confirmed row events. */
+    public WriteResult(long written) {
+        this(written, written);
+    }
 
     public WriteResult {
         if (written < 0) {
             throw new IllegalArgumentException("written must be non-negative: " + written);
+        }
+        if (acknowledgedRows < 0) {
+            throw new IllegalArgumentException("acknowledgedRows must be non-negative: " + acknowledgedRows);
         }
     }
 }

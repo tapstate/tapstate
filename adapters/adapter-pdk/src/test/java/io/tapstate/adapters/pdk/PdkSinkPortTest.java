@@ -469,7 +469,9 @@ class PdkSinkPortTest {
         Path jar = Synthetic.fieldCountingSink(dir);
         PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.FieldCounting"));
         try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.FAIL))) {
-            assertThat(await(writer, List.of(insert(1))).written()).isEqualTo(0);
+            var receipt = await(writer, List.of(insert(1)));
+            assertThat(receipt.written()).isZero();
+            assertThat(receipt.acknowledgedRows()).isEqualTo(1);
         }
     }
 }

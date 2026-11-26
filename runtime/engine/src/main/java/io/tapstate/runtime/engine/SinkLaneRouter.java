@@ -126,6 +126,8 @@ final class SinkLaneRouter extends AbstractProcessor implements Staged {
         if (!flush()) return false;
         if (active.isEmpty() && waiting.isEmpty()) return true;
         Set<SinkLaneClaims.Key> blocked = new HashSet<>();
+        Set<String> pendingStreams = new HashSet<>();
+        Set<String> orderedStreams = new HashSet<>();
         for (var it = active.iterator(); it.hasNext();) {
             var move = it.next();
             if (move.applied != null && replies.take(move.applied)) {
@@ -135,6 +137,7 @@ final class SinkLaneRouter extends AbstractProcessor implements Staged {
             }
             if (System.nanoTime() - move.started >= ACK_TIMEOUT) throw SinkLaneAcks.unconfirmed();
             blocked.addAll(move.row.keys());
+            holdStream(move.row, pendingStreams, orderedStreams);
             move.fences.removeIf(replies::take);
             if (move.fences.isEmpty() && move.applied == null) {
                 move.applied = replies.reserve();
@@ -143,8 +146,11 @@ final class SinkLaneRouter extends AbstractProcessor implements Staged {
         }
         for (var it = waiting.iterator(); it.hasNext();) {
             var row = it.next();
-            if (!Collections.disjoint(blocked, row.keys())) {
+            String stream = row.event().src();
+            if (orderedStreams.contains(stream) || (row.tableOrdered() && pendingStreams.contains(stream))
+                    || !Collections.disjoint(blocked, row.keys())) {
                 blocked.addAll(row.keys());
+                holdStream(row, pendingStreams, orderedStreams);
                 continue;
             }
             it.remove();
@@ -152,6 +158,7 @@ final class SinkLaneRouter extends AbstractProcessor implements Staged {
                 var move = new Pending(row);
                 active.add(move);
                 blocked.addAll(row.keys());
+                holdStream(row, pendingStreams, orderedStreams);
                 for (var lane : row.fences()) {
                     var ticket = replies.reserve();
                     move.fences.add(ticket);
@@ -163,6 +170,12 @@ final class SinkLaneRouter extends AbstractProcessor implements Staged {
             }
         }
         return flush();
+    }
+
+    private static void holdStream(SinkLaneClaims.Row row, Set<String> pending, Set<String> ordered) {
+        String stream = row.event().src();
+        pending.add(stream);
+        if (row.tableOrdered()) ordered.add(stream);
     }
 
     private void enqueue(Object item) {

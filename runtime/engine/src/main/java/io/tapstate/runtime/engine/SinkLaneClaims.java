@@ -19,7 +19,7 @@ import java.util.Set;
 final class SinkLaneClaims implements java.io.Serializable {
     private static final long serialVersionUID = 1L;
     record Key(String table, List<String> columns, List<Object> value) {}
-    record Row(Envelope event, Set<Key> keys, List<String> fences, String destination, boolean reserved) {}
+    record Row(Envelope event, Set<Key> keys, List<String> fences, String destination, boolean reserved, boolean tableOrdered) {}
 
     private final String node;
     private final SinkTarget target;
@@ -73,7 +73,31 @@ final class SinkLaneClaims implements java.io.Serializable {
         return false;
     }
 
+    /**
+     * A stable target primary key still identifies a valid update when a connector emits only its
+     * replica identity in the before image. An unknown release cannot be ordered by tuple, so the
+     * router must order the row against every reserved write for this table.
+     */
+    private boolean ordersByTable(Envelope e) {
+        if (e.op() != Op.UPDATE || e.before() == null || e.after() == null
+                || differs(e, target.keyColumns())) return false;
+        for (var column : target.keyColumns()) {
+            if (!known(e.before(), column, false) || !known(e.after(), column, false)) return false;
+        }
+        boolean omitted = false;
+        for (var columns : secondary) {
+            if (generated(columns, e)) continue;
+            for (var column : columns) {
+                if (!known(e.after(), column, true)) return false;
+                if (!e.before().containsKey(column) && !column.equals("_id")) omitted = true;
+                else if (!known(e.before(), column, true)) return false;
+            }
+        }
+        return omitted;
+    }
+
     Row describe(Envelope e, boolean reserved) {
+        boolean tableOrdered = reserved && ordersByTable(e);
         var keys = new HashSet<Key>();
         var fences = new LinkedHashSet<String>();
         var last = e.op() == Op.DELETE ? e.before() : e.after();
@@ -81,12 +105,15 @@ final class SinkLaneClaims implements java.io.Serializable {
             claim(keys, target.keyColumns(), image, e, false);
             fences.add(RoutingKeys.writerLane(node, target, e, image));
             for (var columns : secondary) {
-                if (!generated(columns, e)) claim(keys, columns, image, e, true);
+                if (generated(columns, e)) continue;
+                if (tableOrdered && image == e.before()
+                        && columns.stream().anyMatch(column -> !image.containsKey(column))) continue;
+                claim(keys, columns, image, e, true);
             }
         }
         if (e.op() == Op.UPDATE && (hasId(e.before()) || hasId(e.after()))
                 && !java.util.Objects.equals(e.before().get("_id"), e.after().get("_id"))) throw unsupported(e);
-        return new Row(e, keys, List.copyOf(fences), RoutingKeys.writerLane(node, target, e, last), reserved);
+        return new Row(e, keys, List.copyOf(fences), RoutingKeys.writerLane(node, target, e, last), reserved, tableOrdered);
     }
 
     private Collection<Map<String, Object>> images(Envelope e) {

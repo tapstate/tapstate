@@ -865,9 +865,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
             try {
                 WriteResult result = settle(batch.future());
-                if (batch.expectedWrites() > 0 && result.written() != batch.expectedWrites()) {
+                if (batch.expectedWrites() > 0 && result.acknowledgedRows() != batch.expectedWrites()) {
                     throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
-                            Map.of("expected", batch.expectedWrites(), "accepted", result.written()), null);
+                            Map.of("expected", batch.expectedWrites(), "accepted", result.acknowledgedRows()), null);
                 }
                 if (batch.reply() != null) laneAcknowledgments.accept(batch.reply());
             } catch (RuntimeException | Error failure) {

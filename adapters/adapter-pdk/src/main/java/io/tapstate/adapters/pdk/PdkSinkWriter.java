@@ -366,7 +366,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
-        var outcome = new BatchOutcome();
+        long written = 0;
+        long acknowledgedRows = 0;
         for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
             List<TapRecordEvent> rows = entry.getValue();
             TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
@@ -383,6 +384,7 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
+            var outcome = new BatchOutcome();
             try {
                 write.writeRecord(connector.context(), rows, table, outcome::accept);
                 if (outcome.failure != null) throw outcome.failure;
@@ -390,9 +392,13 @@ final class PdkSinkWriter implements SinkWriter {
                 operation(table.getId(), failure);
                 throw failure;
             }
-            operation(table.getId(),null);
+            operation(table.getId(), null);
+            written += outcome.written;
+            // The synchronous writer completed this table's submitted events without errors.
+            // Physical change counts can be lower for no-ops or higher for a key change.
+            if (outcome.reported) acknowledgedRows += rows.size();
         }
-        return new WriteResult(outcome.accepted);
+        return new WriteResult(written, acknowledgedRows);
     }
 
     private TargetTable projectedTarget(String stream, TargetTable original) {
@@ -401,7 +407,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private static final class BatchOutcome {
-        private long accepted;
+        private long written;
+        private boolean reported;
         private Throwable failure;
 
         void accept(WriteListResult<TapRecordEvent> result) {
@@ -410,7 +417,8 @@ final class PdkSinkWriter implements SinkWriter {
                 failure = errors.values().iterator().next();
                 if (failure == null) failure = new IllegalStateException("Connector rejected a row without a cause");
             }
-            accepted += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+            written += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+            reported = true;
         }
     }
 

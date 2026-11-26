@@ -94,10 +94,62 @@ class SinkLaneRouterTest {
                     command -> assertThat(command).isInstanceOf(SinkLaneCommand.Fence.class),
                     plain -> assertThat(plain).isSameAs(update));
 
-            var incomplete = Envelope.update(4, "orders", Map.of("id", 1), after, null);
+            // A missing after value is not evidence of an explicit null.
+            var incomplete = Envelope.update(4, "orders", before, Map.of("id", 1), null);
             org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(incomplete))))
                     .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                             error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+        }
+    }
+
+    @Test
+    void an_omitted_old_unique_value_orders_only_its_own_table() throws Exception {
+        var keys = List.of(List.of("id"), List.of("email"), List.of("_id"));
+        var constraints = new TargetKeyConstraints(keys, true, true,
+                Map.of("id", TapstateType.INT64, "email", TapstateType.STRING));
+        var targets = Map.of("orders", TARGET, "lines", new SinkTarget("lines", List.of("id")));
+        try (var f = fixture(targets, Map.of("orders", constraints, "lines", constraints), 32)) {
+            var earlier = update(10, 1, "old", 1, "released");
+            var partial = Envelope.update(11, "orders", Map.of("id", 2), image(2, "new"), null);
+            var later = insert(12, 3, "unknown-previous-owner");
+            var otherTable = Envelope.update(13, "lines", image(4, "other"), image(4, "other"), null);
+            f.router.process(0, new TestInbox(List.of(earlier, partial, later, otherTable)));
+
+            var initial = f.drain(SinkRouter.BY_KEY);
+            assertThat(initial).satisfiesExactly(
+                    item -> assertThat(item).isInstanceOf(SinkLaneCommand.Fence.class),
+                    item -> assertThat(item).isSameAs(otherTable));
+            f.ack((SinkLaneCommand.Fence) initial.getFirst());
+            var priorWrite = f.onlyMove();
+            assertThat(priorWrite.row()).isSameAs(earlier);
+            f.ack(priorWrite);
+
+            var partialFence = f.drain(SinkRouter.BY_KEY);
+            assertThat(partialFence).hasSize(1);
+            f.ack((SinkLaneCommand.Fence) partialFence.getFirst());
+            var partialWrite = f.onlyMove();
+            assertThat(partialWrite.row()).isSameAs(partial);
+            f.ack(partialWrite);
+
+            var laterFence = f.drain(SinkRouter.BY_KEY);
+            assertThat(laterFence).hasSize(1);
+            f.ack((SinkLaneCommand.Fence) laterFence.getFirst());
+            var laterWrite = f.onlyMove();
+            assertThat(laterWrite.row()).isSameAs(later);
+            f.ack(laterWrite);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void a_changed_primary_key_still_requires_known_old_secondary_values() throws Exception {
+        try (var f = fixture(true, 8)) {
+            var move = Envelope.update(10, "orders", Map.of("id", 1), image(2, "new"), null);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    f.router.process(0, new TestInbox(List.of(move))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
         }
     }
 
@@ -279,8 +331,12 @@ class SinkLaneRouterTest {
     }
 
     private static Fixture fixture(TargetKeyConstraints constraints, int capacity) throws Exception {
-        var router = new SinkLaneRouter("copy", Map.of("orders", TARGET),
-                Map.of("orders", constraints), AXES, Map.of(0, List.of("orders")));
+        return fixture(Map.of("orders", TARGET), Map.of("orders", constraints), capacity);
+    }
+
+    private static Fixture fixture(Map<String, SinkTarget> targets, Map<String, TargetKeyConstraints> constraints,
+            int capacity) throws Exception {
+        var router = new SinkLaneRouter("copy", targets, constraints, AXES, Map.of(0, List.of("orders")));
         var out = new TestOutbox(new int[] {capacity, capacity}, capacity);
         router.openReplies(first);
         router.init(out, new TestProcessorContext());
