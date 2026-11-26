@@ -138,10 +138,12 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             var collection = collection();
             var exact = collection.find(session, new Document("_id", id)).first();
             if (exact != null) return decode(access, exact, id).filter(value -> value.state() == PipelineState.STOPPED);
-            var filter = scopeEpoch(access, checkpoint.epoch()).append("state", PipelineState.STOPPED.name())
-                    .append("_id.executionGeneration", original.executionGeneration())
-                    .append("_id.claimGeneration", new Document("$lt", original.claimGeneration()));
-            var retained = collection.find(session, filter).sort(new Document("_id.claimGeneration", -1)).first();
+            var prefix = new Document("scope", id.get("scope")).append("epoch", checkpoint.epoch());
+            var lower = new Document(prefix).append("claimGeneration", new org.bson.types.MinKey());
+            var upper = new Document(prefix).append("claimGeneration", original.claimGeneration());
+            var filter = new Document("_id", new Document("$gte", lower).append("$lt", upper))
+                    .append("state", PipelineState.STOPPED.name()).append("_id.executionGeneration", original.executionGeneration());
+            var retained = collection.find(session, filter).sort(new Document("_id", -1)).first();
             if (retained == null) return Optional.empty();
             var stopped = decode(access, retained, retained.get("_id", Document.class)).orElseThrow();
             // Serialize the publication with execution changes and takeover of the claim.

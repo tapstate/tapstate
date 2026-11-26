@@ -7,6 +7,7 @@ import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.testsupport.RequiresDocker;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -352,7 +353,9 @@ class ThreeLayerSharedCaptureIT {
             mongo.seed(source,"orders",SeedRows.generated(8));mongo.seed(second,"items",SeedRows.generated(5));
             var cache=cacheClient.getDatabase(cacheDb);var config=configClient.getDatabase(configDb);
             var generations=config.getCollection("operator_generations");String canonical,replacement,operation;long firstPid;
-            try(var server=lossServer(configUri,cluster)) {
+            // Both boots represent a process replacement on the same node, including its local artifact directory.
+            Path staging = Files.createDirectory(work.resolve("shared-loss-staging"));
+            try(var server=lossServer(configUri,cluster,staging)) {
                 firstPid=server.pid();
                 var control=new ControlPlane(server.baseUrl());control.login(NativeMongoStorageFixture.USER,NativeMongoStorageFixture.PASSWORD);
                 control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
@@ -466,7 +469,7 @@ class ThreeLayerSharedCaptureIT {
                 assertThat(membership(cache,"reader_b","input").get("_id",Document.class)).containsEntry("chain",replacement);
                 assertThat(membership(cache,"reader_a","second").get("_id",Document.class).getString("chain")).isEqualTo(kept);
             }
-            try(var reopened=lossServer(configUri,cluster)) {
+            try(var reopened=lossServer(configUri,cluster,staging)) {
                 assertThat(reopened.pid()).isNotEqualTo(firstPid);
                 var control=new ControlPlane(reopened.baseUrl());control.login(NativeMongoStorageFixture.USER,NativeMongoStorageFixture.PASSWORD);
                 for(String id:List.of("reader_a","reader_b","reader_c"))Await.until(id+" to resume its original new scope after process replacement",BOUND,
@@ -484,7 +487,10 @@ class ThreeLayerSharedCaptureIT {
     }
 
     private RealProcessServer lossServer(String configurationUri,String cluster) {
-        return RealProcessServer.startPrepared(configurationUri,"127.0.0.1",port -> List.of("--tapstate.cluster.id="+cluster,
+        return lossServer(configurationUri, cluster, null);
+    }
+    private RealProcessServer lossServer(String configurationUri,String cluster,Path staging) {
+        return RealProcessServer.startPrepared(configurationUri,"127.0.0.1",staging,port -> List.of("--tapstate.cluster.id="+cluster,
                 "--tapstate.cluster.node-id=shared-loss-node","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false","--logging.level.io.tapstate.app.HazelcastOperatorReadiness=DEBUG",
                 "--tapstate.connectors.seed-dir="+work.resolve("no-loss-seeds")));
