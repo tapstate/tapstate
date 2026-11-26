@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "version": 4,
+  "version": 5,
   "connectors": [
     {
       "id": "mysql",
@@ -15,18 +15,6 @@
       "loaderRetirementEligible": true
     },
     {
-      "id": "aliyun-rds-mysql",
-      "name": "ApsaraDB RDS for MySQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-rds-mysql-connector",
-      "loaderRetirementEligible": true
-    },
-    {
       "id": "aws-rds-mysql",
       "name": "Amazon RDS for MySQL",
       "roles": [
@@ -36,18 +24,6 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "aws-rds-mysql-connector",
-      "loaderRetirementEligible": true
-    },
-    {
-      "id": "polar-db-mysql",
-      "name": "ApsaraDB PolarDB for MySQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "polar-db-mysql-connector",
       "loaderRetirementEligible": true
     },
     {
@@ -75,54 +51,6 @@
       "loaderRetirementEligible": true
     },
     {
-      "id": "aliyun-rds-postgres",
-      "name": "ApsaraDB RDS for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-rds-postgres-connector",
-      "loaderRetirementEligible": true
-    },
-    {
-      "id": "aliyun-adb-postgres",
-      "name": "ApsaraDB AnalyticDB for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-adb-postgres-connector",
-      "loaderRetirementEligible": true
-    },
-    {
-      "id": "polar-db-postgres",
-      "name": "ApsaraDB PolarDB for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "polar-db-postgres-connector",
-      "loaderRetirementEligible": true
-    },
-    {
-      "id": "tencent-db-postgres",
-      "name": "TencentDB for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "tencent-db-postgres-connector",
-      "loaderRetirementEligible": true
-    },
-    {
       "id": "mongodb",
       "name": "MongoDB",
       "roles": [
@@ -144,30 +72,6 @@
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
       "artifactId": "mongodb-atlas-connector",
-      "loaderRetirementEligible": true
-    },
-    {
-      "id": "aliyun-db-mongodb",
-      "name": "ApsaraDB for MongoDB",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-mongodb-connector",
-      "loaderRetirementEligible": true
-    },
-    {
-      "id": "tencent-db-mongodb",
-      "name": "TencentDB for MongoDB",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "tencent-db-mongodb-connector",
       "loaderRetirementEligible": true
     },
     {

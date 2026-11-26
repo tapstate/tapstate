@@ -364,6 +364,18 @@ class LocalConnectorArtifactsTest {
         assertThat(runtime.registryView().findAll("orders"))
                 .extracting(io.tapstate.spi.store.ConnectorRegistration::contentHash).containsExactly(hash);
         assertThat(runtime.resolve("orders").contentHash()).isEqualTo(hash);
+
+        supported.set(false);
+        assertThat(runtime.admits("orders")).isFalse();
+        Path replacement = Files.copy(artifact("2.9.12"), work.resolve("replacement.jar"));
+        assertThatThrownBy(() -> runtime.installDrop(replacement)).isInstanceOfSatisfying(
+                TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_OFFICIAL));
+
+        var restarted = new LocalConnectorArtifacts(work.resolve("plugins"), new ConnectorIntrospector(), cache,
+                cache.specs, cache, "node", (digest, output) -> { throw new AssertionError("Unexpected GridFS"); },
+                List::of, "2.0.11-SNAPSHOT");
+        restarted.restore();
+        assertThat(restarted.resolve("orders").contentHash()).isEqualTo(hash);
     }
 
     @Test
