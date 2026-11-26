@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,10 +44,28 @@ def download(url: str, destination: Path) -> None:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise STAGE.StageError("connector selection contains an invalid download URL")
-    process = subprocess.run([
+    command = [
         "curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--proto-redir", "=https",
-        "--max-time", "120", "--max-filesize", str(STAGE.MAX_JAR_BYTES), "--output", str(destination), url,
-    ], capture_output=True, timeout=125, check=False)
+        "--max-time", "120", "--max-filesize", str(STAGE.MAX_JAR_BYTES), "--output", str(destination),
+    ]
+    diagnostics = os.environ.get("TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS") == "1"
+    if diagnostics:
+        command += [
+            "--write-out",
+            "http=%{http_code} effective_host=%{urle.host} remote_ip=%{remote_ip} redirects=%{num_redirects} "
+            "dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s "
+            "first_byte=%{time_starttransfer}s redirect=%{time_redirect}s total=%{time_total}s bytes=%{size_download}",
+        ]
+    process = subprocess.run([*command, url], capture_output=True, timeout=125, check=False)
+    if diagnostics:
+        artifact = parsed.path.rsplit("/", 1)[-1]
+        metrics = process.stdout.decode(errors="replace")
+        print(f"Connector download {destination.name}: artifact={artifact} host={parsed.hostname} "
+              f"exit={process.returncode} {metrics}", file=sys.stderr, flush=True)
+        if process.stderr:
+            message = " ".join(process.stderr.decode(errors="replace").splitlines())
+            print(f"Connector download {destination.name}: {re.sub(r'https?://\S+', '[URL]', message)}",
+                  file=sys.stderr, flush=True)
     if process.returncode != 0:
         raise STAGE.StageError(f"{destination.name}: Maven artifact download failed (curl exit={process.returncode})")
 
