@@ -342,7 +342,8 @@ tapstate(admin@127.0.0.1:8080)> explain order_pipeline
 
 `metrics <id>` without `--from` and `--to` keeps its current-snapshot behavior. A history query requires
 both range options. The CLI prints the effective range, segments, rates, lag, gaps, unavailable series,
-retention cutoff, consistency, and continuation cursor.
+retention cutoff, consistency, and continuation cursor. When a point has CDC delivery samples,
+the CLI prints `cdc.delivery.avg` in milliseconds and `samples` as the number of confirmed deliveries.
 
 In a connected session, or when `-c` selects a server explicitly, `explain <id>` is the runtime
 explanation. Without a server target, the existing offline `explain` command remains the DSL field

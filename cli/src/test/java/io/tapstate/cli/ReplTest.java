@@ -5923,7 +5923,8 @@ class ReplTest {
                                 "2026-09-20T10:00:00Z", "2026-09-20T10:30:00Z",
                                 new HistoryOutcome.Rate(1_800, 1, 3), null,
                                 List.of(new HistoryOutcome.Lag(
-                                        "orders", "2026-09-20T10:29:00Z", 2, 9)))))),
+                                        "orders", "2026-09-20T10:29:00Z", 2, 9)),
+                                new HistoryOutcome.CdcDelivery(8, 91.125))))),
                 List.of(), List.of(new HistoryOutcome.Unavailable("bytes.out", null)), "opaque-next");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -5938,6 +5939,7 @@ class ReplTest {
         assertThat(out).contains("PT30M")
                 .contains("records.out=1/s")
                 .contains("lag.orders=2s max=9s")
+                .contains("cdc.delivery.avg=91.125ms samples=8")
                 .contains("unavailable bytes.out")
                 .contains("nextCursor opaque-next");
     }

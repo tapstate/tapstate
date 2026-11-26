@@ -130,7 +130,7 @@ class PipelineObservabilityLiveIT {
     }
 
     @Test
-    void cdcOnlyHistoryCountsTheFirstAcknowledgementAfterAnIdleWindowStarts() throws Exception {
+    void cdcOnlyHistoryCountsTheFirstAcknowledgementInRestAndCli() throws Exception {
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
                 MongoEndpoints mongo = new MongoEndpoints();
                 PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
@@ -173,12 +173,20 @@ class PipelineObservabilityLiveIT {
             var first = awaitHistory(server.baseUrl(), control.credential(), from,
                     history -> points(history).stream().anyMatch(point -> point.containsKey("cdcDelivery")),
                     "the first acknowledgement in CDC-only history");
-            assertThat(points(first).stream().map(point -> point.get("cdcDelivery"))
-                    .filter(Map.class::isInstance).map(Map.class::cast).toList())
-                    .singleElement().satisfies(delivery -> {
-                        assertThat(((Number) delivery.get("sampleCount")).longValue()).isEqualTo(1);
-                        assertThat(((Number) delivery.get("averageMillis")).doubleValue()).isNotNegative();
-                    });
+            var deliveries = points(first).stream().map(point -> point.get("cdcDelivery"))
+                    .filter(Map.class::isInstance).map(Map.class::cast).toList();
+            assertThat(deliveries).hasSize(1);
+            Map<?, ?> delivery = deliveries.getFirst();
+            assertThat(((Number) delivery.get("sampleCount")).longValue()).isEqualTo(1);
+            Number averageMillis = (Number) delivery.get("averageMillis");
+            assertThat(averageMillis.doubleValue()).isNotNegative();
+
+            CliOnce.Run cliHistory = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "metrics", PIPELINE_ID,
+                    "--from", from.toString(), "--to", (String) first.get("effectiveTo"),
+                    "--resolution", "raw", "--limit", "1000", "--table", TABLE);
+            assertThat(cliHistory.exitCode()).isZero();
+            assertThat(cliHistory.stdout()).contains("cdc.delivery.avg=" + averageMillis + "ms samples=1");
         }
     }
 

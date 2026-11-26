@@ -4945,22 +4945,7 @@ final class Repl {
             out.println("segment    " + segment.startReason().toLowerCase(Locale.ROOT)
                     + "  " + segment.intervalStart() + " .. " + segment.intervalEnd());
             for (HistoryOutcome.Point point : segment.points()) {
-                StringBuilder line = new StringBuilder("  ").append(point.intervalEnd());
-                if (point.recordsOut() != null) {
-                    line.append("  records.out=").append(point.recordsOut().averageRate()).append("/s")
-                            .append(" delta=").append(point.recordsOut().delta())
-                            .append(" max=").append(point.recordsOut().maxRate()).append("/s");
-                }
-                if (point.bytesOut() != null) {
-                    line.append("  bytes.out=").append(point.bytesOut().averageRate()).append("/s")
-                            .append(" delta=").append(point.bytesOut().delta())
-                            .append(" max=").append(point.bytesOut().maxRate()).append("/s");
-                }
-                for (HistoryOutcome.Lag lag : point.lag()) {
-                    line.append("  lag.").append(lag.table()).append('=').append(lag.last()).append('s')
-                            .append(" max=").append(lag.max()).append('s');
-                }
-                out.println(line);
+                out.println(renderHistoryPoint(point));
             }
         }
         history.gaps().forEach(gap -> out.println(
@@ -4970,6 +4955,30 @@ final class Repl {
         out.println("cutoff     " + history.retentionCutoff());
         out.println("consistency " + history.consistency().toLowerCase(Locale.ROOT));
         out.println("nextCursor " + (history.nextCursor() == null ? "none" : history.nextCursor()));
+    }
+
+    private static String renderHistoryPoint(HistoryOutcome.Point point) {
+        StringBuilder line = new StringBuilder("  ").append(point.intervalEnd());
+        if (point.recordsOut() != null) {
+            line.append("  records.out=").append(point.recordsOut().averageRate()).append("/s")
+                    .append(" delta=").append(point.recordsOut().delta())
+                    .append(" max=").append(point.recordsOut().maxRate()).append("/s");
+        }
+        if (point.bytesOut() != null) {
+            line.append("  bytes.out=").append(point.bytesOut().averageRate()).append("/s")
+                    .append(" delta=").append(point.bytesOut().delta())
+                    .append(" max=").append(point.bytesOut().maxRate()).append("/s");
+        }
+        HistoryOutcome.CdcDelivery cdc = point.cdcDelivery();
+        if (cdc != null) {
+            line.append("  cdc.delivery.avg=").append(cdc.averageMillis()).append("ms")
+                    .append(" samples=").append(cdc.sampleCount());
+        }
+        for (HistoryOutcome.Lag lag : point.lag()) {
+            line.append("  lag.").append(lag.table()).append('=').append(lag.last()).append('s')
+                    .append(" max=").append(lag.max()).append('s');
+        }
+        return line.toString();
     }
 
     private int explainOnline(List<String> words) {
