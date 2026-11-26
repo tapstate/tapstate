@@ -36,6 +36,15 @@ import org.slf4j.LoggerFactory;
 final class NativePipelineRunProgressPublisher implements PipelineRunProgressEvents, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(NativePipelineRunProgressPublisher.class);
     private record EventKey(PipelineIntentScope scope, WorkloadClaimFence claim, Object fact) {}
+    private record BindingKey(PipelineIntentScope scope, WorkloadClaimFence claim) {}
+    private record Binding(long startRevision, PipelineRunProgress.Mode mode, Instant planReady, Instant connectorsReady) {
+        PipelineRunProgress applyTo(PipelineRunProgress progress) {
+            return progress.inactive().withMode(mode)
+                    .reach(PipelineRunStage.EXECUTION_PLAN_PREPARED, planReady)
+                    .reach(PipelineRunStage.CONNECTORS_READY, connectorsReady);
+        }
+    }
+    private static final int MAX_RETAINED = 2048;
 
     private final MongoCacheDomain cache;
     private final CacheBusinessScope scope;
@@ -50,6 +59,7 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     private final Semaphore slots = new Semaphore(256);
     private final Set<Object> pending = ConcurrentHashMap.newKeySet();
     private final LinkedHashMap<Object, Boolean> recorded = new LinkedHashMap<>(128, 0.75f, true);
+    private final LinkedHashMap<BindingKey, Binding> pendingBindings = new LinkedHashMap<>();
     private boolean prepared;
 
     NativePipelineRunProgressPublisher(MongoCacheDomain cache, CacheBusinessScope scope, PipelineIntentStore intents,
@@ -88,10 +98,12 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
 
     @Override public void bind(PipelineIntentSnapshot intent, WorkloadClaimFence claim, long startRevision,
             PipelineRunProgress.Mode mode, Instant planReady, Instant connectorsReady) {
-        offer(new EventKey(intent.scope(), claim, mode), true, 0,
-                () -> update(intent, claim, startRevision, Execution.BIND, previous -> previous.inactive().withMode(mode)
-                        .reach(PipelineRunStage.EXECUTION_PLAN_PREPARED, planReady)
-                        .reach(PipelineRunStage.CONNECTORS_READY, connectorsReady)));
+        var key = new BindingKey(intent.scope(), claim);
+        synchronized (pendingBindings) {
+            pendingBindings.put(key, new Binding(startRevision, mode, planReady, connectorsReady));
+            if (pendingBindings.size() > MAX_RETAINED) pendingBindings.pollFirstEntry();
+        }
+        offer(key, false, 0, () -> update(intent, claim, startRevision, Execution.BIND, UnaryOperator.identity()));
     }
 
     @Override public void observation(PipelineIntentSnapshot intent, WorkloadClaimFence claim, Observation observation) {
@@ -131,6 +143,12 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
 
     private boolean update(PipelineIntentSnapshot intent, WorkloadClaimFence claim, long originalStart,
             Execution execution, UnaryOperator<PipelineRunProgress> change) {
+        var key = new BindingKey(intent.scope(), claim);
+        Binding binding;
+        synchronized (pendingBindings) {
+            binding = execution == Execution.KEEP ? null : pendingBindings.get(key);
+        }
+        if (execution == Execution.BIND && binding == null) return true;
         active.run();
         var current = intents.executionBindings(intent.scope()).filter(value -> value.intentRevision() == intent.intentRevision()).orElse(null);
         if (current == null) return false;
@@ -141,8 +159,9 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
             prepared = true;
         }
         var store = cache.pipelineRunProgress(intent.scope(), claim, active);
-        long start = originalStart > 0 ? originalStart : anchor;
-        if (originalStart == 0 && current.bindings().handoff() == null) {
+        long capturedStart = originalStart > 0 ? originalStart : binding == null ? 0 : binding.startRevision();
+        long start = capturedStart > 0 ? capturedStart : anchor;
+        if (capturedStart == 0 && current.bindings().handoff() == null) {
             // An execution can open a real connector without retaining an artifact handoff.
             // In that case the original bound projection already proved the explicit Start.
             var retained = store.latest().orElse(null);
@@ -152,8 +171,13 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
         }
         if (start <= 0 || start > current.intentRevision()
                 || current.bindings().handoff() != null && anchor != start) return false;
-        return store.update(start,
-                NativePipelineRunProgressQuery.accepted(intent.scope(), start, null, 3), execution, change);
+        // If the asynchronous startup write was dropped or failed, a subsequent fact can retry it.
+        // The binding is only taken from the exact original claim and the transaction proves that claim.
+        boolean written = store.update(start, NativePipelineRunProgressQuery.accepted(intent.scope(), start, null, 3),
+                binding == null ? execution : Execution.BIND,
+                binding == null ? change : previous -> change.apply(binding.applyTo(previous)));
+        if (written && binding != null) synchronized (pendingBindings) { pendingBindings.remove(key, binding); }
+        return written;
     }
 
     private void offer(Object key, boolean remember, int retries, BooleanSupplier operation) {
@@ -174,7 +198,7 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
                     if (operation.getAsBoolean()) {
                         if (remember) synchronized (recorded) {
                             recorded.put(key, true);
-                            if (recorded.size() > 2048) recorded.pollFirstEntry();
+                            if (recorded.size() > MAX_RETAINED) recorded.pollFirstEntry();
                         }
                     } else if (retries > 0 && !writer.isShutdown()) {
                         LOG.debug("Run progress is waiting for the original execution binding: {}", key);
