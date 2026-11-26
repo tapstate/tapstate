@@ -62,9 +62,11 @@ class ASeedPopulatesThePluginCacheWithoutDownloadingItAgainIT {
             Path cached = cache.resolve(hash + ".jar");
             assertThat(Files.isRegularFile(cached)).isTrue();
             try (var input = Files.newInputStream(cached)) { assertThat(ContentHash.of(input)).isEqualTo(hash); }
-            assertThat(chunkWrites.get()).as("the observer witnessed the real GridFS upload").isPositive();
             assertThat(logger.getAppender(observer.getName())).isSameAs(observer);
-            assertThat(chunkReads.get()).as("the original local seed supplies the plugin cache").isZero();
+            assertThat(observer.isStarted()).isTrue();
+            assertThat(logger.isDebugEnabled()).isTrue();
+            assertThat(chunkReads.get()).as("the local seed needs no GridFS chunk reads").isZero();
+            assertThat(chunkWrites.get()).as("the local seed needs no GridFS chunk writes").isZero();
         } finally {
             logger.detachAppender(observer); observer.stop(); logger.setLevel(previous); logger.setAdditive(additive);
         }

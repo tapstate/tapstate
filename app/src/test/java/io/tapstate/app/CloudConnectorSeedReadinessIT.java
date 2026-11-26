@@ -5,7 +5,8 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CapabilityDeriver;
-import io.tapstate.spi.store.ConnectorRegistration;
+import io.tapstate.spi.store.ConnectorArtifactMetadata;
+import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.StorageBinding;
@@ -24,7 +25,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
@@ -57,13 +58,13 @@ class CloudConnectorSeedReadinessIT {
                     .containsExactlyInAnyOrderElementsOf(IDS);
             assertThat(business.getBean(ConnectorCatalogView.class).summaries())
                     .extracting(summary -> summary.id()).containsExactlyInAnyOrderElementsOf(IDS);
-            assertDummyResolves(business, seeds);
+            assertDummyResolves(business, seeds, RegistrationSource.SEED);
             hashes = registry.list().stream().map(registration -> registration.contentHash()).sorted().toList();
         }
         assertNoArtifactCopies(storage);
         try (var restarted = builder(ready).run(arguments(storage, true, seeds))) {
             assertThat(ready.get()).isEqualTo(2);
-            assertDummyResolves(NativeAppStorage.business(restarted), seeds);
+            assertDummyResolves(NativeAppStorage.business(restarted), seeds, RegistrationSource.SEED);
             assertThat(NativeAppStorage.business(restarted).getBean(ConnectorRegistry.class).list().stream()
                     .map(registration -> registration.contentHash()).sorted()).containsExactlyElementsOf(hashes);
         }
@@ -88,19 +89,19 @@ class CloudConnectorSeedReadinessIT {
         var ready = new AtomicInteger();
         try (var first = builder(ready).run(arguments(storage, false, seeds))) {
             assertThat(ready.get()).isEqualTo(1);
-            assertDummyResolves(NativeAppStorage.business(first), seeds);
+            assertDummyResolves(NativeAppStorage.business(first), seeds, RegistrationSource.REGISTER);
         }
         try (var restarted = builder(ready).run(arguments(storage, false, seeds))) {
             assertThat(ready.get()).isEqualTo(2);
-            assertDummyResolves(NativeAppStorage.business(restarted), seeds);
+            assertDummyResolves(NativeAppStorage.business(restarted), seeds, RegistrationSource.REGISTER);
         }
     }
 
-    private static void assertDummyResolves(org.springframework.context.ApplicationContext business, Path seeds)
-            throws IOException {
+    private static void assertDummyResolves(org.springframework.context.ApplicationContext business, Path seeds,
+                                            RegistrationSource source) throws IOException {
         var registrations = business.getBean(ConnectorRegistry.class).findAll("dummy");
         assertThat(registrations).hasSize(1);
-        assertThat(registrations.getFirst().source()).isEqualTo(RegistrationSource.SEED);
+        assertThat(registrations.getFirst().source()).isEqualTo(source);
         var ref = business.getBean(ConnectorProvisioner.class).resolve("dummy");
         assertThat(ref.contentHash()).isEqualTo(registrations.getFirst().contentHash());
         assertThat(Files.mismatch(ref.classpath().getFirst(), seeds.resolve("dummy-connector.jar"))).isEqualTo(-1);
@@ -143,21 +144,32 @@ class CloudConnectorSeedReadinessIT {
     }
 
     @Test
-    void aRegistrationConflictRefusesCloudBusinessWithoutChangingItsInstallationMode() {
+    void aRegistrationConflictRefusesCloudBusinessWithoutChangingItsInstallationMode() throws IOException {
         var storage = database("conflict",true);
         var ready = new AtomicInteger();
         Path seeds = CloudConnectorTestInputs.seedDirectory();
+        var lock = tools.jackson.databind.json.JsonMapper.builder().build().readTree(seeds.resolveSibling("release")
+                .resolve("connectors.lock.json").toFile());
+        String mysqlDigest = lock.get("connectors").valueStream()
+                .filter(entry -> "mysql".equals(entry.get("id").asText()))
+                .findFirst().orElseThrow().get("sha256").asText();
         try (var context = builder(ready).run(arguments(storage, true, seeds))) {
             var business = NativeAppStorage.business(context);
-            var registry = business.getBean(ConnectorRegistry.class);
-            var registration = registry.findAll("mysql").getFirst();
-            var catalog = business.getBean(io.tapstate.spi.store.ConnectorCatalogStore.class);
-            catalog.upsertBundled(catalog.get("mysql").orElseThrow(),
-                    new ConnectorRegistration("mysql", "0".repeat(64), registration.pdkApiVersion(), RegistrationSource.SEED),
-                    Optional.empty());
+            var registrations = business.getBean(ConnectorRegistry.class).findAll("mysql");
+            assertThat(registrations).singleElement().satisfies(registration -> {
+                assertThat(registration.contentHash()).isEqualTo(mysqlDigest);
+                assertThat(registration.source()).isEqualTo(RegistrationSource.SEED);
+            });
+            var catalog = business.getBean(ConnectorCatalogStore.class);
+            var artifact = catalog.artifact("mysql", mysqlDigest).orElseThrow();
+            assertThat(artifact.origin()).isEqualTo(ConnectorArtifactMetadata.Origin.BUNDLE);
+            var conflicting = new ConnectorArtifactMetadata(artifact.catalog(), mysqlDigest, artifact.version(),
+                    artifact.pdkApiVersion(), ConnectorArtifactMetadata.Origin.DROP_DIRECTORY, artifact.sizeBytes(), artifact.icon());
+            catalog.upsertArtifact(conflicting);
+            assertThat(catalog.artifact("mysql", mysqlDigest)).contains(conflicting);
         }
         ready.set(0);
-        refusesBusiness(storage, seeds, ready);
+        refusesBusiness(storage, seeds, ready, Map.of("connector", "mysql", "reason", "registration-failed"));
     }
 
     @Test
@@ -180,16 +192,25 @@ class CloudConnectorSeedReadinessIT {
     }
 
     private void refusesBusiness(NativeAppStorage storage, Path seeds, AtomicInteger ready) {
+        refusesBusiness(storage, seeds, ready, Map.of());
+    }
+
+    private void refusesBusiness(NativeAppStorage storage, Path seeds, AtomicInteger ready,
+                                  Map<String, Object> expectedDiagnosis) {
         try(var context=builder(ready).run(arguments(storage,true,seeds))) {
             var root=context.getBean(StorageRoot.class);
             assertThat(ready.get()).as("the diagnostic/auth root remains available").isEqualTo(1);
             assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            assertThat(root.mode()).isEqualTo(StorageBinding.Mode.CLOUD);
+            assertThat(root.runtime().current().orElseThrow().binding().mode()).isEqualTo(StorageBinding.Mode.CLOUD);
             assertThat(root.runtime().business()).isEmpty();
             // Retry the actual child assembly to retain the exact release-validation diagnosis.
             assertThatThrownBy(() -> root.runtime().startBusiness(root.runtime().current().orElseThrow(),
                     bound -> new NativeBusinessContext(root,bound,context)))
-                    .isInstanceOfSatisfying(TapstateException.class,
-                            coded -> assertThat(coded.code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID));
+                    .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                        assertThat(coded.code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID);
+                        assertThat(coded.args()).containsAllEntriesOf(expectedDiagnosis);
+                    });
             assertThat(root.runtime().business()).isEmpty();
             assertThat(com.hazelcast.core.Hazelcast.getAllHazelcastInstances()).isEmpty();
         }

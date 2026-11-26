@@ -69,6 +69,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.assertj.core.api.Assertions.tuple;
 
 /** Enforced Mongo authorization, not an unauthenticated simulation of database routing. */
 @RequiresDocker
@@ -286,12 +287,17 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
                 var initialRules = admin.getDatabase(configDb).getCollection("alert_rules").find().into(new ArrayList<>());
-                assertThat(initialRules).hasSize(5);
+                assertThat(initialRules).extracting(rule -> rule.get("_id", Document.class).getString("id"))
+                        .containsExactlyInAnyOrder("builtin-cluster.node-unavailable", "builtin-cluster.storage-unavailable",
+                                "builtin-pipeline.failed", "builtin-pipeline.observation-stale", "builtin-source.connection-failed",
+                                "builtin-cluster.config-structure-drift", "builtin-cluster.cache-structure-drift");
                 for (var rule : initialRules) {
                     assertThat(rule.get("_id", Document.class)).containsEntry("authorityId", setup.scope().installationId())
                             .containsEntry("clusterId", setup.scope().clusterId());
                     assertThat(rule.getString("deployment")).isEqualTo("ON_PREM");
-                    assertThat(rule.get("body", Document.class)).containsEntry("enabled", true);
+                    var body = rule.get("body", Document.class);
+                    assertThat(body).containsEntry("enabled", true);
+                    assertThat(rule.get("_id", Document.class).getString("id")).isEqualTo("builtin-" + body.getString("typeId"));
                 }
                 String key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId");
                 var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
@@ -300,7 +306,8 @@ class ManagedMongoStoreIsolationIT {
                         .body(Map.of("username", "admin", "password", "op-installation-password")).retrieve().body(Map.class);
                 assertThat(created.get("phase")).isEqualTo("COMPLETE");
                 assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
-                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "LOGIN", "management", false));
+                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "LOGIN", "management", false,
+                                "businessReady", true));
                 assertThat(files.capability()).isEmpty();
                 var publicClient = process.publicClient();
                 var login = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "op-installation-password", "createSession", true))
@@ -308,7 +315,15 @@ class ManagedMongoStoreIsolationIT {
                 var client = publicClient.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
                     var rules = client.post().uri("/api/alerts/configuration/list").body(Map.of("kind", "RULE")).retrieve().body(Map.class);
-                    assertThat((List<?>) rules.get("rows")).hasSize(5);
+                    assertThat(rules.get("nextCursor")).isNull();
+                    var storedDefaults = initialRules.stream().map(rule -> {
+                        var body = rule.get("body", Document.class);
+                        return tuple(rule.get("_id", Document.class).getString("id"), body.getString("typeId"), body.getBoolean("enabled"));
+                    }).toList();
+                    assertThat((List<?>) rules.get("rows")).extracting(row -> {
+                        var rule = (Map<?, ?>) row;
+                        return tuple(rule.get("id"), rule.get("typeId"), rule.get("enabled"));
+                    }).containsExactlyInAnyOrderElementsOf(storedDefaults);
                     assertThat(admin.getDatabase(configDb).getCollection("alert_node_lifecycles")
                             .countDocuments(new Document("phase", "EXPECTED"))).isGreaterThanOrEqualTo(1);
                 });
