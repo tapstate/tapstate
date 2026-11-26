@@ -41,14 +41,19 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         try (var storage=PreparedNativeStore.create(); var documents=new NativeSrsDocuments(storage)) {
             var topology = new MongoRenewedTopology(storage.clusterId());
             try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
+                assertThat(server.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
                 var control = new ControlPlane(server.baseUrl());
                 var child = businessContext(server);
                 var member = child.getBean(HazelcastInstance.class);
                 try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
+                    assertThat(peer.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.PEER));
                     storage.loginAndAwaitBusiness(control);
+                    storage.loginAndAwaitBusiness(new ControlPlane(peer.baseUrl()));
                     Await.until("the real two-member topology to form", BOUND,
                             () -> member.getCluster().getMembers().size() == 2,
                             () -> member.getCluster().getMembers().toString());
+                    assertThat(control.clusterMembers()).extracting(ClusterMemberFacts::controlUrl)
+                            .containsExactlyInAnyOrder(server.baseUrl().toString(), peer.baseUrl().toString());
                 }
                 // After committing the two-member topology, run the writer on its sole remaining member.
                 Await.until("the original member to be the only writer host", BOUND,
@@ -126,6 +131,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                 },() -> "the original NODE lease remains live");
             }
             try (var replacement = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
+                assertThat(replacement.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
                 var control=new ControlPlane(replacement.baseUrl()); storage.loginAndAwaitBusiness(control);
                 Await.until("the new native run to enter the previously refused target call",BOUND,
                         () -> holds.holderBefore(TABLE,3).isPresent(),() -> control.state(PIPELINE)+" "+control.failureCode(PIPELINE));

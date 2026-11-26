@@ -16,6 +16,7 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.testcontainers.containers.MongoDBContainer;
@@ -92,10 +93,12 @@ class SplitStoreLeaseLifecycleIT {
             try {
                 assertThatThrownBy(() -> root.runtime().requireConfiguration().artifacts().get("views"))
                         .isInstanceOf(TapstateException.class);
-                try (var unavailable = start(configUri, topology, MongoRenewedTopology.ORIGINAL)) {
+                try (var unavailable = start(configUri, topology, MongoRenewedTopology.UNAVAILABLE)) {
                     var blocked = unavailable.getBean(StorageRoot.class);
                     assertThat(blocked.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
                     assertThat(blocked.runtime().business()).isEmpty();
+                    assertThat(((WebServerApplicationContext) unavailable).getWebServer().getPort())
+                            .isEqualTo(topology.controlUrl(MongoRenewedTopology.UNAVAILABLE).getPort());
                 }
                 await().atMost(TTL.plusSeconds(5)).untilAsserted(() -> {
                     var renewed = claims.read(initial.key()).orElseThrow();
@@ -145,7 +148,6 @@ class SplitStoreLeaseLifecycleIT {
     private ConfigurableApplicationContext start(String configUri, MongoRenewedTopology topology, String name) {
         var arguments = new ArrayList<>(topology.arguments(name));
         arguments.addAll(List.of(
-                "--server.address=127.0.0.1", "--server.port=0",
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=WARN", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + configUri, "--tapstate.store.mongo.server-selection-timeout=2s",
                 "--tapstate.cluster.node-session-ttl=" + TTL.toSeconds() + "s", "--tapstate.cluster.node-session-renew-interval=1s",

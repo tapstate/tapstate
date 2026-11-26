@@ -16,7 +16,6 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.builder.SpringApplicationBuilder;
-import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -41,8 +40,8 @@ class NativeCacheAlertIT {
         var settings=new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5));
         try(var observer=MongoClients.create(storage.configurationUri())) {
             var config=observer.getDatabase(storage.configurationDatabase());var admin=observer.getDatabase("admin");
-            String[] args={"--server.address=127.0.0.1","--server.port=0","--logging.level.root=WARN","--tapstate.store.mongo.uri="+storage.configurationUri(),
-                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.cluster.node-session-ttl=6s","--tapstate.cluster.node-session-renew-interval=1s",
+            String[] args={"--logging.level.root=WARN","--tapstate.store.mongo.uri="+storage.configurationUri(),
+                    "--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.cluster.node-session-ttl=6s","--tapstate.cluster.node-session-renew-interval=1s",
                     "--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),"--tapstate.control.auth.jwt-secret=cache-alert-fixture-signing"};
             var topology = new MongoRenewedTopology(storage.clusterId());
             AlarmKey originalKey;
@@ -56,7 +55,8 @@ class NativeCacheAlertIT {
                 // The committed topology keeps Mongo renewal active after the peer leaves.
                 // Only the member under test can publish the healthy or failing sample.
                 await().atMost(Duration.ofSeconds(15)).until(() -> member.getCluster().getMembers().size() == 1);
-                var client=HttpClient.newHttpClient();String base="http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort();
+                var client = HttpClient.newHttpClient();
+                String base = topology.controlUrl(MongoRenewedTopology.ORIGINAL).toString();
                 var login=post(client,base,"/auth/login",null,Map.of("username","cache-admin","password","isolated-cache-password"));
                 String token=String.valueOf(login.get("token"));
                 post(client,base,"/api/alerts/configuration/save",token,Map.of("kind","RULE","id","cache-required-write","etag","0","form",Map.of("name","Required CACHE access","typeId","cluster.storage-unavailable",
@@ -168,7 +168,6 @@ class NativeCacheAlertIT {
     }
     private ConfigurableApplicationContext start(String[] base, MongoRenewedTopology topology, String node) {
         var arguments = new ArrayList<>(List.of(base));
-        arguments.remove("--tapstate.hz.member-port=0");
         arguments.addAll(topology.arguments(node));
         arguments.add("--tapstate.connectors.plugins-dir=" + work.resolve(node));
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())

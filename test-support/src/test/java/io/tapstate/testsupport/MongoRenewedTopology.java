@@ -5,20 +5,22 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
+import java.net.URI;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /** Startup arguments for two real members that renew their independent node leases in Mongo. */
 public final class MongoRenewedTopology {
     public static final String ORIGINAL = "lease-original";
     public static final String PEER = "lease-peer";
+    public static final String UNAVAILABLE = "lease-unavailable";
+
+    private record Ports(int member, int control) {}
 
     private final String clusterId;
     private final String address;
-    private final int originalPort;
-    private final int peerPort;
-    private final int originalControlPort;
-    private final int peerControlPort;
+    private final Map<String, Ports> nodes;
 
     public MongoRenewedTopology(String clusterId) throws IOException {
         this.clusterId = clusterId;
@@ -27,11 +29,12 @@ public final class MongoRenewedTopology {
         try (var original = new ServerSocket(0, 1, host);
              var peer = new ServerSocket(0, 1, host);
              var originalControl = new ServerSocket(0, 1, host);
-             var peerControl = new ServerSocket(0, 1, host)) {
-            originalPort = original.getLocalPort();
-            peerPort = peer.getLocalPort();
-            originalControlPort = originalControl.getLocalPort();
-            peerControlPort = peerControl.getLocalPort();
+             var peerControl = new ServerSocket(0, 1, host);
+             var unavailable = new ServerSocket(0, 1, host);
+             var unavailableControl = new ServerSocket(0, 1, host)) {
+            nodes = Map.of(ORIGINAL, new Ports(original.getLocalPort(), originalControl.getLocalPort()),
+                    PEER, new Ports(peer.getLocalPort(), peerControl.getLocalPort()),
+                    UNAVAILABLE, new Ports(unavailable.getLocalPort(), unavailableControl.getLocalPort()));
         }
     }
 
@@ -48,22 +51,30 @@ public final class MongoRenewedTopology {
     }
 
     public List<String> arguments(String nodeId) {
-        int memberPort = switch (nodeId) {
-            case ORIGINAL -> originalPort;
-            case PEER -> peerPort;
-            default -> throw new IllegalArgumentException("Unknown test member " + nodeId);
-        };
-        int controlPort = ORIGINAL.equals(nodeId) ? originalControlPort : peerControlPort;
-        return List.of("--tapstate.cluster.id=" + clusterId,
+        Ports ports = ports(nodeId);
+        return List.of("--server.address=" + address,
+                "--server.port=" + ports.control(),
+                "--tapstate.cluster.id=" + clusterId,
                 "--tapstate.cluster.node-id=" + nodeId,
                 "--tapstate.cluster.profile=process-failure-only",
                 "--tapstate.cluster.bootstrap-min-members=2",
                 "--tapstate.hz.bind-address=" + address,
-                "--tapstate.hz.member-port=" + memberPort,
-                "--tapstate.hz.advertised-member-address=" + address + ":" + memberPort,
+                "--tapstate.hz.member-port=" + ports.member(),
+                "--tapstate.hz.advertised-member-address=" + address + ":" + ports.member(),
                 "--tapstate.hz.outbound-member-ports=20000-29999",
                 "--tapstate.hz.discovery.mode=tcp-ip",
-                "--tapstate.hz.discovery.tcp-ip.seeds=" + address + ":" + originalPort + "," + address + ":" + peerPort,
-                "--tapstate.control.advertise-url=http://" + address + ":" + controlPort);
+                "--tapstate.hz.discovery.tcp-ip.seeds=" + address + ":" + ports(ORIGINAL).member()
+                        + "," + address + ":" + ports(PEER).member(),
+                "--tapstate.control.advertise-url=" + controlUrl(nodeId));
+    }
+
+    public URI controlUrl(String nodeId) {
+        return URI.create("http://" + address + ":" + ports(nodeId).control());
+    }
+
+    private Ports ports(String nodeId) {
+        Ports ports = nodes.get(nodeId);
+        if (ports == null) throw new IllegalArgumentException("Unknown test member " + nodeId);
+        return ports;
     }
 }

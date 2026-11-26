@@ -10,6 +10,7 @@ import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
+import org.springframework.web.util.UriComponentsBuilder;
 
 import java.net.URI;
 import java.nio.file.Path;
@@ -110,18 +111,22 @@ final class InProcessServer implements ServerHandle {
             throw e;
         }
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
-        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
-        // one of those is the address bound below.
-        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory, refreshed);
+        String address = context.getEnvironment().getProperty("server.address", "127.0.0.1");
+        URI endpoint = UriComponentsBuilder.newInstance().scheme("http").host(address).port(port).build().toUri();
+        return new InProcessServer(context, endpoint, stagingDirectory, refreshed);
     }
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
             Path stagingDirectory, List<String> additionalArguments,
             java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
             io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
-        java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
-                "--server.address=127.0.0.1", "--server.port=0"));
-        arguments.addAll(additionalArguments);
+        var arguments = new java.util.ArrayList<>(additionalArguments);
+        if (arguments.stream().noneMatch(value -> value.startsWith("--server.address="))) {
+            arguments.add("--server.address=127.0.0.1");
+        }
+        if (arguments.stream().noneMatch(value -> value.startsWith("--server.port="))) {
+            arguments.add("--server.port=0");
+        }
         var defaults = new java.util.ArrayList<>(List.of(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
