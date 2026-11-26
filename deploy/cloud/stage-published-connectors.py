@@ -66,8 +66,8 @@ def download(url: str, destination: Path) -> None:
               f"exit={process.returncode} {metrics}", file=sys.stderr, flush=True)
         if process.stderr:
             message = " ".join(process.stderr.decode(errors="replace").splitlines())
-            print(f"Connector download {destination.name}: {re.sub(r'https?://\S+', '[URL]', message)}",
-                  file=sys.stderr, flush=True)
+            message = re.sub(r"https?://\S+", "[URL]", message)
+            print(f"Connector download {destination.name}: {message}", file=sys.stderr, flush=True)
     if process.returncode != 0:
         raise STAGE.StageError(f"{destination.name}: Maven artifact download failed (curl exit={process.returncode})")
 
