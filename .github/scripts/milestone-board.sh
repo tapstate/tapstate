@@ -262,13 +262,13 @@ reconcile() {
 }
 
 read_event_resource() {
-  local path=$1 response status
+  local path=$1 response status separator=$'\r\n\r\n'
   if response=$(gh api --include "$path"); then
-    if [[ $response != *$'\n\n'* ]]; then
+    if [[ $response != *"$separator"* ]]; then
       error "invalid HTTP response for $path"
       return 1
     fi
-    printf '%s\n' "${response#*$'\n\n'}"
+    printf '%s\n' "${response#*"$separator"}"
     return
   fi
   status=${response%%$'\n'*}

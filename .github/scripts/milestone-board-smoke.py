@@ -34,7 +34,7 @@ def save():
 
 def answer(value, status=200):
     if "--include" in args:
-        print(f"HTTP/2.0 {status}\n")
+        sys.stdout.write(f"HTTP/2.0 {status}\nContent-Type: application/json\r\n\r\n")
     print(json.dumps(value))
     save()
     if status >= 400:
