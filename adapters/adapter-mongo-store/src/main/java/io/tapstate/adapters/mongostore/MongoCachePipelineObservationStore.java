@@ -30,6 +30,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /** An observation is isolated by the checkpoint and execution that measured it. */
 final class MongoCachePipelineObservationStore implements ObservationStore {
+    private static final String EPOCH = "epoch";
+    private static final String SCOPE = "scope";
+    private static final String CLAIM_GENERATION = "claimGeneration";
+    private static final String STATE = "state";
+
     private static final AtomicInteger WRITES = new AtomicInteger();
     private static final AtomicBoolean REAPING = new AtomicBoolean();
     private final MongoCachePipelineAccess access;
@@ -38,7 +43,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     record Reading(MongoCachePipelineAccess access, Document state, Document claim, boolean live) {
         String pipeline() { return access.scope.pipelineId(); }
-        long epoch() { return state.getLong("epoch"); }
+        long epoch() { return state.getLong(EPOCH); }
         PipelineState actual() { return StateJson.parse(state.getString("stateJson")); }
         Document key() {
             return keyOfClaim(access, epoch(), claim);
@@ -107,7 +112,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         var captured = document(refreshed, id);
         return access.observationTransaction(session -> {
             var state = access.stateRow(session);
-            if (!Long.valueOf(checkpointEpoch).equals(state.get("epoch"))
+            if (!Long.valueOf(checkpointEpoch).equals(state.get(EPOCH))
                     || StateJson.parse(state.getString("stateJson")) != expected.state()) return Optional.empty();
             var claimId = claimKey(access);
             var reading = reading(session, access, state, claims(session, access, List.of(claimId)).get(claimId));
@@ -138,11 +143,11 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             var collection = collection();
             var exact = collection.find(session, new Document("_id", id)).first();
             if (exact != null) return decode(access, exact, id).filter(value -> value.state() == PipelineState.STOPPED);
-            var prefix = new Document("scope", id.get("scope")).append("epoch", checkpoint.epoch());
-            var lower = new Document(prefix).append("claimGeneration", new org.bson.types.MinKey());
-            var upper = new Document(prefix).append("claimGeneration", original.claimGeneration());
+            var prefix = new Document(SCOPE, id.get(SCOPE)).append(EPOCH, checkpoint.epoch());
+            var lower = new Document(prefix).append(CLAIM_GENERATION, new org.bson.types.MinKey());
+            var upper = new Document(prefix).append(CLAIM_GENERATION, original.claimGeneration());
             var filter = new Document("_id", new Document("$gte", lower).append("$lt", upper))
-                    .append("state", PipelineState.STOPPED.name()).append("_id.executionGeneration", original.executionGeneration());
+                    .append(STATE, PipelineState.STOPPED.name()).append("_id.executionGeneration", original.executionGeneration());
             var retained = collection.find(session, filter).sort(new Document("_id", -1)).first();
             if (retained == null) return Optional.empty();
             var stopped = decode(access, retained, retained.get("_id", Document.class)).orElseThrow();
@@ -188,19 +193,19 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         for (var reading : readings) {
             if (reading.actual() != PipelineState.RUNNING) continue;
             var exact = current.get(reading.key());
-            if (exact != null && PipelineState.RUNNING.name().equals(exact.get("state"))) {
+            if (exact != null && PipelineState.RUNNING.name().equals(exact.get(STATE))) {
                 if (!reading.live()) unavailable.add(reading.pipeline());
             } else {
-                var prefix = new Document("scope", MongoPipelinePreparationFacts.scope(reading.access().scope))
-                        .append("epoch", reading.epoch());
+                var prefix = new Document(SCOPE, MongoPipelinePreparationFacts.scope(reading.access().scope))
+                        .append(EPOCH, reading.epoch());
                 previousRuns.add(new Document("_id", new Document("$gte",
-                        new Document(prefix).append("claimGeneration", new org.bson.types.MinKey()))
-                        .append("$lt", new Document(prefix).append("claimGeneration", new org.bson.types.MaxKey()))));
+                        new Document(prefix).append(CLAIM_GENERATION, new org.bson.types.MinKey()))
+                        .append("$lt", new Document(prefix).append(CLAIM_GENERATION, new org.bson.types.MaxKey()))));
             }
         }
         if (!previousRuns.isEmpty()) {
             for (var row : SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).aggregate(session, List.of(
-                    new Document("$match", new Document("$or", previousRuns).append("state", PipelineState.RUNNING.name())),
+                    new Document("$match", new Document("$or", previousRuns).append(STATE, PipelineState.RUNNING.name())),
                     new Document("$group", new Document("_id", "$pipelineId"))))) {
                 unavailable.add(row.getString("_id"));
             }
@@ -215,10 +220,10 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             var state = reading.actual();
             if (state != PipelineState.FAILED && state != PipelineState.COMPLETED) continue;
             var exact = current.get(reading.key());
-            if (exact != null && state.name().equals(exact.get("state")) && (state == PipelineState.FAILED
+            if (exact != null && state.name().equals(exact.get(STATE)) && (state == PipelineState.FAILED
                     ? exact.containsKey("failure") : exact.containsKey("initialLoad")
                             || exact.get("snapshot") instanceof Document snapshot && !snapshot.isEmpty())) continue;
-            var filter = scopeEpoch(reading.access(), reading.epoch()).append("state", state.name());
+            var filter = scopeEpoch(reading.access(), reading.epoch()).append(STATE, state.name());
             if (state == PipelineState.FAILED) filter.append("failure", new Document("$type", "object"));
             else filter.append("$or", List.of(new Document("initialLoad", new Document("$type", "object")),
                     new Document("snapshot", new Document("$exists", true).append("$ne", new Document()))));
@@ -240,7 +245,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         var key = keyOfFence(access, checkpointEpoch - 1, access.originalClaim());
         return access.observationTransaction(session -> {
             var state = access.state(session, true);
-            if (!Long.valueOf(checkpointEpoch).equals(state.get("epoch"))
+            if (!Long.valueOf(checkpointEpoch).equals(state.get(EPOCH))
                     || StateJson.parse(state.getString("stateJson")) != PipelineState.COMPLETED) return Optional.empty();
             var row = collection().find(session, new Document("_id", key)).first();
             return decode(access, row, key).filter(value -> value.state() == PipelineState.RUNNING);
@@ -251,7 +256,7 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         if (row == null) return Optional.empty();
         try {
             if (!expected.equals(row.get("_id"))
-                    || !MongoPipelinePreparationFacts.scope(access.scope).equals(expected.get("scope"))
+                    || !MongoPipelinePreparationFacts.scope(access.scope).equals(expected.get(SCOPE))
                     || !access.scope.pipelineId().equals(row.get("pipelineId"))) throw access.unreadable("observation");
             var decoded = MongoObservationStore.toObservation(new Document(row).append("_id", access.scope.pipelineId()));
             if (decoded.failure() != null && row.get("failure", Document.class).containsKey("diagnostic")) {
@@ -387,14 +392,14 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     }
 
     private static Document keyOfClaim(MongoCachePipelineAccess access, long epoch, Document claim) {
-        return key(access, epoch, claim.getLong("claimGeneration"), claim.getLong("executionGeneration"),
+        return key(access, epoch, claim.getLong(CLAIM_GENERATION), claim.getLong("executionGeneration"),
                 claim.getLong("topologyRevision"), claim.getString("ownerNodeId"), claim.getString("ownerBootId"));
     }
 
     private static Document key(MongoCachePipelineAccess access, long epoch, long claim, long execution, long topology,
             String node, String boot) {
-        return new Document("scope", MongoPipelinePreparationFacts.scope(access.scope)).append("epoch", epoch)
-                .append("claimGeneration", claim).append("executionGeneration", execution).append("topologyRevision", topology)
+        return new Document(SCOPE, MongoPipelinePreparationFacts.scope(access.scope)).append(EPOCH, epoch)
+                .append(CLAIM_GENERATION, claim).append("executionGeneration", execution).append("topologyRevision", topology)
                 .append("node", node).append("boot", boot);
     }
 

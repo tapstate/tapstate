@@ -680,20 +680,7 @@ final class ConvergenceDriver implements AutoCloseable {
             LifecycleActuator actuator, RebuildAdmission rebuilds, boolean refreshTerminal) {
         Optional<ObservationPublisher.Publication> publication;
         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PUBLISH)) {
-            boolean terminal = result.checkpoint().map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                    .filter(state -> state == PipelineState.STOPPED || state == PipelineState.FAILED).isPresent();
-            if (scoped != null && terminal && scoped.observations() != null) scoped.observations().forget(pipelineId);
-            boolean finalStopSample = terminal && scoped != null && scoped.stoppedRecheck() != null && pass != null
-                    && pass.intent().desired().targetState() == PipelineState.STOPPED && !pass.intent().desired().purgeState()
-                    && !pass.intent().desired().reassemble()
-                    && result.checkpoint().filter(checkpoint -> StateJson.parse(checkpoint.stateJson()) == PipelineState.STOPPED).isPresent();
-            publication = scoped == null ? publisher.publish(pipelineId, failure)
-                    .map(value -> new ObservationPublisher.Publication(value, true))
-                    : scoped.observations() == null || terminal
-                            ? publishScopedObservation(pass, result, failure,
-                                    !finalStopSample && !refreshTerminal && !scoped.alerts().needsFreshTerminalMetrics(pass.scope()))
-                            : scoped.observations().publish(publisher, pass, result, config, failure)
-                                    .map(value -> new ObservationPublisher.Publication(value, true));
+            publication = publishObservationReading(pipelineId, pass, result, config, failure, refreshTerminal);
         }
         StoppedEvidence evidence = null;
         if (publication.isPresent()) {
@@ -701,35 +688,68 @@ final class ConvergenceDriver implements AutoCloseable {
             var published = reading.observation();
             PipelineDiagnostics.event("observation_" + published.state().name());
             if (canSettleStopped(pass, result, published)) {
-                var checkpoint = result.checkpoint().orElseThrow();
-                var terminal = TerminalPublication.from(pass, checkpoint.epoch(), published);
-                scoped.observations().terminal(terminal);
-                var alertReceipt = TerminalPublication.failed();
-                try {
-                    alertReceipt = scoped.alerts().terminalPublished(pass, terminal, published, result.failure().orElse(null), reading.measured());
-                } catch (RuntimeException unavailable) {
-                    LOG.warn("Could not submit the final alert sample for pipeline {}", pipelineId);
-                }
-                var sample = reading.measured() && sampler != null ? RateSampler.sampleOf(published) : null;
-                var history = sample == null ? null : new ProcessObservationWriter.History(sample,
-                        remaining -> pass.rateHistory(remaining).append(sample));
-                var historyReceipt = scoped.writes().terminalHistory(terminal,
-                        history == null ? null : history.guardedBy(pass.guardOriginal(pass.claim())));
-                evidence = new StoppedEvidence(pass.intent(), checkpoint, pass.claim(), historyReceipt, alertReceipt);
+                evidence = recordStoppedEvidence(pipelineId, pass, result, reading);
             } else {
-                if (scoped != null) alert(() -> scoped.alerts().published(pass, published, result.failure().orElse(null), reading.measured()));
-                if (reading.measured()) {
-                    if (scoped == null || scoped.writes() == null) sample(published, pass);
-                    else {
-                        var history = history(published, pass);
-                        if (history != null) scoped.writes().offerHistory(history.guardedBy(pass.guardOriginal(pass.claim())));
-                    }
-                }
+                notifyObservation(pass, result, reading);
             }
             if (reading.measured()) export(published);
         }
         if (pass != null) rememberTerminal(pass, result, publication.map(ObservationPublisher.Publication::observation),
                 actuator, rebuilds, evidence);
+    }
+
+    private Optional<ObservationPublisher.Publication> publishObservationReading(String pipelineId, PipelineConvergencePass pass,
+            ConvergeResult result, PipelineIntentStore.ActuationReading config, ObservationFailure failure, boolean refreshTerminal) {
+        var actual = result.checkpoint().map(checkpoint -> StateJson.parse(checkpoint.stateJson())).orElse(null);
+        if (scoped == null) return publisher.publish(pipelineId, failure)
+                .map(value -> new ObservationPublisher.Publication(value, true));
+        boolean terminal = actual == PipelineState.STOPPED || actual == PipelineState.FAILED;
+        if (scoped.observations() != null) {
+            if (!terminal) return scoped.observations().publish(publisher, pass, result, config, failure)
+                    .map(value -> new ObservationPublisher.Publication(value, true));
+            scoped.observations().forget(pipelineId);
+        }
+        boolean allowTerminalReuse = !finalStopSample(pass, actual) && !refreshTerminal
+                && !scoped.alerts().needsFreshTerminalMetrics(pass.scope());
+        return publishScopedObservation(pass, result, failure, allowTerminalReuse);
+    }
+
+    private boolean finalStopSample(PipelineConvergencePass pass, PipelineState actual) {
+        if (actual != PipelineState.STOPPED || scoped.stoppedRecheck() == null || pass == null) return false;
+        var desired = pass.intent().desired();
+        return desired.targetState() == PipelineState.STOPPED && !desired.purgeState() && !desired.reassemble();
+    }
+
+    private StoppedEvidence recordStoppedEvidence(String pipelineId, PipelineConvergencePass pass, ConvergeResult result,
+            ObservationPublisher.Publication reading) {
+        var published = reading.observation();
+        var checkpoint = result.checkpoint().orElseThrow();
+        var terminal = TerminalPublication.from(pass, checkpoint.epoch(), published);
+        scoped.observations().terminal(terminal);
+        var alertReceipt = TerminalPublication.failed();
+        try {
+            alertReceipt = scoped.alerts().terminalPublished(pass, terminal, published, result.failure().orElse(null), reading.measured());
+        } catch (RuntimeException unavailable) {
+            LOG.warn("Could not submit the final alert sample for pipeline {}", pipelineId);
+        }
+        var sample = reading.measured() && sampler != null ? RateSampler.sampleOf(published) : null;
+        var history = sample == null ? null : new ProcessObservationWriter.History(sample,
+                remaining -> pass.rateHistory(remaining).append(sample));
+        var historyReceipt = scoped.writes().terminalHistory(terminal,
+                history == null ? null : history.guardedBy(pass.guardOriginal(pass.claim())));
+        return new StoppedEvidence(pass.intent(), checkpoint, pass.claim(), historyReceipt, alertReceipt);
+    }
+
+    private void notifyObservation(PipelineConvergencePass pass, ConvergeResult result, ObservationPublisher.Publication reading) {
+        var published = reading.observation();
+        if (scoped != null) alert(() -> scoped.alerts().published(pass, published, result.failure().orElse(null), reading.measured()));
+        if (!reading.measured()) return;
+        if (scoped == null || scoped.writes() == null) {
+            sample(published, pass);
+        } else {
+            var history = history(published, pass);
+            if (history != null) scoped.writes().offerHistory(history.guardedBy(pass.guardOriginal(pass.claim())));
+        }
     }
 
     private Optional<ObservationPublisher.Publication> publishScopedObservation(PipelineConvergencePass pass,

@@ -10,11 +10,17 @@ import java.util.*;
 
 /** Fixed-scope snapshot facts use the same original CACHE claim transaction as the protected checkpoint. */
 final class MongoSnapshotStateStore implements SnapshotStateStore {
+    private static final String ORDER = "order";
+    private static final String SCHEMA = "schema";
+    private static final String STATE = "state";
+    private static final String CLAIM = "claim";
+    private static final String NODE = "node";
+
     private final MongoCachePipelineAccess access;
     MongoSnapshotStateStore(MongoCachePipelineAccess access) { this.access = Objects.requireNonNull(access,"access"); }
 
     @Override public long order() {
-        return access.stateTransaction(false,session -> { access.verifyOriginalClaim(session, true); return order(session,access.database,access.scope).getLong("order"); });
+        return access.stateTransaction(false,session -> { access.verifyOriginalClaim(session, true); return order(session,access.database,access.scope).getLong(ORDER); });
     }
     @Override public long startupOrder() {
         var original = access.originalClaim();
@@ -26,31 +32,31 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
         var captured = access.startupSnapshot(List.of(
                 new Document("$match", new Document("_id", "cluster")),
                 new Document("$project", new Document("identity", "$$ROOT").append("now", "$$NOW")),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_PIPELINE_STATE, "state", access.scope.pipelineId()),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", claimId),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "node", nodeId),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SNAPSHOT_ORDERS, "order", orderId)));
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_PIPELINE_STATE, STATE, access.scope.pipelineId()),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, CLAIM, claimId),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, NODE, nodeId),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SNAPSHOT_ORDERS, ORDER, orderId)));
         if (captured == null || !"cluster".equals(captured.get("identity", Document.class).get("_id"))
-                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
-                || MongoCaptureStartupRows.ambiguous(captured, "state", access.scope.pipelineId())
-                || MongoCaptureStartupRows.ambiguous(captured, "claim", claimId)
-                || MongoCaptureStartupRows.ambiguous(captured, "node", nodeId)
-                || MongoCaptureStartupRows.ambiguous(captured, "order", orderId)
-                || MongoCaptureStartupRows.get(captured, "schema") == null
-                || MongoCaptureStartupRows.get(captured, "state") == null
-                || MongoCaptureStartupRows.get(captured, "claim") == null
-                || MongoCaptureStartupRows.get(captured, "order") == null) return order();
+                || MongoCaptureStartupRows.ambiguous(captured, SCHEMA, "business")
+                || MongoCaptureStartupRows.ambiguous(captured, STATE, access.scope.pipelineId())
+                || MongoCaptureStartupRows.ambiguous(captured, CLAIM, claimId)
+                || MongoCaptureStartupRows.ambiguous(captured, NODE, nodeId)
+                || MongoCaptureStartupRows.ambiguous(captured, ORDER, orderId)
+                || MongoCaptureStartupRows.get(captured, SCHEMA) == null
+                || MongoCaptureStartupRows.get(captured, STATE) == null
+                || MongoCaptureStartupRows.get(captured, CLAIM) == null
+                || MongoCaptureStartupRows.get(captured, ORDER) == null) return order();
         MongoCacheBusinessIdentity.requireObservedAdmission(captured.get("identity", Document.class),
-                MongoCaptureStartupRows.get(captured, "schema"), business());
-        access.validateState(MongoCaptureStartupRows.get(captured, "state"));
-        var claim = MongoCaptureStartupRows.get(captured, "claim");
+                MongoCaptureStartupRows.get(captured, SCHEMA), business());
+        access.validateState(MongoCaptureStartupRows.get(captured, STATE));
+        var claim = MongoCaptureStartupRows.get(captured, CLAIM);
         access.requirePreparedClaim(claim);
         var decoded = MongoWorkloadClaimStore.decodeStrict(claim);
         if (!original.equals(WorkloadClaimFence.from(decoded))) throw fenced();
         var now = captured.getDate("now").toInstant();
         if (MongoWorkloadClaimStore.nodeBacked(claim)) {
-            var node = MongoCaptureStartupRows.get(captured, "node");
+            var node = MongoCaptureStartupRows.get(captured, NODE);
             if (node == null || !MongoWorkloadClaimStore.canUseNodeLease(original)) throw fenced();
             var decodedNode = MongoWorkloadClaimStore.decodeStrict(node);
             if (!(claim.get(MongoWorkloadClaimStore.NODE_LEASE_GENERATION) instanceof Long generation)
@@ -58,7 +64,7 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
                     || generation != decodedNode.claimGeneration() || !(decodedNode.leaseUntil().isAfter(now) || ProcessNodeSession.isProcessIdentity(decodedNode)
                     && ProcessNodeSession.owns(WorkloadClaimFence.from(decodedNode)))) throw fenced();
         } else if (!decoded.leaseUntil().isAfter(now)) throw fenced();
-        return validatedOrder(MongoCaptureStartupRows.get(captured, "order"), access.scope).getLong("order");
+        return validatedOrder(MongoCaptureStartupRows.get(captured, ORDER), access.scope).getLong(ORDER);
     }
 
     @Override public long advanceOrder(long expected,long floor,Map<String,CaptureCacheState> originals) {
@@ -85,11 +91,11 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
             if (command.equals(row.get("command"))) {
                 if (!Long.valueOf(expected).equals(row.get("previousOrder")) || !Long.valueOf(floor).equals(row.get("retainedFloor"))
                         || !held.equals(row.get("captures"))) throw fenced();
-                return row.getLong("order");
+                return row.getLong(ORDER);
             }
-            if (row.getLong("order")!=expected || Math.max(expected,floor)>=Long.MAX_VALUE-1) throw fenced();
+            if (row.getLong(ORDER)!=expected || Math.max(expected,floor)>=Long.MAX_VALUE-1) throw fenced();
             long next = Math.max(expected,floor)+1;
-            var updated = new Document("_id",id(access.scope)).append("formatVersion",1).append("order",next)
+            var updated = new Document("_id",id(access.scope)).append("formatVersion",1).append(ORDER,next)
                     .append("previousOrder",expected).append("retainedFloor",floor).append("command",command).append("captures",held);
             if (SystemCollections.CACHE_SNAPSHOT_ORDERS.on(access.database).replaceOne(session,row,updated).getMatchedCount()!=1) throw fenced();
             return next;
@@ -138,9 +144,9 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
 
     private static Document validatedOrder(Document row, PipelineIntentScope scope) {
         try {
-            if (row==null || !row.keySet().equals(Set.of("_id","formatVersion","order","previousOrder","retainedFloor","command","captures"))
+            if (row==null || !row.keySet().equals(Set.of("_id","formatVersion",ORDER,"previousOrder","retainedFloor","command","captures"))
                     || !id(scope).equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))
-                    || !(row.get("order") instanceof Long current) || current<0 || current==Long.MAX_VALUE
+                    || !(row.get(ORDER) instanceof Long current) || current<0 || current==Long.MAX_VALUE
                     || !(row.get("previousOrder") instanceof Long prior) || prior<0
                     || !(row.get("retainedFloor") instanceof Long floor) || floor<0 || !(row.get("captures") instanceof List<?> captures)) throw unreadable();
             if (current==0) { if (!initial(scope).equals(row)) throw unreadable(); }
@@ -161,7 +167,7 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
         } catch (IllegalArgumentException|NullPointerException|ClassCastException invalid) { throw unreadable(); }
     }
     private static Document initial(PipelineIntentScope scope) {
-        return new Document("_id",id(scope)).append("formatVersion",1).append("order",0L).append("previousOrder",0L)
+        return new Document("_id",id(scope)).append("formatVersion",1).append(ORDER,0L).append("previousOrder",0L)
                 .append("retainedFloor",0L).append("command",null).append("captures",List.of());
     }
     private static Document id(PipelineIntentScope scope) { return MongoPipelinePreparationFacts.scope(scope); }
