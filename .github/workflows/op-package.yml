@@ -39,16 +39,8 @@ on:
         description: "MySQL"
         type: boolean
         default: false
-      connector_aliyun-rds-mysql:
-        description: "ApsaraDB RDS for MySQL"
-        type: boolean
-        default: false
       connector_aws-rds-mysql:
         description: "Amazon RDS for MySQL"
-        type: boolean
-        default: false
-      connector_polar-db-mysql:
-        description: "ApsaraDB PolarDB for MySQL"
         type: boolean
         default: false
       connector_mysql-pxc:
@@ -57,30 +49,6 @@ on:
         default: false
       connector_postgres:
         description: "PostgreSQL"
-        type: boolean
-        default: false
-      connector_aliyun-rds-postgres:
-        description: "ApsaraDB RDS for PostgreSQL"
-        type: boolean
-        default: false
-      connector_aliyun-adb-postgres:
-        description: "ApsaraDB AnalyticDB for PostgreSQL"
-        type: boolean
-        default: false
-      connector_polar-db-postgres:
-        description: "ApsaraDB PolarDB for PostgreSQL"
-        type: boolean
-        default: false
-      connector_tencent-db-postgres:
-        description: "TencentDB for PostgreSQL"
-        type: boolean
-        default: false
-      connector_aliyun-db-mongodb:
-        description: "ApsaraDB for MongoDB"
-        type: boolean
-        default: false
-      connector_tencent-db-mongodb:
-        description: "TencentDB for MongoDB"
         type: boolean
         default: false
       connector_oracle:
