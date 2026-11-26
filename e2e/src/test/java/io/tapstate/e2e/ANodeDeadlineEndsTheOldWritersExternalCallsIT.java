@@ -41,24 +41,10 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         try (var storage=PreparedNativeStore.create(); var documents=new NativeSrsDocuments(storage)) {
             var topology = new MongoRenewedTopology(storage.clusterId());
             try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
-                assertThat(server.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
-                var control = new ControlPlane(server.baseUrl());
+                var control = ControlPlane.direct(server.baseUrl());
                 var child = businessContext(server);
                 var member = child.getBean(HazelcastInstance.class);
-                try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
-                    assertThat(peer.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.PEER));
-                    storage.loginAndAwaitBusiness(control);
-                    storage.loginAndAwaitBusiness(new ControlPlane(peer.baseUrl()));
-                    Await.until("the real two-member topology to form", BOUND,
-                            () -> member.getCluster().getMembers().size() == 2,
-                            () -> member.getCluster().getMembers().toString());
-                    assertThat(control.clusterMembers()).extracting(ClusterMemberFacts::controlUrl)
-                            .containsExactlyInAnyOrder(server.baseUrl().toString(), peer.baseUrl().toString());
-                }
-                // After committing the two-member topology, run the writer on its sole remaining member.
-                Await.until("the original member to be the only writer host", BOUND,
-                        () -> member.getCluster().getMembers().size() == 1,
-                        () -> member.getCluster().getMembers().toString());
+                commitRenewedTopology(storage, topology, server, member, control);
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID,connector); control.apply(resources(source,target,holds,written,replies));
                 control.discoverSchema(SOURCE,E2eConnectorJar.CONNECTOR_ID,Map.of("uri",source.toString()));
                 control.lifecycle(PIPELINE,LifecycleVerb.START);
@@ -107,9 +93,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                         Files.writeString(replies.resolve("release"),"");
                         Await.until("the expired native member to stop",Duration.ofSeconds(20),
                                 () -> !member.getLifecycleService().isRunning(),() -> "original member still running");
-                        assertThat(holds.holderBefore(TABLE,3)).as("any connector entry for this new row leaves a persistent before-hold witness").isEmpty();
-                        assertThat(written.rowsOf(TABLE)).noneMatch(row -> row.id().equals("3")); assertThat(value(target,"3")).isNull();
-                        assertThat(progress(documents).get("sinkAcked",Document.class)).isEqualTo(confirmed);
+                        assertExpiredWriterCannotContinue(holds, written, target, documents, confirmed);
                         delayed.release.countDown();
                         var renewer=(java.util.concurrent.ScheduledExecutorService)readField(lease,"renewer");
                         Await.until("the original renewer to finish processing its late Mongo result",Duration.ofSeconds(10),renewer::isTerminated,() -> "original renewal task still running");
@@ -132,7 +116,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
             }
             try (var replacement = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
                 assertThat(replacement.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
-                var control=new ControlPlane(replacement.baseUrl()); storage.loginAndAwaitBusiness(control);
+                var control = ControlPlane.direct(replacement.baseUrl()); storage.loginAndAwaitBusiness(control);
                 Await.until("the new native run to enter the previously refused target call",BOUND,
                         () -> holds.holderBefore(TABLE,3).isPresent(),() -> control.state(PIPELINE)+" "+control.failureCode(PIPELINE));
                 holds.releaseBefore(TABLE,3); awaitValue(target,"2","held"); awaitValue(target,"3","after-deadline");
@@ -144,6 +128,34 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                 },() -> String.valueOf(progress(documents)));
             } finally { holds.releaseBefore(TABLE,3); }
         }
+    }
+
+    private static void commitRenewedTopology(PreparedNativeStore storage, MongoRenewedTopology topology,
+            InProcessServer original, HazelcastInstance member, ControlPlane control) {
+        assertThat(original.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
+        try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
+            assertThat(peer.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.PEER));
+            storage.loginAndAwaitBusiness(control);
+            storage.loginAndAwaitBusiness(ControlPlane.direct(peer.baseUrl()));
+            Await.until("the real two-member topology to form", BOUND,
+                    () -> member.getCluster().getMembers().size() == 2,
+                    () -> member.getCluster().getMembers().toString());
+            assertThat(control.clusterMembers()).extracting(ClusterMemberFacts::controlUrl)
+                    .containsExactlyInAnyOrder(original.baseUrl().toString(), peer.baseUrl().toString());
+        }
+        // After committing the two-member topology, run the writer on its sole remaining member.
+        Await.until("the original member to be the only writer host", BOUND,
+                () -> member.getCluster().getMembers().size() == 1,
+                () -> member.getCluster().getMembers().toString());
+    }
+
+    private static void assertExpiredWriterCannotContinue(Holds holds, WriteWitness written, Path target,
+            NativeSrsDocuments documents, Document confirmed) {
+        assertThat(holds.holderBefore(TABLE, 3))
+                .as("any connector entry for this new row leaves a persistent before-hold witness").isEmpty();
+        assertThat(written.rowsOf(TABLE)).noneMatch(row -> row.id().equals("3"));
+        assertThat(value(target, "3")).isNull();
+        assertThat(progress(documents).get("sinkAcked", Document.class)).isEqualTo(confirmed);
     }
 
     private static InProcessServer start(PreparedNativeStore storage, MongoRenewedTopology topology, String node) {

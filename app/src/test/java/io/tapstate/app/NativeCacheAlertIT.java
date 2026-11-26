@@ -7,6 +7,7 @@ import io.tapstate.core.common.*;
 import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.MongoRenewedTopology;
 import io.tapstate.testsupport.RequiresDocker;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.*;
 import java.nio.file.Path;
@@ -55,7 +56,7 @@ class NativeCacheAlertIT {
                 // The committed topology keeps Mongo renewal active after the peer leaves.
                 // Only the member under test can publish the healthy or failing sample.
                 await().atMost(Duration.ofSeconds(15)).until(() -> member.getCluster().getMembers().size() == 1);
-                var client = HttpClient.newHttpClient();
+                var client = HttpClient.newBuilder().proxy(ProxySelector.of(null)).build();
                 String base = topology.controlUrl(MongoRenewedTopology.ORIGINAL).toString();
                 var login=post(client,base,"/auth/login",null,Map.of("username","cache-admin","password","isolated-cache-password"));
                 String token=String.valueOf(login.get("token"));

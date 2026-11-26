@@ -178,36 +178,7 @@ class NativeBusinessCandidateLifecycleIT {
                     assertThat(root.runtime().business()).isEmpty();
                     assertThat(root.runtime().cleanupRequired()).isEqualTo(unknownCleanup);
                     if (!unknownCleanup) {
-                        root.loadExisting(bound -> factory.create(root,bound,application));
-                        assertThat(factory.calls.get()).isEqualTo(4);
-                        await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
-                        var successor=(NativeBusinessContext)root.runtime().business().orElseThrow();
-                        var child=(ConfigurableApplicationContext)ReflectionTestUtils.getField(successor,"context");
-                        var member=child.getBean(HazelcastInstance.class); var node=child.getBean(NodeSessionLease.class);
-                        var exact=node.currentFence().orElseThrow();
-                        var claims=retained.cache().workloadClaims(retained.preparation().businessScope());
-                        await().atMost(Duration.ofSeconds(15)).until(() -> successor.alertHealth()
-                                .map(health -> health.maintenance().get("lastSuccess")!=null).orElse(false));
-                        var admittedKey=SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first();
-                        long originalKeyWrites=armKeyWrites(admin,configName);
-                        try {
-                            var before=claims.read(exact.key()).orElseThrow(); assertThat(before.leased()).isTrue();
-                            assertThat(WorkloadClaimFence.from(before.claim())).isEqualTo(exact);
-                            factory.failed.forEach(candidate -> candidate.nativeOwner.close());
-                            factory.failed.forEach(Candidate::assertStopped);
-                            var live = claims.read(exact.key()).orElseThrow();
-                            assertThat(live.leased()).isTrue();
-                            assertThat(WorkloadClaimFence.from(live.claim())).isEqualTo(exact);
-                            assertThat(live.claim().leaseUntil()).isEqualTo(before.claim().leaseUntil());
-                            assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
-                            assertThat(node.currentFence()).contains(exact); assertThat(root.runtime().current()).contains(retained);
-                            retained.cache().verifyBusinessReady(retained.preparation().businessScope());
-                            root.loadExisting(bound -> { throw new AssertionError("a published successor cannot assemble again"); });
-                            assertThat(factory.calls.get()).isEqualTo(4);
-                            assertThat(SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first()).isEqualTo(admittedKey);
-                        } finally {
-                            assertThat(keyWritesOff(admin)).as("ordinary CACHE renewal and stale-owner cleanup never write CONFIG keys").isEqualTo(originalKeyWrites);
-                        }
+                        verifySuccessorSurvivesEarlierCandidates(root, retained, application, factory, configDatabase, admin);
                     }
                     int port=((WebServerApplicationContext)application).getWebServer().getPort();
                     var http=org.springframework.web.client.RestClient.create("http://127.0.0.1:"+port);
@@ -273,6 +244,40 @@ class NativeBusinessCandidateLifecycleIT {
             assertThat(command.get(findAndModify ? "update" : "u", Document.class))
                     .isEqualTo(new Document("$inc", new Document("sourceWriteFence", 1L)));
             assertThat(command.getBoolean("multi",false)).isFalse();assertThat(command.getBoolean("upsert",false)).isFalse();
+        }
+    }
+
+    private static void verifySuccessorSurvivesEarlierCandidates(StorageRoot root, StorageRuntime.Bound retained,
+            ConfigurableApplicationContext application, Candidates factory, MongoDatabase configDatabase, MongoDatabase admin) {
+        root.loadExisting(bound -> factory.create(root,bound,application));
+        assertThat(factory.calls.get()).isEqualTo(4);
+        await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+        var successor=(NativeBusinessContext)root.runtime().business().orElseThrow();
+        var child=(ConfigurableApplicationContext)ReflectionTestUtils.getField(successor,"context");
+        var member=child.getBean(HazelcastInstance.class); var node=child.getBean(NodeSessionLease.class);
+        var exact=node.currentFence().orElseThrow();
+        var claims=retained.cache().workloadClaims(retained.preparation().businessScope());
+        await().atMost(Duration.ofSeconds(15)).until(() -> successor.alertHealth()
+                .map(health -> health.maintenance().get("lastSuccess")!=null).orElse(false));
+        var admittedKey=SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first();
+        long originalKeyWrites=armKeyWrites(admin,configDatabase.getName());
+        try {
+            var before=claims.read(exact.key()).orElseThrow(); assertThat(before.leased()).isTrue();
+            assertThat(WorkloadClaimFence.from(before.claim())).isEqualTo(exact);
+            factory.failed.forEach(candidate -> candidate.nativeOwner.close());
+            factory.failed.forEach(Candidate::assertStopped);
+            var live = claims.read(exact.key()).orElseThrow();
+            assertThat(live.leased()).isTrue();
+            assertThat(WorkloadClaimFence.from(live.claim())).isEqualTo(exact);
+            assertThat(live.claim().leaseUntil()).isEqualTo(before.claim().leaseUntil());
+            assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
+            assertThat(node.currentFence()).contains(exact); assertThat(root.runtime().current()).contains(retained);
+            retained.cache().verifyBusinessReady(retained.preparation().businessScope());
+            root.loadExisting(bound -> { throw new AssertionError("a published successor cannot assemble again"); });
+            assertThat(factory.calls.get()).isEqualTo(4);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first()).isEqualTo(admittedKey);
+        } finally {
+            assertThat(keyWritesOff(admin)).as("ordinary CACHE renewal and stale-owner cleanup never write CONFIG keys").isEqualTo(originalKeyWrites);
         }
     }
 
