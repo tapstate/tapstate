@@ -171,6 +171,9 @@ enum CliError implements TapstateErrorCode {
     /** The local terminal could not initialize the full-screen workbench. */
     WORKBENCH_UNAVAILABLE(CliErrorDefinitions.WORKBENCH_UNAVAILABLE),
 
+    /** The workbench initialized but could not finish its terminal session. */
+    WORKBENCH_SESSION_FAILED(CliErrorDefinitions.WORKBENCH_SESSION_FAILED),
+
     /**
      * A verb that clears what a pipeline accumulated was run where there is no terminal to confirm at,
      * and nothing said to go ahead unasked; {@code verb} names it. Refused rather than either of the

@@ -210,18 +210,16 @@ class ConnectorAcceptanceGatesTest {
 
     /** Counts include each database kind's own id and its explicitly accepted variants. */
     private static final Map<String, Integer> EXPECTED_IDS_PER_DATABASE_KIND = Map.of(
-            "mysql", 5,
-            "postgres", 5,
-            "mongodb", 4,
+            "mysql", 3,
+            "postgres", 1,
+            "mongodb", 2,
             "oracle", 1,
             "sqlserver", 1);
 
     /** Every id a shipped deployment accepts out of the box, in refusal-message order. */
     private static final List<String> ACCEPTED_OUT_OF_THE_BOX = List.of(
-            "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
-            "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
-            "tencent-db-postgres",
-            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
+            "mysql", "aws-rds-mysql", "mysql-pxc",
+            "postgres", "mongodb", "mongodb-atlas", "oracle", "sqlserver",
             "db2", "db2i", "dummy");
 
     @Test

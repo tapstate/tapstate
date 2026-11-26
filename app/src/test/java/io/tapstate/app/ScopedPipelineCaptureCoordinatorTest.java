@@ -325,17 +325,17 @@ class ScopedPipelineCaptureCoordinatorTest {
     }
     @Test void aRetiredOrSnapshotOnlySessionCannotSupplyACdcValidationRoute() throws Exception {
         try (var f = new Fixture()) {
-            var snapshotRun = new AtomicReference<CaptureRun>();
+            var physical = new AtomicReference<CaptureRun>();
             doAnswer(call -> {
-                var capture = (CaptureRun) call.callRealMethod();
-                snapshotRun.set(capture);
-                return capture;
+                var started = (CaptureRun) call.callRealMethod();
+                physical.set(started);
+                return started;
             }).when(f.runtime).beginSnapshotOnly(any(), anyLong(), any(), any(), any());
             var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
             run.startCapture("flow", f.snapshot(), f.models());
             assertThatThrownBy(() -> run.validationRoute("input", "orders")).isInstanceOf(TapstateException.class);
-            assertThat(snapshotRun.get().awaitLoaded(Duration.ofSeconds(3))).isTrue();
-            assertThat(snapshotRun.get().failure()).isEmpty();
+            assertThat(physical.get().awaitLoaded(Duration.ofSeconds(3))).isTrue();
+            assertThat(physical.get().failure()).isEmpty();
             run.stopCapture("flow", false);
             assertThatThrownBy(() -> run.validationRoute("input", "orders")).isInstanceOf(TapstateException.class);
         }

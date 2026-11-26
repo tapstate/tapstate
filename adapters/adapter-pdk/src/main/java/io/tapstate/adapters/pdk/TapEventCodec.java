@@ -1,8 +1,6 @@
 package io.tapstate.adapters.pdk;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.Instant;
 import java.time.ZonedDateTime;
@@ -60,18 +58,6 @@ public final class TapEventCodec {
 
     /** The {@code schema}-map key under which a ddl event's origin ddl travels. */
     private static final String DDL_ORIGIN = "origin";
-    private static final String BSON_DECIMAL128 = "org.bson.types.Decimal128";
-    private static final ClassValue<Decimal128Access> BSON_DECIMAL128_ACCESS = new ClassValue<>() {
-        @Override
-        protected Decimal128Access computeValue(Class<?> type) {
-            try {
-                return new Decimal128Access(type.getMethod("isFinite"), type.getMethod("bigDecimalValue"));
-            } catch (NoSuchMethodException e) {
-                throw new IllegalStateException("mongodb decimal128 has no exact-value accessor", e);
-            }
-        }
-    };
-
     private static final String BSON_TIMESTAMP = "org.bson.BsonTimestamp";
     private static final ClassValue<Method> BSON_TIMESTAMP_TIME = new ClassValue<>() {
         @Override
@@ -83,9 +69,6 @@ public final class TapEventCodec {
             }
         }
     };
-
-    private record Decimal128Access(Method isFinite, Method bigDecimalValue) {
-    }
 
     private TapEventCodec() {
     }
@@ -478,8 +461,7 @@ public final class TapEventCodec {
 
     // The portable Double alone cannot distinguish a Decimal128 special value from a binary float.
     static String portableOriginType(Object original, Object portable, String declared) {
-        if (declared == null && portable instanceof Double number && original != null
-                && BSON_DECIMAL128.equals(original.getClass().getName())
+        if (declared == null && portable instanceof Double number && PdkBsonDecimal.isNative(original)
                 && (!Double.isFinite(number) || Double.doubleToRawLongBits(number) == Long.MIN_VALUE)) {
             return "DECIMAL128";
         }
@@ -494,17 +476,8 @@ public final class TapEventCodec {
      * milliseconds.
      */
     private static Object portable(Object source, Object value) {
-        if (BSON_DECIMAL128.equals(source.getClass().getName()) && value instanceof Double narrowed) {
-            BigDecimal exact = decimal128Value(source);
-            // Match the exact wrong result before correcting it, the same way the timestamp correction
-            // below does: only the plain narrowing of this very value is replaced. A conversion that
-            // answered some other double decided something of its own - rounding to a declared scale,
-            // say - and replacing that with the full source value would overrule the connector rather
-            // than repair it, silently and on every row.
-            if (exact != null && exact.doubleValue() == narrowed.doubleValue()) {
-                return exact;
-            }
-        }
+        var exactDecimal = PdkBsonDecimal.fromNarrowed(source, value);
+        if (exactDecimal != null) return exactDecimal;
         if (BSON_TIMESTAMP.equals(source.getClass().getName()) && value instanceof DateTime timestamp) {
             int seconds = bsonTimestampSeconds(source);
             // This connector currently treats the seconds half as epoch milliseconds. Match that exact
@@ -514,28 +487,6 @@ public final class TapEventCodec {
             }
         }
         return value instanceof ByteData bytes ? new Bytes(bytes.getType(), bytes.getValue()) : value;
-    }
-
-    /** The finite decimal value, or null for a Decimal128 special value that has no BigDecimal form. */
-    private static BigDecimal decimal128Value(Object value) {
-        Decimal128Access access = BSON_DECIMAL128_ACCESS.get(value.getClass());
-        try {
-            if (!(Boolean) access.isFinite().invoke(value)) {
-                return null;
-            }
-            try {
-                return (BigDecimal) access.bigDecimalValue().invoke(value);
-            } catch (InvocationTargetException e) {
-                // The accessor documents ArithmeticException for Decimal128 forms BigDecimal cannot
-                // represent. Non-finite forms returned above; the remaining form is negative zero.
-                if (e.getCause() instanceof ArithmeticException) {
-                    return null;
-                }
-                throw e;
-            }
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("cannot read mongodb decimal128 exactly", e);
-        }
     }
 
     private static int bsonTimestampSeconds(Object value) {
