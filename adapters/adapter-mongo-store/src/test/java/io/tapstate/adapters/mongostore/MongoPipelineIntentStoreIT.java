@@ -50,6 +50,49 @@ class MongoPipelineIntentStoreIT {
     private static final String HASH = CanonicalHash.of(pipeline());
 
     @Test
+    void displayReadsIntentsInOnlyOneConfigurationSnapshot() {
+        withConfiguration((domain, database, scope) -> {
+            var ids = List.of(scope.pipelineId());
+            var business = domain.bindings().cachePreparation().orElseThrow().businessScope();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                var unprepared = domain.pipelineDisplayHeaders(ids, true);
+                var singleSnapshot = List.copyOf(commands);
+                commands.clear();
+                assertThat(domain.pipelineDisplayHeadersBeforeCache(ids, business)).isEqualTo(unprepared);
+                assertThat(commands).containsExactlyInAnyOrderElementsOf(singleSnapshot);
+
+                var intent = readyForActuation(domain, database, scope);
+                var dormant = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: dormant\nsource: []\n");
+                domain.artifacts().create(dormant);
+                var dormantScope = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(),
+                        scope.cacheIncarnation(), dormant.id(), 1);
+                var stopped = new DesiredState(dormant.id(), PipelineState.STOPPED, CanonicalHash.of(dormant), false);
+                assertThat(domain.intents().compareAndSet(dormantScope, 0, stopped)).isTrue();
+                var page = List.of(scope.pipelineId(), dormant.id());
+                commands.clear();
+                var complete = domain.pipelineDisplayHeaders(page, true);
+                domain.pipelineDisplayHeaders(ids, false);
+                var previous = List.copyOf(commands);
+                commands.clear();
+
+                var before = domain.pipelineDisplayHeadersBeforeCache(page, business);
+                assertThat(before.get(scope.pipelineId()).preparation()).isEqualTo(complete.get(scope.pipelineId()).preparation());
+                assertThat(before.get(scope.pipelineId()).desired()).isEmpty();
+                assertThat(commands).doesNotContain("find:" + SystemCollections.PIPELINE_INTENTS.collectionName());
+                var after = domain.pipelineDisplayHeadersAfterCache(page, ids, before);
+                assertThat(after.get(scope.pipelineId()).desired()).contains(intent);
+                assertThat(after.get(dormant.id())).isEqualTo(complete.get(dormant.id()));
+                assertThat(after.get(dormant.id()).desired()).contains(stopped);
+                assertThat(commands).containsExactlyInAnyOrderElementsOf(previous);
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+        });
+    }
+
+    @Test
     void schedulingHintsUseOneProjectionAndTrackEveryIntentRevisionAndPhysicalScope() {
         withConfiguration((domain, database, scope) -> {
             assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();

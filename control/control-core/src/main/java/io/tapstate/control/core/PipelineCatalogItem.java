@@ -35,7 +35,14 @@ public record PipelineCatalogItem(
             PipelineState observedState,
             ObservationFailure failure,
             Instant observedAt,
-            IntentReadFailure intentReadFailure) {
+            IntentReadFailure intentReadFailure,
+            StopState stopState) {
+
+        public Status(DisplayState state, UiState displayState, PipelineState desiredState,
+                PipelineState observedState, ObservationFailure failure, Instant observedAt,
+                IntentReadFailure intentReadFailure) {
+            this(state, displayState, desiredState, observedState, failure, observedAt, intentReadFailure, null);
+        }
 
         public Status(DisplayState state, UiState displayState, PipelineState desiredState,
                 PipelineState observedState, ObservationFailure failure, Instant observedAt) {
@@ -46,6 +53,12 @@ public record PipelineCatalogItem(
                 ObservationFailure failure, Instant observedAt) {
             this(state, UiState.of(state, true), desiredState, observedState, failure, observedAt, null);
         }
+    }
+
+    public enum StopState {
+        CLEARING,
+        RETAINED,
+        CLEARED
     }
 
     /** A coded failure to read lifecycle intent, carried separately from runtime observation facts. */

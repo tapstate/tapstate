@@ -786,7 +786,9 @@ class MongoCachePipelineRebuildsIT {
     @Test void aCompletedExplicitFullCanBeReadWithItsOriginalInputsAfterAControllerRestart() {
         withFixture(f -> {
             var request = modelFullRequest(f);
+            assertThat(f.configuration.pipelineDisplayHeaders(List.of("flow"), true).get("flow").completedStopClear()).isFalse();
             var pending = f.configuration.rebuilds().begin(request);
+            assertThat(f.configuration.pipelineDisplayHeaders(List.of("flow"), true)).doesNotContainKey("flow");
             String digest = CanonicalHash.ofText(io.tapstate.core.common.JsonWriter.write(
                     new Document("targetInputs", MongoPipelineSourcePreparations.encode(request.inputs()))
                             .append("dependencyHashes", new java.util.TreeMap<>(request.dependencyHashes()))));
@@ -796,6 +798,9 @@ class MongoCachePipelineRebuildsIT {
             var prepared = f.configuration.rebuilds().complete(receipt);
             var settings = new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()), null, Duration.ofSeconds(5));
             try (var reopened = MongoConfigurationDomain.open(settings, f.scope.clusterId())) {
+                var header = reopened.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+                assertThat(header.desired().orElseThrow().purgeState()).isFalse();
+                assertThat(header.completedStopClear()).isTrue();
                 var proof = reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes());
                 assertThat(proof).isPresent();
                 assertThat(proof.orElseThrow().targetScope()).isEqualTo(prepared.scope());
@@ -810,6 +815,10 @@ class MongoCachePipelineRebuildsIT {
                 assertCode(proof.orElseThrow()::requireCurrent, IoError.PIPELINE_INTENT_FENCED);
                 reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes()).orElseThrow().requireCurrent();
                 assertThat(f.mapping().get("stateRebuild", Document.class).get("inputClosureHash")).isEqualTo(digest);
+                var running = reopened.intents().load("flow").orElseThrow();
+                assertThat(reopened.intents().compareAndSet(prepared.scope(), running.intentRevision(),
+                        new DesiredState("flow", PipelineState.STOPPED, request.inputs().pipelineHash(), false))).isTrue();
+                assertThat(reopened.pipelineDisplayHeaders(List.of("flow"), true).get("flow").completedStopClear()).isFalse();
             }
             long version = f.version();
             f.domain.close();
