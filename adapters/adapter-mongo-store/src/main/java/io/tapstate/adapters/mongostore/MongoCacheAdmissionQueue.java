@@ -113,7 +113,7 @@ final class MongoCacheAdmissionQueue {
         }
         boolean entered = false;
         try {
-            for (;;) {
+            while (true) {
                 active.run();
                 if (deadline != Long.MAX_VALUE) MongoReadBudget.until(deadline).remainingMillis();
                 Ticket recovery;
@@ -124,10 +124,16 @@ final class MongoCacheAdmissionQueue {
                         return admission;
                     }
                     recovery = held != null && held.recoverable() ? held : null;
-                    if (recovery == null) awaitTurn(deadline);
+                    if (recovery == null) {
+                        wait(waitMillis(deadline));
+                        continue;
+                    }
                 }
-                if (recovery != null) recovery.recover(Math.min(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(5)));
+                recovery.recover(Math.min(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(5)));
             }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw MongoCacheWorkloadClaimStore.claimFenced(interrupted);
         } finally {
             if (!entered) synchronized (this) {
                 waiters.remove(waiter);
@@ -152,16 +158,10 @@ final class MongoCacheAdmissionQueue {
         if (closed) throw MongoCacheWorkloadClaimStore.claimFenced();
     }
 
-    /** Waits with the queue monitor held and preserves the caller's interruption. */
-    private void awaitTurn(long deadline) {
-        long left = deadline == Long.MAX_VALUE ? 50 : Math.min(50, MongoReadBudget.until(deadline).remainingMillis());
-        try {
-            wait(left);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw MongoCacheWorkloadClaimStore.claimFenced(interrupted);
-        }
+    private static long waitMillis(long deadline) {
+        return deadline == Long.MAX_VALUE ? 50 : Math.min(50, MongoReadBudget.until(deadline).remainingMillis());
     }
+
     private synchronized void released(Ticket expected) { if (held != expected) throw new IllegalStateException("admission ticket changed"); held = null; notifyAll(); }
 
     static <T> T driverTransaction(MongoClient client, MongoClaimOperations operations, TransactionOptions options,
