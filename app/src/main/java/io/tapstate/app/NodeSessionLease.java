@@ -48,6 +48,8 @@ final class NodeSessionLease implements AutoCloseable {
     private final ScheduledExecutorService renewer;
     private long attempt;
 
+    private final AtomicReference<Runnable> stopMember = new AtomicReference<>(() -> { });
+
     /** The claim and its monotonic deadline are published and fenced together. */
     private record Proof(WorkloadClaim claim, long until) {}
 
@@ -298,9 +300,13 @@ final class NodeSessionLease implements AutoCloseable {
         }
     }
 
+    void stopMemberOnClose(Runnable stop) {
+        stopMember.set(Objects.requireNonNull(stop));
+    }
+
     @Override
     public void close() {
-        stopAndClose(() -> { });
+        stopAndClose(stopMember.get());
     }
 
     /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
@@ -310,11 +316,9 @@ final class NodeSessionLease implements AutoCloseable {
         try {
             stop.run();
         } finally {
-            if (ending != null) {
-                if (renewer != null) renewer.shutdownNow();
-                release(ending.claim());
-            }
+            if (ending != null && renewer != null) renewer.shutdownNow();
         }
+        if (ending != null) release(ending.claim());
     }
 
     /** A library lifecycle listener cannot wait for coordination-store I/O. */

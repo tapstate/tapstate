@@ -17,6 +17,13 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class RecoveryContinuationOrderingTest {
+    private static StorageRoot root() {
+        var mongo = new MongoProperties();
+        mongo.setUri(null);
+        return new StorageRoot(mongo, CloudRuntimeSettings.resolve(new CloudProperties()), null, BootId.fresh(),
+                new MetricsHistoryProperties(), new RandomTokenSecrets(), java.time.Clock.systemUTC(), new byte[32]);
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"CONFIRMED,false,false","RUNNING,false,false","CONFIRMED,true,false","RUNNING,true,false","CONFIRMED,false,true","RUNNING,false,true"})
     void aFreshSharedRecoveryStartsItsNativeOwnerBeforeQueuingTheOriginalOperation(StorageRecoveryCommands.Phase phase,boolean startupFails,boolean availabilityFails) {
@@ -45,11 +52,9 @@ class RecoveryContinuationOrderingTest {
         when(business.sharedRecovery()).thenAnswer(call -> {if(!ready.get())throw StorageRuntime.unavailable();return shared;});
         Function<StorageRuntime.Bound,StorageRuntime.Business> assembly=ignored -> business;
         doAnswer(call -> {if(startupFails)throw StorageRuntime.unavailable();current.set(business);return null;}).when(runtime).startBusiness(bound,assembly);
-        var executor=new ManualExecutor();var root=mock(StorageRoot.class,CALLS_REAL_METHODS);
-        ReflectionTestUtils.setField(root,"replacements",new AdmissionDrain());
-        ReflectionTestUtils.setField(root,"initializationProgress",new StorageInitializationProgress(java.time.Clock.systemUTC()));
-        ReflectionTestUtils.setField(root,"runtime",runtime);ReflectionTestUtils.setField(root,"installationActive",(Runnable)() -> {});
-        ReflectionTestUtils.setField(root,"authentication",mock(StorageAuthentication.class));ReflectionTestUtils.setField(root,"cloud",CloudRuntimeSettings.resolve(new CloudProperties()));
+        var executor=new ManualExecutor();var root=root();
+        ReflectionTestUtils.setField(root,"runtime",runtime);
+        ReflectionTestUtils.setField(root,"authentication",mock(StorageAuthentication.class));
         ReflectionTestUtils.setField(root,"recoveryWorker",executor);
         root.loadExisting(assembly,() -> mock(StorageSetupService.DefaultTarget.class));
         if(startupFails) {
@@ -96,9 +101,8 @@ class RecoveryContinuationOrderingTest {
         var recovery=new NativePipelineRecovery(configuration,new CachePreparation("operation",auth),mock(StorePort.class),preparer,mock(ConnectorProvisioner.class),mock(Engine.class),
                 mock(PipelineCaptureCoordinator.class),mock(ExecutionAuthorization.class),() -> {},() -> true,mock(PipelineStoreViews.class));
         ReflectionTestUtils.setField(recovery,"inspector",inspector);
-        var root=mock(StorageRoot.class,CALLS_REAL_METHODS);
-        ReflectionTestUtils.setField(root,"replacements",new AdmissionDrain());
-        ReflectionTestUtils.setField(root,"runtime",runtime);ReflectionTestUtils.setField(root,"installationActive",(Runnable)() -> {});
+        var root=root();
+        ReflectionTestUtils.setField(root,"runtime",runtime);
         ReflectionTestUtils.setField(root,"retainedAssembly",(Function<StorageRuntime.Bound,StorageRuntime.Business>)ignored -> business);
         ReflectionTestUtils.setField(root,"retainedTarget",(java.util.function.Supplier<StorageSetupService.DefaultTarget>)() -> mock(StorageSetupService.DefaultTarget.class));
         ReflectionTestUtils.setField(root,"recoveryWorker",executor);

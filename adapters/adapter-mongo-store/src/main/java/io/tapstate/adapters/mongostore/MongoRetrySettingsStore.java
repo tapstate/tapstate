@@ -100,7 +100,7 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
             });
             return new Settings(row.getLong(REVISION), policy, overrides);
         } catch (ClassCastException | NullPointerException | IllegalArgumentException | ArithmeticException invalid) {
-            throw unreadable();
+            throw unreadable(invalid);
         }
     }
 
@@ -124,6 +124,11 @@ final class MongoRetrySettingsStore implements RetrySettingsStore {
     }
 
     private static TapstateException unreadable() {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "retry-settings", "field", "policy"), null);
+        return unreadable(null);
+    }
+
+    private static TapstateException unreadable(RuntimeException cause) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", "retry-settings", "field", "policy"), cause);
     }
 }
