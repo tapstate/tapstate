@@ -43,6 +43,17 @@ class ThreeLayerObservationTest {
         assertThatThrownBy(() -> f.port.state().read("pipeline")).isInstanceOf(TapstateException.class);
     }
 
+    @Test void retirementAllowsDisplayReadsWithoutOpeningTheFencedCacheGeneration() {
+        var f = new Fixture();
+        f.mapping.set(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.RETIRING, "delete"));
+
+        assertThat(f.port.pipelineRecoveryRequired("pipeline")).isFalse();
+        assertThat(f.port.observations().read("pipeline")).isEmpty();
+        assertThatThrownBy(() -> f.port.scope("pipeline")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        verifyNoInteractions(f.cache, f.recoveries, f.preparations);
+    }
+
     @ParameterizedTest @ValueSource(booleans = {false, true})
     void anAbsentPipelineReportsUnknownWithoutOpeningRetainedCacheState(boolean retired) {
         var f = new Fixture();
