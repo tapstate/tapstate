@@ -379,10 +379,12 @@ class ActionsRunTest(unittest.TestCase):
         performance = {"id": 21, "run_started_at": "2026-11-21T10:00:00Z"}
         deadline = actions_health.workflow_deadline(performance)
         waiting = {"name": "measure (0)", "status": "queued"}
+        seeding = {"name": "Prepare Maven dependencies", "status": "in_progress"}
         reporting = {"name": "report", "status": "in_progress"}
         for seconds_before, live, jobs, expected_calls in (
             (1501, {"run_attempt": 1, "status": "in_progress"}, [waiting], 0),
             (1500, {"run_attempt": 1, "status": "in_progress"}, [waiting], 1),
+            (1500, {"run_attempt": 1, "status": "in_progress"}, [seeding], 1),
             (1500, {"run_attempt": 2, "status": "in_progress"}, [waiting], 0),
             (1500, {"run_attempt": 1, "status": "completed"}, [waiting], 0),
             (1500, {"run_attempt": 1, "status": "in_progress"}, [reporting], 0),
