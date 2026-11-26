@@ -9,6 +9,7 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.connection.ClusterType;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
@@ -35,6 +36,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -49,6 +51,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
     private final MongoWorkloadClaimStore raw;
+    private final AtomicReference<BsonBinary> originalClaimNamespace;
     private final MongoValidationPreparations.Authority validation;
     private final MongoClaimOperations operations;
     private final java.util.function.Supplier<MongoClient> nodeSessionClient;
@@ -64,13 +67,14 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             MongoValidationPreparations.Authority validation, MongoClaimOperations operations) {
-        this(client, database, scope, requireActive, validation, operations, null);
+        this(client, database, scope, requireActive, validation, operations, null, new AtomicReference<>());
     }
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             MongoValidationPreparations.Authority validation, MongoClaimOperations operations,
-            java.util.function.Supplier<MongoClient> nodeSessionClient) {
+            java.util.function.Supplier<MongoClient> nodeSessionClient, AtomicReference<BsonBinary> originalClaimNamespace) {
         this.nodeSessionClient = nodeSessionClient;
+        this.originalClaimNamespace = originalClaimNamespace;
         this.client = Objects.requireNonNull(client, "client");
         this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope");
@@ -237,12 +241,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private WorkloadClaimAttempt acquireInPreparedNamespace(Function<MongoWorkloadClaimStore, WorkloadClaimAttempt> acquire) {
         return StoreIo.call(() -> {
             requireActive.run();
-            var preparedNamespace = claimCollectionId();
+            // A load-balanced transaction pins a connection. Its catalog reads use the isolated pool.
+            var catalog = client.getClusterDescription().getType() == ClusterType.LOAD_BALANCED
+                    ? Objects.requireNonNull(nodeSessionClient, "isolated catalog pool").get().getDatabase(database.getName())
+                    : database;
+            var observed = claimCollectionId(catalog);
+            // Views of the same live business scope retain one physical identity across claim attempts.
+            var original = originalClaimNamespace.compareAndExchange(null, observed);
+            if (original != null && !original.equals(observed)) throw unreadableClaimCollection();
             return transaction(true, (store, session) -> {
                 var result = acquire.apply(store);
                 // The committed catalog cannot see a namespace implicitly created by this transaction.
-                // Keep the same prepared namespace across driver retries and abort before publishing any writes.
-                if (!preparedNamespace.equals(claimCollectionId())) throw unreadableClaimCollection();
+                if (!observed.equals(claimCollectionId(catalog))) throw unreadableClaimCollection();
                 return result;
             });
         });
@@ -849,9 +859,9 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         claimCollection(database);
     }
 
-    private BsonBinary claimCollectionId() {
+    private BsonBinary claimCollectionId(MongoDatabase catalog) {
         var budget = operations.budget();
-        var scopedDatabase = budget == null ? database : budget.database(database);
+        var scopedDatabase = budget == null ? catalog : budget.database(catalog);
         var metadata = claimCollection(scopedDatabase);
         if (budget != null) budget.remainingMillis();
         // Compare the catalog identity in BSON regardless of the client's UUID representation.

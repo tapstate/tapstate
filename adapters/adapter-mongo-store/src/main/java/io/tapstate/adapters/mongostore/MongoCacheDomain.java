@@ -13,6 +13,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.spi.store.StorageBinding;
+import org.bson.BsonBinary;
 import org.bson.Document;
 
 import java.time.Duration;
@@ -21,6 +22,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Owns the CACHE clients and keeps authentication preparation independent from business-domain assembly. */
 public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineStoreViews, io.tapstate.spi.store.SrsStoreViews, AutoCloseable {
@@ -29,6 +32,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
     private final MongoClaimOperations claimOperations;
+    private final Map<CacheBusinessScope, AtomicReference<BsonBinary>> claimNamespaces = new ConcurrentHashMap<>();
     private final MongoStructureProof structures = new MongoStructureProof();
     private final java.util.concurrent.atomic.AtomicReference<Set<SystemCollections>> inspectedCollections =
             new java.util.concurrent.atomic.AtomicReference<>(Set.of());
@@ -478,8 +482,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         claimOperations.requireAdmission();
         loadBusinessScope(expected);
         MongoCacheAdmissionQueue.bind(client, database.getName(), expected, claimOperations);
+        var claimNamespace = claimNamespaces.computeIfAbsent(expected, ignored -> new AtomicReference<>());
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive, null,
-                claimOperations, this::nodeSessionClient);
+                claimOperations, this::nodeSessionClient, claimNamespace);
     }
 
     private synchronized com.mongodb.client.MongoClient nodeSessionClient() {

@@ -28,7 +28,7 @@ class AClaimCannotRecreateItsDroppedCacheCollectionIT {
         try (var installed = PreparedNativeStore.create();
              var config = MongoConfigurationDomain.open(
                      new MongoConnectionSettings(installed.configurationUri(), null, timeout), installed.clusterId());
-             var cache = MongoCacheDomain.connect(standardUuid(config.bindings().load().orElseThrow().cache()), timeout, "claim-witness");
+             var cache = MongoCacheDomain.connect(singleConnectionWithStandardUuid(config.bindings().load().orElseThrow().cache()), timeout, "claim-witness");
              var setupClient = MongoClients.create(installed.cacheUri())) {
             var scope = config.bindings().cachePreparation().orElseThrow().businessScope();
             var claims = cache.workloadClaims(scope);
@@ -49,10 +49,10 @@ class AClaimCannotRecreateItsDroppedCacheCollectionIT {
         }
     }
 
-    private static StorageBinding.Connection standardUuid(StorageBinding.Connection original) {
+    private static StorageBinding.Connection singleConnectionWithStandardUuid(StorageBinding.Connection original) {
         String uri = original.uri();
         String separator = uri.contains("?") ? "&" : "?";
-        return new StorageBinding.Connection(original.kind(), uri + separator + "uuidRepresentation=standard",
+        return new StorageBinding.Connection(original.kind(), uri + separator + "uuidRepresentation=standard&maxPoolSize=1",
                 original.database(), original.caPem());
     }
 }

@@ -128,6 +128,13 @@ class MongoCacheMetadataStoresIT {
             assertThatThrownBy(() -> claims.acquireProcessNode(processKey, processOwner, ttl)).isInstanceOf(TapstateException.class);
             assertThat(f.database.listCollectionNames()).doesNotContain(table.collectionName());
             assertThat(f.admissions()).isEqualTo(admissions);
+
+            table.prepareCollectionOn(f.database);
+            assertThatThrownBy(() -> claims.acquire(key, owner, 1, ttl)).isInstanceOf(TapstateException.class);
+            var anotherView = f.domain.workloadClaims(SCOPE);
+            assertThatThrownBy(() -> anotherView.acquireProcessNode(processKey, processOwner, ttl)).isInstanceOf(TapstateException.class);
+            assertThat(table.on(f.database).countDocuments()).isZero();
+            assertThat(f.admissions()).isEqualTo(admissions);
         });
     }
 
