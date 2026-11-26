@@ -10,6 +10,7 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -29,6 +30,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import org.bson.BsonBinary;
 import org.bson.BsonDocument;
 import org.bson.Document;
 
@@ -40,6 +42,7 @@ final class MongoClaimOperations {
     private static final long RENEWAL_DISPATCH_MARGIN = TimeUnit.SECONDS.toNanos(1);
     private static final java.util.concurrent.atomic.AtomicLong NEXT_DIAGNOSTIC = new java.util.concurrent.atomic.AtomicLong();
     private final MongoClient client;
+    private final ConcurrentHashMap<CacheBusinessScope, BsonBinary> claimNamespaces = new ConcurrentHashMap<>();
     final MongoStructureProof structures = new MongoStructureProof();
     private final ThreadPoolExecutor workers = new ThreadPoolExecutor(4, 4, 100, TimeUnit.MILLISECONDS,
             new LinkedBlockingQueue<>(), action -> {
@@ -55,6 +58,11 @@ final class MongoClaimOperations {
             });
     private final ThreadPoolExecutor nodeSession = nodeSessionWorker("mongo-node-session-io");
     private final ThreadPoolExecutor nodeConfirmation = nodeSessionWorker("mongo-node-confirmation-io");
+
+    boolean retainClaimNamespace(CacheBusinessScope scope, BsonBinary observed) {
+        var original = claimNamespaces.putIfAbsent(scope, observed);
+        return original == null || original.equals(observed);
+    }
 
     private static ThreadPoolExecutor nodeSessionWorker(String threadName) {
         var worker = new ThreadPoolExecutor(1, 1, 100, TimeUnit.MILLISECONDS,

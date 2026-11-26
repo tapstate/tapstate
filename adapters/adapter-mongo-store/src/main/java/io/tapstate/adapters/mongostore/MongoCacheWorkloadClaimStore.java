@@ -36,7 +36,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -51,7 +50,6 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
     private final MongoWorkloadClaimStore raw;
-    private final AtomicReference<BsonBinary> originalClaimNamespace;
     private final MongoValidationPreparations.Authority validation;
     private final MongoClaimOperations operations;
     private final java.util.function.Supplier<MongoClient> nodeSessionClient;
@@ -67,14 +65,13 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             MongoValidationPreparations.Authority validation, MongoClaimOperations operations) {
-        this(client, database, scope, requireActive, validation, operations, null, new AtomicReference<>());
+        this(client, database, scope, requireActive, validation, operations, null);
     }
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             MongoValidationPreparations.Authority validation, MongoClaimOperations operations,
-            java.util.function.Supplier<MongoClient> nodeSessionClient, AtomicReference<BsonBinary> originalClaimNamespace) {
+            java.util.function.Supplier<MongoClient> nodeSessionClient) {
         this.nodeSessionClient = nodeSessionClient;
-        this.originalClaimNamespace = originalClaimNamespace;
         this.client = Objects.requireNonNull(client, "client");
         this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope");
@@ -247,8 +244,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     : database;
             var observed = claimCollectionId(catalog);
             // Views of the same live business scope retain one physical identity across claim attempts.
-            var original = originalClaimNamespace.compareAndExchange(null, observed);
-            if (original != null && !original.equals(observed)) throw unreadableClaimCollection();
+            if (!operations.retainClaimNamespace(scope, observed)) throw unreadableClaimCollection();
             return transaction(true, (store, session) -> {
                 var result = acquire.apply(store);
                 // The committed catalog cannot see a namespace implicitly created by this transaction.
