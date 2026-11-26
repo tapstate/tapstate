@@ -907,6 +907,37 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void aStoppedObservationCanFollowTheSameClaimToItsCurrentTopology() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var checkpoint = states.read("orders").orElseThrow();
+            var original = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var stopped = observation(PipelineState.STOPPED);
+            original.save(stopped, checkpoint.epoch());
+
+            var table = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            var future = table.find().first();
+            var futureId = future.get("_id", Document.class);
+            futureId.put("topologyRevision", f.fence().topologyRevision() + 2);
+            future.put("observedAt", Date.from(AT.plusSeconds(2)));
+            table.insertOne(future);
+
+            var claims = f.domain().workloadClaims(BUSINESS);
+            var reacquired = claims.acquirePipeline(SCOPE, OWNER, f.fence().topologyRevision() + 1, Duration.ofSeconds(30));
+            assertThat(reacquired.acquired()).isTrue();
+            var current = WorkloadClaimFence.from(reacquired.claim());
+            assertThat(current.claimGeneration()).isEqualTo(f.fence().claimGeneration());
+            assertThat(current.executionGeneration()).isEqualTo(f.fence().executionGeneration());
+            assertThat(current.topologyRevision()).isEqualTo(f.fence().topologyRevision() + 1);
+            var observations = f.domain().pipelineObservations(SCOPE, current, ACTIVE);
+            assertThat(original.republishStopped(checkpoint)).isEmpty();
+            assertThat(observations.read("orders")).isEmpty();
+            assertThat(observations.republishStopped(checkpoint)).contains(stopped);
+            assertThat(observations.read("orders")).contains(stopped);
+        });
+    }
+
     @Test void terminalPayloadStaysVisibleAcrossAClaimChangeAndNeverCrossesTheNextEpoch() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);

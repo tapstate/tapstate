@@ -33,6 +33,8 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     private static final String EPOCH = "epoch";
     private static final String SCOPE = "scope";
     private static final String CLAIM_GENERATION = "claimGeneration";
+    private static final String EXECUTION_GENERATION = "executionGeneration";
+    private static final String TOPOLOGY_REVISION = "topologyRevision";
     private static final String STATE = "state";
 
     private static final AtomicInteger WRITES = new AtomicInteger();
@@ -145,7 +147,10 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             if (exact != null) return decode(access, exact, id).filter(value -> value.state() == PipelineState.STOPPED);
             var prefix = new Document(SCOPE, id.get(SCOPE)).append(EPOCH, checkpoint.epoch());
             var lower = new Document(prefix).append(CLAIM_GENERATION, new org.bson.types.MinKey());
-            var upper = new Document(prefix).append(CLAIM_GENERATION, original.claimGeneration());
+            // The same claim can survive a topology advance. Its current topology is the exclusive upper bound.
+            var upper = new Document(prefix).append(CLAIM_GENERATION, original.claimGeneration())
+                    .append(EXECUTION_GENERATION, original.executionGeneration())
+                    .append(TOPOLOGY_REVISION, original.topologyRevision());
             var filter = new Document("_id", new Document("$gte", lower).append("$lt", upper))
                     .append(STATE, PipelineState.STOPPED.name()).append("_id.executionGeneration", original.executionGeneration());
             var retained = collection.find(session, filter).sort(new Document("_id", -1)).first();
@@ -392,14 +397,14 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     }
 
     private static Document keyOfClaim(MongoCachePipelineAccess access, long epoch, Document claim) {
-        return key(access, epoch, claim.getLong(CLAIM_GENERATION), claim.getLong("executionGeneration"),
-                claim.getLong("topologyRevision"), claim.getString("ownerNodeId"), claim.getString("ownerBootId"));
+        return key(access, epoch, claim.getLong(CLAIM_GENERATION), claim.getLong(EXECUTION_GENERATION),
+                claim.getLong(TOPOLOGY_REVISION), claim.getString("ownerNodeId"), claim.getString("ownerBootId"));
     }
 
     private static Document key(MongoCachePipelineAccess access, long epoch, long claim, long execution, long topology,
             String node, String boot) {
         return new Document(SCOPE, MongoPipelinePreparationFacts.scope(access.scope)).append(EPOCH, epoch)
-                .append(CLAIM_GENERATION, claim).append("executionGeneration", execution).append("topologyRevision", topology)
+                .append(CLAIM_GENERATION, claim).append(EXECUTION_GENERATION, execution).append(TOPOLOGY_REVISION, topology)
                 .append("node", node).append("boot", boot);
     }
 

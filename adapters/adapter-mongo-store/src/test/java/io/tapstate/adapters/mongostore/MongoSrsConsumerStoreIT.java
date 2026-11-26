@@ -2955,6 +2955,41 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void wideStartupIdentityFallsBackBeforeDecoding(boolean schema, boolean attach) {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var refs = publishSnapshotModels(f, tables);
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "retained"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "retained", refs), f.fenceA())).isTrue();
+
+            var startup = new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, () -> {});
+            var expected = startup.startupPreparation(A, true).orElseThrow();
+            var table = schema ? SystemCollections.CACHE_SCHEMA_MIGRATIONS : SystemCollections.CACHE_IDENTITY;
+            assertThat(table.on(f.database()).updateOne(new Document("_id", schema ? "business" : "cluster"),
+                    new Document("$set", new Document("padding", "x".repeat(70 * 1024))))
+                    .getModifiedCount()).isOne();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                if (attach) {
+                    assertThat(startup.attachForStartup(A, tables, f.fenceA())).contains(member);
+                } else {
+                    assertThat(startup.startupPreparation(A, true)).contains(expected);
+                }
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(commands).startsWith("aggregate:srs_chains", "aggregate:cache_identity", "find:srs_chains")
+                    .endsWith("commitTransaction:");
+            assertThat(f.consumers().progress(A)).contains(expected.snapshot().progress());
+        });
+    }
+
     @Test void sharedStartupPreparationBatchesTopologyAndPostOpenReadsRemainFresh() {
         withBusiness(f -> {
             var tables = Set.of("orders");

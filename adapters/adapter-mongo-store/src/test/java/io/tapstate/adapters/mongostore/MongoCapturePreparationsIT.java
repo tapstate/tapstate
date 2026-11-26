@@ -921,6 +921,30 @@ class MongoCapturePreparationsIT {
         });
     }
 
+    @Test void wideRetainedCaptureAdmissionReadsTheOriginalClaimInTheOrdinaryTransaction() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var first = f.preparations().createFirst(f.issue(f.request));
+            var key = first.claim().key();
+            var claims = f.claims();
+            var before = claims.acquire(key, OWNER, 1, TTL).claim();
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache);
+            assertThat(table.updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)),
+                    new Document("$set", new Document("padding", "x".repeat(70 * 1024))))
+                    .getModifiedCount()).isOne();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                var acquired = claims.acquire(key, OWNER, 1, TTL);
+                assertThat(acquired.acquired()).isTrue();
+                assertThat(acquired.claim().claimGeneration()).isEqualTo(before.claimGeneration());
+                assertThat(acquired.claim().executionGeneration()).isEqualTo(before.executionGeneration());
+            } finally { MongoCommandObservation.CURRENT.remove(); }
+            assertThat(commands).containsExactly("aggregate", "aggregate", "update", "aggregate",
+                    "findAndModify", "commitTransaction");
+            assertThat(claims.acquire(key, new WorkloadOwner("node-b", "boot-b"), 1, TTL).acquired()).isFalse();
+        });
+    }
+
     @ParameterizedTest @ValueSource(longs = {-1, 0})
     void retainedSharedCaptureLoadBatchesOriginalCheckpointProof(long sequence) {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
