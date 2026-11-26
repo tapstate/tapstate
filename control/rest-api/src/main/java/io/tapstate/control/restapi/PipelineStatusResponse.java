@@ -34,7 +34,7 @@ record PipelineStatusResponse(
         ExecutionPlanResponse plan,
         List<String> awaitingRebalance,
         ApiError intentReadFailure,
-        List<ConnectorUsageQuery.Version> connectorVersions) {
+        List<ConnectorUsageQuery.Version> connectorVersions, PipelineCatalogItem.StopState stopState) {
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
         return of(status, catalog, Clock.systemUTC(), Locale.ENGLISH);
@@ -52,7 +52,7 @@ record PipelineStatusResponse(
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 null, status.observedState(), false, ExecutionPlanResponse.of(status.plan()),
-                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null, null);
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null, null, null);
     }
 
     static PipelineStatusResponse of(
@@ -71,7 +71,7 @@ record PipelineStatusResponse(
                 status.desiredState(), runtime.observedState(), item.hasArtifact(),
                 ExecutionPlanResponse.of(runtime.plan()),
                 runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(),
-                ApiError.from(status.intentReadFailure(), catalog, locale), null);
+                ApiError.from(status.intentReadFailure(), catalog, locale), null, status.stopState());
     }
 
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
@@ -102,12 +102,12 @@ record PipelineStatusResponse(
                 ApiError.from(status.failure(), catalog, locale), observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
-                ApiError.from(status.intentReadFailure(), catalog, locale), null);
+                ApiError.from(status.intentReadFailure(), catalog, locale), null, status.stopState());
     }
 
     PipelineStatusResponse withConnectorVersions(List<ConnectorUsageQuery.Version> versions) {
         return new PipelineStatusResponse(pipelineId, state, displayState, failure, observedAt, observedAgeMillis,
-                desiredState, observedState, hasArtifact, plan, awaitingRebalance, intentReadFailure, List.copyOf(versions));
+                desiredState, observedState, hasArtifact, plan, awaitingRebalance, intentReadFailure, List.copyOf(versions), stopState);
     }
 
     private static boolean knownTransition(PipelineCatalogItem.UiState state) {
