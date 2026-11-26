@@ -933,7 +933,7 @@ public final class Engine {
 
     /**
      * The moment the pipeline's live job began counting what it has delivered, as epoch milliseconds;
-     * empty when it has no live job or nothing has counted yet.
+     * empty when no live writer reports its start.
      *
      * <p>The <strong>latest</strong> start among its sinks, not the earliest, and the choice is a trade
      * rather than a plain reading. A total summed over sinks that began at different moments is not exactly

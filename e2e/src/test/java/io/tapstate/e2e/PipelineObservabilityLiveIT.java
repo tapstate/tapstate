@@ -130,6 +130,59 @@ class PipelineObservabilityLiveIT {
     }
 
     @Test
+    void cdcOnlyHistoryCountsTheFirstAcknowledgementAfterAnIdleWindowStarts() throws Exception {
+        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
+                MongoEndpoints mongo = new MongoEndpoints();
+                PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                RealProcessServer server = start(storage, List.of(
+                        "--tapstate.metrics.history.sample-interval=" + SAMPLE_INTERVAL.toSeconds() + "s"))) {
+            mysql.start();
+            SharedMySql.grantReplication(mysql);
+            seed(mysql);
+            String targetUri = SharedMongo.replicaSetUrl("observability_cdc_only_target");
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            Map<String, Object> mysqlConfig = mysqlConfig(mysql);
+            var resources = resources(mysqlConfig, targetUri);
+            resources.computeIfPresent("pipeline.tap.yml",
+                    (name, yaml) -> yaml.replace("snapshot_and_cdc", "cdc_only"));
+            control.apply(resources);
+            control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            awaitState(control, PipelineState.RUNNING);
+
+            // Take a fresh window after the sink has initialized, and wait for observations in it.
+            Instant launchedAt = Instant.now().minus(REAL_CONNECTOR_WAIT);
+            awaitHistory(server.baseUrl(), control.credential(), launchedAt,
+                    history -> pointCount(history) >= 2, "idle sink observations");
+            Instant from = Instant.now();
+            var idle = awaitHistory(server.baseUrl(), control.credential(), from,
+                    history -> pointCount(history) >= 2, "a zero baseline inside the selected window");
+            assertThat(points(idle)).noneMatch(point -> point.containsKey("cdcDelivery"));
+            assertThat(mongo.documents(target, TABLE)).isEmpty();
+
+            try (Connection connection = DriverManager.getConnection(
+                    mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());
+                    Statement statement = connection.createStatement()) {
+                statement.execute("INSERT INTO orders (id, customer) VALUES (2, 'first-cdc')");
+            }
+            awaitCustomer(mongo, target, "first-cdc", "the first CDC insert to reach Mongo");
+            var first = awaitHistory(server.baseUrl(), control.credential(), from,
+                    history -> points(history).stream().anyMatch(point -> point.containsKey("cdcDelivery")),
+                    "the first acknowledgement in CDC-only history");
+            assertThat(points(first).stream().map(point -> point.get("cdcDelivery"))
+                    .filter(Map.class::isInstance).map(Map.class::cast).toList())
+                    .singleElement().satisfies(delivery -> {
+                        assertThat(((Number) delivery.get("sampleCount")).longValue()).isEqualTo(1);
+                        assertThat(((Number) delivery.get("averageMillis")).doubleValue()).isNotNegative();
+                    });
+        }
+    }
+
+    @Test
     void realRunRestartGapAndCodedFailureAgreeAcrossRestCliAndMcp() throws Exception {
         Instant from = Instant.now().minusSeconds(5);
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));

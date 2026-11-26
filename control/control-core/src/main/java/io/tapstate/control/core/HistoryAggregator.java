@@ -275,7 +275,7 @@ public final class HistoryAggregator {
         // acknowledgement after an in-window baseline.
         return left != null && left.countingSince() == null && !left.observedAt().isBefore(from)
                 && boundary != StartReason.GAP
-                && left.counters().getOrDefault(CdcDeliveryTotals.COUNT_METRIC, 0L) == 0;
+                && Long.valueOf(0L).equals(left.counters().get(CdcDeliveryTotals.COUNT_METRIC));
     }
 
     private static CdcDeliveryTotals measurableCdcTotals(long count, long millis) {

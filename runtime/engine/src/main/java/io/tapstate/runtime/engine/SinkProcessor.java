@@ -435,7 +435,13 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
         // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
         // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
         // so the readings go nowhere instead.
-        if (member != null) return;
+        if (member != null) {
+            if (delivery instanceof JetDeliveryGauge jobGauge) {
+                jobGauge.countingSince(countingSince);
+                jobGauge.cdcDelivered(CdcDeliveryTotals.ZERO);
+            }
+            return;
+        }
         if (supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
         }
@@ -796,9 +802,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             if (!batch.future().isDone()) {
                 return false;
             }
-            WriteResult result;
+            SettledWrite settled;
             try {
-                result = settle(batch.future()); // throws on a failed write, before any position advances
+                settled = settle(batch.future()); // throws on a failed write, before any position advances
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
@@ -821,8 +827,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             long settledAt = clock.getAsLong();
             batch.delivered().foldDurationsInto(settledDurations, settledAt);
             // A partial receipt only identifies a count. It cannot tell us which event times to sample.
+            WriteResult result = settled.result();
             if (result != null && result.acknowledgedRows() == batch.delivered().rowCount()) {
-                cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settledAt);
+                cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settled.acknowledgedAtMillis());
             }
             reportDelivered(batch.delivered().tables());
             return true;
@@ -894,8 +901,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
         }
         delivery.took(durations);
         delivery.cdcDelivered(cdcDelivery);
-        // Published with them and never alone: a total is readable only against what it accumulates from,
-        // and the two arriving by different routes is how they come to disagree.
+        // Keep the starting point alongside every delivery report.
         delivery.countingSince(countingSince);
     }
 
@@ -908,8 +914,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      * The write that settles this batch. A batch always holds a row: words about chains wait apart from the
      * rows rather than riding in a batch, so an external target is never handed an empty call for one.
      */
-    private CompletableFuture<WriteResult> settlementOf(List<Envelope> batch) {
-        return writer.write(batch).toCompletableFuture();
+    private CompletableFuture<SettledWrite> settlementOf(List<Envelope> batch) {
+        return writer.write(batch).toCompletableFuture()
+                .thenApply(result -> new SettledWrite(result, clock.getAsLong()));
     }
 
     /**
@@ -917,7 +924,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      * already raised (coded, for a real connector); the cause is rethrown as-is so it fails the job
      * unwrapped rather than buried in a {@link CompletionException}.
      */
-    private static WriteResult settle(CompletableFuture<WriteResult> future) {
+    private static SettledWrite settle(CompletableFuture<SettledWrite> future) {
         try {
             return future.join();
         } catch (CompletionException wrapper) {
@@ -932,11 +939,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
         }
     }
 
+    private record SettledWrite(WriteResult result, long acknowledgedAtMillis) {
+    }
+
     /**
      * One outstanding write, what its batch contributes to the frontier, what it delivers, and the number of its
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
-    private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
+    private record InFlightBatch(CompletableFuture<SettledWrite> future, List<ChainEntry> positions,
             DeliveredRows delivered, long firstOrder) {
     }
 
@@ -984,15 +994,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
                 // write settles, and a batch that kept only its newest stamp would report the whole batch
                 // as fast as its freshest row.
                 stamps.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(event.ts());
-                // A transform can emit an insert for a snapshot row. Positions carry the original
-                // source order through that transformation. Leave mixed and unproven origins out.
-                if (event.ts() > 0 && event.op() != Op.READ && event.op() != Op.DDL && !event.positions().isEmpty()
-                        && event.positions().values().stream()
-                                .allMatch(position -> position.order() != null && position.order().seq() >= 0)) {
+                if (hasCdcTimestamp(event)) {
                     cdcTimes.add(event.ts());
                 }
             }
             return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount);
+        }
+
+        private static boolean hasCdcTimestamp(Envelope event) {
+            if (event.ts() <= 0 || event.op() == Op.READ || event.op() == Op.DDL || event.positions().size() != 1) {
+                return false;
+            }
+            // A transform can change the operation. The single input position keeps its source order.
+            SourceOrder order = event.positions().values().iterator().next().order();
+            return order != null && order.seq() >= 0;
         }
 
         void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> bytesByTable,

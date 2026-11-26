@@ -131,8 +131,8 @@ class RuntimeConvergenceConfiguration {
 
     /**
      * What {@code engine}'s live job for {@code pipelineId} reports about rows that reached a target.
-     * A run with no start reported has counted nothing, so it reports nothing rather than totals nobody
-     * could place against a starting point.
+     * A writer reports its start even before confirming rows, so an observed CDC zero can be retained.
+     * A job without a reported start cannot supply a counter baseline.
      */
     private static DeliveryReading deliveredBy(Engine engine, String pipelineId) {
         OptionalLong since = engine.countingSince(pipelineId);

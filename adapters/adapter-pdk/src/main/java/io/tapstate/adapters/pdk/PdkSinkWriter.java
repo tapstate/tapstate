@@ -383,7 +383,7 @@ final class PdkSinkWriter implements SinkWriter {
             int submittedRows = rows.size();
             WriteReceipt receipt = new WriteReceipt();
             try {
-                write.writeRecord(connector.context(), rows, table, receipt::record);
+                write.writeRecord(connector.context(), rows, table, receipt::accept);
             } catch (Throwable failure) {
                 operation(table.getId(), failure);
                 throw failure;
@@ -409,7 +409,7 @@ final class PdkSinkWriter implements SinkWriter {
         private boolean reported;
         private boolean hasErrors;
 
-        private void record(WriteListResult<TapRecordEvent> result) {
+        private void accept(WriteListResult<TapRecordEvent> result) {
             written += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
             reported = true;
             hasErrors |= result.getErrorMap() != null && !result.getErrorMap().isEmpty();

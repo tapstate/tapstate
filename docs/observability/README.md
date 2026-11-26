@@ -188,14 +188,15 @@ Lag is the age of the last event that the target acknowledged for that table. It
 and it cannot say whether the source has more changes waiting.
 
 CDC delivery time measures the time from the source event timestamp to target acknowledgement.
-It counts only writes backed by incremental source positions. Full loads, mixed or unknown source
-positions, and missing or future timestamps are excluded. Confirmed no-op writes count as
+It counts only writes with one incremental source position and uses the time the writer confirms
+the batch. Full loads, outputs with multiple or unknown source positions, and missing or future
+timestamps are excluded. Confirmed no-op writes count as
 deliveries. A batch contributes latency samples only when the writer confirms every row event.
 Schema changes do not count as row events. If a change produces multiple confirmed outputs, each
 output is one delivery. History differences the cumulative count and elapsed-time total for each
 usable observation pair. The right observation determines the bucket, and the mean is weighted by
-delivered records. An in-window observation before the first acknowledgement supplies a zero
-baseline for an adjacent sample. Deltas do not span gaps or restarts. If retention removes the
+delivered records. An explicit zero reported within the window supplies a baseline for an
+adjacent sample. Unavailable counters do not establish a baseline. Deltas do not span gaps or restarts. If retention removes the
 cursor sample, CDC calculations resume once the continuation has its own observation pair.
 Points without confirmed CDC samples omit `cdcDelivery`. Old retained samples remain readable.
 A measured average of zero is present with a positive `sampleCount`.

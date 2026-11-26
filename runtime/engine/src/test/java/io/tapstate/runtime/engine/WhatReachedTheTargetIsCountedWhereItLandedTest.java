@@ -81,6 +81,8 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
                 row("orders", now - 800).withPosition(snapshot),
                 row("orders", now - 1_200).withPositions(Map.of("orders", change, "customers", snapshot)),
                 row("orders", now - 1_600),
+                row("orders", now - 1_700).withPositions(Map.of("orders", change,
+                        "customers", new ChainPosition(new SourceOrder(1, 22), "other-change"))),
                 delete("orders", now + 10).withPosition(change)));
         processor.process(0, inbox);
         assertThat(delivery.cdc).isEmpty();
@@ -89,7 +91,26 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         drain(processor);
 
         assertThat(delivery.cdc.getLast()).isEqualTo(new CdcDeliveryTotals(2, 900));
-        assertThat(delivery.latestDurations().get("orders").count()).isEqualTo(6);
+        assertThat(delivery.latestDurations().get("orders").count()).isEqualTo(7);
+    }
+
+    @Test
+    void cdc_duration_stops_when_the_writer_acknowledges_the_batch() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long[] now = {1_700_000_000_000L};
+        SinkProcessor processor = init(writer, delivery, () -> now[0]);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        TestInbox inbox = new TestInbox();
+        inbox.add(row("orders", now[0] - 100).withPosition(change));
+        processor.process(0, inbox);
+
+        now[0] += 2_000;
+        writer.completeAll();
+        now[0] += 5_000;
+        drain(processor);
+
+        assertThat(delivery.cdc).containsExactly(new CdcDeliveryTotals(1, 2_100));
     }
 
     @Test
