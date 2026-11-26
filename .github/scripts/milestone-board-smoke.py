@@ -32,10 +32,14 @@ assert params.get("number") != "1", args
 def save():
     path.write_text(json.dumps(state))
 
-def answer(value):
+def answer(value, status=200):
+    if "--include" in args:
+        print(f"HTTP/2.0 {status}\n")
     print(json.dumps(value))
     save()
-    sys.exit(0)
+    if status >= 400:
+        print(f"gh: request failed (HTTP {status})", file=sys.stderr)
+    sys.exit(status >= 400)
 
 endpoint = "graphql" if "graphql" in args else next(
     (word for word in args if word.startswith("orgs/") or word.startswith("repos/")), ""
@@ -60,6 +64,9 @@ if endpoint == "graphql":
         answer({"data": {"updateProjectV2View": {"projectV2View": {"id": view["id"]}}}})
     if "projectItems(first:100," in query:
         assert "--paginate" in args and "--slurp" in args and "after:$endCursor" in query
+        if params["issue"] == os.environ.get("MOCK_GH_FAIL_PROJECT_ITEM"):
+            print("gh: project item lookup failed", file=sys.stderr)
+            sys.exit(12)
         item = state["items"].get(params["issue"])
         nodes = [{"id": item["id"], "project": {"id": "PVT8"}}] if item else []
         answer([{"data": {"node": {"projectItems": {"nodes": chunk}}}}
@@ -85,7 +92,8 @@ if endpoint == "graphql":
         item = next(value for value in state["items"].values() if value["id"] == params["item"])
         if params["option"] != "TODO":
             assert not item.get("pending_reads"), "an unfinished native add can overwrite this Status"
-        item["status"] = params["option"]
+        if item["id"] != os.environ.get("MOCK_GH_BLOCK_STATUS"):
+            item["status"] = params["option"]
         answer({"data": {"updateProjectV2ItemFieldValue": {
             "projectV2Item": {"id": item["id"]}
         }}})
@@ -104,10 +112,14 @@ if endpoint == "orgs/tapstate/projectsV2/8/views":
     answer({"value": view})
 if endpoint.startswith("repos/tapstate/tapstate/issues/"):
     number = endpoint.rsplit("/", 1)[1]
-    answer(state["issues"]["ISSUE-" + number])
+    if number == os.environ.get("MOCK_GH_FORBIDDEN_ISSUE"):
+        answer({"message": "Forbidden"}, 403)
+    issue = state["issues"].get("ISSUE-" + number)
+    answer(issue or {"message": "Not Found"}, 200 if issue else 404)
 if endpoint.startswith("repos/tapstate/tapstate/milestones/"):
     number = int(endpoint.rsplit("/", 1)[1])
-    answer(next(row for row in state["milestones"] if row["number"] == number))
+    milestone = next((row for row in state["milestones"] if row["number"] == number), None)
+    answer(milestone or {"message": "Not Found"}, 200 if milestone else 404)
 if endpoint.startswith("repos/tapstate/tapstate/milestones?"):
     if os.environ.get("MOCK_GH_FAIL_MILESTONES") == "1":
         sys.exit(12)
@@ -116,6 +128,8 @@ if endpoint.startswith("repos/tapstate/tapstate/milestones?"):
     sys.exit(0)
 if endpoint.startswith("repos/tapstate/tapstate/issues?"):
     number = endpoint.split("milestone=")[1].split("&")[0]
+    if number == os.environ.get("MOCK_GH_FAIL_MILESTONE_ISSUES"):
+        sys.exit(12)
     for issue in state["issues"].values():
         if (issue.get("milestone") or {}).get("number") == int(number):
             print(base64.b64encode(json.dumps(issue).encode()).decode())
@@ -163,7 +177,7 @@ def run():
                    MOCK_GH_STATE=str(state_file), PATH=f"{directory}:{os.environ['PATH']}")
         event_file = directory / "event.json"
 
-        def invoke(event_name, payload, refresh_issue=True):
+        def invoke(event_name, payload, refresh_issue=True, **extra_env):
             if event_name == "issues" and refresh_issue:
                 current_state = json.loads(state_file.read_text())
                 current_issue = payload["issue"]
@@ -177,7 +191,7 @@ def run():
                 state_file.write_text(json.dumps(current_state))
             event_file.write_text(json.dumps(payload))
             result = subprocess.run([str(SCRIPT)], env=dict(env, GITHUB_EVENT_NAME=event_name,
-                                    GITHUB_EVENT_PATH=str(event_file)), capture_output=True,
+                                    GITHUB_EVENT_PATH=str(event_file), **extra_env), capture_output=True,
                                     text=True, check=False)
             assert result.returncode == 0, result.stdout + result.stderr
             return json.loads(state_file.read_text())
@@ -263,6 +277,49 @@ def run():
         assert state["views"][:-1] == views_before, "ambiguity must preserve the existing views"
         assert state["views"][-1]["filter"] == 'repo:tapstate/tapstate milestone:"Current milestone"'
         assert invoke("milestone", rename)["views"] == state["views"], "replay must reuse the new view"
+
+        existing_view_count = len(state["views"])
+        original_view = state["views"][0]
+        closed = dict(week4, state="closed", title="Week 4 archived")
+        state = invoke("milestone", {"action": "edited", "milestone": closed,
+                                      "changes": {"title": {"from": week4["title"]}}})
+        assert state["views"][0] == dict(original_view, filter='milestone:"Week 4 archived" is:issue')
+        state = invoke("milestone", {"action": "opened", "milestone": dict(closed, state="open")})
+        assert len(state["views"]) == existing_view_count, "reopening a renamed milestone must reuse the same view"
+        untracked = dict(week12, number=13, state="closed", title="Untracked closed")
+        state = invoke("milestone", {"action": "edited", "milestone": untracked,
+                                      "changes": {"title": {"from": "No old view"}}})
+        assert len(state["views"]) == existing_view_count, "a closed rename must not create a board"
+
+        assert invoke("milestone", {"action": "edited", "milestone": dict(week4, number=404)},
+                      refresh_issue=False) == state
+        assert invoke("issues", {"action": "labeled", "issue": issue(404, week4)},
+                      refresh_issue=False) == state
+        event_file.write_text(json.dumps({"issue": issue(576, week4)}))
+        forbidden = subprocess.run([str(SCRIPT)], env=dict(env, GITHUB_EVENT_NAME="issues",
+                                   GITHUB_EVENT_PATH=str(event_file), MOCK_GH_FORBIDDEN_ISSUE="576"),
+                                   capture_output=True, text=True, check=False)
+        assert forbidden.returncode != 0 and "cannot read issue #576" in forbidden.stderr
+
+        state["issues"].update({
+            "ISSUE-577": issue(577, week4),
+            "ISSUE-578": issue(578, week4),
+            "ISSUE-903": issue(903, week12),
+        })
+        state["issues"]["ISSUE-576"]["state"] = "closed"
+        state["milestones"].append({"number": 14, "title": "Later milestone", "state": "open"})
+        state_file.write_text(json.dumps(state))
+        partial = subprocess.run([str(SCRIPT), "--reconcile"], capture_output=True, text=True, check=False,
+                                 env=dict(env, MOCK_GH_BLOCK_STATUS="ITEM-ISSUE-576",
+                                          MOCK_GH_FAIL_PROJECT_ITEM="ISSUE-577",
+                                          MOCK_GH_FAIL_MILESTONE_ISSUES="6"))
+        assert partial.returncode != 0
+        for error in ("issue #576 failed to sync", "issue #577 failed to sync", "milestone #6: cannot list issues"):
+            assert error in partial.stderr, partial.stderr
+        state = json.loads(state_file.read_text())
+        assert state["items"]["ISSUE-578"]["status"] == "TODO"
+        assert state["items"]["ISSUE-903"]["status"] == "TODO"
+        assert any(view["name"] == "Later milestone" for view in state["views"])
         print("milestone board smoke: PASS")
 
 
