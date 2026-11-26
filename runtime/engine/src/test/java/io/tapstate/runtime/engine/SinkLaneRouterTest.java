@@ -12,6 +12,7 @@ import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.util.ArrayList;
@@ -23,6 +24,8 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 class SinkLaneRouterTest {
     private static final ChainAxes AXES = ChainAxes.assign(List.of("orders"));
@@ -102,15 +105,17 @@ class SinkLaneRouterTest {
         }
     }
 
-    @Test
-    void an_omitted_old_unique_value_orders_only_its_own_table() throws Exception {
+    @ParameterizedTest
+    @EnumSource(value = Op.class, names = {"UPDATE", "DELETE"})
+    void an_omitted_old_unique_value_orders_only_its_own_table(Op op) throws Exception {
         var keys = List.of(List.of("id"), List.of("email"), List.of("_id"));
         var constraints = new TargetKeyConstraints(keys, true, true,
                 Map.of("id", TapstateType.INT64, "email", TapstateType.STRING));
         var targets = Map.of("orders", TARGET, "lines", new SinkTarget("lines", List.of("id")));
         try (var f = fixture(targets, Map.of("orders", constraints, "lines", constraints), 32)) {
             var earlier = update(10, 1, "old", 1, "released");
-            var partial = Envelope.update(11, "orders", Map.of("id", 2), image(2, "new"), null);
+            var partial = op == Op.DELETE ? Envelope.delete(11, "orders", Map.of("id", 2), null)
+                    : Envelope.update(11, "orders", Map.of("id", 2), image(2, "new"), null);
             var later = insert(12, 3, "unknown-previous-owner");
             var otherTable = Envelope.update(13, "lines", image(4, "other"), image(4, "other"), null);
             f.router.process(0, new TestInbox(List.of(earlier, partial, later, otherTable)));
@@ -138,6 +143,21 @@ class SinkLaneRouterTest {
             assertThat(laterWrite.row()).isSameAs(later);
             f.ack(laterWrite);
             assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void aDeleteWithAnIncompleteCompositePrimaryKeyCannotUseTableOrdering() throws Exception {
+        var primary = List.of("id", "region");
+        var target = new SinkTarget("orders", primary);
+        var constraints = new TargetKeyConstraints(List.of(primary, List.of("email")), true, false,
+                Map.of("id", TapstateType.INT64, "region", TapstateType.STRING, "email", TapstateType.STRING));
+        try (var f = fixture(Map.of("orders", target), Map.of("orders", constraints), 8)) {
+            var partial = Envelope.delete(11, "orders", Map.of("id", 2), null);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(partial))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
         }
     }
 

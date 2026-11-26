@@ -73,22 +73,17 @@ final class SinkLaneClaims implements java.io.Serializable {
         return false;
     }
 
-    /**
-     * A stable target primary key still identifies a valid update when a connector emits only its
-     * replica identity in the before image. An unknown release cannot be ordered by tuple, so the
-     * router must order the row against every reserved write for this table.
-     */
+    /** A known row can release an unknown secondary value. Order that release against the whole table. */
     private boolean ordersByTable(Envelope e) {
-        if (e.op() != Op.UPDATE || e.before() == null || e.after() == null
-                || differs(e, target.keyColumns())) return false;
-        for (var column : target.keyColumns()) {
-            if (!known(e.before(), column, false) || !known(e.after(), column, false)) return false;
-        }
+        if (e.before() == null) return false;
+        boolean deleting = e.op() == Op.DELETE;
+        if (!deleting && (e.op() != Op.UPDATE || differs(e, target.keyColumns()))) return false;
+        // describe always claims the complete primary key, even when a secondary tuple is absent.
         boolean omitted = false;
         for (var columns : secondary) {
             if (generated(columns, e)) continue;
             for (var column : columns) {
-                if (!known(e.after(), column, true)) return false;
+                if (!deleting && !known(e.after(), column, true)) return false;
                 if (!e.before().containsKey(column) && !column.equals("_id")) omitted = true;
                 else if (!known(e.before(), column, true)) return false;
             }

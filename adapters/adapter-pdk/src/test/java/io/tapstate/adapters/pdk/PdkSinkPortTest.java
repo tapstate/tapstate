@@ -340,7 +340,8 @@ class PdkSinkPortTest {
                     Envelope.delete(2L, "t1", Map.of("id", 2), null),
                     Envelope.ddl(3L, "t1", Map.of()));
             assertThat(await(writer, batch)).isEqualTo(new WriteResult(0, 2));
-            assertThat(await(writer, batch)).isEqualTo(new WriteResult(2, 0));
+            assertThatThrownBy(() -> await(writer, batch)).isInstanceOf(ExecutionException.class)
+                    .hasRootCauseMessage("row rejected");
             assertThat(await(writer, batch)).isEqualTo(new WriteResult(0, 0));
         }
     }
