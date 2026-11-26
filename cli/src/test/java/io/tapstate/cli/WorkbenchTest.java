@@ -33,15 +33,70 @@ class WorkbenchTest {
     }
 
     @Test
-    void checkedSessionFailureIsDistinguishedFromStartupFailure() {
+    void nonInteractiveTerminalUsesTheExistingTerminalRequirement() {
         var stderr = new StringWriter();
 
-        int result = Workbench.run(new PrintWriter(stderr), WorkbenchTest::interactiveTerminal,
-                runner -> { throw new IOException("terminal I/O stopped"); });
+        int result = Workbench.run(new PrintWriter(stderr),
+                () -> new DumbTerminal(new ByteArrayInputStream(new byte[0]), new ByteArrayOutputStream()),
+                runner -> { throw new AssertionError("session must not run"); });
 
         assertThat(result).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(stderr.toString()).contains(CliError.WORKBENCH_SESSION_FAILED.code())
-                .doesNotContain(CliError.WORKBENCH_UNAVAILABLE.code(), "terminal I/O stopped");
+        assertThat(stderr.toString()).contains(CliError.WORKBENCH_NEEDS_A_TERMINAL.code());
+    }
+
+    @Test
+    void normallyCompletedSessionReturnsSuccessWithoutADiagnostic() {
+        var stderr = new StringWriter();
+        var entered = new AtomicBoolean();
+
+        int result = Workbench.run(new PrintWriter(stderr), WorkbenchTest::interactiveTerminal,
+                runner -> entered.set(true));
+
+        assertThat(entered).isTrue();
+        assertThat(result).isEqualTo(Cli.EXIT_OK);
+        assertThat(stderr.toString()).isEmpty();
+    }
+
+    @Test
+    void failedTerminalSetupPreservesThePrimaryFailureAndSuppressesCleanupFailure() {
+        var stderr = new StringWriter();
+        var failure = new IllegalStateException("broken terminal invariant");
+        var cleanup = new IOException("terminal cleanup failed");
+
+        assertThatThrownBy(() -> Workbench.run(new PrintWriter(stderr), () -> new DumbTerminal(
+                "test", "xterm", new ByteArrayInputStream(new byte[0]), new ByteArrayOutputStream(),
+                StandardCharsets.UTF_8) {
+            @Override
+            public String getType() {
+                throw failure;
+            }
+
+            @Override
+            protected void doClose() throws IOException {
+                super.doClose();
+                throw cleanup;
+            }
+        }, runner -> { throw new AssertionError("session must not run"); })).isSameAs(failure);
+
+        assertThat(failure.getSuppressed()).containsExactly(cleanup);
+        assertThat(stderr.toString()).isEmpty();
+    }
+
+    @Test
+    void interruptedSessionPreservesTheFlagAndItsSessionDiagnostic() {
+        var stderr = new StringWriter();
+
+        try {
+            int result = Workbench.run(new PrintWriter(stderr), WorkbenchTest::interactiveTerminal,
+                    runner -> { throw new InterruptedException("terminal I/O stopped"); });
+
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            assertThat(result).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+            assertThat(stderr.toString()).contains(CliError.WORKBENCH_SESSION_FAILED.code())
+                    .doesNotContain(CliError.WORKBENCH_UNAVAILABLE.code(), "terminal I/O stopped");
+        } finally {
+            Thread.interrupted();
+        }
     }
 
     @Test
@@ -68,7 +123,6 @@ class WorkbenchTest {
         return new DumbTerminal("test", "xterm", new ByteArrayInputStream(new byte[0]),
                 new ByteArrayOutputStream(), StandardCharsets.UTF_8);
     }
-
 
     @Test
     void runnerConfigurationDisablesPeriodicTicks() throws Exception {

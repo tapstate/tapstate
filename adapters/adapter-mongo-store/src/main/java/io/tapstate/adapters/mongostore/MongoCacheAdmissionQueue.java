@@ -106,7 +106,11 @@ final class MongoCacheAdmissionQueue {
     }
     private Ticket enter(boolean priority, long deadline, Runnable active) {
         var waiter = new Waiter();
-        synchronized (this) { if (closed) throw MongoCacheWorkloadClaimStore.claimFenced(); (priority ? first : other).addLast(waiter); }
+        var waiters = priority ? first : other;
+        synchronized (this) {
+            requireOpen();
+            waiters.addLast(waiter);
+        }
         boolean entered = false;
         try {
             for (;;) {
@@ -114,27 +118,48 @@ final class MongoCacheAdmissionQueue {
                 if (deadline != Long.MAX_VALUE) MongoReadBudget.until(deadline).remainingMillis();
                 Ticket recovery;
                 synchronized (this) {
-                    if (closed) throw MongoCacheWorkloadClaimStore.claimFenced();
-                    var next = !first.isEmpty() && (!lastFirst || other.isEmpty()) ? first.peekFirst() : other.peekFirst();
-                    if (next == null) next = first.peekFirst();
-                    if (held == null && next == waiter) {
-                        (priority ? first : other).removeFirst(); lastFirst = priority;
-                        held = new Ticket(this, priority); entered = true; return held;
+                    Ticket admission = tryAcquire(waiter, waiters, priority);
+                    if (admission != null) {
+                        entered = true;
+                        return admission;
                     }
                     recovery = held != null && held.recoverable() ? held : null;
-                    if (recovery == null) {
-                        long left = deadline == Long.MAX_VALUE ? 50 : Math.min(50, MongoReadBudget.until(deadline).remainingMillis());
-                        try { wait(left); }
-                        catch (InterruptedException interrupted) {
-                            Thread.currentThread().interrupt();
-                            throw MongoCacheWorkloadClaimStore.claimFenced(interrupted);
-                        }
-                    }
+                    if (recovery == null) awaitTurn(deadline);
                 }
                 if (recovery != null) recovery.recover(Math.min(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(5)));
             }
         } finally {
-            if (!entered) synchronized (this) { (priority ? first : other).remove(waiter); notifyAll(); }
+            if (!entered) synchronized (this) {
+                waiters.remove(waiter);
+                notifyAll();
+            }
+        }
+    }
+
+    /** Caller holds the queue monitor. */
+    private Ticket tryAcquire(Waiter waiter, ArrayDeque<Waiter> waiters, boolean priority) {
+        requireOpen();
+        var next = !first.isEmpty() && (!lastFirst || other.isEmpty()) ? first.peekFirst() : other.peekFirst();
+        if (next == null) next = first.peekFirst();
+        if (held != null || next != waiter) return null;
+        waiters.removeFirst();
+        lastFirst = priority;
+        held = new Ticket(this, priority);
+        return held;
+    }
+
+    private void requireOpen() {
+        if (closed) throw MongoCacheWorkloadClaimStore.claimFenced();
+    }
+
+    /** Waits with the queue monitor held and preserves the caller's interruption. */
+    private void awaitTurn(long deadline) {
+        long left = deadline == Long.MAX_VALUE ? 50 : Math.min(50, MongoReadBudget.until(deadline).remainingMillis());
+        try {
+            wait(left);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw MongoCacheWorkloadClaimStore.claimFenced(interrupted);
         }
     }
     private synchronized void released(Ticket expected) { if (held != expected) throw new IllegalStateException("admission ticket changed"); held = null; notifyAll(); }
