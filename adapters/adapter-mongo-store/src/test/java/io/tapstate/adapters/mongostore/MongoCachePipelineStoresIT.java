@@ -888,14 +888,21 @@ class MongoCachePipelineStoresIT {
             assertThat(original.republishStopped(checkpoint)).isEmpty();
             assertThat(resumed.republishStopped(checkpoint)).contains(stopped);
             assertThat(resumed.read("orders")).contains(stopped);
+            var later = new Observation("orders", PipelineState.STOPPED, Map.of(), Map.of(),
+                    Map.of("source.orders", "later-position"), null, AT.plusSeconds(1), List.of());
+            resumed.save(later, checkpoint.epoch());
+            assertThat(resumed.republishStopped(checkpoint)).contains(later);
+            assertThat(resumed.read("orders")).contains(later);
 
             var advanced = claims.advanceExecution(granted.claim(), 1, Set.of("node-b")).orElseThrow();
             var successor = WorkloadClaimFence.from(advanced);
             var newObservations = f.domain().pipelineObservations(SCOPE, successor, ACTIVE);
             assertThat(newObservations.republishStopped(checkpoint)).isEmpty();
-            assertThat(f.domain().pipelineStates(SCOPE, successor, ACTIVE)
-                    .compareAndSwap("orders", checkpoint.epoch(), "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var successorStates = f.domain().pipelineStates(SCOPE, successor, ACTIVE);
+            assertThat(successorStates.compareAndSwap("orders", checkpoint.epoch(), "RUNNING", AT))
+                    .isInstanceOf(CasOutcome.Applied.class);
             assertThat(newObservations.republishStopped(checkpoint)).isEmpty();
+            assertThat(newObservations.republishStopped(successorStates.read("orders").orElseThrow())).isEmpty();
             assertThat(newObservations.read("orders")).isEmpty();
         });
     }
