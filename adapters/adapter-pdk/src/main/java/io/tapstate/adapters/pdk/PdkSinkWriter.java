@@ -362,7 +362,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
-        long[] accepted = {0};
+        long written = 0;
+        long acknowledgedRows = 0;
         for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
             List<TapRecordEvent> rows = entry.getValue();
             TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
@@ -379,12 +380,23 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
-            try {write.writeRecord(connector.context(), rows, table,
-                    result -> accepted[0] += accepted(result));}
-            catch(Throwable failure){operation(table.getId(),failure);throw failure;}
-            operation(table.getId(),null);
+            int submittedRows = rows.size();
+            WriteReceipt receipt = new WriteReceipt();
+            try {
+                write.writeRecord(connector.context(), rows, table, receipt::record);
+            } catch (Throwable failure) {
+                operation(table.getId(), failure);
+                throw failure;
+            }
+            operation(table.getId(), null);
+            written += receipt.written;
+            if (receipt.reported && !receipt.hasErrors) {
+                // Successful writeRecord completion with a receipt covers the submitted rows.
+                // Its change counts can be lower after no-ops or higher after a key change.
+                acknowledgedRows += submittedRows;
+            }
         }
-        return new WriteResult(accepted[0]);
+        return new WriteResult(written, acknowledgedRows);
     }
 
     private TargetTable projectedTarget(String stream, TargetTable original) {
@@ -392,8 +404,16 @@ final class PdkSinkWriter implements SinkWriter {
         return plan == null ? original : plan.target();
     }
 
-    private static long accepted(WriteListResult<TapRecordEvent> result) {
-        return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+    private static final class WriteReceipt {
+        private long written;
+        private boolean reported;
+        private boolean hasErrors;
+
+        private void record(WriteListResult<TapRecordEvent> result) {
+            written += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+            reported = true;
+            hasErrors |= result.getErrorMap() != null && !result.getErrorMap().isEmpty();
+        }
     }
 
     private TapRecordEvent encode(Envelope env) {

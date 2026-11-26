@@ -550,8 +550,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             // write; this keeps one number per table and operation in it instead.
             var positions = positionsOf(batch);
             var delivered = DeliveredRows.of(batch);
-            int size = batch.size();
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder, size));
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder));
         }
         // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
         // backpressures upstream until reapSettled frees a slot on a later call.
@@ -822,7 +821,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             long settledAt = clock.getAsLong();
             batch.delivered().foldDurationsInto(settledDurations, settledAt);
             // A partial receipt only identifies a count. It cannot tell us which event times to sample.
-            if (result != null && result.written() == batch.size()) {
+            if (result != null && result.acknowledgedRows() == batch.delivered().rowCount()) {
                 cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settledAt);
             }
             reportDelivered(batch.delivered().tables());
@@ -938,7 +937,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
     private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
-            DeliveredRows delivered, long firstOrder, int size) {
+            DeliveredRows delivered, long firstOrder) {
     }
 
     /** A row taken in and not yet handed to the writer, with the number it was taken in under. */
@@ -955,7 +954,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      * and applied when the write succeeds, so nothing here depends on the envelopes still being reachable.
      */
     private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
-            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes, List<Long> cdcTimes) {
+            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes, List<Long> cdcTimes,
+            int rowCount) {
 
         /** The tables this batch settled rows of, which are the ones whose readings have moved. */
         Set<String> tables() {
@@ -968,7 +968,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             Map<String, Long> newest = new LinkedHashMap<>();
             Map<String, List<Long>> stamps = new LinkedHashMap<>();
             List<Long> cdcTimes = new ArrayList<>();
+            int rowCount = 0;
             for (Envelope event : batch) {
+                if (event.op() != Op.DDL) {
+                    rowCount++;
+                }
                 rows.computeIfAbsent(event.src(), table -> new LinkedHashMap<>())
                         .merge(event.op().symbol(), 1L, Long::sum);
                 // Weighed while the batch still holds the envelopes, alongside the count, so that what
@@ -988,7 +992,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
                     cdcTimes.add(event.ts());
                 }
             }
-            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes);
+            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount);
         }
 
         void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> bytesByTable,

@@ -70,6 +70,7 @@ public final class HistoryAggregator {
     private final List<EmittedGap> gaps = new ArrayList<>();
 
     private Entry previous;
+    private boolean skipFirstCdc;
     private Bucket active;
     private int segment;
     private StartReason segmentReason;
@@ -101,10 +102,15 @@ public final class HistoryAggregator {
 
     /** Supplies the predecessor without outputting it. */
     public void begin(Entry predecessor) {
+        begin(predecessor, false);
+    }
+
+    void begin(Entry predecessor, boolean skipFirstCdc) {
         if (previous != null) {
             throw new IllegalStateException("a history aggregation predecessor is supplied once");
         }
         previous = predecessor;
+        this.skipFirstCdc = skipFirstCdc;
     }
 
     /** Adds one in-window sample. Calls may span any number of store pages. */
@@ -114,11 +120,12 @@ public final class HistoryAggregator {
             throw new IllegalStateException("rate-history entries are not in stable ascending order");
         }
         if (previous == null) {
-            addFrame(current, cdcDelta(null, current.sample(), from, null));
+            addFrame(current, cdcForFrame(null, current.sample(), null));
         } else {
             processPair(previous, current, true);
         }
         previous = current;
+        skipFirstCdc = false;
     }
 
     /**
@@ -158,8 +165,12 @@ public final class HistoryAggregator {
             startSegment(left.key(), a.observedAt(), b.observedAt(), boundary);
         }
         if (includeRightFrame && !full()) {
-            addFrame(right, cdcDelta(a, b, from, boundary));
+            addFrame(right, cdcForFrame(a, b, boundary));
         }
+    }
+
+    private CdcDeliveryTotals cdcForFrame(RateSample left, RateSample right, StartReason boundary) {
+        return skipFirstCdc ? CdcDeliveryTotals.ZERO : cdcDelta(left, right, from, boundary);
     }
 
     private void startSegment(Key left, Instant leftAt, Instant rightAt, StartReason reason) {
@@ -244,7 +255,8 @@ public final class HistoryAggregator {
 
         if (left == null || !start.equals(left.countingSince())) {
             boolean startsInWindow = !start.isBefore(from) && (left == null || start.isAfter(left.observedAt()));
-            return startsInWindow ? measurableCdcTotals(count, millis) : CdcDeliveryTotals.ZERO;
+            return startsInWindow || observedZeroBaseline(left, from, boundary)
+                    ? measurableCdcTotals(count, millis) : CdcDeliveryTotals.ZERO;
         }
 
         if (boundary != null || left.observedAt().isAfter(right.observedAt()) || left.observedAt().isBefore(from)) {
@@ -256,6 +268,14 @@ public final class HistoryAggregator {
             return CdcDeliveryTotals.ZERO;
         }
         return measurableCdcTotals(count - beforeCount, millis - beforeMillis);
+    }
+
+    private static boolean observedZeroBaseline(RateSample left, Instant from, StartReason boundary) {
+        // The job start can precede the window, but this observation places every first
+        // acknowledgement after an in-window baseline.
+        return left != null && left.countingSince() == null && !left.observedAt().isBefore(from)
+                && boundary != StartReason.GAP
+                && left.counters().getOrDefault(CdcDeliveryTotals.COUNT_METRIC, 0L) == 0;
     }
 
     private static CdcDeliveryTotals measurableCdcTotals(long count, long millis) {

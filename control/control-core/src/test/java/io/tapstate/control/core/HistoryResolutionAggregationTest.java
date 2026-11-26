@@ -3,12 +3,15 @@ package io.tapstate.control.core;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.RateSample;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import static io.tapstate.control.core.HistoryTestSupport.COUNTING_SINCE;
 import static io.tapstate.control.core.HistoryTestSupport.NOW;
@@ -144,9 +147,74 @@ class HistoryResolutionAggregationTest {
         });
     }
 
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void firstAcknowledgementsUseTheObservedZeroBaselineEvenWhenTheJobStartedEarlier(HistoryResolution resolution) {
+        var store = new HistoryTestSupport.MutableHistory();
+        Instant runStart = Instant.parse("2026-09-21T09:59:00Z");
+        Instant restart = Instant.parse("2026-09-21T10:02:30Z");
+        store.add(awaitingDelivery("2026-09-21T10:00:00Z"));
+        store.add(cdcSample("2026-09-21T10:01:00Z", 2, 600, runStart));
+        store.add(cdcSample("2026-09-21T10:02:00Z", 3, 900, runStart));
+        store.add(awaitingDelivery("2026-09-21T10:03:00Z"));
+        store.add(cdcSample("2026-09-21T10:04:00Z", 4, 800, restart));
+
+        var answer = service(store, 2, 25_000).query(query("2026-09-21T10:00:00Z",
+                "2026-09-21T10:05:00Z", resolution, 20, List.of(), null));
+        var readings = points(answer).stream().map(PipelineMetricsHistory.Point::cdcDelivery)
+                .filter(Objects::nonNull).toList();
+        assertThat(readings.stream().mapToLong(PipelineMetricsHistory.CdcDelivery::sampleCount).sum()).isEqualTo(7);
+        assertThat(readings.getFirst().averageMillis()).isEqualByComparingTo("300");
+        assertThat(readings.getLast().sampleCount()).isEqualTo(4);
+        assertThat(readings.getLast().averageMillis()).isEqualByComparingTo("200");
+
+        var clipped = service(store, 2, 25_000).query(query("2026-09-21T10:00:30Z",
+                "2026-09-21T10:05:00Z", resolution, 20, List.of(), null));
+        assertThat(cdcCount(clipped)).isEqualTo(5);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void continuationWithAPurgedCursorSampleDoesNotCountItsDeliveriesAgain(HistoryResolution resolution) {
+        var store = new HistoryTestSupport.MutableHistory();
+        String from = "2026-09-21T10:00:00Z";
+        String to = "2026-09-21T10:06:00Z";
+        Instant start = Instant.parse(from);
+        var older = store.add(cdcSample("2026-09-21T10:04:00Z", 1, 100, start));
+        var cursorSample = store.add(cdcSample("2026-09-21T10:04:30Z", 2, 200, start));
+        store.add(cdcSample("2026-09-21T10:05:00Z", 3, 300, start));
+        store.add(cdcSample("2026-09-21T10:05:30Z", 4, 400, start));
+        var history = service(store, 2, 25_000);
+        int limit = resolution == HistoryResolution.RAW ? 2 : 1;
+        var first = history.query(query(from, to, resolution, limit, List.of(), null));
+        assertThat(first.nextCursor()).isNotBlank();
+        assertThat(cdcCount(first)).isEqualTo(2);
+        var continuation = query(from, to, resolution, limit, List.of(), first.nextCursor());
+        assertThat(cdcCount(history.query(continuation))).isEqualTo(2);
+
+        store.removeAt(cursorSample.sample().observedAt());
+        assertThat(cdcCount(history.query(continuation))).as("only an older fallback remains").isEqualTo(1);
+
+        store.removeAt(older.sample().observedAt());
+        assertThat(cdcCount(history.query(continuation))).as("no predecessor remains").isEqualTo(1);
+    }
+
+    private static long cdcCount(PipelineMetricsHistory history) {
+        return points(history).stream().map(PipelineMetricsHistory.Point::cdcDelivery)
+                .filter(Objects::nonNull).mapToLong(PipelineMetricsHistory.CdcDelivery::sampleCount).sum();
+    }
+
+    private static RateSample awaitingDelivery(String at) {
+        return new RateSample("orders", Instant.parse(at), Map.of("records.in", 1L), Map.of(), null);
+    }
+
     private static RateSample cdcSample(String at, long count, long totalMillis) {
+        return cdcSample(at, count, totalMillis, COUNTING_SINCE);
+    }
+
+    private static RateSample cdcSample(String at, long count, long totalMillis, Instant start) {
         return new RateSample("orders", Instant.parse(at), Map.of("records.out", count,
                 CdcDeliveryTotals.COUNT_METRIC, count, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, totalMillis),
-                Map.of(), COUNTING_SINCE);
+                Map.of(), start);
     }
 }

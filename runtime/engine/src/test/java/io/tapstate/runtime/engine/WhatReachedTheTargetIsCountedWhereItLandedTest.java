@@ -93,6 +93,25 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
     }
 
     @Test
+    void measures_acknowledged_no_op_rows_in_a_batch_with_ignored_ddl() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(writer, delivery, () -> now);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(
+                update("orders", now - 300).withPosition(change),
+                Envelope.ddl(now - 500, "orders", Map.of()).withPosition(change),
+                delete("orders", now - 600).withPosition(change)));
+        processor.process(0, inbox);
+        writer.completeNext(new WriteResult(0, 2));
+        drain(processor);
+
+        assertThat(delivery.cdc).containsExactly(new CdcDeliveryTotals(2, 900));
+    }
+
+    @Test
     void omits_partial_acknowledgements_from_cdc_and_resumes_with_the_next_complete_batch() throws Exception {
         RecordingDelivery delivery = new RecordingDelivery();
         ManualWriter writer = new ManualWriter();
@@ -103,7 +122,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         inbox.addAll(List.of(row("orders", now - 300).withPosition(change),
                 update("orders", now - 600).withPosition(change)));
         processor.process(0, inbox);
-        writer.completeNext(1);
+        writer.completeNext(new WriteResult(2, 1));
         processor.tryProcess();
         assertThat(delivery.cdc).containsExactly(CdcDeliveryTotals.ZERO);
 
@@ -560,9 +579,9 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
             return future;
         }
 
-        void completeNext(int accepted) {
+        void completeNext(WriteResult result) {
             pending.keySet().stream().filter(future -> !future.isDone()).findFirst().orElseThrow()
-                    .complete(new WriteResult(accepted));
+                    .complete(result);
         }
 
         void completeAll() {
