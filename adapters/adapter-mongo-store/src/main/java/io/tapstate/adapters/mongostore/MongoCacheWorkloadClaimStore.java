@@ -230,12 +230,12 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         }
         return StoreIo.call(() -> {
             requireActive.run();
-            var preparedNamespace = claimCollectionId(database);
+            var preparedNamespace = claimCollectionId();
             return transaction(true, (store, session) -> {
                 var result = store.acquire(key, owner, topologyRevision, ttl);
                 // The committed catalog cannot see a namespace implicitly created by this transaction.
                 // Keep the same prepared namespace across driver retries and abort before publishing any writes.
-                if (!preparedNamespace.equals(claimCollectionId(database))) throw unreadableClaimCollection();
+                if (!preparedNamespace.equals(claimCollectionId())) throw unreadableClaimCollection();
                 return result;
             });
         });
@@ -844,8 +844,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         claimCollection(database);
     }
 
-    private static Binary claimCollectionId(MongoDatabase database) {
-        var info = claimCollection(database).get("info", Document.class);
+    private Binary claimCollectionId() {
+        var budget = operations.budget();
+        var scopedDatabase = budget == null ? database : budget.database(database);
+        var info = claimCollection(scopedDatabase).get("info", Document.class);
+        if (budget != null) budget.remainingMillis();
         if (info == null || !(info.get("uuid") instanceof Binary id)) throw unreadableClaimCollection();
         return id;
     }
