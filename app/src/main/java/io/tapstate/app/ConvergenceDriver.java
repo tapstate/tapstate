@@ -766,7 +766,7 @@ final class ConvergenceDriver implements AutoCloseable {
         }
         var logParams = PipelineFailures.isCoded(original) ? failure.params()
                 : Map.of("pipeline", pipelineId, "cause", original == null ? "unknown" : original.getClass().getName());
-        LOG.atWarn().addKeyValue("diagnostic", logDiagnostic)
+        LOG.atError().addKeyValue("diagnostic", logDiagnostic)
                 .log("Pipeline {} entered FAILED [{}]: {}", pipelineId, failure.code(), logParams);
         return failure;
     }
