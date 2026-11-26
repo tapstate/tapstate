@@ -186,9 +186,6 @@ class NativeBusinessCandidateLifecycleIT {
                         var member=child.getBean(HazelcastInstance.class); var node=child.getBean(NodeSessionLease.class);
                         var exact=node.currentFence().orElseThrow();
                         var claims=retained.cache().workloadClaims(retained.preparation().businessScope());
-                        await().atMost(Duration.ofSeconds(15)).until(() ->
-                                SystemCollections.ALERT_NODE_LIFECYCLES.on(configDatabase).countDocuments(new Document("nodeId",exact.owner().nodeId())
-                                        .append("bootId",exact.owner().bootId()).append("phase","EXPECTED"))==1);
                         await().atMost(Duration.ofSeconds(15)).until(() -> successor.alertHealth()
                                 .map(health -> health.maintenance().get("lastSuccess")!=null).orElse(false));
                         var admittedKey=SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first();

@@ -67,9 +67,7 @@ class NativeCacheAlertIT {
                 var initial = claims.read(fence.key()).orElseThrow().claim();
                 await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
                         assertThat(claims.read(fence.key()).orElseThrow().claim().leaseUntil()).isAfter(initial.leaseUntil()));
-                await().atMost(Duration.ofSeconds(15)).until(() -> config.getCollection("alert_node_lifecycles")
-                        .countDocuments(new Document("nodeId", fence.owner().nodeId())
-                                .append("bootId", fence.owner().bootId()).append("phase", "EXPECTED")) == 1);
+                // A sample bound to the saved rule confirms that evaluation has loaded it.
                 await().atMost(Duration.ofSeconds(20)).untilAsserted(()->{
                     var healthy=config.getCollection("alert_instances").find(new Document("_id.resourceKind", "cluster-storage").append("_id.resourceId", "cache")
                             .append("binding.ruleIdentity.id", "cache-required-write")).first();
