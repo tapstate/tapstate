@@ -1342,17 +1342,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         var original = bindings.authenticationRecovery();
         var bound = bindings.load().orElseThrow(MongoCachePipelineAccess::fenced);
         candidate.requireRecoveryTarget(bound);
-        if (!original.pending()) {
-            if (!candidate.emptyForAuthenticationRecovery()) {
-                candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
-                bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
-            }
+        if (!original.pending() && candidate.emptyForAuthenticationRecovery()) {
             candidate.verifyRecoveryPermissions(); active.run();
             original = bindings.reserveAuthenticationRecovery(original.preparation());
-            if (!original.pending()) {
-                candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
-                bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
-            }
+        }
+        if (!original.pending()) {
+            candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
+            bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
         }
         var expected = original.preparation();
         Runnable pending = () -> { requireOpen(); active.run(); bindings.requireAuthenticationRecoveryPending(expected); };

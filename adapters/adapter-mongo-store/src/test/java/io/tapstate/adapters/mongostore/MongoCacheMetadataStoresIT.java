@@ -21,6 +21,7 @@ import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ContentHash;
+import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -102,7 +103,9 @@ class MongoCacheMetadataStoresIT {
             var owner = new WorkloadOwner("node", "boot");
             var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node");
             var ttl = Duration.ofSeconds(30);
-            var original = claims.acquire(key, owner, 1, ttl);
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            var original = ((DeadlineWorkloadClaimStore) claims).withClaimAcquisitionDeadline(key, deadline, ACTIVE,
+                    () -> claims.acquire(key, owner, 1, ttl));
             assertThat(original.acquired()).isTrue();
             var renewed = claims.acquire(key, owner, 1, ttl);
             assertThat(renewed.acquired()).isTrue();
