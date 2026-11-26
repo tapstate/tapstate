@@ -36,6 +36,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
@@ -230,11 +231,15 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 return store.acquireExisting(key, owner, topologyRevision, ttl);
             });
         }
+        return acquireInPreparedNamespace(store -> store.acquire(key, owner, topologyRevision, ttl));
+    }
+
+    private WorkloadClaimAttempt acquireInPreparedNamespace(Function<MongoWorkloadClaimStore, WorkloadClaimAttempt> acquire) {
         return StoreIo.call(() -> {
             requireActive.run();
             var preparedNamespace = claimCollectionId();
             return transaction(true, (store, session) -> {
-                var result = store.acquire(key, owner, topologyRevision, ttl);
+                var result = acquire.apply(store);
                 // The committed catalog cannot see a namespace implicitly created by this transaction.
                 // Keep the same prepared namespace across driver retries and abort before publishing any writes.
                 if (!preparedNamespace.equals(claimCollectionId())) throw unreadableClaimCollection();
@@ -242,6 +247,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             });
         });
     }
+
     @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
         return acquireValidationExecution(key, owner, topologyRevision, ttl, null);
@@ -278,7 +284,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(key);
         if (key.type() != WorkloadClaimType.NODE_SESSION || !scope.clusterId().equals(key.resourceId())
                 || !key.resourceId().equals(owner.nodeId())) throw claimFenced();
-        return transaction(true, (store, session) -> store.acquireProcessNode(key, owner, proofWindow));
+        return acquireInPreparedNamespace(store -> store.acquireProcessNode(key, owner, proofWindow));
     }
 
     @Override public WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision) {

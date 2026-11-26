@@ -109,10 +109,12 @@ class MongoAuthenticationRecoveryIT {
             Document authority = f.config.getCollection("storage_recovery").find().first();
             try (var cache = connect(f.binding)) {
                 var published = f.configuration.bindings().cachePreparation().orElseThrow();
+                assertThat(f.configuration.authenticationRecoveryRequired(cache, ACTIVE)).isFalse();
                 assertThat(f.configuration.prepareAuthenticationRecovery(cache, ACTIVE)).isEqualTo(published);
                 assertThat(f.config.getCollection("storage_recovery").find().first()).isEqualTo(authority);
 
                 f.cache.getCollection("op_sessions").drop();
+                assertThatThrownBy(() -> f.configuration.authenticationRecoveryRequired(cache, ACTIVE)).isInstanceOf(TapstateException.class);
                 assertThatThrownBy(() -> f.configuration.prepareAuthenticationRecovery(cache, ACTIVE)).isInstanceOf(TapstateException.class);
                 assertThat(f.cache.listCollectionNames().into(new ArrayList<>())).doesNotContain("op_sessions");
                 assertThat(f.config.getCollection("storage_recovery").find().first()).isEqualTo(authority);

@@ -1395,7 +1395,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         if (candidate.emptyForAuthenticationRecovery()) {
             candidate.verifyRecoveryPermissions(); active.run(); return true;
         }
-        candidate.loadAuthScope(original.preparation().authScope());
+        candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
         bindings.requireAuthenticationPublished(original.preparation()); active.run(); return false;
     }
 

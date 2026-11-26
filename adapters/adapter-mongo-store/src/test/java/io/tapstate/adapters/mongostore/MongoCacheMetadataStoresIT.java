@@ -31,6 +31,8 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -115,20 +117,27 @@ class MongoCacheMetadataStoresIT {
             assertThat(competing.acquired()).isFalse();
             assertThat(competing.claim()).isEqualTo(renewed.claim());
 
+            var processOwner = new WorkloadOwner(SCOPE.clusterId(), "process-boot");
+            var processKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, processOwner.nodeId());
+            assertThat(claims.acquireProcessNode(processKey, processOwner, ttl).acquired()).isTrue();
+
             var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
             table.on(f.database).drop();
             long admissions = f.admissions();
             assertThatThrownBy(() -> claims.acquire(key, owner, 1, ttl)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> claims.acquireProcessNode(processKey, processOwner, ttl)).isInstanceOf(TapstateException.class);
             assertThat(f.database.listCollectionNames()).doesNotContain(table.collectionName());
             assertThat(f.admissions()).isEqualTo(admissions);
         });
     }
 
-    @Test void aDropAfterClaimNamespaceCheckCannotCommitAnImplicitNamespace() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aDropAfterClaimNamespaceCheckCannotCommitAnImplicitNamespace(boolean processOwned) {
         withFixture(f -> {
             var claims = f.domain.workloadClaims(SCOPE);
-            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node");
-            var owner = new WorkloadOwner("node", "boot");
+            var owner = new WorkloadOwner(processOwned ? SCOPE.clusterId() : "node", "boot");
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, owner.nodeId());
             var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
             long admissions = f.admissions();
             var dropped = new AtomicBoolean();
@@ -139,8 +148,11 @@ class MongoCacheMetadataStoresIT {
                 }
             });
             try {
-                assertThatThrownBy(() -> claims.acquire(key, owner, 1, Duration.ofSeconds(30)))
-                        .isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> {
+                    var ttl = Duration.ofSeconds(30);
+                    if (processOwned) claims.acquireProcessNode(key, owner, ttl);
+                    else claims.acquire(key, owner, 1, ttl);
+                }).isInstanceOf(TapstateException.class);
             } finally {
                 MongoCommandObservation.COLLECTIONS.remove();
             }
