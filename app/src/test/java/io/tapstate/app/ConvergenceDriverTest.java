@@ -364,7 +364,7 @@ class ConvergenceDriverTest {
             driverLogger.setLevel(previousLevel);
         }
 
-        assertThat(sink.tail("orders")).extracting(LogLine::level).contains("WARN");
+        assertThat(sink.tail("orders")).extracting(LogLine::level).containsExactly("ERROR");
         assertThat(sink.tail("orders")).allSatisfy(line -> assertThat(line.diagnostic()).doesNotContainKey("code"));
         assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
     }
