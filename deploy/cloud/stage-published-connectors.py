@@ -26,8 +26,9 @@ OP_DEFAULT_CONNECTORS = ("mongodb", "mongodb-atlas")
 def select(boot_jar: Path, profile: str, java: str, extra: tuple[str, ...] = ()) -> list[dict]:
     command = [java, "-Dloader.main=io.tapstate.app.ConnectorBundleSelection", "-cp", str(boot_jar),
                "org.springframework.boot.loader.launch.PropertiesLauncher", profile, *extra]
+    selection_timeout = int(os.environ.get("TAPSTATE_OP_SELECTION_TIMEOUT_SECONDS", "300"))
     try:
-        process = subprocess.run(command, capture_output=True, check=True, timeout=300)
+        process = subprocess.run(command, capture_output=True, check=True, timeout=selection_timeout)
         selected = json.loads(process.stdout, object_pairs_hook=STAGE.unique_object)
     except (OSError, subprocess.SubprocessError, ValueError) as failure:
         diagnostic = (failure.stderr or "").decode(errors="replace") if isinstance(
@@ -44,9 +45,10 @@ def download(url: str, destination: Path) -> None:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise STAGE.StageError("connector selection contains an invalid download URL")
+    download_timeout = int(os.environ.get("TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS", "120"))
     command = [
         "curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--proto-redir", "=https",
-        "--max-time", "120", "--max-filesize", str(STAGE.MAX_JAR_BYTES), "--output", str(destination),
+        "--max-time", str(download_timeout), "--max-filesize", str(STAGE.MAX_JAR_BYTES), "--output", str(destination),
     ]
     diagnostics = os.environ.get("TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS") == "1"
     if diagnostics:
@@ -56,7 +58,7 @@ def download(url: str, destination: Path) -> None:
             "dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s "
             "first_byte=%{time_starttransfer}s redirect=%{time_redirect}s total=%{time_total}s bytes=%{size_download}",
         ]
-    process = subprocess.run([*command, url], capture_output=True, timeout=125, check=False)
+    process = subprocess.run([*command, url], capture_output=True, timeout=download_timeout + 5, check=False)
     if diagnostics:
         artifact = parsed.path.rsplit("/", 1)[-1]
         metrics = process.stdout.decode(errors="replace")
