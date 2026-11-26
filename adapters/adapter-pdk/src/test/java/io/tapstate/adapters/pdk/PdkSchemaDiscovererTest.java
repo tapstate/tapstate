@@ -3,6 +3,8 @@ package io.tapstate.adapters.pdk;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.tapdata.entity.schema.TapField;
+import io.tapdata.entity.schema.TapTable;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.ConnectionConfig;
@@ -58,13 +60,12 @@ class PdkSchemaDiscovererTest {
     }
 
     @Test
-    void boundedStringSurvivesDiscoveryAndTargetReconstruction() throws Exception {
+    void boundedStringSurvivesDiscoveryAndTargetReconstruction() {
         var declared = new io.tapdata.entity.schema.type.TapString().bytes(36L).fixed(false)
                 .doubleBytes(true).defaultValue(1L).byteRatio(2);
-        var field = PdkSchemaDiscoverer.class.getDeclaredMethod("field", String.class, String.class,
-                io.tapdata.entity.schema.type.TapType.class);
-        field.setAccessible(true);
-        SourceField normalized = (SourceField) field.invoke(null, "id", "varchar(36)", declared);
+        var reported = new TapTable("orders").add(new TapField("id", "varchar(36)").tapType(declared));
+        var normalized = PdkSchemaDiscoverer.structuralModel(List.of(reported))
+                .tables().getFirst().fields().getFirst();
         var table = TargetTapTable.build(new io.tapstate.spi.sink.TargetTable("orders", List.of(
                 new io.tapstate.spi.sink.TargetField(normalized.name(), normalized.dataType(), true,
                         normalized.type(), normalized.numericType(), normalized.stringType()))));
@@ -80,14 +81,13 @@ class PdkSchemaDiscovererTest {
     }
 
     @Test
-    void normalizationRetainsAllDeclaredNumericAttributes() throws Exception {
+    void normalizationRetainsAllDeclaredNumericAttributes() {
         var declared = new io.tapdata.entity.schema.type.TapNumber().bit(128).fixed(true).unsigned(false).zerofill(true)
                 .precision(18).scale(4).minValue(new java.math.BigDecimal("-99999999999999.9999"))
                 .maxValue(new java.math.BigDecimal("99999999999999.9999"));
-        var field = PdkSchemaDiscoverer.class.getDeclaredMethod("field", String.class, String.class,
-                io.tapdata.entity.schema.type.TapType.class);
-        field.setAccessible(true);
-        SourceField normalized = (SourceField) field.invoke(null, "amount", "DECIMAL(18,4)", declared);
+        var reported = new TapTable("orders").add(new TapField("amount", "DECIMAL(18,4)").tapType(declared));
+        var normalized = PdkSchemaDiscoverer.structuralModel(List.of(reported))
+                .tables().getFirst().fields().getFirst();
         assertThat(normalized.numericType()).isEqualTo(PdkTypeMapping.numericType(declared));
         declared.scale(0).maxValue(java.math.BigDecimal.ONE);
         assertThat(normalized.numericType().scale()).isEqualTo(4);

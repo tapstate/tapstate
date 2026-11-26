@@ -23,7 +23,7 @@ import java.util.*;
  * the described shape; it neither freezes a plugin's mutable graph nor certifies codec behavior.
  */
 final class PdkValidationModelVersion {
-    private static final String PROFILE="pdk-validation-model-v1";
+    static final String PROFILE="pdk-validation-model-v1";
     private static final String DOCUMENT_PROFILE="pdk-validation-document-model-v1";
     private static final String DOCUMENT_SCOPE_PROFILE="pdk-validation-document-scope-v1";
     static final String STRUCTURAL_SCOPE_PROFILE="pdk-validation-structural-scope-v1";
@@ -75,7 +75,10 @@ final class PdkValidationModelVersion {
 
     static String structuralScopeVersion(TapTable model, ConnectorRef artifact) {
         // Collections with sampled fields already have a stable namespace scope.
-        if (documentFields(artifact)) return scopeVersion(model, artifact);
+        return documentFields(artifact) ? scopeVersion(model, artifact) : declaredStructuralVersion(model);
+    }
+
+    static String declaredStructuralVersion(TapTable model) {
         requireFields(model);
         var scope = List.of(STRUCTURAL_SCOPE_PROFILE, new Walker(false, false, true).value(model, 0));
         return STRUCTURAL_SCOPE_PROFILE + ":" + CanonicalHash.ofText(JsonWriter.write(scope));
@@ -96,7 +99,7 @@ final class PdkValidationModelVersion {
             if(entry.getKey()==null||entry.getValue()==null||!entry.getKey().equals(entry.getValue().getName()))throw invalid("fieldNames");
     }
     private static boolean documentFields(ConnectorRef artifact){
-        return Objects.requireNonNull(artifact).className().equals("io.tapdata.mongodb.MongodbConnector");
+        return PdkBsonDecimal.usesBsonModel(Objects.requireNonNull(artifact).className());
     }
 
     /** Binding to actual retained artifact/configuration/profile; never an equivalence oracle. */
