@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "version": 2,
+  "version": 5,
   "connectors": [
     {
       "id": "mysql",
@@ -11,18 +11,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "mysql-connector"
-    },
-    {
-      "id": "aliyun-rds-mysql",
-      "name": "ApsaraDB RDS for MySQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-rds-mysql-connector"
+      "artifactId": "mysql-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "aws-rds-mysql",
@@ -33,18 +23,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "aws-rds-mysql-connector"
-    },
-    {
-      "id": "polar-db-mysql",
-      "name": "ApsaraDB PolarDB for MySQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "polar-db-mysql-connector"
+      "artifactId": "aws-rds-mysql-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "mysql-pxc",
@@ -55,7 +35,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "mysql-pxc-connector"
+      "artifactId": "mysql-pxc-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "postgres",
@@ -66,51 +47,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "postgres-connector"
-    },
-    {
-      "id": "aliyun-rds-postgres",
-      "name": "ApsaraDB RDS for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-rds-postgres-connector"
-    },
-    {
-      "id": "aliyun-adb-postgres",
-      "name": "ApsaraDB AnalyticDB for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-adb-postgres-connector"
-    },
-    {
-      "id": "polar-db-postgres",
-      "name": "ApsaraDB PolarDB for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "polar-db-postgres-connector"
-    },
-    {
-      "id": "tencent-db-postgres",
-      "name": "TencentDB for PostgreSQL",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "tencent-db-postgres-connector"
+      "artifactId": "postgres-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "mongodb",
@@ -121,7 +59,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "mongodb-connector"
+      "artifactId": "mongodb-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "mongodb-atlas",
@@ -132,29 +71,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "mongodb-atlas-connector"
-    },
-    {
-      "id": "aliyun-db-mongodb",
-      "name": "ApsaraDB for MongoDB",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "aliyun-mongodb-connector"
-    },
-    {
-      "id": "tencent-db-mongodb",
-      "name": "TencentDB for MongoDB",
-      "roles": [
-        "source",
-        "target"
-      ],
-      "minimumTapstateVersion": "0.8.0",
-      "repository": "oss",
-      "artifactId": "tencent-db-mongodb-connector"
+      "artifactId": "mongodb-atlas-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "oracle",
@@ -165,7 +83,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "enterprise",
-      "artifactId": "oracle-connector"
+      "artifactId": "oracle-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "sqlserver",
@@ -176,7 +95,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "enterprise",
-      "artifactId": "mssql-connector"
+      "artifactId": "mssql-connector",
+      "loaderRetirementEligible": true
     },
     {
       "id": "db2",
@@ -186,7 +106,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "enterprise",
-      "artifactId": "db2-connector"
+      "artifactId": "db2-connector",
+      "loaderRetirementEligible": false
     },
     {
       "id": "db2i",
@@ -196,7 +117,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "enterprise",
-      "artifactId": "db2i-connector"
+      "artifactId": "db2i-connector",
+      "loaderRetirementEligible": false
     },
     {
       "id": "dummy",
@@ -207,7 +129,8 @@
       ],
       "minimumTapstateVersion": "0.8.0",
       "repository": "oss",
-      "artifactId": "dummy-connector"
+      "artifactId": "dummy-connector",
+      "loaderRetirementEligible": true
     }
   ]
 }
