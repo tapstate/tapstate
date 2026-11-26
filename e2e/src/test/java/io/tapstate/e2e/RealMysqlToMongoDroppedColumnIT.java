@@ -165,15 +165,14 @@ class RealMysqlToMongoDroppedColumnIT {
             var mappings = client.getDatabase(storage.configurationDatabase()).getCollection("operator_generations");
             var key = new Document("_id", PIPELINE_ID);
             var admin = client.getDatabase("admin");
-            long entered = admin.runCommand(new Document("configureFailPoint", "failCommand")
+            String failPoint = "hangDuringBatchUpdate";
+            long entered = admin.runCommand(new Document("configureFailPoint", failPoint)
                     .append("mode", "alwaysOn")
-                    .append("data", new Document("failCommands", List.of("update"))
-                            .append("namespace", storage.cacheDatabase() + ".operator_cleanup")
-                            .append("errorCode", 13)))
+                    .append("data", new Document("nss", storage.cacheDatabase() + ".operator_cleanup")))
                     .get("count", Number.class).longValue();
             try {
                 control.stop(PIPELINE_ID, true);
-                admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                admin.runCommand(new Document("waitForFailPoint", failPoint)
                         .append("timesEntered", entered + 1).append("maxTimeMS", 30000));
                 var pending = mappings.find(key).first();
                 assertThat(pending).containsEntry("phase", "REBUILDING").containsEntry("stateGeneration", 1L);
@@ -183,7 +182,7 @@ class RealMysqlToMongoDroppedColumnIT {
                 assertThat(connectorHashes(status)).isEmpty();
                 assertThat(mappings.find(key).first()).isEqualTo(pending);
             } finally {
-                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                admin.runCommand(new Document("configureFailPoint", failPoint).append("mode", "off"));
             }
             Await.until("the replacement generation to finish stopping", () -> {
                 var mapping = mappings.find(key).first();
