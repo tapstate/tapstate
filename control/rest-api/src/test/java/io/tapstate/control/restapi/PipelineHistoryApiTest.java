@@ -4,6 +4,7 @@ import io.tapstate.control.core.HistoryCursorCodec;
 import io.tapstate.control.core.HistoryResolution;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenService;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore.Key;
 import org.junit.jupiter.api.AfterAll;
@@ -217,6 +218,27 @@ class PipelineHistoryApiTest {
                 .containsEntry("retentionCutoff", cutoff.toString())
                 .containsEntry("nextCursor", null);
         assertThat(empty.get("segments")).isEqualTo(List.of());
+    }
+
+    @Test
+    void returnsCdcDeliveryForConfirmedChangesAndOmitsTheReadingWhenIdle() {
+        history().append(new RateSample("pl1", Instant.parse("2026-07-12T11:58:00Z"),
+                Map.of("records.out", 100L, CdcDeliveryTotals.COUNT_METRIC, 0L, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 0L),
+                Map.of(), COUNTING_SINCE));
+        for (String at : List.of("2026-07-12T11:59:00Z", "2026-07-12T11:59:30Z")) {
+            history().append(new RateSample("pl1", Instant.parse(at),
+                    Map.of("records.out", 102L, CdcDeliveryTotals.COUNT_METRIC, 2L, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 900L),
+                    Map.of(), COUNTING_SINCE));
+        }
+
+        var idleAtStart = page(null, List.of());
+        var delivered = page((String) idleAtStart.get("nextCursor"), List.of());
+        var idleAtEnd = page((String) delivered.get("nextCursor"), List.of());
+
+        assertThat(points(idleAtStart).getFirst()).doesNotContainKey("cdcDelivery");
+        assertThat(points(delivered).getFirst()).containsEntry("cdcDelivery",
+                Map.of("sampleCount", 2, "averageMillis", 450));
+        assertThat(points(idleAtEnd).getFirst()).doesNotContainKey("cdcDelivery");
     }
 
     private Map<String, Object> page(String cursor, List<String> tables) {

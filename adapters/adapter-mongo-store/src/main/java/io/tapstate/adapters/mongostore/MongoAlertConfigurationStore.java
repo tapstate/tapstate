@@ -63,7 +63,6 @@ final class MongoAlertConfigurationStore {
                 "pipeline.failed", "Pipeline execution failed",
                 "pipeline.observation-stale", "Pipeline observation stale",
                 "source.connection-failed", "Source connection failed",
-                "cluster.node-unavailable", "Cluster node unavailable",
                 "cluster.storage-unavailable", "Required storage unavailable",
                 "cluster.config-structure-drift", "CONFIG collection or index changed",
                 "cluster.cache-structure-drift", "CACHE collection or index changed");

@@ -33,10 +33,14 @@ sealed interface HistoryOutcome {
         }
     }
 
-    record Point(String intervalStart, String intervalEnd, Rate recordsOut, Rate bytesOut, List<Lag> lag) {
+    record Point(String intervalStart, String intervalEnd, Rate recordsOut, Rate bytesOut, List<Lag> lag,
+            CdcDelivery cdcDelivery) {
         public Point {
             lag = List.copyOf(lag);
         }
+    }
+
+    record CdcDelivery(long sampleCount, Number averageMillis) {
     }
 
     record Rate(Number delta, Number averageRate, Number maxRate) {

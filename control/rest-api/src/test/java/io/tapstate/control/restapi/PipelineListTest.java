@@ -17,6 +17,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PipelineListTest {
 
     @Test
+    void stopResultIsVisibleInBothReadResponses() {
+        var catalog = MessageCatalog.bundled();
+        for (var result : PipelineCatalogItem.StopState.values()) {
+            var status = new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.STOPPED,
+                    PipelineCatalogItem.UiState.STOPPED, PipelineState.STOPPED, PipelineState.STOPPED,
+                    null, null, null, result);
+            var item = new PipelineCatalogItem("orders", "Orders", null, null, null, null, "hash", true, status);
+            assertThat(PipelineList.of(List.of(item), catalog, Locale.ENGLISH).items().getFirst().status().stopState())
+                    .isEqualTo(result);
+            assertThat(PipelineStatusResponse.of(item, catalog).stopState()).isEqualTo(result);
+        }
+    }
+
+    @Test
     void projectsExistingListFieldsAndLocalizesRuntimeAndIntentFailures() {
         var failure = new ObservationFailure("TS0060027",
                 Map.of("connector", "mysql", "detail", "write refused"),

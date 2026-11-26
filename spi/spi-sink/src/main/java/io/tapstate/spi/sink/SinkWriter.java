@@ -17,8 +17,8 @@ import java.util.concurrent.CompletionStage;
 public interface SinkWriter extends AutoCloseable {
 
     /**
-     * Writes a batch of events asynchronously. The returned stage completes with the number of
-     * events the target accepted once it has taken the batch. Ownership of {@code records} passes to
+     * Writes a batch of events asynchronously. The returned stage completes with the write and
+     * acknowledgement counts once the target responds. Ownership of {@code records} passes to
      * the writer for the duration of the write; the caller must not mutate the list until the
      * returned stage completes.
      */

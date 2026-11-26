@@ -20,15 +20,19 @@ final class ObservedMongoConnectorJar {
     private ObservedMongoConnectorJar() {}
 
     static byte[] build(byte[] original, Path witness) throws IOException, URISyntaxException {
+        return build(original, witness, null);
+    }
+
+    static byte[] build(byte[] original, Path witness, String wrapperVersion) throws IOException, URISyntaxException {
         Path delegate = witness.resolveSibling(witness.getFileName() + ".mongodb.jar");
-        return build(original, witness, delegate, "mongo-write-witness-path.txt");
+        return build(original, witness, delegate, "mongo-write-witness-path.txt", wrapperVersion);
     }
 
     static byte[] buildLatencyProbe(byte[] original, Path witness, Path delegate) throws IOException, URISyntaxException {
-        return build(original, witness, delegate, "mongo-latency-witness-path.txt");
+        return build(original, witness, delegate, "mongo-latency-witness-path.txt", null);
     }
 
-    private static byte[] build(byte[] original, Path witness, Path delegate, String resourceName)
+    private static byte[] build(byte[] original, Path witness, Path delegate, String resourceName, String wrapperVersion)
             throws IOException, URISyntaxException {
         Manifest manifest;
         byte[] spec = null;
@@ -43,6 +47,9 @@ final class ObservedMongoConnectorJar {
         // probe that never initializes or stops the connector. The test directory owns the bytes.
         Files.write(delegate, original);
         manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, delegate.toAbsolutePath().toUri().toString());
+        if (wrapperVersion != null) {
+            manifest.getMainAttributes().put(Attributes.Name.IMPLEMENTATION_VERSION, wrapperVersion);
+        }
         var resource = ObservedMongoConnectorJar.class.getClassLoader().getResource(PACKAGE);
         if (resource == null) throw new AssertionError("observer package was not compiled");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();

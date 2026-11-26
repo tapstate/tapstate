@@ -1,7 +1,5 @@
 package io.tapstate.app;
 
-import com.hazelcast.cluster.*;
-import com.hazelcast.core.HazelcastInstance;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.alerting.*;
@@ -9,7 +7,6 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.capture.SourceOperationObserver;
 import io.tapstate.spi.store.*;
-import io.tapstate.spi.store.AlertNodeLifecycleStore.*;
 import io.tapstate.testsupport.RequiresDocker;
 import java.net.*;
 import java.nio.file.*;
@@ -24,7 +21,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import static org.assertj.core.api.Assertions.*;
 import static org.awaitility.Awaitility.await;
-import static org.mockito.Mockito.*;
 
 /** Classified producer evidence traverses real CONFIG, planner, worker, SDK and local event-center policy. */
 @RequiresDocker
@@ -32,7 +28,7 @@ import static org.mockito.Mockito.*;
 class AlertCloudBuiltinWorkerIT {
     @org.testcontainers.junit.jupiter.Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
     static final Runnable ACTIVE=()->{};
-    @Test void fiveBuiltinTypesPersistOriginalFaultReminderAndRecoveryReceiptsForTwoClusters()throws Exception{
+    @Test void eligibleBuiltinTypesPersistEventAndPolicyEmailReceiptsForTwoClusters()throws Exception{
         var root=Path.of(System.getProperty("tapstate.test.alert-cloud-worker-root"));var json=new ObjectMapper();
         var launch=json.readTree(root.resolve("launch.json").toFile());
         assertThat(launch.path("source").asText()).isEqualTo("5c2ad398f3ecbd40a70beadedfcc9cd9632b8322");
@@ -52,11 +48,11 @@ class AlertCloudBuiltinWorkerIT {
                 AlertEvaluationHostIT.withFixture(false,true,new AlarmKey.Scope(org.toHexString(),cluster.toHexString()),f->exercise(f,origin,ssl,token,rows));
             }
             var events=db.getCollection("events");var alerts=db.getCollection("alerts");var deliveries=db.getCollection("notification_deliveries");
-            assertThat(rows).hasSize(30);assertThat(rows.stream().map(r->r.get("eventId")).distinct()).hasSize(30);
-            assertThat(events.countDocuments(new Document("orgId",org))).isEqualTo(30);
-            await().atMost(Duration.ofSeconds(30)).until(()->deliveries.countDocuments(new Document("orgId",org).append("status","SENT"))==30);
+            assertThat(rows).hasSize(18);assertThat(rows.stream().map(r->r.get("eventId")).distinct()).hasSize(18);
+            assertThat(events.countDocuments(new Document("orgId",org))).isEqualTo(18);
+            await().atMost(Duration.ofSeconds(30)).until(()->deliveries.countDocuments(new Document("orgId",org).append("status","SENT"))==18);
             var smtp=new ArrayList<com.fasterxml.jackson.databind.JsonNode>();var receiptLines=Files.readAllLines(root.resolve("smtp-receipts.jsonl"));
-            assertThat(receiptLines).hasSize((int)smtpBefore+30);for(var line:receiptLines.subList((int)smtpBefore,receiptLines.size()))smtp.add(json.readTree(line));
+            assertThat(receiptLines).hasSize((int)smtpBefore+18);for(var line:receiptLines.subList((int)smtpBefore,receiptLines.size()))smtp.add(json.readTree(line));
             for(var row:rows){
                 var eventId=new ObjectId((String)row.get("eventId"));var event=events.find(new Document("_id",eventId)).first();
                 assertThat(event.getObjectId("orgId")).isEqualTo(org);assertThat(event.get("payload",Document.class).getString("clusterId")).isEqualTo(row.get("cluster"));
@@ -68,8 +64,8 @@ class AlertCloudBuiltinWorkerIT {
                         &&java.util.stream.StreamSupport.stream(s.path("alertIds").spliterator(),false).anyMatch(id->id.asText().equals(alertId))).toList();
                 assertThat(actual).hasSize(1);row.put("alertId",alertId);row.put("remoteDeliveryId",delivery.getObjectId("_id").toHexString());row.put("smtpSha256",actual.getFirst().path("sha256").asText());
             }
-            json.writerWithDefaultPrettyPrinter().writeValue(root.resolve("worker-verification.json").toFile(),Map.of("controlPlaneSource",launch.path("source").asText(),"rows",rows,"events",30,"smtpAccepted",30,
-                    "scope","Actual CONFIG/planner/worker/SDK/local policy with classified original producer seams and controlled membership; no real outage, three-process or human acceptance claim"));
+            json.writerWithDefaultPrettyPrinter().writeValue(root.resolve("worker-verification.json").toFile(),Map.of("controlPlaneSource",launch.path("source").asText(),"rows",rows,"events",18,"smtpAccepted",18,
+                    "scope","Actual CONFIG/planner/worker/SDK/local policy with classified original producer seams"));
         }
     }
     static void exercise(AlertEvaluationHostIT.Fixture f,URI origin,SSLContext ssl,String token,List<Map<String,Object>> rows){
@@ -79,7 +75,7 @@ class AlertCloudBuiltinWorkerIT {
         var properties=new CloudProperties();properties.setBaseUrl(origin.toString());properties.setToken(token);properties.setClusterId(scope.clusterId());properties.setAtlasUri(f.settings().uri());
         var cloud=CloudRuntimeSettings.resolve(properties);String managed=AlertNotificationPlanner.managedBinding(origin,scope,setup);
         var host=new AlertStore.Host(scope,setup,AlertChannelPolicy.Deployment.CLOUD_MANAGED,ACTIVE,new AlertIntent.SystemRoute("managed-events",managed,1),
-                new AlertIntent.SdkTarget(managed,scope.clusterId(),managed),signals::resourceEvidence,AlertChannels.capabilities(AlertChannelPolicy.Deployment.CLOUD_MANAGED,cloud));
+                new AlertIntent.SdkTarget(managed,scope.clusterId(),managed),signals::resourceEvidence,Set.of(AlertChannelPolicy.CLOUD_EVENTS));
         var catalog=BuiltinAlarmTypes.catalog();var store=f.configuration().alerts(host,catalog,f.clock());var rules=new LinkedHashMap<String,AlertConfiguration.Rule>();
         var access=AlertStore.Access.cloud("operator",scope.authorityId(),"ADMIN",ACTIVE,ACTIVE);
         for(var type:catalog.types()){
@@ -90,35 +86,24 @@ class AlertCloudBuiltinWorkerIT {
         }
         var evaluator=new AlertEvaluationHost(store,catalog,host.deployment(),f.clock(),"builtin-worker",ACTIVE);
         var planner=new AlertNotificationPlanner(store,f.clock(),"builtin-planner",origin,ACTIVE);evaluator.withPlanner(planner);
-        var claims=f.cache().workloadClaims(f.business());var ownClaim=claims.read(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.NODE_SESSION,"node-a")).orElseThrow().claim();
-        var peerClaim=claims.acquire(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.NODE_SESSION,"node-b"),new WorkloadOwner("node-b","boot-b"),1,Duration.ofSeconds(60)).claim();
-        var own=new Registration(new Key(scope,"node-a","boot-a"),setup,cache,WorkloadClaimFence.from(ownClaim),UUID.randomUUID().toString(),1);
-        var peer=new Registration(new Key(scope,"node-b","boot-b"),setup,cache,WorkloadClaimFence.from(peerClaim),UUID.randomUUID().toString(),1);
-        var lifecycle=f.configuration().alertNodeLifecycles(scope,setup,ACTIVE);lifecycle.register(peer,f.clock().instant(),ACTIVE);
-        var member=mock(HazelcastInstance.class);var cluster=mock(Cluster.class);var membership=mock(ClusterMembershipGate.class);
-        var ownMember=ClusterNodeAlertSourceTest.member(own);var peerMember=ClusterNodeAlertSourceTest.member(peer);var live=new LinkedHashSet<Member>(List.of(ownMember,peerMember));
-        when(member.getCluster()).thenReturn(cluster);when(cluster.addMembershipListener(any())).thenReturn(UUID.randomUUID());when(cluster.getMembers()).thenAnswer(c->Set.copyOf(live));
-        when(membership.committed()).thenReturn(new ClusterMembership(scope.clusterId(),1,Set.of("node-a","node-b")));
-        when(membership.visibleNodeIds()).thenAnswer(c->live.stream().map(ClusterMembershipGate::stableIdOf).collect(java.util.stream.Collectors.toSet()));
         f.configuration().artifacts().create(new SourceResource("erp",null,"mongodb",Map.of("uri","mongodb://source.invalid/fixture"),null,null,null,null));
         var channels=new AlertChannels(host.deployment(),cloud,f.clock(),ACTIVE,scope.authorityId(),hostname->new InetAddress[]{InetAddress.getLoopbackAddress()},ssl);
         var source=signals.source(f.configuration().artifacts().sourceBinding("erp").orElseThrow(),"worker-matrix",ACTIVE,ACTIVE);
-        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(store,evaluator,catalog,null,null,Set.of("pipeline-lifecycle","pipeline-observations","source-operational-health","cluster-storage-health","cluster-member-health")),
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(store,evaluator,catalog,null,null,Set.of("pipeline-lifecycle","pipeline-observations","source-operational-health","cluster-storage-health")),
                     f.configuration().intents(),(intent,fence)->Optional.of(ACTIVE),ACTIVE,f.clock());
-                var node=new ClusterNodeAlertSource(member,membership,runtime,signals,ACTIVE,f.clock(),()->lifecycle,()->own,registration->ACTIVE);
                 var worker=new AlertDeliveryRuntime(store,f.clock(),"builtin-sender",ACTIVE,channels,authority->{throw new AssertionError("Cloud cannot continue channel tests");})){
-            runtimeRef.set(runtime);runtime.tick();node.tick();drain(runtime);live.remove(peerMember);f.now().set(f.clock().instant().plusSeconds(1));
+            runtimeRef.set(runtime);runtime.tick();drain(runtime);f.now().set(f.clock().instant().plusSeconds(1));
             for(int phase=0;phase<3;phase++){
-                if(phase==1)f.now().set(f.clock().instant().plusSeconds(3601));if(phase==2){f.now().set(f.clock().instant().plusSeconds(1));live.add(peerMember);}
+                if(phase==1)f.now().set(f.clock().instant().plusSeconds(3601));if(phase==2)f.now().set(f.clock().instant().plusSeconds(1));
                 boolean good=phase==2;int sequence=phase+1;
                 var failed=new AlertEvaluationHost.Binding(rules.get("pipeline.failed"),new AlarmKey.Resource("pipeline","orders","1"),"pipeline-matrix",0,ACTIVE,()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
                 assertThat(evaluator.accept(failed,sequence,new AlertInput.Conditions(f.clock().instant(),good?AlertSignal.Condition.GOOD:AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
                 var stale=new AlertEvaluationHost.Binding(rules.get("pipeline.observation-stale"),failed.resource(),"freshness-matrix",0,ACTIVE,()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
                 assertThat(evaluator.accept(stale,sequence,new AlertInput.Freshness(f.clock().instant(),true,f.clock().instant().minusSeconds(60),good?f.clock().instant():f.clock().instant().minusSeconds(10),Duration.ZERO,Duration.ofSeconds(5)))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
                 source.completed("connection",SourceOperationObserver.Capability.STREAM_READ,good?null:new SQLException("Controlled connection evidence","08001"));
-                signals.cacheOperation(true,good?null:new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","controlled-cache-write"),null));node.tick();drain(runtime);
-                assertThat(store.active(null,100,f.reads()).total()).as("active builtin heads in phase %s",phase).isEqualTo(good?0:5);
-                int expected=(phase+1)*5;
+                signals.cacheOperation(true,good?null:new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","controlled-cache-write"),null));drain(runtime);
+                assertThat(store.active(null,100,f.reads()).total()).as("active builtin heads in phase %s",phase).isEqualTo(good?0:4);
+                int expected=(phase+1)*3;
                 planner.tick();
                 await().atMost(Duration.ofSeconds(15)).untilAsserted(()->{worker.tick();assertThat(worker.failure()).as("dispatch health").isNull();
                     var retained=store.deliveries(null,100,null,null,f.reads()).rows();assertThat(retained).hasSize(expected);
@@ -126,8 +111,13 @@ class AlertCloudBuiltinWorkerIT {
                             +(r.value().state().attempts().isEmpty()?"none":r.value().state().attempts().getFirst().protocol())).toList())
                             .allMatch(row->row.contains(":ACCEPTED:1:"));});
             }
-            var records=store.deliveries(null,100,null,null,f.reads()).rows();assertThat(records).hasSize(15);
-            var expectedKinds=new TreeMap<String,Long>();for(var type:catalog.types())for(var kind:List.of(DeliveryKey.Kind.FAULT,DeliveryKey.Kind.REMINDER,DeliveryKey.Kind.RECOVERY))expectedKinds.put(type.id()+":"+kind,1L);
+            var records=store.deliveries(null,100,null,null,f.reads()).rows();assertThat(records).hasSize(9);
+            var expectedKinds = new TreeMap<String, Long>();
+            for (var type : List.of("pipeline.failed", "source.connection-failed", "cluster.storage-unavailable")) {
+                for (var kind : List.of(DeliveryKey.Kind.FAULT, DeliveryKey.Kind.REMINDER, DeliveryKey.Kind.RECOVERY)) {
+                    expectedKinds.put(type + ":" + kind, 1L);
+                }
+            }
             var actualKinds=new TreeMap<String,Long>();for(var record:records){assertThat(record.value().frozen().members()).hasSize(1);
                 actualKinds.merge(record.value().frozen().members().getFirst().evaluation().key().typeId()+":"+((AlertIntent.Business)record.value().frozen().identity()).key().notification().kind(),1L,Long::sum);}
             assertThat(actualKinds).containsExactlyInAnyOrderEntriesOf(expectedKinds);

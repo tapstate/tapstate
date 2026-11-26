@@ -70,11 +70,22 @@ public record PipelineMetricsHistory(
     }
 
     public record Point(Instant intervalStart, Instant intervalEnd, Rate recordsOut,
-            Rate bytesOut, List<Lag> lag) {
+            Rate bytesOut, List<Lag> lag, CdcDelivery cdcDelivery) {
         public Point {
             Objects.requireNonNull(intervalStart, "intervalStart");
             Objects.requireNonNull(intervalEnd, "intervalEnd");
             lag = List.copyOf(Objects.requireNonNull(lag, "lag"));
+        }
+
+        public Point(Instant intervalStart, Instant intervalEnd, Rate recordsOut, Rate bytesOut, List<Lag> lag) {
+            this(intervalStart, intervalEnd, recordsOut, bytesOut, lag, null);
+        }
+    }
+
+    /** The mean over the newly confirmed CDC records represented by one point. */
+    public record CdcDelivery(long sampleCount, BigDecimal averageMillis) {
+        public CdcDelivery {
+            averageMillis = wireNumber(Objects.requireNonNull(averageMillis, "averageMillis"));
         }
     }
 

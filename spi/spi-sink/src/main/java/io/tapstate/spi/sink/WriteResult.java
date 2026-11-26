@@ -8,7 +8,7 @@ package io.tapstate.spi.sink;
  */
 public record WriteResult(long written, long acknowledgedRows) {
 
-    /** For writers whose reported count already counts confirmed row events. */
+    /** For writers whose reported count is already a count of confirmed row events. */
     public WriteResult(long written) {
         this(written, written);
     }

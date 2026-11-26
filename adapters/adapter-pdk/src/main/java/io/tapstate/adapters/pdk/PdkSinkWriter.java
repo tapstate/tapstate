@@ -384,6 +384,7 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
+            int submittedRows = rows.size();
             var outcome = new BatchOutcome();
             try {
                 write.writeRecord(connector.context(), rows, table, outcome::accept);
@@ -396,7 +397,7 @@ final class PdkSinkWriter implements SinkWriter {
             written += outcome.written;
             // The synchronous writer completed this table's submitted events without errors.
             // Physical change counts can be lower for no-ops or higher for a key change.
-            if (outcome.reported) acknowledgedRows += rows.size();
+            if (outcome.reported) acknowledgedRows += submittedRows;
         }
         return new WriteResult(written, acknowledgedRows);
     }
