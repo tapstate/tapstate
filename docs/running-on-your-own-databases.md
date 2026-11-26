@@ -147,18 +147,18 @@ failed. Having the server's output in your own terminal is one of the reasons to
 
 ## When a source refuses the connection
 
-The connector is the only thing that knows why a database said no: the password, the permission, the
-database that is not there. From outside it, the server can say only that the read failed and name the
-exception class. So what the connector says about it is written into that pipeline's own tail:
+The connector can report why a database refused the connection. The pipeline's log tail can show
+that detail alongside the server's terminal state transition. In this example, the diagnostic
+details on the second line are abbreviated.
 
 ```
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline
 2026-09-15T08:21:04.318Z  ERROR  password authentication failed for user "orders_reader"
-2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [TS0060024]: its data-plane job died
+2026-09-15T08:21:04.502Z  ERROR  Pipeline order_pipeline entered FAILED [TS0060024]: {connector=postgres, detail=...}
 ```
 
-The first line is the connector's; the second is the server's own account of the same event. You want
-the first one - it names the thing to go and fix.
+Both lines can appear in an ERROR filter. The connector's line explains the refusal, and the
+server's `entered FAILED` line confirms that the pipeline stopped.
 
 Two limits worth knowing before you go looking for a line that is not there. A connector's routine
 progress chatter is deliberately kept out of this tail: it is a bounded window of recent lines, and

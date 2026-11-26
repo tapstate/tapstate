@@ -4,7 +4,6 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.sql.Expressions;
-import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinKind;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
@@ -786,8 +785,10 @@ public final class JoinDriver {
         boolean keyMoved = !Objects.equals(was, now);
 
         if (was != null && keyMoved) {
-            stores.removeDimensionRow(dimension.source(), was);
-            queueRecompute(dimension, was, event.ts(), event.positions());
+            String previousIdentity = identityOfDimensionRow(before, dimension);
+            if (stores.removeDimensionRow(dimension.source(), was, dimension.rowKeyColumns(), previousIdentity)) {
+                queueRecompute(dimension, was, event.ts(), event.positions());
+            }
         }
         if (after == null || now == null) {
             // A dimension row whose join key holds a null matches nothing, by the same rule that makes
@@ -1174,8 +1175,7 @@ public final class JoinDriver {
      * made of rows that should not have matched at all.
      */
     private static String keyOf(Map<String, Object> row, List<String> columns) {
-        JoinKey key = JoinKey.of(JoinKeys.valuesOf(row, columns));
-        return key.matchable() ? key.name() : null;
+        return JoinKeys.nameOf(row, columns);
     }
 
     /**
