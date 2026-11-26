@@ -23,6 +23,7 @@ import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
+import org.bson.types.Binary;
 
 import java.time.Duration;
 import java.util.Collection;
@@ -220,13 +221,23 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 return raw.inStrictSession(session).acquireRetainedCapture(key, owner, topologyRevision, ttl, row);
             }, null);
         }
-        return transaction(true, (store, session) -> {
-            if (key.type() == WorkloadClaimType.VALIDATION) {
+        if (key.type() == WorkloadClaimType.VALIDATION) {
+            return transaction(true, (store, session) -> {
                 var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
                 requireValidationClaim(session, row, key);
                 return store.acquireExisting(key, owner, topologyRevision, ttl);
-            }
-            return store.acquire(key,owner,topologyRevision,ttl);
+            });
+        }
+        return StoreIo.call(() -> {
+            requireActive.run();
+            var preparedNamespace = claimCollectionId(database);
+            return transaction(true, (store, session) -> {
+                var result = store.acquire(key, owner, topologyRevision, ttl);
+                // The committed catalog cannot see a namespace implicitly created by this transaction.
+                // Keep the same prepared namespace across driver retries and abort before publishing any writes.
+                if (!preparedNamespace.equals(claimCollectionId(database))) throw unreadableClaimCollection();
+                return result;
+            });
         });
     }
     @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
@@ -830,9 +841,24 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     static void requireCollection(MongoDatabase database) {
+        claimCollection(database);
+    }
+
+    private static Binary claimCollectionId(MongoDatabase database) {
+        var info = claimCollection(database).get("info", Document.class);
+        if (info == null || !(info.get("uuid") instanceof Binary id)) throw unreadableClaimCollection();
+        return id;
+    }
+
+    private static Document claimCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
         Document found = database.listCollections().filter(new Document("name", table.collectionName())).first();
-        if (found == null || !"collection".equals(found.get("type"))) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+        if (found == null || !"collection".equals(found.get("type"))) throw unreadableClaimCollection();
+        return found;
+    }
+
+    private static TapstateException unreadableClaimCollection() {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
                 Map.of("id", "cache-business", "field", "workload-claims"), null);
     }
 }

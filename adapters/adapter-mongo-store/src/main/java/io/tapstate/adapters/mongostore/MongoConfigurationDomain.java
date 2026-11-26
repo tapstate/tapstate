@@ -1344,13 +1344,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         candidate.requireRecoveryTarget(bound);
         if (!original.pending()) {
             if (!candidate.emptyForAuthenticationRecovery()) {
-                candidate.loadAuthScope(original.preparation().authScope());
+                candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
                 bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
             }
             candidate.verifyRecoveryPermissions(); active.run();
             original = bindings.reserveAuthenticationRecovery(original.preparation());
             if (!original.pending()) {
-                candidate.loadAuthScope(original.preparation().authScope());
+                candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
                 bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
             }
         }
@@ -1883,9 +1883,18 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             if (!scope.session().hasActiveTransaction())
                 return fenceWrite(scope, keyId, keys.find(scope.session(), new Document("_id", "cluster")).first());
             if (!cipher.activeKeyId().equals(keyId)) throw invalidKey();
-            // Validate the exact key that this write fenced. An invalid pre-image aborts the transaction.
-            var original = keys.findOneAndUpdate(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
+            // A missing legacy counter initializes on first use. A bounded integer always advances by one.
+            var fenceType = new Document("$type", "$sourceWriteFence");
+            var advanceable = new Document("$or", List.of(
+                    new Document("$eq", List.of(fenceType, "missing")),
+                    new Document("$and", List.of(
+                            new Document("$in", List.of(fenceType, List.of("int", "long"))),
+                            new Document("$gte", List.of("$sourceWriteFence", 0L)),
+                            new Document("$lt", List.of("$sourceWriteFence", Long.MAX_VALUE))))));
+            var original = keys.findOneAndUpdate(scope.session(),
+                    new Document("_id", "cluster").append("keyId", keyId).append("$expr", advanceable),
                     new Document("$inc", new Document("sourceWriteFence", 1L)));
+            // Validate the exact key that advanced in this transaction. An invalid pre-image aborts it.
             if (!keyId.equals(decode(original).activeKeyId())) throw invalidKey();
             return true;
         }

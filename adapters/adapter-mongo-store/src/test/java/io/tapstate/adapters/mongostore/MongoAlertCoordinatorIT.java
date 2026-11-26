@@ -116,6 +116,10 @@ class MongoAlertCoordinatorIT {
         });
     }
 
+    private static boolean keyWrite(String command, String collection) {
+        return collection.equals("cluster_keys") && (command.equals("update") || command.equals("findAndModify"));
+    }
+
     @Test void validBackgroundPlanReadsOneVersionAndPreservesAtomicFences() {
         withStore(f -> {
             var facts = businessFacts(f);
@@ -123,7 +127,7 @@ class MongoAlertCoordinatorIT {
             var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
             var beforeKey = SystemCollections.CLUSTER_KEYS.on(f.db).find().first();
             var commands = new ArrayList<String>();
-            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(keyWrite(command, collection) ? "key-write" : command + ":" + collection));
             try {
                 assertThat(f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,
                         new StateChange(0, null, facts.head, List.of(), null),
@@ -131,11 +135,11 @@ class MongoAlertCoordinatorIT {
                         List.of(new ScheduleChange(null, facts.schedule)), planned))).isEqualTo(Outcome.STAGED);
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }
             assertThat(Collections.frequency(commands, "find:configuration_version")).isEqualTo(1);
-            assertThat(commands.indexOf("update:cluster_keys")).isGreaterThan(commands.indexOf("find:schema_migrations"));
+            assertThat(commands.indexOf("key-write")).isGreaterThan(commands.indexOf("find:schema_migrations"));
             assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(planned.alertFence() + 1);
             assertThat(versions.find().first().getLong("revision")).isEqualTo(planned.configurationRevision());
             assertThat(SystemCollections.CLUSTER_KEYS.on(f.db).find().first().getLong("sourceWriteFence"))
-                    .isEqualTo(beforeKey.getLong("sourceWriteFence") + Collections.frequency(commands, "update:cluster_keys"));
+                    .isEqualTo(beforeKey.getLong("sourceWriteFence") + Collections.frequency(commands, "key-write"));
             assertThat(f.store.evaluationStates(null, 10).rows()).hasSize(1);
             assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).hasSize(1);
         });
@@ -151,7 +155,7 @@ class MongoAlertCoordinatorIT {
             var injected = new java.util.concurrent.atomic.AtomicBoolean();
             var observer = new AtomicReference<java.util.function.BiConsumer<String,String>>();
             observer.set((command, collection) -> {
-                commands.add(command + ":" + collection);
+                commands.add(keyWrite(command, collection) ? "key-write" : command + ":" + collection);
                 if (command.equals("aggregate") && collection.equals("cluster_identity") && injected.compareAndSet(false, true)) {
                     MongoCommandObservation.COLLECTIONS.remove();
                     try {
@@ -170,7 +174,7 @@ class MongoAlertCoordinatorIT {
             assertThat(injected).isTrue();
             assertThat(Collections.frequency(commands, "aggregate:cluster_identity")).isEqualTo(1);
             assertThat(Collections.frequency(commands, "find:configuration_version")).isEqualTo(2);
-            assertThat(Collections.frequency(commands, "update:cluster_keys")).isEqualTo(1);
+            assertThat(Collections.frequency(commands, "key-write")).isEqualTo(1);
             assertThat(commands.subList(commands.lastIndexOf("find:configuration_version"), commands.size()))
                     .containsExactly("find:configuration_version", "abortTransaction:");
             assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(planned.alertFence() + 1);
@@ -193,10 +197,10 @@ class MongoAlertCoordinatorIT {
                 var admin = control.getDatabase("admin");
                 admin.runCommand(new Document("configureFailPoint", "failCommand")
                         .append("mode", new Document("times", 1))
-                        .append("data", new Document("failCommands", List.of("update"))
+                        .append("data", new Document("failCommands", List.of("update", "findAndModify"))
                                 .append("namespace", f.db.getName() + ".cluster_keys")
                                 .append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))));
-                MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(keyWrite(command, collection) ? "key-write" : command + ":" + collection));
                 try { assertThat(accept(f, facts)).isEqualTo(Outcome.STAGED); }
                 finally {
                     MongoCommandObservation.COLLECTIONS.remove();
@@ -205,14 +209,14 @@ class MongoAlertCoordinatorIT {
             }
             int aborted = commands.indexOf("abortTransaction:");
             assertThat(aborted).isPositive();
-            assertThat(commands.subList(0, aborted)).contains("update:cluster_keys")
+            assertThat(commands.subList(0, aborted)).contains("key-write")
                     .contains("aggregate:cluster_identity", "find:schema_migrations", "find:configuration_version")
                     .doesNotContain("listIndexes:sources");
-            assertThat(commands.indexOf("update:cluster_keys")).isGreaterThan(commands.indexOf("find:schema_migrations"));
+            assertThat(commands.indexOf("key-write")).isGreaterThan(commands.indexOf("find:schema_migrations"));
             long committedKeyWrites = commands.subList(aborted + 1, commands.size()).stream()
-                    .filter("update:cluster_keys"::equals).count();
+                    .filter("key-write"::equals).count();
             assertThat(committedKeyWrites).isPositive();
-            assertThat((long) Collections.frequency(commands, "update:cluster_keys")).isEqualTo(committedKeyWrites + 1);
+            assertThat((long) Collections.frequency(commands, "key-write")).isEqualTo(committedKeyWrites + 1);
             assertThat(keys.find().first().getLong("sourceWriteFence")).isEqualTo(beforeKey.getLong("sourceWriteFence") + committedKeyWrites);
             assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE))
                     .isEqualTo(beforeVersion.getLong(ConfigurationVersion.ALERT_FENCE) + 1);
@@ -1048,7 +1052,7 @@ class MongoAlertCoordinatorIT {
             port.maintain(new AlertMaintenance.Cursor(4,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
             var remaining=new java.util.concurrent.atomic.AtomicInteger(4);var attempts=new java.util.concurrent.atomic.AtomicInteger();
             MongoCommandObservation.COLLECTIONS.set((command,collection)->{
-                if(command.equals("update")&&collection.equals("cluster_keys")&&remaining.getAndUpdate(n->Math.max(0,n-1))>0){
+                if(keyWrite(command, collection)&&remaining.getAndUpdate(n->Math.max(0,n-1))>0){
                     attempts.incrementAndGet();SystemCollections.CLUSTER_KEYS.on(f.db).updateOne(new Document("_id","cluster"),new Document("$inc",new Document("sourceWriteFence",1L)));
                 }
             });

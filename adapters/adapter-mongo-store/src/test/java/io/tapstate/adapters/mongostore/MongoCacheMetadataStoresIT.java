@@ -23,6 +23,9 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.bson.types.Binary;
@@ -94,14 +97,53 @@ class MongoCacheMetadataStoresIT {
         });
     }
     @Test void aWarmClaimViewCannotRecreateADroppedClaimNamespace() {
-        withFixture(f->{
-            var claims=f.domain.workloadClaims(SCOPE);
-            var owner=new io.tapstate.spi.store.WorkloadOwner("node","boot");
-            var original=new io.tapstate.spi.store.WorkloadClaimKey(SCOPE.clusterId(),io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION,"node");
-            claims.acquire(original,owner,1,Duration.ofSeconds(30));
-            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).drop();
-            assertThatThrownBy(()->claims.acquire(original,owner,1,Duration.ofSeconds(30))).isInstanceOf(TapstateException.class);
-            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName());
+        withFixture(f -> {
+            var claims = f.domain.workloadClaims(SCOPE);
+            var owner = new WorkloadOwner("node", "boot");
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node");
+            var ttl = Duration.ofSeconds(30);
+            var original = claims.acquire(key, owner, 1, ttl);
+            assertThat(original.acquired()).isTrue();
+            var renewed = claims.acquire(key, owner, 1, ttl);
+            assertThat(renewed.acquired()).isTrue();
+            assertThat(renewed.claim().claimGeneration()).isEqualTo(original.claim().claimGeneration());
+            assertThat(renewed.claim().owner()).isEqualTo(owner);
+            var competing = claims.acquire(key, new WorkloadOwner("other-node", "other-boot"), 1, ttl);
+            assertThat(competing.acquired()).isFalse();
+            assertThat(competing.claim()).isEqualTo(renewed.claim());
+
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
+            table.on(f.database).drop();
+            long admissions = f.admissions();
+            assertThatThrownBy(() -> claims.acquire(key, owner, 1, ttl)).isInstanceOf(TapstateException.class);
+            assertThat(f.database.listCollectionNames()).doesNotContain(table.collectionName());
+            assertThat(f.admissions()).isEqualTo(admissions);
+        });
+    }
+
+    @Test void aDropAfterClaimNamespaceCheckCannotCommitAnImplicitNamespace() {
+        withFixture(f -> {
+            var claims = f.domain.workloadClaims(SCOPE);
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node");
+            var owner = new WorkloadOwner("node", "boot");
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
+            long admissions = f.admissions();
+            var dropped = new AtomicBoolean();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (collection.equals(table.collectionName()) && !dropped.get()) {
+                    f.database.runCommand(new Document("drop", collection).append("maxTimeMS", 2_000));
+                    dropped.set(true);
+                }
+            });
+            try {
+                assertThatThrownBy(() -> claims.acquire(key, owner, 1, Duration.ofSeconds(30)))
+                        .isInstanceOf(TapstateException.class);
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+            assertThat(dropped).isTrue();
+            assertThat(f.database.listCollectionNames()).doesNotContain(table.collectionName());
+            assertThat(f.admissions()).isEqualTo(admissions);
         });
     }
     @Test void smallResourcesRemainSeparateAndPreserveCanonicalBodiesAndByteExactSpecs() {
