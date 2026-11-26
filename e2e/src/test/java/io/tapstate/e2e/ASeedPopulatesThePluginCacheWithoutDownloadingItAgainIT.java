@@ -38,7 +38,10 @@ class ASeedPopulatesThePluginCacheWithoutDownloadingItAgainIT {
             @Override protected void append(ILoggingEvent event) {
                 String message = event.getFormattedMessage();
                 if (message.contains("\"find\": \"connector_artifacts.chunks\"")) chunkReads.incrementAndGet();
-                if (message.contains("\"insert\": \"connector_artifacts.chunks\"")) chunkWrites.incrementAndGet();
+                if (message.contains("\"insert\": \"connector_artifacts.chunks\"")
+                        || message.contains("\"delete\": \"connector_artifacts.chunks\"")) {
+                    chunkWrites.incrementAndGet();
+                }
             }
         };
         observer.setName("seed-transfer-observer");
