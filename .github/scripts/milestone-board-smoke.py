@@ -125,6 +125,12 @@ if endpoint.startswith("repos/tapstate/tapstate/milestones?"):
         sys.exit(12)
     for milestone in state["milestones"]:
         print(base64.b64encode(json.dumps(milestone).encode()).decode())
+    if os.environ.get("MOCK_GH_STALE_LISTING") == "1":
+        for milestone in state["milestones"]:
+            if milestone["number"] == 15:
+                milestone["state"] = "closed"
+        state["milestones"] = [row for row in state["milestones"] if row["number"] != 16]
+        save()
     sys.exit(0)
 if endpoint.startswith("repos/tapstate/tapstate/issues?"):
     number = endpoint.split("milestone=")[1].split("&")[0]
@@ -133,6 +139,10 @@ if endpoint.startswith("repos/tapstate/tapstate/issues?"):
     for issue in state["issues"].values():
         if (issue.get("milestone") or {}).get("number") == int(number):
             print(base64.b64encode(json.dumps(issue).encode()).decode())
+    if os.environ.get("MOCK_GH_STALE_LISTING") == "1" and number == "15":
+        state["issues"]["ISSUE-904"]["milestone"] = None
+        state["issues"].pop("ISSUE-905", None)
+        save()
     sys.exit(0)
 raise AssertionError("Unhandled API call: " + repr(args))
 '''
@@ -320,6 +330,28 @@ def run():
         assert state["items"]["ISSUE-578"]["status"] == "TODO"
         assert state["items"]["ISSUE-903"]["status"] == "TODO"
         assert any(view["name"] == "Later milestone" for view in state["views"])
+        live_closed = {"number": 15, "title": "Closed after listing", "state": "open"}
+        live_deleted = {"number": 16, "title": "Deleted after listing", "state": "open"}
+        state["milestones"].extend([live_closed, live_deleted])
+        state["issues"].update({
+            "ISSUE-904": issue(904, live_closed, labels=["status:in-progress"]),
+            "ISSUE-905": issue(905, live_closed),
+            "ISSUE-906": issue(906, live_closed, state="closed"),
+            "ISSUE-907": issue(907, live_closed),
+            "ISSUE-908": issue(908, live_closed),
+        })
+        state["items"]["ISSUE-904"] = {"id": "ITEM-ISSUE-904", "status": "TODO"}
+        state_file.write_text(json.dumps(state))
+        fresh = subprocess.run([str(SCRIPT), "--reconcile"], capture_output=True, text=True, check=False,
+                               env=dict(env, MOCK_GH_STALE_LISTING="1", MOCK_GH_FORBIDDEN_ISSUE="907"))
+        assert fresh.returncode != 0 and "cannot read issue #907" in fresh.stderr, fresh.stderr
+        assert "cannot read issue #905" not in fresh.stderr and "cannot read milestone #16" not in fresh.stderr
+        state = json.loads(state_file.read_text())
+        assert all(v["name"] not in (live_closed["title"], live_deleted["title"]) for v in state["views"])
+        assert state["items"]["ISSUE-904"]["status"] == "TODO"
+        assert "ISSUE-905" not in state["items"] and "ISSUE-907" not in state["items"]
+        assert state["items"]["ISSUE-906"]["status"] == "DONE"
+        assert state["items"]["ISSUE-908"]["status"] == "TODO"
         print("milestone board smoke: PASS")
 
 

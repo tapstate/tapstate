@@ -222,16 +222,25 @@ upsert_issue() {
 }
 
 reconcile() {
-  local milestone_lines milestone encoded title number state issue_lines issue_encoded issue failed=0
+  local milestone_lines milestone encoded title number state issue_lines issue_encoded issue issue_number failed=0
   milestone_lines=$(gh api --paginate "repos/$repo/milestones?state=all&per_page=100" \
     --jq '.[] | @base64') || die 'cannot list milestones'
   while IFS= read -r encoded; do
     [[ -n $encoded ]] || continue
     if ! milestone=$(printf '%s' "$encoded" | base64 -d) ||
-       ! number=$(jq -er '.number' <<<"$milestone") ||
-       ! title=$(jq -er '.title' <<<"$milestone") ||
-       ! state=$(jq -er '.state' <<<"$milestone"); then
+       ! number=$(jq -er '.number' <<<"$milestone"); then
       error 'invalid entry in milestone listing'
+      failed=1
+      continue
+    fi
+    if ! milestone=$(read_event_resource "repos/$repo/milestones/$number"); then
+      error "cannot read milestone #$number during reconciliation"
+      failed=1
+      continue
+    fi
+    [[ -n $milestone ]] || continue
+    if ! title=$(jq -er '.title' <<<"$milestone") || ! state=$(jq -er '.state' <<<"$milestone"); then
+      error "milestone #$number: invalid current resource"
       failed=1
       continue
     fi
@@ -247,13 +256,20 @@ reconcile() {
     fi
     while IFS= read -r issue_encoded; do
       [[ -n $issue_encoded ]] || continue
-      if ! issue=$(printf '%s' "$issue_encoded" | base64 -d); then
+      if ! issue=$(printf '%s' "$issue_encoded" | base64 -d) ||
+         ! issue_number=$(jq -er '.number' <<<"$issue"); then
         error "milestone #$number: invalid entry in issue listing"
         failed=1
         continue
       fi
+      if ! issue=$(read_event_resource "repos/$repo/issues/$issue_number"); then
+        error "milestone #$number: cannot read issue #$issue_number during reconciliation"
+        failed=1
+        continue
+      fi
+      [[ -n $issue ]] || continue
       if ! upsert_issue "$issue"; then
-        error "milestone #$number: issue #$(jq -r '.number // "unknown"' <<<"$issue") failed to sync"
+        error "milestone #$number: issue #$issue_number failed to sync"
         failed=1
       fi
     done <<<"$issue_lines"
