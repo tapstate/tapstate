@@ -1,0 +1,7 @@
+version: tapstate/v1
+kind: source
+id: shop_db
+connector: mysql
+config: { host: ${SHOP_HOST}, port: ${SHOP_PORT}, database: ${SHOP_DATABASE}, username: ${SHOP_USERNAME}, password: ${SHOP_PASSWORD} }
+mode: cdc
+tables: [ orders, customers ]

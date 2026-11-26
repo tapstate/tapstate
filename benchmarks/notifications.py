@@ -5,6 +5,7 @@ from html import escape
 import re
 
 import actions_report
+import baseline
 import catalog
 import verdict
 
@@ -198,6 +199,9 @@ def card(health, updates, details_url):
 
 
 def metric_unit(metric):
+    unit = baseline.metric_unit(metric)
+    if unit:
+        return f" {unit}"
     for suffix, unit in (("_nanos", "ns"), ("_kib_per_second", "KiB/s"), ("_kib", "KiB")):
         if metric.endswith(suffix):
             return f" {unit}"
