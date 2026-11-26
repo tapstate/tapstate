@@ -87,6 +87,15 @@ final class MongoCachePipelineAccess {
 
     <T> T observationTransaction(Function<ClientSession, T> action) { return transaction(action); }
 
+    <T> T pointRead(java.util.function.Supplier<T> action) {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            T value = action.get();
+            requireActive.run();
+            return value;
+        });
+    }
+
     <T> T checkpointTransaction(Function<ClientSession, T> action) { return checkpointTransaction(TRANSACTION, action); }
 
     private <T> T checkpointTransaction(TransactionOptions options, Function<ClientSession, T> action) {

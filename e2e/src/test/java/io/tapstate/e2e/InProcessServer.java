@@ -173,6 +173,13 @@ final class InProcessServer implements ServerHandle {
         return baseUrl;
     }
 
+    Object nativeLifecycleActuator() {
+        return refreshedContexts.stream()
+                .filter(owner -> owner.isActive() && belongsToThisServer(owner)
+                        && owner.getBeanFactory().containsLocalBean("lifecycleActuator"))
+                .findFirst().orElseThrow().getBean("lifecycleActuator");
+    }
+
     /**
      * Stops this server publishing observations, while leaving everything that answers a read alone.
      *

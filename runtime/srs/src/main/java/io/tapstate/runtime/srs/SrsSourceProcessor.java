@@ -121,6 +121,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private boolean vouchesForSnapshot = true;
     private String initialMode = "UNPROVEN";
     private SourceInitialLoadObserver initialObserver;
+    private Runnable onChangeStreamReady;
     private long observedJob, observedExecution;
     private int observedIndex;
     private boolean completedInput;
@@ -235,6 +236,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             confirmed = progress.confirmed().orElse(null);
         }
         Object observer = context.hazelcastInstance().getUserContext().get(SourceInitialLoadObserver.USER_CONTEXT_KEY);
+        Object readiness = context.hazelcastInstance().getUserContext().get(ChangeStreamReadyObserver.USER_CONTEXT_KEY);
+        if (!bounded && readiness instanceof ChangeStreamReadyObserver changeStream && context.jobConfig() != null) {
+            Object identity = context.jobConfig().getArgument(
+                    io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT);
+            long jobId = context.jobId();
+            long executionId = context.executionId();
+            onChangeStreamReady = () -> changeStream.ready(identity, jobId, executionId);
+        }
         if (observer instanceof SourceInitialLoadObserver receipt) {
             try {
                 receipt.started(context.hazelcastInstance(), context.jobConfig().getArgument(io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT),
@@ -288,7 +297,10 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                 }
             }
         }
-        lookAtTheGate();
+        boolean directReady = onChangeStreamReady != null && ringTail == null && buffered != null
+                && buffered.changesReady(pipelineId, ringName);
+        lookAtTheGate(directReady);
+        if (directReady && !awaitingSnapshot && !holding) reportChangeStreamReady();
         // Reading and projecting what arrived is this stage's unit of work; a pass that finds nothing is
         // not a unit and is not timed, or the distribution would be swamped by the idle polls between rows.
         long started = timer.begin();
@@ -310,6 +322,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                     read = order;
                 }, readBatch);
                 refused = false;
+                reportChangeStreamReady();
             } catch (RingWriteRefusedException refusal) {
                 // Whatever this pass read before the refusal is already pending, and the reader stands at
                 // the first change it did not read, so the next pass carries on from there.
@@ -479,8 +492,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * yet delivered hands the load over afresh, so this is a state nothing enters; were anything to, the run
      * ends here rather than stand still.
      */
-    private void lookAtTheGate() {
-        if (!holding || awaitingSnapshot || (ringTail == null && held.isEmpty())) {
+    private void lookAtTheGate(boolean directReady) {
+        if (!holding || awaitingSnapshot || (ringTail == null && held.isEmpty() && !directReady)) {
             return;
         }
         long now = System.nanoTime();
@@ -500,6 +513,18 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         holding = false;
         while (!held.isEmpty()) {
             take(held.poll());
+        }
+    }
+
+    private void reportChangeStreamReady() {
+        var report = onChangeStreamReady;
+        if (report == null) return;
+        onChangeStreamReady = null;
+        try {
+            report.run();
+        } catch (RuntimeException failedObservation) {
+            System.getLogger(SrsSourceProcessor.class.getName())
+                    .log(System.Logger.Level.WARNING, "change-stream observation failed", failedObservation);
         }
     }
 

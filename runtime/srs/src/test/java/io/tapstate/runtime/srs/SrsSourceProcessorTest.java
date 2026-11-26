@@ -447,6 +447,25 @@ class SrsSourceProcessorTest {
         exerciseDeclaredBufferSource(3, true);
     }
 
+    @Test
+    void aQuietSharedRingStillReportsTheConsumerIsReady() throws Exception {
+        String ring = "srs.chain.ready-empty";
+        String output = "out-ready-empty";
+        var cdcReady = new java.util.concurrent.CompletableFuture<Long>();
+        hz.getUserContext().put(ChangeStreamReadyObserver.USER_CONTEXT_KEY,
+                (ChangeStreamReadyObserver) (identity, job, execution) -> cdcReady.complete(job));
+        Job job = hz.getJet().newJob(projectedDag(ring, "orders", output, 1024, SrsReadCursorPublisherFactory.NONE));
+        var rows = hz.getList(output);
+        try {
+            assertThat(cdcReady.get(5, TimeUnit.SECONDS)).isEqualTo(job.getId());
+            assertThat(rows).isEmpty();
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(ChangeStreamReadyObserver.USER_CONTEXT_KEY);
+            rows.destroy();
+        }
+    }
+
     private void exerciseDeclaredBufferSource(int rows, boolean direct) throws Exception {
         String ring = "srs.chain.bounded-" + rows + "-" + direct;
         String output = "out-bounded-" + rows + "-" + direct;
@@ -454,6 +473,9 @@ class SrsSourceProcessorTest {
         buffer.declareSnapshot(PIPELINE, ring);
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
         var initialModes = new CopyOnWriteArrayList<String>();
+        var cdcReady = new java.util.concurrent.CompletableFuture<Long>();
+        hz.getUserContext().put(ChangeStreamReadyObserver.USER_CONTEXT_KEY,
+                (ChangeStreamReadyObserver) (identity, job, execution) -> cdcReady.complete(job));
         hz.getUserContext().put(SourceInitialLoadObserver.USER_CONTEXT_KEY, (SourceInitialLoadObserver) (member, identity, job, execution, stream, index, mode, epoch) -> {
             assertThat(member.getCluster().getLocalMember().getUuid()).isEqualTo(hz.getCluster().getLocalMember().getUuid()); assertThat(stream).isEqualTo("orders"); assertThat(epoch).isEqualTo(1);
             assertThat(job).isNotZero(); assertThat(execution).isNotZero(); initialModes.add(mode);
@@ -484,12 +506,16 @@ class SrsSourceProcessorTest {
                 Thread.sleep(20);
             }
             assertThat(job.getStatus()).as("an empty buffer is not end of input").isEqualTo(JobStatus.RUNNING);
+            buffer.handoff(PIPELINE, ring).changesReady();
+            assertThat(cdcReady).as("the declared snapshot still prevents CDC").isNotDone();
             for (int row = 0; row < rows; row++) {
                 buffer.append(PIPELINE, ring, snapshotRow(row).withOrder(SourceOrder.snapshotRow(1L)));
             }
             buffer.endSnapshot(PIPELINE, ring);
             if (direct) {
                 awaitSize(out, rows);
+                assertThat(cdcReady.get(5, TimeUnit.SECONDS)).isEqualTo(job.getId());
+                assertThat(out).hasSize(rows);
                 Thread.sleep(300);
                 assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
                 buffer.append(PIPELINE, ring, snapshotRow(99).withOrder(new SourceOrder(1L, 1L)));
@@ -499,6 +525,7 @@ class SrsSourceProcessorTest {
                 job.getFuture().get(5, TimeUnit.SECONDS);
                 assertThat(job.getStatus()).isEqualTo(JobStatus.COMPLETED);
                 assertThat(out).hasSize(rows);
+                assertThat(cdcReady).as("a bounded source has no CDC stream").isNotDone();
             }
         } finally {
             if (!job.getStatus().isTerminal()) {
@@ -506,6 +533,7 @@ class SrsSourceProcessorTest {
             }
             hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
             hz.getUserContext().remove(SourceInitialLoadObserver.USER_CONTEXT_KEY);
+            hz.getUserContext().remove(ChangeStreamReadyObserver.USER_CONTEXT_KEY);
             out.destroy();
         }
     }

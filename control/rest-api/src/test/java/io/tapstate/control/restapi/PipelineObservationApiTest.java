@@ -246,6 +246,18 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void runProgressUsesStatusReadAuthorizationAndCanBeUnavailable() {
+        String path = "/api/pipelines/pl1/run-progress";
+        client().get().uri(path).exchange((request, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            return null;
+        });
+        var response = client().get().uri(path).header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        assertThat(response).containsEntry("availability", "UNAVAILABLE");
+    }
+
+    @Test
     void lifecycleConsumersReadObservedStatesWhileUiTransitionsHaveTheirOwnField() {
         PipelineState[][] transitions = {
                 {PipelineState.STOPPED, PipelineState.RUNNING},
@@ -768,6 +780,7 @@ class PipelineObservationApiTest {
         assertThat(projectedReadFaces)
                 .as("every pipeline face imported here projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder("pipeline.status", "pipeline.metrics", "pipeline.snapshot",
+                        "pipeline.status",
                         "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position");
     }

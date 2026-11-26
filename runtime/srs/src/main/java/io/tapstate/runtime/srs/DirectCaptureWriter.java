@@ -20,6 +20,7 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
     private final WorkloadClaimFence capture,pipeline;
     private final Consumer<Envelope> downstream;
     private final Runnable active;
+    private final Runnable changesReady;
     private final int capacity;
     private final AtomicBoolean started=new AtomicBoolean(),closed=new AtomicBoolean();
     private final AtomicReference<Throwable> failure=new AtomicReference<>();
@@ -35,10 +36,17 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
     public DirectCaptureWriter(DirectChannelProgress opened, WorkloadClaimFence originalCapture,
             WorkloadClaimFence originalPipeline, DirectChannelStore channels, Consumer<Envelope> downstream,
             int capacity, Runnable requireActive) {
+        this(opened, originalCapture, originalPipeline, channels, downstream, capacity, requireActive, () -> {});
+    }
+
+    DirectCaptureWriter(DirectChannelProgress opened, WorkloadClaimFence originalCapture,
+            WorkloadClaimFence originalPipeline, DirectChannelStore channels, Consumer<Envelope> downstream,
+            int capacity, Runnable requireActive, Runnable changesReady) {
         this.opened=Objects.requireNonNull(opened,"opened"); this.context=opened.context();
         this.capture=Objects.requireNonNull(originalCapture,"originalCapture"); this.pipeline=Objects.requireNonNull(originalPipeline,"originalPipeline");
         this.active=Objects.requireNonNull(requireActive,"requireActive"); this.channels=Objects.requireNonNull(channels,"channels").guardedBy(this::requireUsable);
         this.downstream=Objects.requireNonNull(downstream,"downstream"); this.capacity=capacity;
+        this.changesReady = Objects.requireNonNull(changesReady, "changesReady");
         if (capacity<1) throw new IllegalArgumentException("a private producer requires bounded headroom");
         requireCurrent(opened);
         if (opened.current().recordedThrough()!=0) throw unavailable();
@@ -94,6 +102,7 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
             if (expectedResume!=null && !expectedResume.equals(position.token()) || anchor!=null && !anchor.equals(position.token())) throw unavailable();
             if (!channels.confirmAnchor(context,opened.epoch(),position.token(),capture,pipeline)) throw unavailable();
             requireUsable(); anchor=position.token();
+            changesReady.run();
         } catch(RuntimeException|Error failed) { fail(failed); throw failed; }
     }
     @Override public synchronized void onBatch(List<Envelope> events, Optional<SourcePosition> position) {

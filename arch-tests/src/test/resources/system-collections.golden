@@ -75,6 +75,7 @@ direct_channel_offsets | cache | MongoDirectChannelStore | migrated | 1 | -
 direct_batches | cache | MongoDirectChannelStore | migrated | 1 | _id.channel+_id.epoch+_id.ordinal
 pipeline_state | cache | MongoCachePipelineStateStore | migrated | 1 | -
 pipeline_observation | cache | MongoCachePipelineObservationStore | migrated | 1 | -
+pipeline_run_progress | cache | MongoCachePipelineRunProgressStore | migrated | 1 | -
 source_schemas | cache | MongoCacheSchemaStore | migrated | 1 | -
 connector_catalog | cache | MongoCacheConnectorCatalogStore | migrated | 1 | -
 connector_specs | cache | MongoCacheConnectorSpecStore | migrated | 1 | -

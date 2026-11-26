@@ -995,6 +995,33 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases);
     }
 
+    public MongoCachePipelineRunProgressStore pipelineRunProgress(PipelineIntentScope scope,
+            WorkloadClaimFence claim, Runnable requireActive) {
+        return new MongoCachePipelineRunProgressStore(pipelineAccess(scope, claim, requireActive), claim);
+    }
+
+    /** Prepares the optional display resource without placing schema work on the Start path. */
+    public void preparePipelineRunProgress(CacheBusinessScope expected, Runnable requireActive) {
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        StoreIo.run(() -> {
+            active.run();
+            if (structure.hasPipelineRunProgress()) {
+                structure.verifyFacet(SystemCollections.CACHE_PIPELINE_RUN_PROGRESS);
+                return;
+            }
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    active.run();
+                    new MongoCacheBusinessIdentity(database, expected).admitMetadataWrite(session);
+                    structure.preparePipelineRunProgressInTransaction(session, active);
+                    return null;
+                }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.LOCAL)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+        });
+    }
+
     /**
      * Only the original authorized operation may retire a business scope; it does not change auth.
      * Cache fencing does not establish that external calls already issued have drained; the caller

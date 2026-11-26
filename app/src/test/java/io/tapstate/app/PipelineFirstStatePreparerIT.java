@@ -10,6 +10,8 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineRunProgress;
+import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -55,6 +57,75 @@ class PipelineFirstStatePreparerIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-18T08:00:00Z"), ZoneOffset.UTC);
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
+
+    @Test void runProgressTracksTheStoredStartBeforeAnyCheckpointOrMetrics() {
+        withFixture(false, f -> {
+            var id = f.scope.pipelineId();
+            var intents = f.configuration.intents();
+            var preparations = f.configuration.preparations();
+            var query = new NativePipelineRunProgressQuery(f.business(), intents, preparations, () -> true);
+            String hash = CanonicalHash.of(f.configuration.artifacts().get(id).orElseThrow());
+            var start = new DesiredState(id, PipelineState.RUNNING, hash);
+            var inputs = new PipelinePreparationInputs(hash, Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, 0, start, inputs)).isTrue();
+
+            var queued = query.find(id).orElseThrow().progress();
+            assertThat(queued.active()).containsExactly(
+                    new PipelineRunProgress.Activity(PipelineRunStage.WAITING_FOR_SCHEDULER, null));
+            assertThat(f.state()).isNull();
+
+            var pending = intents.pendingStart(id).orElseThrow();
+            var issued = (FirstPipelineCreationResult.Issued) preparations.issueDeferred(pending, f.node);
+            var preparing = query.find(id).orElseThrow().progress();
+            assertThat(preparing.runId()).isEqualTo(queued.runId());
+            assertThat(preparing.version()).isGreaterThan(queued.version());
+            assertThat(preparing.active()).containsExactly(
+                    new PipelineRunProgress.Activity(PipelineRunStage.RUN_RESOURCES_PREPARING, null));
+            assertThat(f.state()).isNull();
+
+            var cache = f.cache.admittedPipelinePreparations(f.business(), ACTIVE);
+            var reservation = cache.reserveFirst(issued.creation(), TTL);
+            var receipt = cache.seedDeferred(reservation, preparations, pending, CLOCK.instant());
+            preparations.completeDeferred(pending, receipt);
+
+            var prepared = query.find(id).orElseThrow().progress();
+            assertThat(prepared.runId()).isEqualTo(queued.runId());
+            assertThat(prepared.version()).isGreaterThan(preparing.version());
+            assertThat(prepared.active()).isEmpty();
+            assertThat(prepared.milestones()).containsExactly(
+                    new PipelineRunProgress.Milestone(PipelineRunStage.START_ACCEPTED, null));
+        });
+    }
+
+    @Test void runProgressRecoveryReadsTheSharedRowAndRejectsDelayedExecutionWrites() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope, OWNER, 1, TTL).claim();
+            var firstClaim = claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var first = f.cache.pipelineRunProgress(f.scope, WorkloadClaimFence.from(firstClaim), ACTIVE);
+            var seed = PipelineRunProgress.empty("first");
+            var bind = io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution.BIND;
+            var requireBound = io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution.REQUIRE_BOUND;
+            assertThat(first.update(1, seed, bind, p -> p.reach(PipelineRunStage.ENGINE_RUNNING, CLOCK.instant()))).isTrue();
+            try (var secondMember = MongoCacheDomain.connect(f.cacheConnection, Duration.ofSeconds(5), "run-progress-member-b")) {
+                var reader = secondMember.pipelineRunProgress(f.scope, null, ACTIVE);
+                assertThat(reader.latest().orElseThrow().progress().runId()).isEqualTo("first");
+                var secondClaim = claims.advanceExecution(firstClaim, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+                var second = secondMember.pipelineRunProgress(f.scope, WorkloadClaimFence.from(secondClaim), ACTIVE);
+                assertCode(() -> first.update(1, seed, requireBound,
+                        p -> p.reach(PipelineRunStage.CDC_READY, CLOCK.instant())), IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(second.update(2, PipelineRunProgress.empty("second"), bind,
+                        p -> p.enter(PipelineRunStage.SOURCE_CAPTURE_PREPARING, CLOCK.instant()))).isTrue();
+                assertThat(first.update(1, seed, requireBound,
+                        p -> p.reach(PipelineRunStage.INITIAL_LOAD_COMPLETED, CLOCK.instant()))).isFalse();
+                var latest = reader.latest().orElseThrow();
+                assertThat(latest.startRevision()).isEqualTo(2);
+                assertThat(latest.progress().runId()).isEqualTo("second");
+                assertThat(latest.progress().milestones()).isEmpty();
+            }
+        });
+    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"issued-live", "issued-expired", "unassigned", "complete-missing"})

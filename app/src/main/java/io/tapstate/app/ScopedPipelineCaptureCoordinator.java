@@ -1319,6 +1319,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             Runnable guard) {
         return new CaptureHandoff() {
             @Override
+            public void changesReady() {
+                originalHandoffs.values().forEach(CaptureHandoff::changesReady);
+            }
+
+            @Override
             public void accept(Envelope row) {
                 guard.run();
                 if (!source.selected.tables().contains(row.src())) throw refused();
