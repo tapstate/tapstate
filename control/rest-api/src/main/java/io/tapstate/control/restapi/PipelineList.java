@@ -30,12 +30,12 @@ record PipelineList(List<Item> items) {
 
     record Status(PipelineCatalogItem.DisplayState state, PipelineCatalogItem.UiState displayState,
             PipelineState desiredState, PipelineState observedState, ApiError failure, Instant observedAt,
-            ApiError intentReadFailure) {
+            ApiError intentReadFailure, PipelineCatalogItem.StopState stopState) {
 
         static Status of(PipelineCatalogItem.Status status, MessageCatalog catalog, Locale locale) {
             return new Status(status.state(), status.displayState(), status.desiredState(), status.observedState(),
                     ApiError.from(status.failure(), catalog, locale), status.observedAt(),
-                    ApiError.from(status.intentReadFailure(), catalog, locale));
+                    ApiError.from(status.intentReadFailure(), catalog, locale), status.stopState());
         }
     }
 }
