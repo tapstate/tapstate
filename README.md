@@ -10,11 +10,11 @@ Tapstate is an open-source, **operational data engine** that can be used to buil
 
 ![Tapstate Operational State Layer: operational systems flow through CDC into Capture, Transform, Consolidate, and Materialize, maintaining live business state for Agentic AI and mission-critical applications.](docs/assets/operational-state-layer.svg)
 
-*Conceptual architecture: the current Alpha materializes state in MongoDB; stable state-consumption APIs and push delivery are not yet available.*
+*Conceptual architecture: the current version stores state in MongoDB; stable state-consumption APIs and push delivery are not yet available.*
 
 ## Try it in minutes
 
-**Requirements:** Docker with the Compose plugin, and `jq`.
+**Requirements:** Docker with the Compose plugin.
 
 Run this from an empty directory. The installer creates `tapstate-demo/` there and keeps everything inside it:
 
@@ -24,15 +24,21 @@ curl -fsSL https://install.tapstate.dev/demo | sh
 
 It starts a local playground with MySQL, PostgreSQL, MongoDB, and Tapstate. No existing database or Atlas account is needed.
 
-**Administrator credentials.** Nothing is preset: the installer asks you to *choose* a username (Enter accepts `admin`) and a password for the playground's first administrator, then signs in with them. Keep them. You use them to sign in to the web UI, and a re-run in the same directory asks for the same ones. To skip the prompt, set `TAPSTATE_ADMIN_USER` and `TAPSTATE_ADMIN_PASSWORD`. If you lose them, run `docker compose down -v` in `tapstate-demo/`, remove the directory, and start again.
+**Administrator credentials.** 
+
+The installer asks you to *choose* a username (Enter accepts `admin`) and a password for the playground's first administrator, then signs in with them. Keep them. You use them to sign in to the web UI
 
 Open **http://127.0.0.1:8080**, sign in, and explore the running pipeline. The installer also writes `tapstate-demo/tapstate-mcp.json`, an MCP configuration you can hand to an AI agent so it can manage the playground's pipelines.
 
 **What you'll see:** MySQL orders and PostgreSQL shipments continuously assembled into live order documents in MongoDB. Change a source record and watch the consolidated state update—without re-running a join or batch job.
 
+**Restart the demo** 
+Run `docker compose down -v` in `tapstate-demo/`, remove the directory, and start again.
+
 [Follow the full quickstart](https://tapstate.dev/docs/overview/quickstart) · [Explore the documentation](https://tapstate.dev/docs)
 
 For a single-node installation with your own MongoDB, see the [OP server archive guide](deploy/op/README.md).
+
 
 > **Alpha preview — local evaluation only.** The bundled MongoDB has no authentication, and Tapstate users with tokens can access control-plane data through source declarations. Use non-sensitive data and do not expose the playground to untrusted networks.
 
