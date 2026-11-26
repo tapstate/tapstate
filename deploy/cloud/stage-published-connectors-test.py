@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Published bundle selection and transfer must preserve exact release identities."""
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +55,21 @@ class PublishedConnectorsTest(unittest.TestCase):
             PUBLISHED.download("https://maven.example.test/db2-connector.jar", Path("db2-connector.jar"))
         command = curl.call_args.args[0]
         self.assertEqual(command[command.index("--max-filesize") + 1], "512000000")
+
+    def test_op_download_timeout_preserves_safe_diagnostics(self):
+        settings = {"TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS": "600", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "1"}
+        failure = SimpleNamespace(returncode=28, stdout=b"http=200 bytes=42",
+                                  stderr=b"curl: (28) timed out at https://example.test/jar?token=secret")
+        output = io.StringIO()
+        with patch.dict(os.environ, settings), patch.object(PUBLISHED.subprocess, "run", return_value=failure) as curl:
+            with contextlib.redirect_stderr(output), self.assertRaisesRegex(PUBLISHED.STAGE.StageError, "curl exit=28"):
+                PUBLISHED.download("https://maven.example.test/db2-connector-2.11.0.jar", Path("db2-connector.jar"))
+        command = curl.call_args.args[0]
+        self.assertEqual(command[command.index("--max-time") + 1], "600")
+        self.assertEqual(curl.call_args.kwargs["timeout"], 605)
+        self.assertIn("http=200 bytes=42", output.getvalue())
+        self.assertIn("curl: (28) timed out at [URL]", output.getvalue())
+        self.assertNotIn("token=secret", output.getvalue())
 
     def test_op_keeps_its_licenses_when_the_selection_matches_cloud(self):
         selected = [entry for entry in self.selection if entry["id"] in PUBLISHED.STAGE.CLOUD_IDS]
