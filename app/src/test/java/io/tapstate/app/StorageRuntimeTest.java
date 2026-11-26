@@ -92,9 +92,10 @@ class StorageRuntimeTest {
             verify(cache).loadAuthScope(PREPARATION.authScope());
             verify(cache, never()).prepareAuth(any(), any(), any());
             verify(cache, never()).prepareInitialBusiness(any(), any());
-            doThrow(StorageRuntime.unavailable()).when(cache).verifyBusinessReady(PREPARATION.businessScope());
+            doThrow(StorageRuntime.unavailable()).when(cache).loadBusinessScope(PREPARATION.businessScope());
             assertThatThrownBy(() -> root.startBusiness(bound, ignored -> { calls.incrementAndGet(); throw new AssertionError(); }))
                     .isInstanceOf(TapstateException.class);
+            verify(cache, never()).verifyBusinessReady(any());
             assertThat(calls).hasValue(0);
             assertThat(root.businessStarted()).isFalse();
         }
@@ -128,6 +129,23 @@ class StorageRuntimeTest {
             assertThat(root.businessStarted()).isFalse();
             doNothing().when(candidate).close();
         }
+    }
+
+    @Test void cacheCloseFailureStillClosesConfigurationAndPreservesTheFailure() {
+        var config = configuration();
+        var cache = mock(MongoCacheDomain.class);
+        var failure = new IllegalStateException("cache close failed");
+        var root = new StorageRuntime(config, binding -> cache);
+        root.loadBound().orElseThrow();
+        doThrow(failure).when(cache).close();
+
+        assertThat(catchThrowable(root::close)).hasSuppressedException(failure);
+        verify(config).close();
+        assertThat(root.cleanupRequired()).isTrue();
+
+        doNothing().when(cache).close();
+        root.close();
+        verify(config).close();
     }
 
     @Test void businessCleanupErrorRetainsClientsUntilTheOriginalOwnerCanBeRetried() {

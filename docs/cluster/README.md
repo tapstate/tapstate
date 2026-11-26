@@ -9,6 +9,23 @@ target: https://tapstate.dev/docs/guides/cluster
 Cluster mode is opt-in. An installation that does not set a discovery mode remains a single member,
 binds the member protocol to `127.0.0.1`, and cannot discover another Tapstate process.
 
+Single-node OP (`tapstate.cluster.profile=single`, the default) requires exclusive use of its storage.
+The process owns its Node Session in memory. Pipeline and Capture follow that session without
+periodic Mongo renewals. Mongo records the boot and execution generations at acquisition so
+a previous execution cannot write after a restart. Pipeline intents, checkpoints, SRS offsets
+and NEST state remain durable. NEST reuses its placement proof for the current execution.
+
+Multi-member profiles and Cloud use Mongo leases. The earlier draft setting
+`tapstate.cluster.workload-leases-enabled` has no effect. A single member checks the Hazelcast
+membership at startup and listens for subsequent joins. On seeing a peer, the OP process reports
+the cluster name and member addresses, stops serving work and exits with a nonzero status.
+
+If the network closes idle Mongo connections, the JVM option
+`-Dtapstate.store.mongo.max-idle-time-ms=45000` makes CONFIG and CACHE clients discard
+connections after 45 seconds of inactivity. Place it before `-jar` when starting OP.
+An explicit `maxIdleTimeMS` in a connection URI takes precedence. Omitting the JVM option
+keeps the driver's existing idle policy.
+
 Every cluster member needs:
 
 - one shared `tapstate.cluster.id`;

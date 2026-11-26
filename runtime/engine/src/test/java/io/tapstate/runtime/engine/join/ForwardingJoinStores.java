@@ -56,8 +56,9 @@ public class ForwardingJoinStores implements JoinStores {
     }
 
     @Override
-    public void removeDimensionRow(String source, String dimensionKey) {
-        held.removeDimensionRow(source, dimensionKey);
+    public boolean removeDimensionRow(String source, String dimensionKey, List<String> identityColumns,
+            String expectedIdentity) {
+        return held.removeDimensionRow(source, dimensionKey, identityColumns, expectedIdentity);
     }
 
     @Override

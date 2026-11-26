@@ -64,7 +64,9 @@ final class MongoAlertConfigurationStore {
                 "pipeline.observation-stale", "Pipeline observation stale",
                 "source.connection-failed", "Source connection failed",
                 "cluster.node-unavailable", "Cluster node unavailable",
-                "cluster.storage-unavailable", "Required storage unavailable");
+                "cluster.storage-unavailable", "Required storage unavailable",
+                "cluster.config-structure-drift", "CONFIG collection or index changed",
+                "cluster.cache-structure-drift", "CACHE collection or index changed");
         return catalog.types().stream().map(type -> {
             var identity = AlertConfiguration.Identity.create(Kind.RULE, scope, "builtin-" + type.id());
             var header = AlertConfiguration.Header.create(identity, deployment, at, "system:cluster-initialization");
@@ -87,8 +89,13 @@ final class MongoAlertConfigurationStore {
     }
 
     Optional<MongoAlertConfigurationCodec.Stored> load(ClientSession session, Kind kind, String id) {
+        return load(session,kind,id,null);
+    }
+
+    Optional<MongoAlertConfigurationCodec.Stored> load(ClientSession session,Kind kind,String id,MongoAlertWriteFacts facts) {
         MongoAlertStateStore.requireTransaction(session); requireActive.run();
-        Document row = collection(kind).find(session, new Document("_id", MongoAlertConfigurationCodec.key(scope, id))).first();
+        Document row = facts==null?collection(kind).find(session,new Document("_id",MongoAlertConfigurationCodec.key(scope,id))).first()
+                :facts.row(SystemCollections.ALERT_RULES,MongoAlertConfigurationCodec.key(scope,id));
         if (row == null) { requireActive.run(); return Optional.empty(); }
         var result = MongoAlertConfigurationCodec.read(kind, scope, id, row);
         requireActive.run(); return Optional.of(result);
@@ -159,8 +166,17 @@ final class MongoAlertConfigurationStore {
         var identity = expected.header().identity(); requireScope(identity.scope());
         if (!expected.header().active()) { return false; }
         var actual = load(session, identity.kind(), identity.id());
-        if (actual.isEmpty() || !sameCommand(expected,actual.orElseThrow().definition())) { return false; }
-        long original = actual.orElseThrow().writeFence(); long next = increment(original);
+        return actual.isPresent() && fenceChecked(session,expected,actual.orElseThrow());
+    }
+
+    /** Reuse only a definition decoded in this same transaction callback; retain its protected-row CAS. */
+    boolean fenceChecked(ClientSession session, Definition expected, MongoAlertConfigurationCodec.Stored actual) {
+        Objects.requireNonNull(expected, "expected");
+        expected = normalized(expected);
+        var identity = expected.header().identity(); requireScope(identity.scope());
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("original transaction required");
+        if (!expected.header().active() || !sameCommand(expected,actual.definition())) { return false; }
+        long original = actual.writeFence(); long next = increment(original);
         Document filter = new Document("_id", MongoAlertConfigurationCodec.key(scope, identity.id()))
                 .append("incarnation", identity.incarnation()).append("recordRevision", expected.header().revision())
                 .append("writeFence", original);

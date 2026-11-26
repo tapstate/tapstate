@@ -1,17 +1,133 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.MongoException;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.FindIterable;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.result.UpdateResult;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class MongoPipelineDraftStoreTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void boundsPersistentUnknownCommitResults(boolean changeDefinition) {
+        var attempt = commitAttempt(changeDefinition);
+        var unknown = unknownCommit();
+        doThrow(unknown, unknown, unknown, new AssertionError("Unexpected fourth commit"))
+                .when(attempt.session()).commitTransaction();
+
+        assertThatThrownBy(() -> attempt.write().get())
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(IoError.PIPELINE_COMMIT_OUTCOME_UNKNOWN);
+                    assertThat(failure.args()).containsEntry("pipeline", "orders");
+                });
+        verify(attempt.session(), times(3)).commitTransaction();
+        verify(attempt.session(), never()).abortTransaction();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retriesAnUnconfirmedCommitWithinTheSameTransaction(boolean changeDefinition) {
+        var attempt = commitAttempt(changeDefinition);
+        doThrow(unknownCommit()).doNothing().when(attempt.session()).commitTransaction();
+
+        assertThat(attempt.write().get()).isEqualTo(attempt.success());
+        verify(attempt.session()).startTransaction();
+        verify(attempt.session(), times(2)).commitTransaction();
+        verify(attempt.session(), never()).abortTransaction();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void confirmedCommitFailureIsAbortedWithoutRetry(boolean changeDefinition) {
+        var attempt = commitAttempt(changeDefinition);
+        var failure = new MongoException("Commit failed");
+        var cleanupFailure = new MongoException("Abort failed");
+        doThrow(failure).when(attempt.session()).commitTransaction();
+        doThrow(cleanupFailure).when(attempt.session()).abortTransaction();
+
+        assertThatThrownBy(() -> attempt.write().get())
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+        assertThat(failure.getSuppressed()).containsExactly(cleanupFailure);
+        verify(attempt.session()).commitTransaction();
+        verify(attempt.session()).abortTransaction();
+    }
+
+    private record CommitAttempt(ClientSession session, Supplier<PipelineDraftMutation> write,
+                                 PipelineDraftMutation success) {}
+
+    private static MongoException unknownCommit() {
+        var error = new MongoException("Commit result unavailable");
+        error.addLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL);
+        return error;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static CommitAttempt commitAttempt(boolean changeDefinition) {
+        MongoClient client = mock(MongoClient.class);
+        ClientSession session = mock(ClientSession.class);
+        MongoCollection<Document> drafts = mock(MongoCollection.class);
+        MongoCollection<Document> artifacts = mock(MongoCollection.class);
+        FindIterable<Document> draftQuery = mock(FindIterable.class);
+        FindIterable<Document> artifactQuery = mock(FindIterable.class, RETURNS_SELF);
+        when(client.startSession()).thenReturn(session);
+
+        PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
+                "Orders", "", new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)),
+                null, null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        when(drafts.find(eq(session), any(Document.class))).thenReturn(draftQuery);
+        when(draftQuery.first()).thenReturn(MongoPipelineDraftStore.toDocument(draft));
+        when(artifacts.find(eq(session), any(Document.class))).thenReturn(artifactQuery);
+        when(artifactQuery.first()).thenReturn(new Document("kind", "pipeline").append("contentHash", "before"));
+        when(artifacts.replaceOne(eq(session), any(Document.class), any(Document.class)))
+                .thenReturn(UpdateResult.acknowledged(1, 1L, null));
+        when(drafts.replaceOne(eq(session), any(Document.class), any(Document.class)))
+                .thenReturn(UpdateResult.acknowledged(1, 1L, null));
+
+        var artifact = new PipelineResource("orders", null, List.of(SourceRef.bare("crm")), List.of(),
+                null, null, null, Map.of());
+        var store = new MongoPipelineDraftStore(client, drafts, artifacts);
+        String hash = CanonicalHash.of(artifact);
+        if (changeDefinition) {
+            var change = new PipelineDraft.DefinitionChange("orders", "before", artifact, hash,
+                    Map.of(), current -> current);
+            return new CommitAttempt(session, () -> store.changeDefinition(change), PipelineDraftMutation.REPLACED);
+        }
+        var publication = new PipelineDraft.Publication("orders", 1, "before", artifact, hash,
+                Instant.EPOCH, "publisher");
+        return new CommitAttempt(session, () -> store.publish(publication), PipelineDraftMutation.PUBLISHED);
+    }
 
     @Test
     void roundTripsTheVersionedDraftShapeWithoutCollapsingModePayloads() {

@@ -1,7 +1,5 @@
 package io.tapstate.adapters.mongostore;
 
-import com.mongodb.client.ListCollectionsIterable;
-import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CheckpointDoc;
@@ -20,9 +18,7 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,39 +28,47 @@ import static org.mockito.Mockito.*;
 
 class MongoObservationStructureProofTest {
     @Test void anInvalidatedCollationAuditCannotOverwriteTheCurrentVerdict() throws Exception {
-        var database = mock(MongoDatabase.class);
-        var collections = mock(ListCollectionsIterable.class, RETURNS_SELF);
-        when(database.listCollections()).thenReturn(collections);
+        var database = mock(MongoDatabase.class, RETURNS_DEEP_STUBS);
+        when(database.getName()).thenReturn("cache");
         var oldMetadataRead = new CountDownLatch(1);
         var finishOldAudit = new CountDownLatch(1);
-        var audits = new AtomicInteger();
-        when(collections.iterator()).thenAnswer(call -> {
-            var row = new Document("name", "cache_identity");
-            if (audits.incrementAndGet() == 1) {
-                oldMetadataRead.countDown();
-                assertThat(finishOldAudit.await(5, TimeUnit.SECONDS)).isTrue();
-            } else {
-                row.append("options", new Document("collation", new Document("locale", "en")));
-            }
-            return cursor(row);
-        });
-
-        var proof = new MongoStructureProof();
-        try (var domain = domain(database, proof); var worker = Executors.newSingleThreadExecutor()) {
+        try (var domain = domain(database, new MongoStructureProof()); var worker = Executors.newSingleThreadExecutor()) {
             var readiness = MongoCacheDomain.class.getDeclaredMethod("canBatchSrsControlReadiness");
             readiness.setAccessible(true);
-            var old = worker.submit(() -> (boolean) readiness.invoke(domain));
+            var old = worker.submit(() -> {
+                inspect(domain, database, () -> {
+                    oldMetadataRead.countDown();
+                    try { assertThat(finishOldAudit.await(5, TimeUnit.SECONDS)).isTrue(); }
+                    catch (InterruptedException interrupted) { throw new AssertionError(interrupted); }
+                    return java.util.List.of();
+                });
+                return (boolean) readiness.invoke(domain);
+            });
             try {
-                assertThat(oldMetadataRead.await(3, TimeUnit.SECONDS)).isTrue();
-                proof.clear();
+                assertThat(oldMetadataRead.await(5, TimeUnit.SECONDS)).isTrue();
+                inspect(domain, database, () -> java.util.List.of(customCollation()));
                 assertThat((boolean) readiness.invoke(domain)).isFalse();
                 finishOldAudit.countDown();
                 assertThat(old.get(3, TimeUnit.SECONDS)).isFalse();
                 assertThat((boolean) readiness.invoke(domain)).isFalse();
-                assertThat(audits).hasValue(2);
-            } finally {
-                finishOldAudit.countDown();
-            }
+            } finally { finishOldAudit.countDown(); }
+        }
+    }
+
+    private static MongoStructureInspection.Difference customCollation() {
+        return new MongoStructureInspection.Difference(SystemCollections.Database.CACHE, "cache", "cache_identity", null,
+                MongoStructureInspection.Problem.COLLECTION_OPTIONS, "ordinary", "custom collation", null);
+    }
+
+    private static void inspect(MongoCacheDomain domain, MongoDatabase database,
+            java.util.function.Supplier<java.util.List<MongoStructureInspection.Difference>> result) {
+        var budget = mock(MongoReadBudget.class);
+        when(budget.database(database)).thenReturn(database);
+        try (var inspection = mockStatic(MongoStructureInspection.class)) {
+            inspection.when(() -> MongoStructureInspection.inspect(eq(database), anyList(), eq(budget)))
+                    .thenAnswer(ignored -> result.get());
+            domain.inspectStructure(new io.tapstate.spi.store.CacheAuthScope("cluster", 1,
+                    io.tapstate.spi.store.StorageBinding.Mode.OP, "cache", 1), budget);
         }
     }
 
@@ -92,6 +96,8 @@ class MongoObservationStructureProofTest {
                  when(writer.updateExisting(failedObservation, 1)).thenThrow(unavailable);
              })) {
             topology.when(() -> MongoReadBudget.supportsSnapshotReads(any())).thenReturn(true);
+            assertThat(domain.readObservation(scope, original, Map.of(), () -> {})).isEmpty();
+            inspect(domain, database, java.util.List::of);
             var old = domain.readObservation(scope, original, Map.of(), () -> {}).orElseThrow();
             assertThat(old.facts()).isEqualTo(facts);
             now.set(TimeUnit.SECONDS.toNanos(10) + 1);
@@ -115,8 +121,7 @@ class MongoObservationStructureProofTest {
 
     @Test void aNonSimpleCollationKeepsObservationReadsOnTheOrdinaryPath() throws Exception {
         var database = mock(MongoDatabase.class, RETURNS_DEEP_STUBS);
-        when(database.listCollections().iterator()).thenAnswer(ignored -> cursor(new Document("name", "cache_identity")
-                .append("options", new Document("collation", new Document("locale", "en")))));
+        when(database.getName()).thenReturn("cache");
         var scope = new PipelineIntentScope("cluster", 1, "cache", "flow", 1);
         var original = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "flow"),
                 new WorkloadOwner("node", "boot"), 1, 1, 1);
@@ -127,16 +132,10 @@ class MongoObservationStructureProofTest {
              var readers = mockConstruction(MongoPipelineObservationRead.class)) {
             topology.when(() -> MongoReadBudget.supportsSnapshotReads(any())).thenReturn(true);
             assertThat(domain.readObservation(scope, original, Map.of(), () -> {})).isEmpty();
+            inspect(domain, database, () -> java.util.List.of(customCollation()));
+            assertThat(domain.readObservation(scope, original, Map.of(), () -> {})).isEmpty();
             assertThat(readers.constructed()).isEmpty();
         }
-    }
-
-    @SuppressWarnings("unchecked")
-    private static MongoCursor<Document> cursor(Document row) {
-        MongoCursor<Document> cursor = mock(MongoCursor.class);
-        when(cursor.hasNext()).thenReturn(true, false);
-        when(cursor.next()).thenReturn(row);
-        return cursor;
     }
 
     private static MongoCacheDomain domain(MongoDatabase database, MongoStructureProof proof) throws Exception {

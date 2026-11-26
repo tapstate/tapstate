@@ -38,6 +38,8 @@ a-large-recompute-finishes-after-the-input-stops on IN_PROCESS
 a-large-recompute-finishes-after-the-input-stops on REAL_PROCESS
 a-mongo-collection-lands-in-the-managed-store on IN_PROCESS
 a-mongo-collection-lands-in-the-managed-store on REAL_PROCESS
+a-moving-customer-leaves-the-other-customer-in-place on IN_PROCESS
+a-moving-customer-leaves-the-other-customer-in-place on REAL_PROCESS
 a-null-joined-column-fails-with-an-expression-code on IN_PROCESS
 a-null-joined-column-fails-with-an-expression-code on REAL_PROCESS
 a-parent-column-change-reaches-the-assembled-document on IN_PROCESS
@@ -126,6 +128,8 @@ an-unwind-index-cannot-overwrite-a-parent-column on IN_PROCESS
 an-unwind-index-cannot-overwrite-a-parent-column on REAL_PROCESS
 an-unwind-element-key-cannot-overwrite-a-parent-column on IN_PROCESS
 an-unwind-element-key-cannot-overwrite-a-parent-column on REAL_PROCESS
+an-upsert-refuses-a-dropped-unwind-locator on IN_PROCESS
+an-upsert-refuses-a-dropped-unwind-locator on REAL_PROCESS
 many-parents-share-flat-children on IN_PROCESS
 many-parents-share-flat-children on REAL_PROCESS
 nest-rollup-fields-snapshot on IN_PROCESS

@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import org.bson.types.Decimal128;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
@@ -127,6 +128,30 @@ class PdkValidationCodecsTest {
         }
         // Floating data remains available to its own declared lane; this is not a global float ban.
         assertThat(selector.select("ratio", 1.25d, new TapNumber().fixed(false)).value()).isEqualTo(1.25d);
+    }
+
+    @Test void bsonDecimalRestoresOnlyTheKnownPlainNarrowing() {
+        var registry = new Registry();
+        registry.registerToTapValue(Decimal128.class, (value, model) -> new TapNumberValue(((Decimal128) value).doubleValue()));
+        var mongo = new PdkValidationCodecs("mongodb-atlas", "binding-v1", registry, true);
+        var unproven = codecs(registry);
+        var expected = new BigDecimal("1234567890.123456789012345678901234");
+        var nativeValue = new Decimal128(expected);
+        var model = new TapNumber().scale(1000);
+
+        assertThat(mongo.exactNumber("amount", mongo.select("amount", nativeValue, model))).isEqualTo(expected);
+        assertThatThrownBy(() -> mongo.exactNumber("amount", mongo.select("amount", nativeValue, null)))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ValidationError.CODEC_VALUE_UNAVAILABLE));
+        assertThatThrownBy(() -> unproven.exactNumber("amount", unproven.select("amount", nativeValue, model)))
+                .isInstanceOf(TapstateException.class);
+        for (var special : List.of(Decimal128.NaN, Decimal128.POSITIVE_INFINITY, Decimal128.NEGATIVE_ZERO)) {
+            assertThatThrownBy(() -> mongo.exactNumber("amount", mongo.select("amount", special, model)))
+                    .isInstanceOf(TapstateException.class);
+        }
+        registry.registerToTapValue(Decimal128.class, (value, type) -> new TapNumberValue(1d));
+        assertThatThrownBy(() -> mongo.exactNumber("amount", mongo.select("amount", nativeValue, model)))
+                .isInstanceOf(TapstateException.class);
     }
 
     @Test void exactCustomPayloadIsUsedAsReturnedAndWrapperFailureKeepsItsCause() {

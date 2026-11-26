@@ -89,7 +89,7 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
         try {
             List<TapTable> tables = drive(connector);
-            return entered(config.id(), toSourceModel(tables, countRows?counts(connector,tables):Map.of()));
+            return entered(config.id(), toSourceModel(tables, countRows?counts(connector,tables):Map.of(), null));
         } finally {
             connector.stopQuietly();
             connector.close();
@@ -201,7 +201,9 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
     }
 
     /** Normalizes the actual open session's metadata without launching a separate discovery or count. */
-    static SourceModel structuralModel(List<TapTable> tables) { return toSourceModel(tables, Map.of()); }
+    static SourceModel structuralModel(List<TapTable> tables) {
+        return toSourceModel(tables, Map.of(), null);
+    }
 
     /**
      * The same metadata as a source's tables are known once they have entered: a column carrying the
@@ -211,7 +213,7 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
      * talks to a connector on either side of a pipeline.
      */
     static SourceModel enteredModel(String source, List<TapTable> tables) {
-        return entered(source, toSourceModel(tables, Map.of()));
+        return entered(source, toSourceModel(tables, Map.of(), null));
     }
 
     private static SourceModel entered(String source, SourceModel model) {
@@ -222,11 +224,16 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
         return new SourceModel(tables);
     }
 
-    private static SourceModel toSourceModel(List<TapTable> tables, Map<TapTable, Long> counts) {
+    /** Validation interprets native types without changing the model retained by capture. */
+    static SourceModel validationModel(List<TapTable> tables, String connectorClass) {
+        return toSourceModel(tables, Map.of(), connectorClass);
+    }
+
+    private static SourceModel toSourceModel(List<TapTable> tables, Map<TapTable, Long> counts, String connectorClass) {
         List<SourceTable> mapped = new ArrayList<>(tables.size());
         for (TapTable table : tables) {
             mapped.add(new SourceTable(
-                    table.getId(), fields(table), primaryKey(table), indexes(table), counts.get(table)));
+                    table.getId(), fields(table, connectorClass), primaryKey(table), indexes(table), counts.get(table)));
         }
         return new SourceModel(mapped);
     }
@@ -236,16 +243,16 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
      * nothing did - the mapping's own attribution rather than a restatement of it. This is the point at
      * which the connector is still open, and afterwards nobody can tell the several unknowns apart.
      */
-    private static SourceField field(String name, String dataType, TapType declared) {
-        PdkTypeMapping.Resolved resolved = PdkTypeMapping.resolve(declared);
+    private static SourceField field(String name, String dataType, TapType declared, String connectorClass) {
+        PdkTypeMapping.Resolved resolved = PdkTypeMapping.resolve(declared, dataType, connectorClass);
         return new SourceField(name, dataType, resolved.type(), resolved.unknownBecause(), PdkTypeMapping.numericType(declared), PdkTypeMapping.stringType(declared));
     }
 
-    private static List<SourceField> fields(TapTable table) {
+    private static List<SourceField> fields(TapTable table, String connectorClass) {
         List<SourceField> fields = new ArrayList<>();
         if (table.getNameFieldMap() != null) {
             table.getNameFieldMap().forEach((name, field) ->
-                    fields.add(field(name, field.getDataType(), field.getTapType())));
+                    fields.add(field(name, field.getDataType(), field.getTapType(), connectorClass)));
         }
         return fields;
     }

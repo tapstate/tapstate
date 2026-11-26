@@ -5,7 +5,7 @@ import java.util.Map;
 
 /** Reports whether a failed renewal can be retried or must be read back first. */
 public final class WorkloadClaimRenewalException extends TapstateException {
-    public enum Reason { WRITE_CONFLICT, UNCONFIRMED }
+    public enum Reason { WRITE_CONFLICT, UNCONFIRMED, NOT_STARTED }
 
     private final Reason reason;
 

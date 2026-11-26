@@ -12,7 +12,7 @@ class StoreDiagnosticContractTest {
     @Test void remainingDefinitionsKeepParametersSeverityAndHistoricalRecovery() {
         var codes = new ArrayList<TapstateErrorCode>();
         codes.addAll(List.of(StoreError.values()));
-        assertThat(codes).hasSize(18);
+        assertThat(codes).hasSize(20);
         var catalog = MessageCatalog.bundled();
         for (var code : codes) {
             String legacy = "store." + ((Enum<?>) code).name().toLowerCase(Locale.ROOT).replace('_', '-');

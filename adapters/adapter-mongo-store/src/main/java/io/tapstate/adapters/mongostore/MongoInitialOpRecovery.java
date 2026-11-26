@@ -24,8 +24,9 @@ final class MongoInitialOpRecovery {
     static SourceResource require(MongoClient client, ClientSession session, MongoDatabase database,
             MongoStorageBindingStore bindings, MongoConfigurationArtifactStore artifacts, CacheAuthScope scope, boolean allowCompleted) {
         if (scope.mode() != StorageBinding.Mode.OP || scope.authGeneration() != 1) throw MongoCachePipelineAccess.fenced();
-        var binding = bindings.loadForTransaction(session).orElseThrow(MongoCachePipelineAccess::fenced);
-        if (binding.mode() != StorageBinding.Mode.OP || !bindings.cachePreparationForTransaction(session).orElseThrow(MongoCachePipelineAccess::fenced).authScope().equals(scope))
+        var original = bindings.readForStorageLifecycle(session).loaded().orElseThrow(MongoCachePipelineAccess::fenced);
+        var binding = original.binding();
+        if (binding.mode() != StorageBinding.Mode.OP || !original.cachePreparation().authScope().equals(scope))
             throw MongoCachePipelineAccess.fenced();
         var setup = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();
         if (setup == null || SystemCollections.CONFIG_TOKENS.on(database).find(session).limit(1).first() != null) throw MongoCachePipelineAccess.fenced();

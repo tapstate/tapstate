@@ -1079,10 +1079,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         public Collection<? extends Processor> get(int count) {
             // A gauge per processor, not one shared: the handles it keeps belong to the sink that took the
             // reading, and a shared one would have each sink's readings land under the other's.
-            var next=new java.util.concurrent.atomic.AtomicInteger();
             IndexedSinkWriterFactory.Opening opening = writerFactory instanceof IndexedSinkWriterFactory indexed
                     ? indexed.opening() : (member, local) -> writerFactory.get();
-            return openedTogether(count, () -> new SinkProcessor(opening.open(totalOne?0:memberIndex,next.getAndIncrement()), sinkAck, frontierFactory.get(),
+            return openedTogether(count, opening, totalOne ? 0 : memberIndex,
+                    writer -> new SinkProcessor(writer, sinkAck, frontierFactory.get(),
                     DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
                     new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
                     edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime)
@@ -1106,22 +1106,38 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         return ServedRows.over(writer, deliver);
     }
 
-    private static List<Processor> openedTogether(int count, SupplierEx<SinkProcessor> processor) {
+    private static List<Processor> openedTogether(int count, IndexedSinkWriterFactory.Opening opening, int member,
+            java.util.function.Function<SinkWriter, SinkProcessor> processor) {
         List<Processor> processors = new ArrayList<>(count);
+        var remaining = new ArrayDeque<SinkWriter>();
         try {
-            for (int i = 0; i < count; i++) {
-                processors.add(processor.get());
+            if (count == 0) return processors;
+            processors.add(processor(opening.open(member, 0), processor));
+            if (count == 1) return processors;
+            int parallelism = Math.min(2, Math.max(1, opening.maximumConcurrentRemainingOpens()));
+            if (parallelism == 1) {
+                for (int i = 1; i < count; i++) processors.add(processor(opening.open(member, i), processor));
+            } else {
+                remaining.addAll(ParallelSinkOpenings.open(1, count - 1, Math.min(parallelism, count - 1),
+                        index -> opening.open(member, index)));
+                while (!remaining.isEmpty()) processors.add(processor(remaining.removeFirst(), processor));
             }
         } catch (Throwable failure) {
             for (Processor opened : processors) {
-                try {
-                    opened.close();
-                } catch (Exception closing) {
-                    failure.addSuppressed(closing);
-                }
+                try { opened.close(); } catch (Throwable closing) { if (closing != failure) failure.addSuppressed(closing); }
             }
-            throw failure;
+            for (var writer : remaining) ParallelSinkOpenings.close(writer, failure);
+            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+            if (failure instanceof Exception exception) throw com.hazelcast.internal.util.ExceptionUtil.sneakyThrow(exception);
+            if (failure instanceof Error error) throw error;
+            throw new IllegalStateException("unexpected processor construction failure", failure);
         }
         return processors;
+    }
+
+    private static SinkProcessor processor(SinkWriter writer,
+            java.util.function.Function<SinkWriter, SinkProcessor> factory) {
+        try { return factory.apply(writer); }
+        catch (Throwable failure) { ParallelSinkOpenings.close(writer, failure); throw failure; }
     }
 }

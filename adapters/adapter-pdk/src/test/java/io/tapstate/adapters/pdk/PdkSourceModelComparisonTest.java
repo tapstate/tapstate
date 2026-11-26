@@ -7,6 +7,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class PdkSourceModelComparisonTest {
     @Test void anIdOrTypeSpellingCannotGrantTheDocumentPolicy() {
+        var atlas = artifact(PdkBsonDecimal.ATLAS, "b".repeat(64));
+        assertThat(PdkSourceModelComparison.forVerifiedArtifact("mongodb-atlas", atlas)).isEqualTo(SourceModelComparison.SAMPLED_DOCUMENT);
+        assertThat(PdkSourceModelComparison.forVerifiedArtifact("mongodb", atlas)).isEqualTo(SourceModelComparison.DECLARED_STRUCTURE);
         var known = artifact("io.tapdata.mongodb.MongodbConnector", "a".repeat(64));
         assertThat(PdkSourceModelComparison.forVerifiedArtifact("mongodb", known)).isEqualTo(SourceModelComparison.SAMPLED_DOCUMENT);
         assertThat(PdkSourceModelComparison.forVerifiedArtifact("postgres", known)).isEqualTo(SourceModelComparison.DECLARED_STRUCTURE);

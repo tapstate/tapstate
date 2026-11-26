@@ -35,6 +35,8 @@ class NativeSrsRetentionTest {
     @Test void aConsumerDetachedAfterTheTopologyReadDoesNotFailOtherReaders() {
         var scope=new CacheBusinessScope("cluster",1,"cache");var chains=mock(SrsChainStore.class);
         var models=mock(SrsModelStore.class);var log=mock(SrsLogStore.class);var consumers=mock(SrsConsumerStore.class);
+        when(consumers.retentionSnapshot(anyString(),any(SrsChainStore.class))).thenCallRealMethod();
+        when(consumers.retentionFloors(anyString(),any(SrsChainStore.class))).thenCallRealMethod();
         when(chains.guardedBy(any())).thenReturn(chains);when(models.guardedBy(any())).thenReturn(models);when(consumers.guardedBy(any())).thenReturn(consumers);
         var owner=new WorkloadOwner("node","boot");
         var capture=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),owner,1,1,1);
@@ -52,5 +54,6 @@ class NativeSrsRetentionTest {
             assertThatCode(() -> runtime.retain(scope,"chain",capture,() -> {})).doesNotThrowAnyException();
         }
         verify(log,never()).trim(anyString(),anyLong(),any());verify(models,never()).reclaim(anyString(),any());
+        verify(consumers).progress(members.getFirst().context());
     }
 }

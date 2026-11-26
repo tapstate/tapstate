@@ -128,7 +128,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                         var filter = new Document("_id", MongoWorkloadClaimStore.id(request.originalClaim().key()));
                         Document row = claims.find(session, filter).first();
                         if (row == null) throw rebuild(old);
-                        WorkloadClaim claim = new MongoWorkloadClaimStore(claims).inStrictSession(session).decodeStored(row);
+                        var claimWriter = new MongoWorkloadClaimStore(claims).inStrictSession(session);
+                        WorkloadClaim claim = claimWriter.decodeStored(row);
                         var scope = storedScope(row, old);
                         if (scope.equals(target)) {
                             var receipt = retained(session, original, row, claim);
@@ -159,12 +160,12 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                                 .append("pipelinePreparation", row.get("pipelinePreparation"));
                         for (String field : List.of("ownerNodeId", "ownerBootId", "claimGeneration", "executionGeneration", "topologyRevision")) expected.append(field, row.get(field));
                         var values = new Document("ownerNodeId", nextClaim.owner().nodeId()).append("ownerBootId", nextClaim.owner().bootId())
-                                .append("claimGeneration", nextClaim.claimGeneration()).append("leaseUntil", java.util.Date.from(now.toInstant().plusMillis(ttl.toMillis())))
+                                .append("claimGeneration", nextClaim.claimGeneration())
                                 .append("pipelineScope", MongoPipelinePreparationFacts.scope(target))
                                 .append("pipelinePreparation", MongoCachePipelinePreparations.marker(original.preparationId(), PipelineCachePreparations.Phase.PREPARED))
                                 .append("pipelineSources", MongoPipelineSourcePreparations.encode(request.inputs()))
                                 .append("sinkPreparations",MongoSinkPreparationStore.initial(original.preparationId())).append("pipelineRebuild", marker(receipt));
-                        if (claims.updateOne(session, expected, new Document("$set", values)).getMatchedCount() != 1) throw fenced();
+                        if (!claimWriter.issuePipelineLease(expected, values, now, ttl)) throw fenced();
                         var checkpoint = new Document("scope", MongoPipelinePreparationFacts.scope(target))
                                 .append("stateJson", StateJson.of(PipelineState.STOPPED)).append("epoch", epoch)
                                 .append("runtimeWriteFence", writeFence).append("touchMillis", touchTime.toEpochMilli());
