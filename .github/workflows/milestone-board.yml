@@ -29,6 +29,9 @@ jobs:
           app-id: ${{ secrets.CATALOG_BOT_APP_ID }}
           private-key: ${{ secrets.CATALOG_BOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          repositories: tapstate
+          permission-issues: read
+          permission-organization-projects: write
       - name: Update milestone project
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}

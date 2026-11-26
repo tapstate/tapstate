@@ -106,8 +106,7 @@ ensure_view() {
         return
         ;;
       *)
-        note "multiple views match the previous milestone '$previous'; leaving them for a maintainer"
-        return
+        note "multiple views match the previous milestone '$previous'; preserving them"
         ;;
     esac
   fi

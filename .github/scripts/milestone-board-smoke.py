@@ -138,6 +138,8 @@ def run():
     workflow = (ROOT.parent / "workflows/milestone-board.yml").read_text()
     assert "group: tapstate-milestone-board-8" in workflow and "queue: max" in workflow
     assert "types: [created, edited, opened, closed, deleted]" in workflow
+    for scope in ("repositories: tapstate", "permission-issues: read", "permission-organization-projects: write"):
+        assert f"          {scope}\n" in workflow
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
         mock = directory / "gh"
@@ -247,6 +249,20 @@ def run():
                                  env=dict(env, MOCK_GH_FAIL_MILESTONES="1"),
                                  capture_output=True, text=True, check=False)
         assert failure.returncode != 0 and "cannot list milestones" in failure.stderr
+        views_before = state["views"] + [
+            {"id": "VIEW-21", "name": "Original custom title", "layout": "BOARD_LAYOUT",
+             "filter": 'milestone:"Previous milestone" is:issue'},
+            {"id": "VIEW-22", "name": "Another custom title", "layout": "BOARD_LAYOUT",
+             "filter": 'repo:tapstate/tapstate milestone:"Previous milestone"'},
+        ]
+        state["views"] = views_before
+        state_file.write_text(json.dumps(state))
+        rename = {"action": "edited", "milestone": {"number": 11, "state": "open", "title": "Current milestone"},
+                  "changes": {"title": {"from": "Previous milestone"}}}
+        state = invoke("milestone", rename)
+        assert state["views"][:-1] == views_before, "ambiguity must preserve the existing views"
+        assert state["views"][-1]["filter"] == 'repo:tapstate/tapstate milestone:"Current milestone"'
+        assert invoke("milestone", rename)["views"] == state["views"], "replay must reuse the new view"
         print("milestone board smoke: PASS")
 
 
