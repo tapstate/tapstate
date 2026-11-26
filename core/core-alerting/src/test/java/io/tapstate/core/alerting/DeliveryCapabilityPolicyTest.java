@@ -106,6 +106,18 @@ class DeliveryCapabilityPolicyTest {
         assertThat(policy.assess(SCOPE, sdk, false, Deployment.CLOUD_MANAGED, START).disposition()).isEqualTo(Disposition.COMPATIBLE);
     }
 
+    @Test void cloudEmailAcceptsItsBuiltinEnvelopeOnlyInCloudDeployment() {
+        var policy = new DeliveryCapabilityPolicy(List.of(CLOUD_EMAIL), List.of(CLOUD_EMAIL));
+        var registered = new Header(2, SCOPE, "email-delivery", CLOUD_EMAIL.typeId(), CLOUD_EMAIL.version(), DEADLINE);
+        assertThat(policy.assess(SCOPE, registered, false, Deployment.CLOUD_MANAGED, START))
+                .isEqualTo(new Decision(Disposition.COMPATIBLE, Reason.SUPPORTED));
+        assertThat(policy.assess(SCOPE, registered, false, Deployment.ON_PREM, START))
+                .isEqualTo(new Decision(Disposition.STOPPED, Reason.CHANNEL_NOT_PERMITTED));
+        var extension = new Header(3, SCOPE, "email-delivery", CLOUD_EMAIL.typeId(), CLOUD_EMAIL.version(), DEADLINE);
+        assertThat(policy.assess(SCOPE, extension, false, Deployment.CLOUD_MANAGED, START))
+                .isEqualTo(new Decision(Disposition.ISOLATED, Reason.UNSUPPORTED_RECORD_VERSION));
+    }
+
     @Test void boundedStaticRegistrationRejectsDuplicatesAndInconsistentAvailableCapabilities() {
         assertThatThrownBy(() -> new DeliveryCapabilityPolicy(List.of(WEBHOOK, WEBHOOK), List.of()))
                 .isInstanceOf(TapstateException.class);

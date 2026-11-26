@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tapstate.cloud.sdk.ApiClient;
 import io.tapstate.cloud.sdk.ApiException;
 import io.tapstate.cloud.sdk.api.C2ClusterEventsApi;
+import io.tapstate.cloud.sdk.api.C2ClusterNotificationsApi;
 import io.tapstate.cloud.sdk.model.ClusterEventRequest;
+import io.tapstate.cloud.sdk.model.NotificationSendRequest;
 import io.tapstate.core.alerting.AlertChannelPolicy;
 import io.tapstate.core.alerting.DeliveryEvidence.Outcome;
 import io.tapstate.spi.alerting.NotificationChannel;
@@ -36,9 +38,11 @@ import org.apache.hc.core5.io.CloseMode;
 
 /** Single-attempt SDK adapter. Durable admission, deduplication and DNS refresh belong to the host. */
 final class CloudAlertSdkChannel implements NotificationChannel {
-    private static final AlertChannelPolicy.Capability CAPABILITY = new AlertChannelPolicy.Capability("cloud-sdk", 2, AlertChannelPolicy.Family.CLOUD_SDK);
+    private static final String OBJECT_ID_PATTERN = "[a-fA-F0-9]{24}";
+    private static final String EVENT_PAYLOAD = "eventPayload";
     private static final ObjectMapper JSON = new ObjectMapper();
     private final Destination binding;
+    private final AlertChannelPolicy.Capability capability;
     private final URI origin;
     private final String token;
     private final String expectedOrg;
@@ -59,37 +63,33 @@ final class CloudAlertSdkChannel implements NotificationChannel {
     }
     CloudAlertSdkChannel(AlertChannelPolicy.Deployment deployment, Destination binding, URI origin, String token,
             String expectedOrg, InetAddress[] trustedAddresses, SSLContext ssl, Clock clock, Duration timeout, boolean localFixture) {
-        AlertChannelPolicy.requireDeliverable(deployment, CAPABILITY);
         this.binding = Objects.requireNonNull(binding); this.origin = Objects.requireNonNull(origin);
+        this.capability = switch (binding.channelType()) {
+            case "cloud-sdk" -> AlertChannelPolicy.CLOUD_EVENTS;
+            case "cloud-sdk-email" -> AlertChannelPolicy.CLOUD_EMAIL;
+            default -> throw CloudAlertEventWire.invalid("sdkBinding");
+        };
+        AlertChannelPolicy.requireDeliverable(deployment, capability);
         this.ssl = Objects.requireNonNull(ssl); this.clock = Objects.requireNonNull(clock);
-        if (!binding.channelType().equals("cloud-sdk") || !binding.scope().clusterId().matches("[a-fA-F0-9]{24}")
+        if (!binding.scope().clusterId().matches(OBJECT_ID_PATTERN)
                 || origin.getHost() == null || origin.getRawUserInfo() != null || origin.getRawQuery() != null || origin.getRawFragment() != null
                 || !(origin.getPath().isEmpty() || origin.getPath().equals("/"))
                 || !("https".equalsIgnoreCase(origin.getScheme()) || (localFixture && "http".equalsIgnoreCase(origin.getScheme()) && origin.getHost().equals("127.0.0.1")))
                 || token == null || token.isBlank() || token.length() > 4096 || token.codePoints().anyMatch(Character::isISOControl)
                 || trustedAddresses == null || trustedAddresses.length == 0 || trustedAddresses.length > 8
                 || timeout == null || timeout.isZero() || timeout.isNegative() || timeout.compareTo(Duration.ofSeconds(30)) > 0
-                || (expectedOrg != null && (!expectedOrg.matches("[a-fA-F0-9]{24}")))) { throw CloudAlertEventWire.invalid("sdkBinding"); }
+                || (expectedOrg != null && (!expectedOrg.matches(OBJECT_ID_PATTERN)))) { throw CloudAlertEventWire.invalid("sdkBinding"); }
         this.token = token; this.expectedOrg = expectedOrg; this.addresses = trustedAddresses.clone();
         for (InetAddress address : addresses) { Objects.requireNonNull(address); }
         this.totalTimeout = timeout;
         deadlines.setRemoveOnCancelPolicy(true);
     }
-    @Override public AlertChannelPolicy.Capability capability() { return CAPABILITY; }
+    @Override public AlertChannelPolicy.Capability capability() { return capability; }
     @Override public Result send(Request request) throws InterruptedException {
         if (Thread.currentThread().isInterrupted()) { throw new InterruptedException(); }
         if (!binding.equals(request.destination()) || request.purpose() != Purpose.BUSINESS || !request.contentType().equals("application/json")
                 || request.payload().length > CloudAlertEventWire.MAX_BYTES) { throw CloudAlertEventWire.invalid("frozenRequest"); }
-        final ClusterEventRequest event;
-        try {
-            var tree = JSON.readTree(request.payload());
-            if (!tree.isObject() || tree.size() != 6 || !tree.path("type").asText().startsWith("cluster.alert.")
-                    || !tree.path("dedupeKey").asText().matches("[a-f0-9]{64}") || !tree.path("subject").isTextual()
-                    || !tree.path("occurredAt").isTextual() || !tree.path("payload").isObject()
-                    || tree.path("payload").path("wireVersion").asInt(-1) != CloudAlertEventWire.VERSION) { throw CloudAlertEventWire.invalid("eventPayload"); }
-            event = JSON.treeToValue(tree, ClusterEventRequest.class);
-            if (event.getSeverity() == null || event.getOccurredAt() == null) { throw CloudAlertEventWire.invalid("eventPayload"); }
-        } catch (IOException bad) { throw CloudAlertEventWire.invalid("eventPayload"); }
+        var payload = decodePayload(request.payload());
         Duration remaining = Duration.between(clock.instant(), request.deadline());
         if (remaining.isNegative() || remaining.isZero()) { return result(Outcome.NOT_ACCEPTED, Action.STOP, Phase.DEADLINE, 0, null); }
         if (closed.get() || !slots.tryAcquire()) { return result(Outcome.NOT_ACCEPTED, Action.PAUSE, Phase.CAPACITY, 0, null); }
@@ -121,23 +121,12 @@ final class CloudAlertSdkChannel implements NotificationChannel {
             Duration budget = remaining.compareTo(totalTimeout) < 0 ? remaining : totalTimeout;
             timer = deadlines.schedule(() -> { expired.set(true); active.close(CloseMode.IMMEDIATE); }, budget.toNanos(), TimeUnit.NANOSECONDS);
             interrupt = deadlines.scheduleAtFixedRate(() -> { if (caller.isInterrupted()) { active.close(CloseMode.IMMEDIATE); } }, 0, 10, TimeUnit.MILLISECONDS);
-            long started = System.nanoTime();
             long millis = Math.max(1, budget.toMillis());
             ApiClient client = new BoundedApiClient(http).setBasePath(origin.toString().replaceAll("/$", ""))
                     .setConnectTimeout((int)Math.min(5000, millis)).setReadTimeout((int)Math.min(10000, millis));
-            var response = new C2ClusterEventsApi(client).ingestClusterEvent(binding.scope().clusterId(), event, "Bearer " + token);
+            var outcome = dispatch(client, payload);
             if (Thread.currentThread().isInterrupted()) { throw new InterruptedException(); }
-            var data = response == null ? null : response.getData();
-            if (response == null || !"ok".equals(response.getCode()) || data == null
-                    || !identifier(data.getId()) || !identifier(data.getOrgId()) || (expectedOrg != null && !expectedOrg.equals(data.getOrgId()))
-                    || !"cluster".equals(data.getSource()) || !event.getType().equals(data.getType()) || !event.getDedupeKey().equals(data.getDedupeKey())
-                    || !Integer.valueOf(1).equals(data.getSchemaVersion()) || data.getPayload() == null
-                    || !binding.scope().clusterId().equals(data.getPayload().get("clusterId"))) { return result(Outcome.UNKNOWN, Action.STOP, Phase.FINAL_RESPONSE, 200, null); }
-            String opId = response.getOpId();
-            if (opId != null && (opId.isBlank() || opId.length() > 256 || opId.codePoints().anyMatch(Character::isISOControl) || !java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(opId))) {
-                return result(Outcome.UNKNOWN, Action.STOP, Phase.FINAL_RESPONSE, 200, null);
-            }
-            return result(Outcome.ACCEPTED, Action.STOP, Phase.FINAL_RESPONSE, 200, new Receipt(data.getId(), opId));
+            return outcome;
         } catch (ApiException failure) {
             if (Thread.currentThread().isInterrupted()) { throw new InterruptedException(); }
             int status = Math.max(0, Math.min(599, failure.getCode()));
@@ -156,9 +145,73 @@ final class CloudAlertSdkChannel implements NotificationChannel {
             slots.release();
         }
     }
-    private static boolean identifier(String value) { return value != null && value.matches("[a-fA-F0-9]{24}"); }
-    private static Result result(Outcome outcome, Action action, Phase phase, int status, Receipt receipt) {
-        return new Result(outcome, action, null, phase, status, "sdk-event-center", receipt);
+
+    private DecodedPayload decodePayload(byte[] payload) {
+        return capability.equals(AlertChannelPolicy.CLOUD_EMAIL)
+                ? new DecodedPayload(null, CloudAlertNotificationWire.decode(payload))
+                : new DecodedPayload(decodeEvent(payload), null);
+    }
+    private Result dispatch(ApiClient client, DecodedPayload payload) throws ApiException {
+        return payload.notification() == null ? ingest(client, payload.event()) : enqueue(client, payload.notification());
+    }
+    private record DecodedPayload(ClusterEventRequest event, NotificationSendRequest notification) { }
+    private static ClusterEventRequest decodeEvent(byte[] payload) {
+        try {
+            var tree = JSON.readTree(payload);
+            if (tree == null || !tree.isObject() || tree.size() != 6 || !tree.path("type").asText().startsWith("cluster.alert.")
+                    || !tree.path("dedupeKey").asText().matches("[a-f0-9]{64}") || !tree.path("subject").isTextual()
+                    || !tree.path("occurredAt").isTextual() || !tree.path("payload").isObject()
+                    || tree.path("payload").path("wireVersion").asInt(-1) != CloudAlertEventWire.VERSION) {
+                throw CloudAlertEventWire.invalid(EVENT_PAYLOAD);
+            }
+            var event = JSON.treeToValue(tree, ClusterEventRequest.class);
+            if (event.getSeverity() == null || event.getOccurredAt() == null) throw CloudAlertEventWire.invalid(EVENT_PAYLOAD);
+            return event;
+        } catch (IOException bad) {
+            throw CloudAlertEventWire.invalid(EVENT_PAYLOAD);
+        }
+    }
+
+    private Result ingest(ApiClient client, ClusterEventRequest event) throws ApiException {
+        var response = new C2ClusterEventsApi(client).ingestClusterEvent(binding.scope().clusterId(), event, "Bearer " + token);
+        var data = response == null ? null : response.getData();
+        if (response == null || !"ok".equals(response.getCode()) || data == null
+                || !"cluster".equals(data.getSource()) || !event.getType().equals(data.getType())
+                || !event.getDedupeKey().equals(data.getDedupeKey()) || !Integer.valueOf(1).equals(data.getSchemaVersion())
+                || data.getPayload() == null || !binding.scope().clusterId().equals(data.getPayload().get("clusterId"))) {
+            return unknownReceipt();
+        }
+        return accepted(data.getId(), data.getOrgId(), response.getOpId());
+    }
+
+    private Result enqueue(ApiClient client, NotificationSendRequest notification) throws ApiException {
+        var response = new C2ClusterNotificationsApi(client).send(binding.scope().clusterId(), notification, "Bearer " + token);
+        var data = response == null ? null : response.getData();
+        if (response == null || !"ok".equals(response.getCode()) || data == null || !"EMAIL".equals(data.getChannel())
+                || data.getRecipient() == null || data.getRecipient().isBlank() || data.getStatus() == null
+                || !Set.of("PENDING", "SENDING", "SENT", "FAILED", "DEAD").contains(data.getStatus())) {
+            return unknownReceipt();
+        }
+        return accepted(data.getId(), data.getOrgId(), response.getOpId());
+    }
+
+    private Result accepted(String id, String org, String opId) {
+        if (!identifier(id) || !identifier(org) || (expectedOrg != null && !expectedOrg.equals(org))
+                || opId != null && (opId.isBlank() || opId.length() > 256 || opId.codePoints().anyMatch(Character::isISOControl)
+                        || !java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(opId))) {
+            return unknownReceipt();
+        }
+        return result(Outcome.ACCEPTED, Action.STOP, Phase.FINAL_RESPONSE, 200, new Receipt(id, opId));
+    }
+
+    private Result unknownReceipt() {
+        return result(Outcome.UNKNOWN, Action.STOP, Phase.FINAL_RESPONSE, 200, null);
+    }
+
+    private static boolean identifier(String value) { return value != null && value.matches(OBJECT_ID_PATTERN); }
+    private Result result(Outcome outcome, Action action, Phase phase, int status, Receipt receipt) {
+        return new Result(outcome, action, null, phase, status,
+                capability.equals(AlertChannelPolicy.CLOUD_EMAIL) ? "sdk-notification" : "sdk-event-center", receipt);
     }
     int activeCalls() { return clients.size(); }
     int pendingDeadlineTasks() { return deadlines.getQueue().size(); }

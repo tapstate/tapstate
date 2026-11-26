@@ -42,7 +42,7 @@ final class AlertChannelRegistry {
     record Registration(AlertChannelCatalog.Descriptor descriptor,Factory factory) {
         Registration { Objects.requireNonNull(descriptor);Objects.requireNonNull(factory);
             if(descriptor.transportFamily()!=AlertChannelCatalog.TransportFamily.HTTPS_JSON||descriptor.capability().version()!=1
-                    ||Set.of("email","webhook","cloud-sdk").contains(descriptor.capability().typeId()))throw new IllegalArgumentException("invalid static HTTPS registration"); }
+                    ||Set.of("email","webhook","cloud-sdk","cloud-sdk-email").contains(descriptor.capability().typeId()))throw new IllegalArgumentException("invalid static HTTPS registration"); }
     }
     private final Map<String,Registration> extensions;
     private final AlertChannelCatalog catalog;

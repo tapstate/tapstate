@@ -21,7 +21,7 @@ import static org.mockito.Mockito.*;
 class CloudInitialAlertRulesIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
-    @Test void aNewCloudConfigurationAlreadyContainsTheEnabledScopedRules() {
+    @Test void aNewCloudConfigurationContainsOnlyTheSupportedEnabledRules() {
         String database = "cloud_initial_alerts_" + UUID.randomUUID().toString().replace("-", "");
         var settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(database), null, Duration.ofSeconds(5));
         var properties = new CloudProperties();
@@ -36,7 +36,7 @@ class CloudInitialAlertRulesIT {
         try (var initializer = new CloudConfigurationInitialization(settings, cloud, bridge, BootId.fresh());
                 var configuration = initializer.open(); var observer = MongoClients.create(settings.uri())) {
             var rows = observer.getDatabase(database).getCollection("alert_rules").find().into(new ArrayList<>());
-            assertThat(rows).hasSize(7);
+            assertThat(rows).hasSize(6);
             assertThat(rows).extracting(row -> row.get("body", Document.class).getString("typeId"))
                     .containsExactlyInAnyOrderElementsOf(BuiltinAlarmTypes.catalog().types().stream().map(type -> type.id()).toList());
             for (var row : rows) {
