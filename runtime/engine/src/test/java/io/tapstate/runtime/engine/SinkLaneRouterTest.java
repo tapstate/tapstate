@@ -15,6 +15,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -70,6 +71,33 @@ class SinkLaneRouterTest {
                     .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                             error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
             assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+        }
+    }
+
+    @Test
+    void anExplicitNullUniqueValueStaysOnTheOrdinaryWriter() throws Exception {
+        try (var f = fixture(true, 32)) {
+            var before = new HashMap<String, Object>();
+            before.put("id", 1);
+            before.put("email", null);
+            var after = new HashMap<>(before);
+            after.put("value", 21);
+            var snapshot = Envelope.read(1, "orders", before, null);
+            var update = Envelope.update(2, "orders", before, after, null);
+            f.router.process(0, new TestInbox(List.of(snapshot, update)));
+            assertThat(f.drain(SinkRouter.SPREAD)).containsExactly(snapshot);
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactly(update);
+
+            var unrelated = update(3, 2, "old", 2, "new");
+            f.router.process(0, new TestInbox(List.of(unrelated, update)));
+            assertThat(f.drain(SinkRouter.BY_KEY)).satisfiesExactly(
+                    command -> assertThat(command).isInstanceOf(SinkLaneCommand.Fence.class),
+                    plain -> assertThat(plain).isSameAs(update));
+
+            var incomplete = Envelope.update(4, "orders", Map.of("id", 1), after, null);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(incomplete))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
         }
     }
 

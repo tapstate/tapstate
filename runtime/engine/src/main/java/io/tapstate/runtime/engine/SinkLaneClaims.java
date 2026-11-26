@@ -8,6 +8,7 @@ import io.tapstate.core.event.Op;
 import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -47,8 +48,8 @@ final class SinkLaneClaims implements java.io.Serializable {
             return false;
         }
         for (var column : target.keyColumns()) {
-            if (e.op() != Op.INSERT && !known(e.before(), column)
-                    || e.op() != Op.DELETE && !known(e.after(), column)) throw unsupported(e);
+            if (e.op() != Op.INSERT && !known(e.before(), column, false)
+                    || e.op() != Op.DELETE && !known(e.after(), column, false)) throw unsupported(e);
         }
         if (e.op() == Op.UPDATE && differs(e, target.keyColumns())) return true;
         for (var columns : secondary) {
@@ -56,7 +57,7 @@ final class SinkLaneClaims implements java.io.Serializable {
             if (e.op() != Op.UPDATE || differs(e, columns)) return true;
             // A partial or non-scalar key cannot prove a secondary value was preserved.
             for (String column : columns) {
-                if (!known(e.before(), column) || !known(e.after(), column)) return true;
+                if (!known(e.before(), column, true) || !known(e.after(), column, true)) return true;
             }
         }
         return false;
@@ -77,10 +78,10 @@ final class SinkLaneClaims implements java.io.Serializable {
         var fences = new LinkedHashSet<String>();
         var last = e.op() == Op.DELETE ? e.before() : e.after();
         for (var image : images(e)) {
-            claim(keys, target.keyColumns(), image, e);
+            claim(keys, target.keyColumns(), image, e, false);
             fences.add(RoutingKeys.writerLane(node, target, e, image));
             for (var columns : secondary) {
-                if (!generated(columns, e)) claim(keys, columns, image, e);
+                if (!generated(columns, e)) claim(keys, columns, image, e, !reserved);
             }
         }
         if (e.op() == Op.UPDATE && (hasId(e.before()) || hasId(e.after()))
@@ -100,20 +101,23 @@ final class SinkLaneClaims implements java.io.Serializable {
         };
     }
 
-    private void claim(Set<Key> keys, List<String> columns, Map<String, Object> image, Envelope e) {
+    private void claim(Set<Key> keys, List<String> columns, Map<String, Object> image, Envelope e, boolean allowExplicitNull) {
         var tuple = new ArrayList<>();
         for (var column : columns) {
-            if (!known(image, column)) throw unsupported(e);
+            if (!known(image, column, allowExplicitNull)) throw unsupported(e);
             Object value = ConvertedValue.unwrap(image.get(column));
             tuple.add(value instanceof Number n ? n.longValue() : value);
         }
-        keys.add(new Key(target.table(), columns, List.copyOf(tuple)));
+        keys.add(new Key(target.table(), columns, Collections.unmodifiableList(tuple)));
     }
 
-    private boolean known(Map<String, Object> image, String column) {
+    private boolean known(Map<String, Object> image, String column, boolean allowExplicitNull) {
         if (image == null) return false;
         Object v = ConvertedValue.unwrap(image.get(column));
         var type = constraints.fieldTypes().get(column);
+        // A stable update can preserve an explicit null. Moves still require non-null scalar claims.
+        if (v == null) return allowExplicitNull && !column.equals("_id") && image.containsKey(column)
+                && (type == TapstateType.STRING || type == TapstateType.INT64);
         return type == TapstateType.STRING && v instanceof String || type == TapstateType.INT64
                 && (v instanceof Long || v instanceof Integer || v instanceof Short || v instanceof Byte);
     }
