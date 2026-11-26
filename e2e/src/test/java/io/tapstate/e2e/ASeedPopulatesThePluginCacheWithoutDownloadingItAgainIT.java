@@ -4,13 +4,14 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.AppenderBase;
+import com.mongodb.client.MongoClients;
 import io.tapstate.spi.store.ContentHash;
 import io.tapstate.testsupport.RequiresDocker;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
@@ -70,6 +71,22 @@ class ASeedPopulatesThePluginCacheWithoutDownloadingItAgainIT {
             assertThat(logger.isDebugEnabled()).isTrue();
             assertThat(chunkReads.get()).as("the local seed needs no GridFS chunk reads").isZero();
             assertThat(chunkWrites.get()).as("the local seed needs no GridFS chunk writes").isZero();
+            // Only the control accesses chunks, after the seed path's counters have been checked.
+            try (var mongo = MongoClients.create(storage.cacheUri())) {
+                var controlDatabase = mongo.getDatabase(storage.cacheDatabase() + "_observer");
+                var chunks = controlDatabase.getCollection("connector_artifacts.chunks");
+                var probe = new Document("_id", "observer-probe");
+                try {
+                    chunks.insertOne(probe);
+                    assertThat(chunkWrites.get()).as("the observer detects the control chunk insert").isEqualTo(1);
+                    assertThat(chunks.find(probe).first()).isEqualTo(probe);
+                    assertThat(chunkReads.get()).as("the observer detects the control chunk find").isEqualTo(1);
+                    assertThat(chunks.deleteOne(probe).getDeletedCount()).isOne();
+                    assertThat(chunkWrites.get()).as("the observer detects the control chunk delete").isEqualTo(2);
+                } finally {
+                    controlDatabase.drop();
+                }
+            }
         } finally {
             logger.detachAppender(observer); observer.stop(); logger.setLevel(previous); logger.setAdditive(additive);
         }
