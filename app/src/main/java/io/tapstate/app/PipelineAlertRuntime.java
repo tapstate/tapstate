@@ -430,8 +430,6 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if(closed.get()||!started.compareAndSet(false,true))throw new IllegalStateException("evaluation host already started or closed");
         freshness.setRemoveOnCancelPolicy(true);freshness.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);
     }
-    private final AtomicReference<Runnable> observerTick=new AtomicReference<>(()->{});
-    void observerTick(Runnable observer){observerTick.set(Objects.requireNonNull(observer));}
     void tick() {
         if (closed.get()) return;
         long round=evaluationRound.incrementAndGet();
@@ -547,12 +545,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(new RuleSnapshot(List.copyOf(all), unavailableRules.isEmpty()));
             servicesReady.countDown();
         }
-        observerTick.get().run();
         if(reconciliationCursor.get()==null)legacyBindingsInScan=false;
         var retained = snapshot.states();
-        // Node lifecycle evidence is published by the observer after the current rules are installed.
-        if (retained.rows().stream().anyMatch(row -> row.value().snapshot().rule().key().resource().kind().equals("cluster-node")))
-            retained = resolved.store().evaluationStates(after,50);
         for(var row:retained.rows())if((row.value().binding()==null||!unavailableRules.contains(row.value().binding().ruleIdentity().id()))&&retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             if(row.value().retiredAt()==null)AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
             var resource=row.value().snapshot().rule().key().resource();ResourceSlot obsolete;

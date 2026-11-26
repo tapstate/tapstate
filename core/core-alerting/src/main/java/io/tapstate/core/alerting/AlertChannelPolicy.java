@@ -4,6 +4,9 @@ import java.util.Objects;
 
 /** Deployment comes from trusted host settings; channel families come from static adapter registration. */
 public final class AlertChannelPolicy {
+    public static final Capability CLOUD_EVENTS = new Capability("cloud-sdk", 2, Family.CLOUD_SDK);
+    public static final Capability CLOUD_EMAIL = new Capability("cloud-sdk-email", 1, Family.CLOUD_SDK);
+
     private AlertChannelPolicy() { }
     public enum Deployment { ON_PREM, CLOUD_MANAGED, UNRESOLVED }
     public enum Family { OP_EXTERNAL, CLOUD_SDK }
