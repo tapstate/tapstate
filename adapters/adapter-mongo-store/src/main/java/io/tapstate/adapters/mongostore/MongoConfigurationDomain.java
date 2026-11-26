@@ -4,6 +4,7 @@ import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.client.ClientSession;
 import java.util.UUID;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import com.mongodb.ReadPreference;
 import com.mongodb.WriteConcern;
@@ -854,7 +855,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
             Optional<io.tapstate.core.lifecycle.DesiredState> desired,
             Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure,
-            long intentRevision, Map<String, String> startFailureParams) {
+            long intentRevision, Map<String, String> startFailureParams, boolean completedStopClear) {
         public PipelineDisplayHeader {
             startFailureParams = Map.copyOf(startFailureParams);
         }
@@ -862,7 +863,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
                 Optional<io.tapstate.core.lifecycle.DesiredState> desired, Optional<TapstateException> intentFailure,
                 boolean recovering, Optional<IoError> startFailure, long intentRevision) {
-            this(mapping, preparation, desired, intentFailure, recovering, startFailure, intentRevision, Map.of());
+            this(mapping, preparation, desired, intentFailure, recovering, startFailure, intentRevision, Map.of(), false);
         }
 
         public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
@@ -873,25 +874,65 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     /** Batch display headers use one CONFIG snapshot and retain the original intent validation. */
     public Map<String, PipelineDisplayHeader> pipelineDisplayHeaders(List<String> ids, boolean includeIntents) {
+        return pipelineDisplayHeaders(ids, includeIntents, null);
+    }
+
+    /** Reads intents here only when the catalog can finish without a CACHE read and a second CONFIG snapshot. */
+    public Map<String, PipelineDisplayHeader> pipelineDisplayHeadersBeforeCache(List<String> ids, CacheBusinessScope cache) {
+        return pipelineDisplayHeaders(ids, true, Objects.requireNonNull(cache));
+    }
+
+    /** Rechecks the CACHE scopes and reads the current intents for the whole catalog page in one CONFIG snapshot. */
+    public Map<String, PipelineDisplayHeader> pipelineDisplayHeadersAfterCache(
+            List<String> page, List<String> cacheIds, Map<String, PipelineDisplayHeader> before) {
+        return withDisplaySnapshot((session, database) -> {
+            var mappings = readDisplayMappings(session, database, displayIds(cacheIds));
+            // Unprepared pipelines had no CACHE read. Keep their original mapping and preparation.
+            before.forEach((id, header) -> {
+                if (header.preparation().phase() != PipelinePreparation.Phase.COMPLETE) {
+                    mappings.put(id, new DisplayMapping(null, header.mapping(), header.preparation(), header.recovering()));
+                }
+            });
+            return readDisplayIntents(session, database, mappings, displayIds(page), true);
+        });
+    }
+
+    private Map<String, PipelineDisplayHeader> pipelineDisplayHeaders(
+            List<String> ids, boolean includeIntents, CacheBusinessScope deferIntentsFor) {
+        if (ids.isEmpty()) {
+            requireOpen();
+            return Map.of();
+        }
+        var filter = displayIds(ids);
+        return withDisplaySnapshot((session, database) -> {
+            var mappings = readDisplayMappings(session, database, filter);
+            boolean readIntents = includeIntents && (deferIntentsFor == null
+                    || mappings.values().stream().noneMatch(mapping -> mapping.readableFrom(deferIntentsFor)));
+            return readDisplayIntents(session, database, mappings, filter, readIntents);
+        });
+    }
+
+    private Map<String, PipelineDisplayHeader> withDisplaySnapshot(
+            BiFunction<ClientSession, MongoDatabase, Map<String, PipelineDisplayHeader>> read) {
         requireOpen();
-        if (ids.isEmpty()) return Map.of();
         var client = connection.client();
         var database = connection.database();
-        var filter = new Document("_id", new Document("$in", ids));
         return StoreIo.call(() -> {
             try (var session = client.startSession()) {
-                return session.withTransaction(() -> readDisplayHeaders(session, database, filter, includeIntents),
+                return session.withTransaction(() -> read.apply(session, database),
                         TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
                                 .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build());
             }
         });
     }
 
-    private Map<String, PipelineDisplayHeader> readDisplayHeaders(
-            ClientSession session, MongoDatabase database, Document filter, boolean includeIntents) {
-        var definitions = SystemCollections.PIPELINES.on(database).find(session, filter)
-                .projection(new Document("_id", 1)).map(row -> row.getString("_id"))
-                .into(new java.util.HashSet<String>());
+    private static Document displayIds(List<String> ids) {
+        return new Document("_id", new Document("$in", ids));
+    }
+
+    private Map<String, PipelineDisplayHeader> readDisplayIntents(
+            ClientSession session, MongoDatabase database, Map<String, DisplayMapping> mappings,
+            Document filter, boolean includeIntents) {
         var intentsById = new java.util.HashMap<String, Document>();
         if (includeIntents) {
             for (var row : SystemCollections.PIPELINE_INTENTS.on(database).find(session, filter)) {
@@ -902,16 +943,35 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 ? new DisplayIntentScope(Optional.empty(), null) : readDisplayIntentScope(session);
         var intentReader = new MongoPipelineIntentStore(connection.client(), database, clusterId, bindings);
         var result = new java.util.HashMap<String, PipelineDisplayHeader>();
+        mappings.forEach((id, display) -> result.put(id, readDisplayHeader(display.row(), display.mapping(),
+                display.preparation(), display.recovering(), intentsById.get(id), intentScope, intentReader)));
+        return Map.copyOf(result);
+    }
+
+    private Map<String, DisplayMapping> readDisplayMappings(ClientSession session, MongoDatabase database, Document filter) {
+        var definitions = SystemCollections.PIPELINES.on(database).find(session, filter)
+                .projection(new Document("_id", 1)).map(row -> row.getString("_id"))
+                .into(new java.util.HashSet<String>());
+        var result = new java.util.HashMap<String, DisplayMapping>();
         for (var row : SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, filter)) {
             String id = row.getString("_id");
             if (!definitions.contains(id)) continue;
             var mapping = MongoPipelineStateMappings.decode(id, row);
             if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE) continue;
             var preparation = MongoPipelinePreparationFacts.decode(id, row, clusterId);
-            result.put(id, readDisplayHeader(mapping, preparation, row.containsKey("cacheRecovery"),
-                    intentsById.get(id), intentScope, intentReader));
+            result.put(id, new DisplayMapping(row, mapping, preparation, row.containsKey("cacheRecovery")));
         }
-        return Map.copyOf(result);
+        return result;
+    }
+
+    private record DisplayMapping(Document row, PipelineStateMapping mapping, PipelinePreparation preparation,
+            boolean recovering) {
+        boolean readableFrom(CacheBusinessScope cache) {
+            if (recovering || preparation.phase() != PipelinePreparation.Phase.COMPLETE) return false;
+            var scope = preparation.scope();
+            return cache.clusterId().equals(scope.clusterId()) && cache.bindingVersion() == scope.bindingVersion()
+                    && cache.cacheIncarnation().equals(scope.cacheIncarnation());
+        }
     }
 
     private record DisplayIntentScope(Optional<CachePreparation> preparation, TapstateException failure) {
@@ -931,19 +991,23 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
     }
 
-    private static PipelineDisplayHeader readDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
+    private static PipelineDisplayHeader readDisplayHeader(Document row, PipelineStateMapping mapping, PipelinePreparation preparation,
             boolean recovering, Document intent, DisplayIntentScope scope, MongoPipelineIntentStore reader) {
         if (intent == null) return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.empty(), recovering);
         try {
             if (scope.failure() != null) throw scope.failure();
             var snapshot = reader.decode(intent);
             scope.requireMatches(snapshot.scope());
-            if (snapshot.deleted()) return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.empty(), recovering);
-            var code = snapshot.scope().stateGeneration() == mapping.stateGeneration()
+            boolean sameGeneration = snapshot.scope().stateGeneration() == mapping.stateGeneration();
+            if (snapshot.deleted() || (row == null && !sameGeneration)) {
+                return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.empty(), recovering);
+            }
+            var code = sameGeneration
                     ? MongoPipelineIntentStore.startFailure(intent) : Optional.<IoError>empty();
             var params = code.map(value -> MongoPipelineIntentStore.startFailureParams(intent, value)).orElseGet(Map::of);
             return new PipelineDisplayHeader(mapping, preparation, Optional.of(snapshot.desired()), Optional.empty(), recovering,
-                    code, snapshot.intentRevision(), params);
+                    code, snapshot.intentRevision(), params,
+                    row != null && MongoPipelinePreparationFacts.completedStopClear(row, preparation, snapshot));
         } catch (TapstateException malformed) {
             if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
             return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.of(malformed), recovering);
