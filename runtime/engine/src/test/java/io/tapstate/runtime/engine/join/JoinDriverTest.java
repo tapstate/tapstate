@@ -1380,9 +1380,11 @@ class JoinDriverTest {
         JoinStores wrap(JoinStores delegate) {
             return new ForwardingJoinStores(delegate) {
                 @Override
-                public void removeDimensionRow(String source, String key) {
-                    super.removeDimensionRow(source, key);
+                public boolean removeDimensionRow(String source, String key, List<String> identityColumns,
+                        String expectedIdentity) {
+                    boolean removed = super.removeDimensionRow(source, key, identityColumns, expectedIdentity);
                     rowsWritten.countDown();
+                    return removed;
                 }
 
                 @Override

@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.join;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
+import io.tapstate.core.sql.JoinKey;
 import io.tapstate.spi.store.KeyedStateStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -83,6 +84,33 @@ class ImapJoinStoresTest {
         assertThat(stores.dimensionRow(DIMENSION, "d1")).isEqualTo(row("name", "Ada"));
         stores.removeFact("f1");
         assertThat(stores.fact("f1")).isNull();
+    }
+
+    @Test
+    void aColdDimensionRemovalChecksTheSourceIdentity() {
+        List<String> identityColumns = List.of("row_id");
+        String grace = JoinKey.of(List.of(10L)).name();
+        String returning = JoinKey.of(List.of(11L)).name();
+        Map<String, Object> occupant = Map.of("row_id", 10L, "name", "Grace");
+        IMap<String, Map<String, Object>> dimensions =
+                member.getMap(JoinMaps.dimensionMirror(PIPELINE, STEP, DIMENSION));
+
+        stores.putDimensionRow(DIMENSION, "old", occupant);
+        dimensions.evict("old");
+
+        assertThat(stores.removeDimensionRow(DIMENSION, "old", identityColumns, returning)).isFalse();
+        assertThat(stores.dimensionRow(DIMENSION, "old")).isEqualTo(occupant);
+        dimensions.evict("old");
+
+        assertThat(stores.removeDimensionRow(DIMENSION, "old", identityColumns, grace)).isTrue();
+        assertThat(stores.dimensionRow(DIMENSION, "old")).isNull();
+        assertThat(stores.removeDimensionRow(DIMENSION, "old", identityColumns, grace))
+                .as("a replay still recomputes dependents after the previous removal")
+                .isTrue();
+
+        stores.putDimensionRow(DIMENSION, "old", Map.of("name", "Missing source identity"));
+        assertThat(stores.removeDimensionRow(DIMENSION, "old", identityColumns, returning)).isTrue();
+        assertThat(stores.dimensionRow(DIMENSION, "old")).isNull();
     }
 
     /**

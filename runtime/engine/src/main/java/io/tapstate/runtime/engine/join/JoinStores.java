@@ -69,8 +69,12 @@ public interface JoinStores {
      */
     Map<String, Object> putDimensionRow(String source, String dimensionKey, Map<String, Object> row);
 
-    /** Forgets one dimension row. */
-    void removeDimensionRow(String source, String dimensionKey);
+    /**
+     * Removes the row unless both source identities are known and differ. Returns true for an absent
+     * row so a replay can finish recomputing its dependents after an earlier removal.
+     */
+    boolean removeDimensionRow(String source, String dimensionKey, List<String> identityColumns,
+            String expectedIdentity);
 
     /** How many pages of fact keys reference {@code dimensionKey}; zero where none do. */
     int indexPageCount(String source, String dimensionKey);
