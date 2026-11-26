@@ -9,11 +9,66 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class WorkbenchTest {
+
+    @Test
+    void terminalOpenFailureRetainsItsStartupDiagnostic() {
+        var stderr = new StringWriter();
+
+        int result = Workbench.run(new PrintWriter(stderr), () -> {
+            throw new IOException("terminal unavailable");
+        }, runner -> { throw new AssertionError("session must not run"); });
+
+        assertThat(result).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(stderr.toString()).contains(CliError.WORKBENCH_UNAVAILABLE.code());
+    }
+
+    @Test
+    void checkedSessionFailureIsDistinguishedFromStartupFailure() {
+        var stderr = new StringWriter();
+
+        int result = Workbench.run(new PrintWriter(stderr), WorkbenchTest::interactiveTerminal,
+                runner -> { throw new IOException("terminal I/O stopped"); });
+
+        assertThat(result).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(stderr.toString()).contains(CliError.WORKBENCH_SESSION_FAILED.code())
+                .doesNotContain(CliError.WORKBENCH_UNAVAILABLE.code(), "terminal I/O stopped");
+    }
+
+    @Test
+    void programmerFailureEscapesAfterTheTerminalIsRestored() {
+        var stderr = new StringWriter();
+        var failure = new IllegalStateException("broken workbench invariant");
+        var terminalClosed = new AtomicBoolean();
+
+        assertThatThrownBy(() -> Workbench.run(new PrintWriter(stderr), () -> new DumbTerminal(
+                "test", "xterm", new ByteArrayInputStream(new byte[0]), new ByteArrayOutputStream(),
+                StandardCharsets.UTF_8) {
+            @Override
+            protected void doClose() throws IOException {
+                terminalClosed.set(true);
+                super.doClose();
+            }
+        }, runner -> { throw failure; })).isSameAs(failure);
+
+        assertThat(terminalClosed).isTrue();
+        assertThat(stderr.toString()).isEmpty();
+    }
+
+    private static DumbTerminal interactiveTerminal() throws IOException {
+        return new DumbTerminal("test", "xterm", new ByteArrayInputStream(new byte[0]),
+                new ByteArrayOutputStream(), StandardCharsets.UTF_8);
+    }
+
 
     @Test
     void runnerConfigurationDisablesPeriodicTicks() throws Exception {

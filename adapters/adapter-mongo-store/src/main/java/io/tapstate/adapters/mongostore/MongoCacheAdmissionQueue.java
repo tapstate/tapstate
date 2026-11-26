@@ -125,7 +125,10 @@ final class MongoCacheAdmissionQueue {
                     if (recovery == null) {
                         long left = deadline == Long.MAX_VALUE ? 50 : Math.min(50, MongoReadBudget.until(deadline).remainingMillis());
                         try { wait(left); }
-                        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw MongoCacheWorkloadClaimStore.claimFenced(); }
+                        catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw MongoCacheWorkloadClaimStore.claimFenced(interrupted);
+                        }
                     }
                 }
                 if (recovery != null) recovery.recover(Math.min(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(5)));
