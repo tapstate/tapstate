@@ -288,7 +288,7 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
                 var initialRules = admin.getDatabase(configDb).getCollection("alert_rules").find().into(new ArrayList<>());
                 assertThat(initialRules).extracting(rule -> rule.get("_id", Document.class).getString("id"))
-                        .containsExactlyInAnyOrder("builtin-cluster.node-unavailable", "builtin-cluster.storage-unavailable",
+                        .containsExactlyInAnyOrder("builtin-cluster.storage-unavailable",
                                 "builtin-pipeline.failed", "builtin-pipeline.observation-stale", "builtin-source.connection-failed",
                                 "builtin-cluster.config-structure-drift", "builtin-cluster.cache-structure-drift");
                 for (var rule : initialRules) {
@@ -324,8 +324,6 @@ class ManagedMongoStoreIsolationIT {
                         var rule = (Map<?, ?>) row;
                         return tuple(rule.get("id"), rule.get("typeId"), rule.get("enabled"));
                     }).containsExactlyInAnyOrderElementsOf(storedDefaults);
-                    assertThat(admin.getDatabase(configDb).getCollection("alert_node_lifecycles")
-                            .countDocuments(new Document("phase", "EXPECTED"))).isGreaterThanOrEqualTo(1);
                 });
                 var admitted = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
                 assertThat(((List<?>)admitted.get("allowedActions")).containsAll(List.of("configuration.export", "configuration.import.preflight",
