@@ -3,11 +3,14 @@ package io.tapstate.e2e;
 import io.tapstate.app.Bootstrap;
 import io.tapstate.app.IsolatedConnectionDiagnostics;
 import io.tapstate.app.ObservationWorkerFixture;
+import io.tapstate.testsupport.MongoRenewedTopology;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.boot.web.server.context.WebServerInitializedEvent;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -15,6 +18,7 @@ import org.springframework.web.util.UriComponentsBuilder;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The product booted inside the test JVM, from its real assembly root.
@@ -138,6 +142,16 @@ final class InProcessServer implements ServerHandle {
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
         var builder = new SpringApplicationBuilder(Bootstrap.class);
+        String advertiseSetting = "--" + MongoRenewedTopology.CONTROL_ADVERTISE_URL + "=";
+        if (arguments.stream().anyMatch(argument -> argument.startsWith(advertiseSetting) && argument.endsWith(":0"))) {
+            builder.listeners((ApplicationListener<WebServerInitializedEvent>) event -> {
+                var environment = ((ConfigurableApplicationContext) event.getApplicationContext()).getEnvironment();
+                var url = MongoRenewedTopology.controlUrl(environment.getRequiredProperty("server.address"),
+                        event.getWebServer().getPort());
+                environment.getPropertySources().addFirst(new MapPropertySource("fixtureControlEndpoint",
+                        Map.of(MongoRenewedTopology.CONTROL_ADVERTISE_URL, url.toString())));
+            });
+        }
         if (diagnostics != null) {
             builder.initializers(context -> context.getBeanFactory().registerSingleton("isolatedConnectionDiagnostics", diagnostics));
         }

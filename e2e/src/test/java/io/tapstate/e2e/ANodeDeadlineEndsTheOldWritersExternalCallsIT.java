@@ -40,7 +40,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         var originalAcknowledgement=new AtomicReference<Document>();
         try (var storage=PreparedNativeStore.create(); var documents=new NativeSrsDocuments(storage)) {
             var topology = new MongoRenewedTopology(storage.clusterId());
-            try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
+            try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL, 0)) {
                 var control = ControlPlane.direct(server.baseUrl());
                 var child = commitRenewedTopology(storage, topology, server, control);
                 var member = child.getBean(HazelcastInstance.class);
@@ -113,8 +113,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                     return rows.size()==1 && Boolean.FALSE.equals(rows.getFirst().get("leased"));
                 },() -> "the original NODE lease remains live");
             }
-            try (var replacement = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
-                assertThat(replacement.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
+            try (var replacement = start(storage, topology, MongoRenewedTopology.ORIGINAL, 0)) {
                 var control = ControlPlane.direct(replacement.baseUrl()); storage.loginAndAwaitBusiness(control);
                 Await.until("the new native run to enter the previously refused target call",BOUND,
                         () -> holds.holderBefore(TABLE,3).isPresent(),() -> control.state(PIPELINE)+" "+control.failureCode(PIPELINE));
@@ -131,16 +130,14 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
 
     private static ConfigurableApplicationContext commitRenewedTopology(PreparedNativeStore storage,
             MongoRenewedTopology topology, InProcessServer original, ControlPlane control) throws Exception {
-        assertThat(original.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.ORIGINAL));
-        ConfigurableApplicationContext child;
-        HazelcastInstance member;
+        ConfigurableApplicationContext child = Await.answered("the original Hazelcast member to bind",
+                () -> businessContext(original));
+        HazelcastInstance member = child.getBean(HazelcastInstance.class);
+        int seedPort = member.getCluster().getLocalMember().getAddress().getPort();
         // The original cannot admit business until the peer joins the bootstrap topology.
-        try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
-            assertThat(peer.baseUrl()).isEqualTo(topology.controlUrl(MongoRenewedTopology.PEER));
+        try (var peer = start(storage, topology, MongoRenewedTopology.PEER, seedPort)) {
             storage.loginAndAwaitBusiness(control);
             storage.loginAndAwaitBusiness(ControlPlane.direct(peer.baseUrl()));
-            child = businessContext(original);
-            member = child.getBean(HazelcastInstance.class);
             Await.until("the real two-member topology to form", BOUND,
                     () -> member.getCluster().getMembers().size() == 2,
                     () -> member.getCluster().getMembers().toString());
@@ -163,9 +160,9 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         assertThat(progress(documents).get("sinkAcked", Document.class)).isEqualTo(confirmed);
     }
 
-    private static InProcessServer start(PreparedNativeStore storage, MongoRenewedTopology topology, String node) {
+    private static InProcessServer start(PreparedNativeStore storage, MongoRenewedTopology topology, String node, int seedPort) {
         var args = new ArrayList<>(ARGUMENTS);
-        args.addAll(topology.arguments(node));
+        args.addAll(topology.arguments(node, seedPort));
         return InProcessServer.startPrepared(storage, args);
     }
 
@@ -175,11 +172,16 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         var offset=documents.consumerOffset(key.getString("chain"),SrsConsumerId.of(PIPELINE,SOURCE).value());
         return offset==null ? null : offset.get("progress",Document.class);
     }
-    private static ConfigurableApplicationContext businessContext(InProcessServer server) throws Exception {
-        @SuppressWarnings("unchecked") var contexts=(List<ConfigurableApplicationContext>)readField(server,"refreshedContexts");
-        return contexts.stream().filter(context -> context.containsLocalBean("nativeBusinessContext")).findFirst().orElseThrow();
+    private static Optional<ConfigurableApplicationContext> businessContext(InProcessServer server) {
+        try {
+            @SuppressWarnings("unchecked")
+            var contexts = (List<ConfigurableApplicationContext>) readField(server, "refreshedContexts");
+            return contexts.stream().filter(context -> context.containsLocalBean("nativeBusinessContext")).findFirst();
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("The in-process server must expose its refreshed contexts", failure);
+        }
     }
-    private static Object readField(Object owner,String name) throws Exception {
+    private static Object readField(Object owner,String name) throws ReflectiveOperationException {
         Field field=owner.getClass().getDeclaredField(name); field.setAccessible(true); return field.get(owner);
     }
     private static String value(Path target,String id) {

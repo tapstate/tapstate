@@ -46,10 +46,11 @@ class NativeCacheAlertIT {
                     "--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),"--tapstate.control.auth.jwt-secret=cache-alert-fixture-signing"};
             var topology = new MongoRenewedTopology(storage.clusterId());
             AlarmKey originalKey;
-            try (var app = start(args, topology, MongoRenewedTopology.ORIGINAL)) {
+            try (var app = start(args, topology, MongoRenewedTopology.ORIGINAL, 0)) {
                 var child = NativeAppStorage.business(app);
                 var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
-                try (var peer = start(args, topology, MongoRenewedTopology.PEER)) {
+                try (var peer = start(args, topology, MongoRenewedTopology.PEER,
+                        member.getCluster().getLocalMember().getAddress().getPort())) {
                     NativeAppStorage.awaitBusiness(app);
                     assertThat(member.getCluster().getMembers()).hasSize(2);
                 }
@@ -57,7 +58,7 @@ class NativeCacheAlertIT {
                 // Only the member under test can publish the healthy or failing sample.
                 await().atMost(Duration.ofSeconds(15)).until(() -> member.getCluster().getMembers().size() == 1);
                 var client = HttpClient.newBuilder().proxy(ProxySelector.of(null)).build();
-                String base = topology.controlUrl(MongoRenewedTopology.ORIGINAL).toString();
+                String base = NativeAppStorage.advertisedControl(app).toString();
                 var login=post(client,base,"/auth/login",null,Map.of("username","cache-admin","password","isolated-cache-password"));
                 String token=String.valueOf(login.get("token"));
                 post(client,base,"/api/alerts/configuration/save",token,Map.of("kind","RULE","id","cache-required-write","etag","0","form",Map.of("name","Required CACHE access","typeId","cluster.storage-unavailable",
@@ -153,7 +154,7 @@ class NativeCacheAlertIT {
                         .append("resourceId", MongoRenewedTopology.ORIGINAL)).first();
                 return row==null || row.getDate("leaseUntil").before(Date.from(Instant.now()));
             });
-            try(var restarted = start(args, topology, MongoRenewedTopology.ORIGINAL);
+            try(var restarted = start(args, topology, MongoRenewedTopology.ORIGINAL, 0);
                     var domain=MongoConfigurationDomain.open(settings,storage.clusterId())) {
                 NativeAppStorage.awaitBusiness(restarted);var setup=domain.bindings().load().orElseThrow().setup();
                 var store=domain.alerts(new AlertStore.Host(originalKey.scope(),setup,AlertChannelPolicy.Deployment.ON_PREM,()->{}),BuiltinAlarmTypes.catalog(),Clock.systemUTC());
@@ -167,11 +168,12 @@ class NativeCacheAlertIT {
             try(var cleanup=MongoClients.create(storage.configurationUri())){cleanup.getDatabase(storage.configurationDatabase()).drop();cleanup.getDatabase(storage.cacheDatabase()).drop();cleanup.getDatabase(storage.masterDatabase()).drop();}
         }
     }
-    private ConfigurableApplicationContext start(String[] base, MongoRenewedTopology topology, String node) {
+    private ConfigurableApplicationContext start(String[] base, MongoRenewedTopology topology, String node, int seedPort) {
         var arguments = new ArrayList<>(List.of(base));
-        arguments.addAll(topology.arguments(node));
+        arguments.addAll(topology.arguments(node, seedPort));
         arguments.add("--tapstate.connectors.plugins-dir=" + work.resolve(node));
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .listeners(NativeAppStorage.boundControlAdvertisement())
                 .run(arguments.toArray(String[]::new));
     }
     private static ValidationMemberResources.Control holdQueuedControl(

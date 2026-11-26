@@ -68,8 +68,8 @@ class SplitStoreLeaseLifecycleIT {
         }
 
         var topology = new MongoRenewedTopology(scope.clusterId());
-        try (var app = start(configUri, topology, MongoRenewedTopology.ORIGINAL);
-             var peer = start(configUri, topology, MongoRenewedTopology.PEER);
+        try (var app = start(configUri, topology, MongoRenewedTopology.ORIGINAL, 0);
+             var peer = start(configUri, topology, MongoRenewedTopology.PEER, memberPort(app));
              MongoClient observer = MongoClients.create(CACHE.getReplicaSetUrl(cacheDb))) {
             var root = app.getBean(StorageRoot.class);
             await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
@@ -93,12 +93,13 @@ class SplitStoreLeaseLifecycleIT {
             try {
                 assertThatThrownBy(() -> root.runtime().requireConfiguration().artifacts().get("views"))
                         .isInstanceOf(TapstateException.class);
-                try (var unavailable = start(configUri, topology, MongoRenewedTopology.UNAVAILABLE)) {
+                try (var unavailable = start(configUri, topology, MongoRenewedTopology.UNAVAILABLE, memberPort(app))) {
                     var blocked = unavailable.getBean(StorageRoot.class);
                     assertThat(blocked.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
                     assertThat(blocked.runtime().business()).isEmpty();
                     assertThat(((WebServerApplicationContext) unavailable).getWebServer().getPort())
-                            .isEqualTo(topology.controlUrl(MongoRenewedTopology.UNAVAILABLE).getPort());
+                            .isEqualTo(NativeAppStorage.advertisedControl(unavailable).getPort())
+                            .isNotEqualTo(NativeAppStorage.advertisedControl(app).getPort());
                 }
                 await().atMost(TTL.plusSeconds(5)).untilAsserted(() -> {
                     var renewed = claims.read(initial.key()).orElseThrow();
@@ -145,8 +146,13 @@ class SplitStoreLeaseLifecycleIT {
         }
     }
 
-    private ConfigurableApplicationContext start(String configUri, MongoRenewedTopology topology, String name) {
-        var arguments = new ArrayList<>(topology.arguments(name));
+    private static int memberPort(ConfigurableApplicationContext context) {
+        return NativeAppStorage.business(context).getBean(HazelcastInstance.class)
+                .getCluster().getLocalMember().getAddress().getPort();
+    }
+
+    private ConfigurableApplicationContext start(String configUri, MongoRenewedTopology topology, String name, int seedPort) {
+        var arguments = new ArrayList<>(topology.arguments(name, seedPort));
         arguments.addAll(List.of(
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=WARN", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + configUri, "--tapstate.store.mongo.server-selection-timeout=2s",
@@ -155,6 +161,7 @@ class SplitStoreLeaseLifecycleIT {
                 "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"),
                 "--tapstate.connectors.plugins-dir=" + work.resolve(name)));
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .listeners(NativeAppStorage.boundControlAdvertisement())
                 .run(arguments.toArray(String[]::new));
     }
 
