@@ -48,6 +48,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private ManagedStorageInspection storageInspection;
     private final java.util.concurrent.atomic.AtomicReference<PipelineAlertRuntime> alertRuntime = new java.util.concurrent.atomic.AtomicReference<>();
     private final ShutdownAwait shutdown = new ShutdownAwait();
+    private ShutdownOwners shutdownOwners;
+    private final java.util.concurrent.atomic.AtomicReference<MemberStop> memberStop = new java.util.concurrent.atomic.AtomicReference<>();
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicReference<Thread> initialTestCaller = new java.util.concurrent.atomic.AtomicReference<>();
@@ -340,45 +342,136 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     private void closeOwned(long deadline) {
         active.set(false); handlers = List.of();
-        Object driver=context==null?null:context.getBeanFactory().getSingleton("convergenceDriver");
-        if(driver instanceof ConvergenceDriver convergence)convergence.stopForShutdown();
-        Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
-        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
-        if (storageInspection != null) {
-            storageInspection.close();
-            storageInspection.awaitStopped(deadline);
+        boolean retrying = shutdownOwners != null;
+        var owners = shutdownOwners;
+        if (owners == null) {
+            owners = ShutdownOwners.capture(context);
+            // Spring removes its singletons on close. Retain them until cleanup has succeeded.
+            if (context != null) shutdownOwners = owners;
         }
-        var beans = context == null ? null : context.getBeanFactory();
-        var periodic = beans == null ? null : (PeriodicObservations) beans.getSingleton("periodicObservations");
-        var convergence = beans == null ? null : (PipelineConvergences) beans.getSingleton("pipelineConvergences");
-        var observationWrites = beans == null ? null : (ProcessObservationWriter) beans.getSingleton("processObservationWriter");
-        if (convergence != null) convergence.close();
-        if (periodic != null) periodic.close();
-        var alerts = alertRuntime.get();
-        if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
-        if(driver instanceof ConvergenceDriver convergenceDriver)convergenceDriver.awaitStopped(deadline);
-        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
-        if (convergence != null) convergence.awaitStopped(deadline);
-        if (periodic != null) periodic.awaitStopped(deadline);
-        if (observationWrites != null) observationWrites.close();
-        var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
-        Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
-        Throwable failure = null;
-        try { if (payloadCleanup != null) { payloadCleanup.close(); payloadCleanup = null; } }
-        catch (RuntimeException | Error cleanup) { failure = cleanup; }
-        try { if (memberStorage != null) memberStorage.close(); } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
-        }
-        try { if (context != null) context.close(); } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
-        }
+
+        boolean drained = false;
         try {
-            if (member instanceof HazelcastInstance actual && actual.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
-        } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+            var retained = owners;
+            ShutdownAwait.stage("business worker drain", () -> drainWorkers(retained, deadline));
+            drained = true;
+        } finally {
+            if (!drained) stopMemberAfterFailedClose(owners);
         }
-        if (failure instanceof Error error) throw error;
-        if (failure instanceof RuntimeException error) throw error;
+
+        if (memberStop.get() != null) {
+            var stopping = startMemberStop(owners);
+            ShutdownAwait.future(stopping.result(), Math.min(deadline, stopping.deadline()));
+        }
+        closeWorkerResources(owners.member(), retrying);
+        shutdownOwners = null;
+    }
+
+    void stopMemberAfterFailedClose() {
+        stopMemberAfterFailedClose(ShutdownOwners.capture(context));
+    }
+
+    private void stopMemberAfterFailedClose(ShutdownOwners owners) {
+        if (owners.member() == null) return;
+        try {
+            var stop = startMemberStop(owners);
+            ShutdownAwait.future(stop.result().handle((ignored, failure) -> null), stop.deadline());
+        } catch (RuntimeException failed) {
+            // The fallback must never replace the worker failure or close resources used by live workers.
+            org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).warn("Member stop during failed shutdown did not complete", failed);
+        }
+    }
+
+    private MemberStop startMemberStop(ShutdownOwners owners) {
+        var stop = memberStop.updateAndGet(previous ->
+                previous == null || previous.result().isCompletedExceptionally() ? new MemberStop() : previous);
+        stop.start(owners);
+        return stop;
+    }
+
+    private record MemberStop(java.util.concurrent.CompletableFuture<Void> result, AtomicBoolean started, long deadline) {
+        MemberStop() {
+            this(new java.util.concurrent.CompletableFuture<>(), new AtomicBoolean(),
+                    System.nanoTime() + Duration.ofSeconds(7).toNanos());
+        }
+
+        void start(ShutdownOwners owners) {
+            if (started.compareAndSet(false, true)) {
+                result.completeAsync(() -> {
+                    ShutdownAwait.stage("member and node-session close", () -> stopMember(owners.member(), owners.lease()));
+                    return null;
+                }, Thread::startVirtualThread);
+            }
+        }
+    }
+
+    private void drainWorkers(ShutdownOwners owners, long deadline) {
+        var pipelines = owners.pipelines();
+        var periodic = owners.periodic();
+        var convergence = owners.convergence();
+        var observationWrites = owners.observationWrites();
+        var alerts = alertRuntime.get();
+        var initial = initialTestCaller.get();
+        var drain = new ArrayList<Runnable>();
+        var driver = owners.driver();
+        if (driver != null) drain.add(driver::stopForShutdown);
+        if (pipelines != null) drain.add(pipelines::stopForShutdown);
+        if (convergence != null) drain.add(convergence::close);
+        if (periodic != null) drain.add(periodic::close);
+        if (storageInspection != null) {
+            drain.add(storageInspection::close);
+            drain.add(() -> storageInspection.awaitStopped(deadline));
+        }
+        if (alerts != null) {
+            drain.add(alerts::close);
+            drain.add(() -> alerts.awaitStopped(deadline));
+        }
+        if (driver != null) drain.add(() -> driver.awaitStopped(deadline));
+        if (pipelines != null) drain.add(() -> pipelines.awaitStopped(deadline));
+        if (convergence != null) drain.add(() -> convergence.awaitStopped(deadline));
+        if (periodic != null) drain.add(() -> periodic.awaitStopped(deadline));
+        if (observationWrites != null) drain.add(observationWrites::close);
+        if (initial != null) drain.add(initial::interrupt);
+        ShutdownAwait.all(drain);
+    }
+
+    private void closeWorkerResources(HazelcastInstance member, boolean retrying) {
+        var cleanup = new ArrayList<Runnable>();
+        if (payloadCleanup != null) cleanup.add(() -> { payloadCleanup.close(); payloadCleanup = null; });
+        if (memberStorage != null) cleanup.add(memberStorage::close);
+        if (context != null) cleanup.add(context::close);
+        if (member != null) cleanup.add(() -> {
+            if (retrying) stopMember(member, null);
+            else requireStopped(member);
+        });
+        ShutdownAwait.all(cleanup);
+    }
+
+    private static void stopMember(HazelcastInstance member, NodeSessionLease lease) {
+        if (lease != null) lease.close();
+        if (member.getLifecycleService().isRunning()) member.shutdown();
+        requireStopped(member);
+    }
+
+    private static void requireStopped(HazelcastInstance member) {
+        if (member.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
+    }
+
+    private record ShutdownOwners(PipelineActuationOwnership pipelines, PeriodicObservations periodic,
+            PipelineConvergences convergence, ProcessObservationWriter observationWrites, HazelcastInstance member,
+            NodeSessionLease lease, ConvergenceDriver driver) {
+        static ShutdownOwners capture(GenericApplicationContext context) {
+            if (context == null) return new ShutdownOwners(null, null, null, null, null, null, null);
+            var beans = context.getBeanFactory();
+            return new ShutdownOwners(
+                    (PipelineActuationOwnership) beans.getSingleton("pipelineActuationOwnership"),
+                    (PeriodicObservations) beans.getSingleton("periodicObservations"),
+                    (PipelineConvergences) beans.getSingleton("pipelineConvergences"),
+                    (ProcessObservationWriter) beans.getSingleton("processObservationWriter"),
+                    (HazelcastInstance) beans.getSingleton("hazelcastMember"),
+                    (NodeSessionLease) beans.getSingleton("nodeSessionLease"),
+                    (ConvergenceDriver) beans.getSingleton("convergenceDriver"));
+        }
     }
 
     static final class ChildOnly implements Condition {

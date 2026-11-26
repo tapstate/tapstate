@@ -64,6 +64,7 @@ final class RealProcessServer implements ServerHandle {
     // witness's to keep or clear.
     private final boolean ownsStagingDirectory;
     private boolean closeRequested;
+    private boolean forcedDuringClose;
     private boolean exitedBeforeCloseRequest;
     private long closeRequestedAt;
     private ClusterLifecycleProbe.Facts lifecycle;
@@ -687,6 +688,10 @@ final class RealProcessServer implements ServerHandle {
         return exitedBeforeCloseRequest;
     }
 
+    boolean forcedDuringClose() {
+        return forcedDuringClose;
+    }
+
     /** Confirms exit under the original grace and forced-exit budgets before discarding staging. */
     void awaitClosed() {
         long requestedAt;
@@ -710,6 +715,7 @@ final class RealProcessServer implements ServerHandle {
             }
             ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.GRACE_RETURNED);
             if (!exited) {
+                forcedDuringClose = true;
                 process.destroyForcibly();
                 observe(ClusterLifecycleProbe.Phase.FORCE_REQUESTED);
                 ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.FORCE_RETURNED);

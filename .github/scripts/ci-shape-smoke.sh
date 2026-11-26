@@ -203,6 +203,11 @@ def check(workflows, contexts, inputs):
     assert 'package io.tapstate.app;' in cloud_context_source \
         and re.search(r'\bclass\s+CloudClusterContextCarriesTheCurrentEgressAddressIT\b', cloud_context_source), \
         'the Cloud context test class named by CI must still exist at its declared package'
+    temporary = jobs(workflows['build-cluster-image.yml'])['image']
+    assert 'bash workflow-tools/deploy/cloud/ghcr-publish.sh publish-temporary ' in temporary, \
+        'branch-pair builds must use the workflow publisher in temporary mode'
+    assert 'notify-cloud-dev.mjs' not in temporary and 'ghcr-publish.sh publish-dev ' not in temporary, \
+        'branch-pair builds must leave the shared dev tag and catalog alone'
     cloud_dev = jobs(workflows['cloud-cluster-dev.yml']).get('image', '')
     assert cloud_dev, 'the Cloud dev image job must exist'
     assert '  workflow_call:' in workflows['cloud-cluster-dev.yml'], \

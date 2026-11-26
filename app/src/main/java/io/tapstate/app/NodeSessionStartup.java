@@ -59,6 +59,7 @@ final class NodeSessionStartup implements HazelcastInstanceAware, LifecycleListe
             bind(instance);
             accepted = isCurrent();
             if (accepted) {
+                lease.stopMemberOnClose(new Stop(instance, false)::run);
                 handedOff = true;
                 stop = null;
             } else {
@@ -86,8 +87,7 @@ final class NodeSessionStartup implements HazelcastInstanceAware, LifecycleListe
 
     @Override
     public void stateChanged(LifecycleEvent event) {
-        if (event.getState() == LifecycleEvent.LifecycleState.SHUTTING_DOWN
-                || event.getState() == LifecycleEvent.LifecycleState.SHUTDOWN) {
+        if (event.getState() == LifecycleEvent.LifecycleState.SHUTDOWN) {
             synchronized (this) {
                 stopped = true;
             }
@@ -129,6 +129,9 @@ final class NodeSessionStartup implements HazelcastInstanceAware, LifecycleListe
         void run() {
             if (force) member.getLifecycleService().terminate();
             else member.shutdown();
+            if (Thread.currentThread().isInterrupted() || member.getLifecycleService().isRunning()) {
+                throw StorageRuntime.unavailable();
+            }
         }
     }
 }
