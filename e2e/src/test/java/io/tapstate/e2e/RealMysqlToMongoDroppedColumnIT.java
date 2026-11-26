@@ -6,12 +6,14 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ContentHash;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
@@ -60,7 +62,10 @@ class RealMysqlToMongoDroppedColumnIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void every_real_mongo_write_receives_the_projected_model(Tiers tier) throws Exception {
-        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
+        try (var mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
+                var store = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                        .withCommand("--replSet", "docker-rs", "--bind_ip_all", "--setParameter", "enableTestCommands=1")) {
+            store.start();
             mysql.start();
             SharedMySql.grantReplication(mysql);
             seedMysqlOrders(mysql, SEEDED_ROWS);
@@ -72,14 +77,16 @@ class RealMysqlToMongoDroppedColumnIT {
 
             Path witness = directory.resolve("writes-" + suffix + ".tsv");
             assertThat(witness).doesNotExist();
-            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
+            try (PreparedNativeStore storage = PreparedNativeStore.createOn(store); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
 
-                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-                control.registerConnector("mongodb",
-                        ObservedMongoConnectorJar.build(ConnectorJars.bytesFor("mongodb"), witness));
+                byte[] mysqlJar = ConnectorJars.bytesFor("mysql");
+                byte[] mongoJar = ConnectorJars.bytesFor("mongodb");
+                byte[] observedJar = ObservedMongoConnectorJar.build(mongoJar, witness, "0.0.1");
+                control.registerConnector("mysql", mysqlJar);
+                control.registerConnector("mongodb", observedJar);
 
                 Map<String, Object> mysqlConfig = mysqlConfig(mysql);
                 Map<String, String> resources = new LinkedHashMap<>();
@@ -113,10 +120,13 @@ class RealMysqlToMongoDroppedColumnIT {
                             .containsEntry(TIMESTAMP_COLUMN, Date.from(CREATED_AT))
                             .doesNotContainKey("secret");
                 }
-                control.stop(PIPELINE_ID, true);
-                Await.until("pipeline to stop before reading all write attempts",
-                        () -> control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent(),
-                        () -> String.valueOf(control.state(PIPELINE_ID)));
+                assertThat(connectorHashes(control.pipelineStatus(PIPELINE_ID)))
+                        .containsExactlyInAnyOrder(ContentHash.of(mysqlJar), ContentHash.of(observedJar));
+                // Register the successor while the first generation still owns the instrumented artifact.
+                control.registerConnector("mongodb", mongoJar);
+                assertThat(connectorHashes(control.pipelineStatus(PIPELINE_ID)))
+                        .containsExactlyInAnyOrder(ContentHash.of(mysqlJar), ContentHash.of(observedJar));
+                assertRebuildStatus(control, storage);
                 assertEveryWriteModel(witness);
                 try (var client = MongoClients.create(targetUri)) {
                     MongoDatabase database = client.getDatabase(new ConnectionString(targetUri).getDatabase());
@@ -140,8 +150,55 @@ class RealMysqlToMongoDroppedColumnIT {
                     }
                     assertPreimageEnabled(database, "after-direct-update", tier);
                 }
+                control.startAnswering(PIPELINE_ID, "target-not-empty", "keep");
+                Await.until("the successor generation to run with the new Mongo artifact",
+                        () -> control.state(PIPELINE_ID).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> String.valueOf(control.pipelineStatus(PIPELINE_ID)));
+                assertThat(connectorHashes(control.pipelineStatus(PIPELINE_ID)))
+                        .containsExactlyInAnyOrder(ContentHash.of(mysqlJar), ContentHash.of(mongoJar));
             }
         }
+    }
+
+    private static void assertRebuildStatus(ControlPlane control, PreparedNativeStore storage) {
+        try (var client = MongoClients.create(storage.configurationUri())) {
+            var mappings = client.getDatabase(storage.configurationDatabase()).getCollection("operator_generations");
+            var key = new Document("_id", PIPELINE_ID);
+            var admin = client.getDatabase("admin");
+            String failPoint = "hangDuringBatchUpdate";
+            long entered = admin.runCommand(new Document("configureFailPoint", failPoint)
+                    .append("mode", "alwaysOn")
+                    .append("data", new Document("nss", storage.cacheDatabase() + ".operator_cleanup")))
+                    .get("count", Number.class).longValue();
+            try {
+                control.stop(PIPELINE_ID, true);
+                admin.runCommand(new Document("waitForFailPoint", failPoint)
+                        .append("timesEntered", entered + 1).append("maxTimeMS", 30000));
+                var pending = mappings.find(key).first();
+                assertThat(pending).containsEntry("phase", "REBUILDING").containsEntry("stateGeneration", 1L);
+                var status = control.pipelineStatus(PIPELINE_ID);
+                assertThat(status).containsEntry("displayState", "STOPPING").containsEntry("desiredState", "STOPPED")
+                        .doesNotContainKeys("state", "observedState");
+                assertThat(connectorHashes(status)).isEmpty();
+                assertThat(mappings.find(key).first()).isEqualTo(pending);
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", failPoint).append("mode", "off"));
+            }
+            Await.until("the replacement generation to finish stopping", () -> {
+                var mapping = mappings.find(key).first();
+                return Long.valueOf(2).equals(mapping.getLong("stateGeneration")) && "ACTIVE".equals(mapping.getString("phase"))
+                        && control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent();
+            }, () -> String.valueOf(mappings.find(key).first()));
+        }
+        var stopped = control.pipelineStatus(PIPELINE_ID);
+        assertThat(stopped).containsEntry("state", "STOPPED");
+        assertThat(connectorHashes(stopped)).isEmpty();
+    }
+
+    private static List<String> connectorHashes(Map<String, Object> status) {
+        return ((List<?>) status.get("connectorVersions")).stream()
+                .map(row -> (String) ((Map<?, ?>) row).get("sha256"))
+                .toList();
     }
 
     private static void assertEveryWriteModel(Path witness) throws Exception {
