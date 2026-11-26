@@ -6,6 +6,7 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.*;
+import io.tapstate.testsupport.MongoRenewedTopology;
 import io.tapstate.testsupport.RequiresDocker;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
@@ -38,13 +39,27 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         Path replies=Files.createDirectory(directory.resolve("replies"));
         var originalAcknowledgement=new AtomicReference<Document>();
         try (var storage=PreparedNativeStore.create(); var documents=new NativeSrsDocuments(storage)) {
-            try (var server=InProcessServer.startPrepared(storage,ARGUMENTS)) {
-                var control=new ControlPlane(server.baseUrl()); storage.loginAndAwaitBusiness(control);
+            var topology = new MongoRenewedTopology(storage.clusterId());
+            try (var server = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
+                var control = new ControlPlane(server.baseUrl());
+                var child = businessContext(server);
+                var member = child.getBean(HazelcastInstance.class);
+                try (var peer = start(storage, topology, MongoRenewedTopology.PEER)) {
+                    storage.loginAndAwaitBusiness(control);
+                    Await.until("the real two-member topology to form", BOUND,
+                            () -> member.getCluster().getMembers().size() == 2,
+                            () -> member.getCluster().getMembers().toString());
+                }
+                // After committing the two-member topology, run the writer on its sole remaining member.
+                Await.until("the original member to be the only writer host", BOUND,
+                        () -> member.getCluster().getMembers().size() == 1,
+                        () -> member.getCluster().getMembers().toString());
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID,connector); control.apply(resources(source,target,holds,written,replies));
                 control.discoverSchema(SOURCE,E2eConnectorJar.CONNECTOR_ID,Map.of("uri",source.toString()));
                 control.lifecycle(PIPELINE,LifecycleVerb.START);
                 Await.until("the native continuous pipeline to run",BOUND,() -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> control.state(PIPELINE)+" "+control.failureCode(PIPELINE));
+                assertThat(control.pipelineControllerOf(PIPELINE)).contains(MongoRenewedTopology.ORIGINAL);
                 awaitValue(target,"1","initial");
                 CdcRecoveryFixture.change(source,1,TABLE,"1","initial","confirmed"); awaitValue(target,"1","confirmed");
                 Await.until("the first CDC change to have an actual durable acknowledgement",BOUND,() -> {
@@ -53,8 +68,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                 },() -> String.valueOf(progress(documents)));
                 var confirmed=progress(documents).get("sinkAcked",Document.class);
                 originalAcknowledgement.set(confirmed);
-                var child=businessContext(server); Object lease=child.getBean("nodeSessionLease");
-                var member=child.getBean(HazelcastInstance.class);
+                Object lease = child.getBean("nodeSessionLease");
                 try (var delayed=new DelayedNodeRenewal(lease)) {
                     try {
                         CdcRecoveryFixture.change(source,2,TABLE,"2","","held");
@@ -79,10 +93,10 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                         assertThat(delayed.accepted.get()).isPresent(); assertThat(delayed.deadline-effectObserved).isPositive();
                         assertThat(delayed.deadline-System.nanoTime()).isPositive();
                         assertThat(progress(documents).get("sinkAcked",Document.class)).isEqualTo(confirmed);
-                        AtomicBoolean closed=(AtomicBoolean)readField(lease,"closed");
-                        Await.until("the original monotonic proof to close despite its successful result still being held",Duration.ofSeconds(12),
-                                () -> closed.get() && System.nanoTime()>=delayed.deadline,() -> "closed="+closed+", remaining="+(delayed.deadline-System.nanoTime()));
-                        assertThat(delayed.returnedAt).isZero(); assertThat(readField(lease,"provenUntil")).isEqualTo(delayed.deadline);
+                        Await.until("the original monotonic proof to close despite its successful result still being held", Duration.ofSeconds(12),
+                                () -> delayed.current.get() == null && System.nanoTime() >= delayed.deadline,
+                                () -> "proof=" + delayed.current.get() + ", remaining=" + (delayed.deadline - System.nanoTime()));
+                        assertThat(delayed.returnedAt).isZero();
                         assertThat(Files.exists(replies.resolve("returned"))).isFalse();
                         assertThat(value(target,"2")).as("an effect from the pre-deadline call remains visible after expiry").isEqualTo("held");
                         Files.writeString(replies.resolve("release"),"");
@@ -96,7 +110,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                         Await.until("the original renewer to finish processing its late Mongo result",Duration.ofSeconds(10),renewer::isTerminated,() -> "original renewal task still running");
                         assertThat(Files.exists(replies.resolve("returned"))).isTrue();
                         assertThat(delayed.returnedAt).isGreaterThanOrEqualTo(delayed.deadline);
-                        assertThat(closed).isTrue(); assertThat(readField(lease,"provenUntil")).isEqualTo(delayed.deadline);
+                        assertThat(delayed.current.get()).isNull();
                         assertThat(member.getLifecycleService().isRunning()).isFalse();
                     } finally { delayed.release.countDown(); Files.writeString(replies.resolve("release"),""); }
                 }
@@ -105,12 +119,13 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
             try (var observer=MongoClients.create(storage.cacheUri())) {
                 Await.until("the original stable node's actual Mongo lease to expire before a new boot",Duration.ofSeconds(15),() -> {
                     var rows=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(observer.getDatabase(storage.cacheDatabase())).aggregate(List.of(
-                            new Document("$match",new Document("resourceType","NODE_SESSION")),
+                            new Document("$match", new Document("resourceType", "NODE_SESSION")
+                                    .append("resourceId", MongoRenewedTopology.ORIGINAL)),
                             new Document("$project",new Document("leased",new Document("$gt",List.of("$leaseUntil","$$NOW")))))).into(new ArrayList<>());
                     return rows.size()==1 && Boolean.FALSE.equals(rows.getFirst().get("leased"));
                 },() -> "the original NODE lease remains live");
             }
-            try (var replacement=InProcessServer.startPrepared(storage,ARGUMENTS)) {
+            try (var replacement = start(storage, topology, MongoRenewedTopology.ORIGINAL)) {
                 var control=new ControlPlane(replacement.baseUrl()); storage.loginAndAwaitBusiness(control);
                 Await.until("the new native run to enter the previously refused target call",BOUND,
                         () -> holds.holderBefore(TABLE,3).isPresent(),() -> control.state(PIPELINE)+" "+control.failureCode(PIPELINE));
@@ -123,6 +138,12 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
                 },() -> String.valueOf(progress(documents)));
             } finally { holds.releaseBefore(TABLE,3); }
         }
+    }
+
+    private static InProcessServer start(PreparedNativeStore storage, MongoRenewedTopology topology, String node) {
+        var args = new ArrayList<>(ARGUMENTS);
+        args.addAll(topology.arguments(node));
+        return InProcessServer.startPrepared(storage, args);
     }
 
     private static Document progress(NativeSrsDocuments documents) {
@@ -170,7 +191,7 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
     }
 
     private static final class DelayedNodeRenewal implements WorkloadClaimStore,AutoCloseable {
-        private final Object lease;
+        private final AtomicReference<?> current;
         private final WorkloadClaimStore delegate;
         private final WorkloadClaim original;
         private final AtomicBoolean arm=new AtomicBoolean();
@@ -178,15 +199,27 @@ class ANodeDeadlineEndsTheOldWritersExternalCallsIT {
         private final AtomicReference<Optional<WorkloadClaim>> accepted=new AtomicReference<>(Optional.empty());
         private volatile long deadline,returnedAt;
         DelayedNodeRenewal(Object lease) throws Exception {
-            this.lease=lease; delegate=(WorkloadClaimStore)readField(lease,"store");
-            @SuppressWarnings("unchecked") var current=(AtomicReference<WorkloadClaim>)readField(lease,"current"); original=current.get();
+            delegate = (WorkloadClaimStore) readField(lease, "store");
+            assertThat(readField(lease, "renewer")).isNotNull();
+            current = (AtomicReference<?>) readField(lease, "current");
+            original = (WorkloadClaim) proofValue(current.get(), "claim");
             assertThat(original.key().type()).isEqualTo(WorkloadClaimType.NODE_SESSION);
             Field field=lease.getClass().getDeclaredField("store"); field.setAccessible(true); field.set(lease,this);
         }
+        private static Object proofValue(Object proof, String component) {
+            try {
+                var method = proof.getClass().getDeclaredMethod(component);
+                method.setAccessible(true);
+                return method.invoke(proof);
+            } catch (ReflectiveOperationException failure) {
+                throw new AssertionError(failure);
+            }
+        }
+
         @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected,Duration ttl) {
             boolean delay=expected.key().equals(original.key()) && expected.owner().equals(original.owner())
                     && expected.claimGeneration()==original.claimGeneration() && arm.compareAndSet(true,false);
-            if (delay) try { deadline=(long)readField(lease,"provenUntil"); } catch (Exception failure) { throw new AssertionError(failure); }
+            if (delay) deadline = (long) proofValue(current.get(), "until");
             var result=delegate.renew(expected,ttl);
             if (delay) {
                 accepted.set(result); held.countDown(); boolean interrupted=false;

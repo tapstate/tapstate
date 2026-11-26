@@ -2,6 +2,11 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.sun.jdi.ObjectReference;
+import com.sun.jdi.StringReference;
+import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.EventSet;
+import com.sun.jdi.request.EventRequest;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
@@ -13,10 +18,15 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.DockerGate;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -28,8 +38,8 @@ import org.junit.jupiter.api.Test;
  * must not leave that consumer without a tail. Once the actual capture-owning process exits, the
  * surviving consumer's member takes the tail over from its durable position.
  *
- * <p>Candidates are started through the other member and classified by their actual claims until two
- * are driven away from the capture holder. The first joiner is stopped with its state cleared before the pipelines driven by the holder are stopped
+ * <p>The capture holder's claim calls are held for two designated pipelines until the other
+ * member has their claims. The first joiner is stopped with its state cleared before the holder's pipeline is stopped
  * the same way. Changes before and after the owner's exit have to reach the one left, and taking the tail over must not
  * attach the stopped first joiner to the chain again.
  * The source and the targets are real Mongo: the harness's own connector replays its whole table through
@@ -40,7 +50,7 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
     private static final String CONNECTOR = "mongodb";
     private static final String TABLE = "orders";
     private static final long SEEDED_ROWS = 5;
-    private static final int MOST_PIPELINES = 12;
+    private static final int PIPELINES = 3;
 
     private static final String SOURCE_ID = "let_go_src";
 
@@ -58,16 +68,16 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
     }
 
     @Test
-    void startingTheTakeoverWitnessOnTheOtherMemberPlacesItsDriverThere() {
+    void startingTheTakeoverWitnessOnTheOtherMemberPlacesItsDriverThere() throws Exception {
         runTakeoverWitness();
     }
 
     @Test
-    void thePipelineLeftReadingACaptureNobodyElseNeedsTakesItsTailOver() {
+    void thePipelineLeftReadingACaptureNobodyElseNeedsTakesItsTailOver() throws Exception {
         runTakeoverWitness();
     }
 
-    private void runTakeoverWitness() {
+    private void runTakeoverWitness() throws Exception {
         String run = UUID.randomUUID().toString().replace("-", "");
         String sourceUri = SharedMongo.replicaSetUrl("e2e_let_go_src_" + run);
 
@@ -76,7 +86,7 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
             try (PreparedNativeStore storage = PreparedNativeStore.create();
-                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage);
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedWithClaimBreakpoints(storage);
                     StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri());
                     MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
                             new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)));
@@ -89,7 +99,11 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 control.discoverSchema(SOURCE_ID, CONNECTOR, Map.of("uri", sourceUri));
 
                 String first = pipelineId(1);
-                EndpointAddress firstTarget = startPipelineInto(control, 1, sourceUri, run);
+                EndpointAddress firstTarget = withClaimsHeld(cluster.processCarrying(TwoMemberCluster.NODE_B), Set.of(first), () -> {
+                    var target = startPipelineInto(control, 1, sourceUri, run);
+                    awaitController(control, first, TwoMemberCluster.NODE_A);
+                    return target;
+                });
                 Await.until("the first pipeline's load to cross",
                         () -> mongo.count(firstTarget, TABLE) >= SEEDED_ROWS,
                         () -> "rows at the first target = " + mongo.count(firstTarget, TABLE));
@@ -102,16 +116,27 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 String remoteMember = holder.equals(TwoMemberCluster.NODE_A)
                         ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
 
-                CaptureTakeoverCandidates candidates = new CaptureTakeoverCandidates(holder, remoteMember, MOST_PIPELINES);
+                CaptureTakeoverCandidates candidates = new CaptureTakeoverCandidates(holder, remoteMember, PIPELINES);
                 Placement firstPlacement = tracePlacement(configuration, claims, control, cluster, storage,
                         first, holder, TwoMemberCluster.NODE_A);
                 candidates.add(first, firstPlacement.driver(), firstPlacement.trace());
-                for (int n = 2; n <= MOST_PIPELINES; n++) {
-                    String pipeline = pipelineId(n);
-                    EndpointAddress target = startPipelineInto(remote, n, sourceUri, run);
+                var remoteTargets = withClaimsHeld(cluster.processCarrying(holder),
+                        Set.of(pipelineId(2), pipelineId(3)), () -> {
+                            var targets = new LinkedHashMap<String, EndpointAddress>();
+                            for (int n = 2; n <= PIPELINES; n++) {
+                                String pipeline = pipelineId(n);
+                                targets.put(pipeline, startPipelineInto(remote, n, sourceUri, run));
+                                awaitController(remote, pipeline, remoteMember);
+                            }
+                            return targets;
+                        });
+                for (var remoteTarget : remoteTargets.entrySet()) {
+                    String pipeline = remoteTarget.getKey();
+                    EndpointAddress target = remoteTarget.getValue();
                     Placement placement = tracePlacement(configuration, claims, remote, cluster, storage,
                             pipeline, holder, remoteMember);
-                    if (!candidates.add(pipeline, placement.driver(), placement.trace())) continue;
+                    assertThat(placement.driver()).isEqualTo(remoteMember);
+                    assertThat(candidates.add(pipeline, placement.driver(), placement.trace())).isTrue();
                     String driver = placement.driver();
                     Await.until(pipeline + " to receive its load",
                             () -> mongo.count(target, TABLE) >= SEEDED_ROWS,
@@ -186,6 +211,56 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 }
                 candidates.requireReady();
             }
+        }
+    }
+
+    private static void awaitController(ControlPlane control, String pipeline, String node) {
+        Await.until("the selected member to own " + pipeline,
+                () -> control.pipelineControllerOf(pipeline).filter(node::equals).isPresent(),
+                () -> "controller=" + control.pipelineControllerOf(pipeline));
+    }
+
+    private static <T> T withClaimsHeld(RealProcessServer contender, Set<String> pipelines, Callable<T> start)
+            throws Exception {
+        var vm = contender.attachDebugger();
+        var held = new ArrayList<EventSet>();
+        try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var store = vm.classesByName("io.tapstate.adapters.mongostore.MongoCacheWorkloadClaimStore").getFirst();
+            var method = store.methodsByName("acquirePipeline").getFirst();
+            var request = vm.eventRequestManager().createBreakpointRequest(method.location());
+            request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            request.enable();
+            var result = workers.submit(start);
+            long deadline = System.nanoTime() + Duration.ofSeconds(120).toNanos();
+            try {
+                while (!result.isDone() && System.nanoTime() < deadline) {
+                    var events = vm.eventQueue().remove(100);
+                    if (events == null) continue;
+                    if (events.stream().anyMatch(event -> event instanceof BreakpointEvent hit
+                            && request.equals(hit.request()) && targets(hit, pipelines))) {
+                        held.add(events);
+                    } else {
+                        events.resume();
+                    }
+                }
+                return result.get(1, TimeUnit.SECONDS);
+            } finally {
+                request.disable();
+                held.forEach(EventSet::resume);
+                result.cancel(true);
+            }
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    private static boolean targets(BreakpointEvent hit, Set<String> pipelines) {
+        try {
+            var scope = (ObjectReference) hit.thread().frame(0).getArgumentValues().getFirst();
+            return scope.getValue(scope.referenceType().fieldByName("pipelineId")) instanceof StringReference id
+                    && pipelines.contains(id.value());
+        } catch (com.sun.jdi.IncompatibleThreadStateException failure) {
+            throw new AssertionError("The claim breakpoint did not suspend its worker", failure);
         }
     }
 

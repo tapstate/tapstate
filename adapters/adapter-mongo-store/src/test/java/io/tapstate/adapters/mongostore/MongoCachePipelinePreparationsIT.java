@@ -237,7 +237,8 @@ class MongoCachePipelinePreparationsIT {
                 case "failure" -> intents.updateOne(new Document("_id", "flow"), new Document("$set", new Document("startFailure", "PIPELINE_INTENT_FENCED")));
                 case "replacement" -> intents.updateOne(new Document("_id", "flow"), new Document("$set", new Document("stateGeneration", 2L)));
                 case "mapping" -> SystemCollections.OPERATOR_GENERATIONS.on(f.configDatabase).updateOne(new Document("_id", "flow"),
-                        new Document("$set", new Document("stateGeneration", 2L)));
+                        new Document("$set", new Document("stateGeneration", 2L))
+                                .append("$unset", new Document("connectorBindings", "")));
                 case "reset" -> SystemCollections.CONFIG_CLUSTER_IDENTITY.on(f.configDatabase).updateOne(new Document("_id", "cluster"),
                         new Document("$set", new Document("bindingVersion", 0L)));
                 default -> throw new AssertionError(change);

@@ -75,7 +75,7 @@ class NativeBusinessCandidateLifecycleIT {
                                 var intents=org.mockito.Mockito.spy(ports.intents());
                                 org.mockito.Mockito.doAnswer(read -> {
                                     reads.incrementAndGet();if(!starting.get())prematureReads.incrementAndGet();return read.callRealMethod();
-                                }).when(intents).dispatchSnapshot();
+                                }).when(intents).scanCandidates();
                                 ReflectionTestUtils.setField(driver,"scoped",new ConvergenceDriver.ScopedPorts(intents,ports.stores(),ports.requireActive(),
                                         ports.actuators(),ports.rebuilds(),ports.retainRebuilds()));
                                 var cache=observer.getDatabase(storage.cacheDatabase());
@@ -198,11 +198,10 @@ class NativeBusinessCandidateLifecycleIT {
                             assertThat(WorkloadClaimFence.from(before.claim())).isEqualTo(exact);
                             factory.failed.forEach(candidate -> candidate.nativeOwner.close());
                             factory.failed.forEach(Candidate::assertStopped);
-                            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
-                                var live=claims.read(exact.key()).orElseThrow();
-                                assertThat(live.leased()).isTrue(); assertThat(WorkloadClaimFence.from(live.claim())).isEqualTo(exact);
-                                assertThat(live.claim().leaseUntil()).isAfter(before.claim().leaseUntil());
-                            });
+                            var live = claims.read(exact.key()).orElseThrow();
+                            assertThat(live.leased()).isTrue();
+                            assertThat(WorkloadClaimFence.from(live.claim())).isEqualTo(exact);
+                            assertThat(live.claim().leaseUntil()).isEqualTo(before.claim().leaseUntil());
                             assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
                             assertThat(node.currentFence()).contains(exact); assertThat(root.runtime().current()).contains(retained);
                             retained.cache().verifyBusinessReady(retained.preparation().businessScope());
@@ -264,10 +263,18 @@ class NativeBusinessCandidateLifecycleIT {
                 .as("the no-op positive control was not evicted from the profiler")
                 .isEqualTo(new Document("$set",new Document("keyId",current.get("keyId"))));
         for(var row:rows.subList(before,rows.size())) {
-            assertThat(row.getString("op")).isEqualTo("update");
-            var command=row.get("command",Document.class);
-            assertThat(command.get("q",Document.class)).isEqualTo(new Document("_id",current.get("_id")).append("keyId",current.get("keyId")));
-            assertThat(command.get("u",Document.class)).isEqualTo(new Document("$inc",new Document("sourceWriteFence",1L)));
+            var command = row.get("command", Document.class);
+            boolean findAndModify = "command".equals(row.getString("op"));
+            if (findAndModify) {
+                assertThat(command.getString("findAndModify")).isEqualTo("cluster_keys");
+                assertThat(command.getBoolean("remove", false)).isFalse();
+            } else {
+                assertThat(row.getString("op")).isEqualTo("update");
+            }
+            assertThat(command.get(findAndModify ? "query" : "q", Document.class))
+                    .isEqualTo(new Document("_id", current.get("_id")).append("keyId", current.get("keyId")));
+            assertThat(command.get(findAndModify ? "update" : "u", Document.class))
+                    .isEqualTo(new Document("$inc", new Document("sourceWriteFence", 1L)));
             assertThat(command.getBoolean("multi",false)).isFalse();assertThat(command.getBoolean("upsert",false)).isFalse();
         }
     }
@@ -310,7 +317,10 @@ class NativeBusinessCandidateLifecycleIT {
         @Override public void start() {
             nativeOwner.start(); child=(ConfigurableApplicationContext)ReflectionTestUtils.getField(nativeOwner,"context");
             member=child.getBean(HazelcastInstance.class);
-            executors.add((ExecutorService)ReflectionTestUtils.getField(child.getBean(NodeSessionLease.class),"renewer"));
+            var lease = child.getBean(NodeSessionLease.class);
+            assertThat(lease.active()).isTrue();
+            assertThat(ReflectionTestUtils.getField(lease, "renewer"))
+                    .as("a process-owned node has no Mongo renewal executor").isNull();
             executors.add((ExecutorService)ReflectionTestUtils.getField(child.getBean(ExecutionAuthorization.class),"refresher"));
             var cleanup=ReflectionTestUtils.getField(nativeOwner,"payloadCleanup");
             if (cleanup!=null && ReflectionTestUtils.getField(cleanup,"worker") instanceof ExecutorService executor) executors.add(executor);

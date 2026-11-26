@@ -5,6 +5,7 @@ import io.tapstate.adapters.mongostore.*;
 import io.tapstate.core.alerting.*;
 import io.tapstate.core.common.*;
 import io.tapstate.spi.store.*;
+import io.tapstate.testsupport.MongoRenewedTopology;
 import io.tapstate.testsupport.RequiresDocker;
 import java.net.URI;
 import java.net.http.*;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -39,22 +41,40 @@ class NativeCacheAlertIT {
         var settings=new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5));
         try(var observer=MongoClients.create(storage.configurationUri())) {
             var config=observer.getDatabase(storage.configurationDatabase());var admin=observer.getDatabase("admin");
-            String[] args={"--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--tapstate.store.mongo.uri="+storage.configurationUri(),
+            String[] args={"--server.address=127.0.0.1","--server.port=0","--logging.level.root=WARN","--tapstate.store.mongo.uri="+storage.configurationUri(),
                     "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.cluster.node-session-ttl=6s","--tapstate.cluster.node-session-renew-interval=1s",
-                    "--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),"--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=cache-alert-fixture-signing"};
+                    "--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),"--tapstate.control.auth.jwt-secret=cache-alert-fixture-signing"};
+            var topology = new MongoRenewedTopology(storage.clusterId());
             AlarmKey originalKey;
-            try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(args)) {
-                NativeAppStorage.awaitBusiness(app);var client=HttpClient.newHttpClient();String base="http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort();
+            try (var app = start(args, topology, MongoRenewedTopology.ORIGINAL)) {
+                var child = NativeAppStorage.business(app);
+                var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
+                try (var peer = start(args, topology, MongoRenewedTopology.PEER)) {
+                    NativeAppStorage.awaitBusiness(app);
+                    assertThat(member.getCluster().getMembers()).hasSize(2);
+                }
+                // The committed topology keeps Mongo renewal active after the peer leaves.
+                // Only the member under test can publish the healthy or failing sample.
+                await().atMost(Duration.ofSeconds(15)).until(() -> member.getCluster().getMembers().size() == 1);
+                var client=HttpClient.newHttpClient();String base="http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort();
                 var login=post(client,base,"/auth/login",null,Map.of("username","cache-admin","password","isolated-cache-password"));
                 String token=String.valueOf(login.get("token"));
                 post(client,base,"/api/alerts/configuration/save",token,Map.of("kind","RULE","id","cache-required-write","etag","0","form",Map.of("name","Required CACHE access","typeId","cluster.storage-unavailable",
                         "resourceKinds",List.of("cluster-storage"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true)));
-                await().atMost(Duration.ofSeconds(10)).until(()->config.getCollection("alert_node_lifecycles").countDocuments()==1);
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(()->{
-                    var healthy=config.getCollection("alert_instances").find(new Document("_id.resourceKind","cluster-storage").append("_id.resourceId","cache")).first();
+                var lease = child.getBean(NodeSessionLease.class);
+                var fence = lease.currentFence().orElseThrow();
+                var claims = child.getBean(WorkloadClaimStore.class);
+                var initial = claims.read(fence.key()).orElseThrow().claim();
+                await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                        assertThat(claims.read(fence.key()).orElseThrow().claim().leaseUntil()).isAfter(initial.leaseUntil()));
+                await().atMost(Duration.ofSeconds(15)).until(() -> config.getCollection("alert_node_lifecycles")
+                        .countDocuments(new Document("nodeId", fence.owner().nodeId())
+                                .append("bootId", fence.owner().bootId()).append("phase", "EXPECTED")) == 1);
+                await().atMost(Duration.ofSeconds(20)).untilAsserted(()->{
+                    var healthy=config.getCollection("alert_instances").find(new Document("_id.resourceKind", "cluster-storage").append("_id.resourceId", "cache")
+                            .append("binding.ruleIdentity.id", "cache-required-write")).first();
                     assertThat(healthy).isNotNull();assertThat(healthy).containsEntry("status","CLEAR");
                 });
-                var child = NativeAppStorage.business(app);
                 var runtime = child.getBean(PipelineAlertRuntime.class);
                 var controlRelease = new java.util.concurrent.CountDownLatch(queuedControl ? 1 : 0);
                 var controlExecuted = new java.util.concurrent.atomic.AtomicBoolean();
@@ -76,14 +96,18 @@ class NativeCacheAlertIT {
                                     exited.countDown();
                                 }
                             };
-                            org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "submit", null, 0, block);
-                            org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "submit", null, 0, block);
+                            org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "submit", null, 0, block, (Runnable) () -> {});
+                            org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "submit", null, 0, block, (Runnable) () -> {});
                             assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                            admin.runCommand(new Document("configureFailPoint", "failCommand")
-                                    .append("mode", new Document("times", 1))
+                            long initialFaults = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                                    .append("mode", "alwaysOn")
                                     .append("data", new Document("namespace", storage.cacheDatabase() + ".workload_claims")
-                                            .append("failCommands", List.of("findAndModify")).append("errorCode", 8)));
-                            await().atMost(Duration.ofSeconds(8)).until(() -> !child.getBean(NodeSessionLease.class).active());
+                                            .append("appName", "tapstate/" + fence.owner().bootId())
+                                            .append("failCommands", List.of("findAndModify")).append("errorCode", 8)))
+                                    .get("count")).longValue();
+                            admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                                    .append("timesEntered", initialFaults + 1).append("maxTimeMS", 5000));
+                            await().atMost(Duration.ofSeconds(12)).until(() -> !lease.active());
                             if (queued != null) {
                                 controlRelease.countDown();
                                 assertThatThrownBy(() -> queued.released().toCompletableFuture()
@@ -97,7 +121,8 @@ class NativeCacheAlertIT {
                             release.countDown();
                             await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
                                 var raw = config.getCollection("alert_instances")
-                                        .find(new Document("_id.resourceKind", "cluster-storage").append("_id.resourceId", "cache"))
+                                        .find(new Document("_id.resourceKind", "cluster-storage").append("_id.resourceId", "cache")
+                                                .append("binding.ruleIdentity.id", "cache-required-write"))
                                         .first();
                                 assertThat(raw).isNotNull();
                                 assertThat(raw).containsEntry("status", "FIRING");
@@ -125,10 +150,11 @@ class NativeCacheAlertIT {
                 }
             }
             await().atMost(Duration.ofSeconds(10)).until(()->{
-                var row=observer.getDatabase(storage.cacheDatabase()).getCollection("workload_claims").find(new Document("_id.resourceId",storage.clusterId())).first();
+                var row=observer.getDatabase(storage.cacheDatabase()).getCollection("workload_claims").find(new Document("resourceType", "NODE_SESSION")
+                        .append("resourceId", MongoRenewedTopology.ORIGINAL)).first();
                 return row==null || row.getDate("leaseUntil").before(Date.from(Instant.now()));
             });
-            try(var restarted=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(args);
+            try(var restarted = start(args, topology, MongoRenewedTopology.ORIGINAL);
                     var domain=MongoConfigurationDomain.open(settings,storage.clusterId())) {
                 NativeAppStorage.awaitBusiness(restarted);var setup=domain.bindings().load().orElseThrow().setup();
                 var store=domain.alerts(new AlertStore.Host(originalKey.scope(),setup,AlertChannelPolicy.Deployment.ON_PREM,()->{}),BuiltinAlarmTypes.catalog(),Clock.systemUTC());
@@ -141,6 +167,14 @@ class NativeCacheAlertIT {
         }finally{
             try(var cleanup=MongoClients.create(storage.configurationUri())){cleanup.getDatabase(storage.configurationDatabase()).drop();cleanup.getDatabase(storage.cacheDatabase()).drop();cleanup.getDatabase(storage.masterDatabase()).drop();}
         }
+    }
+    private ConfigurableApplicationContext start(String[] base, MongoRenewedTopology topology, String node) {
+        var arguments = new ArrayList<>(List.of(base));
+        arguments.remove("--tapstate.hz.member-port=0");
+        arguments.addAll(topology.arguments(node));
+        arguments.add("--tapstate.connectors.plugins-dir=" + work.resolve(node));
+        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .run(arguments.toArray(String[]::new));
     }
     private static ValidationMemberResources.Control holdQueuedControl(
             org.springframework.context.ConfigurableApplicationContext child,
