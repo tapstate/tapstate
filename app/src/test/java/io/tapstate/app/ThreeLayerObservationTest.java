@@ -20,6 +20,39 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 class ThreeLayerObservationTest {
     @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aStopAfterAnUnpreparedFirstStartLeavesARealRetryOrPendingClear(boolean purge) {
+        var f = new Fixture();
+        var preparation = new PipelinePreparation("pipeline", 1,
+                PipelinePreparation.Phase.UNASSIGNED, null, null, null);
+        var header = new AtomicReference<>(new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.RUNNING, "hash")),
+                Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1));
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
+                .thenAnswer(call -> Map.of("pipeline", header.get()));
+        var memory = new InMemoryStorePort();
+        memory.artifacts().save(new PipelineResource("pipeline", null, List.of(), null, null, null, null, null));
+        var artifacts = new ArtifactQueryService(memory.artifacts());
+        var catalog = new PipelineCatalogService(artifacts, new PipelineDraftService(mock(PipelineDraftStore.class)),
+                new PipelineObservationQueryService(artifacts, f.port.observations()), f.port);
+        assertThat(catalog.find("pipeline").orElseThrow().status().displayState())
+                .isEqualTo(PipelineCatalogItem.UiState.FAILED);
+
+        header.set(new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.STOPPED, "hash", purge)),
+                Optional.empty(), false, Optional.empty(), 2));
+        var detail = catalog.find("pipeline").orElseThrow();
+        assertThat(detail.status().displayState()).isEqualTo(purge
+                ? PipelineCatalogItem.UiState.STOPPING : PipelineCatalogItem.UiState.NOT_STARTED);
+        assertThat(detail.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(detail.status().stopState()).isEqualTo(purge ? PipelineCatalogItem.StopState.CLEARING : null);
+        assertThat(detail.status().observedState()).isNull();
+        assertThat(detail.status().failure()).isNull();
+        assertThat(catalog.list()).containsExactly(detail);
+        verifyNoInteractions(f.cache);
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
     void aPurgeInProgressRemainsStoppingWithoutReusingItsRetiredObservation(boolean recoveredCache) {
         var f = new Fixture();
         if (recoveredCache) when(f.recoveries.read("pipeline")).thenReturn(Optional.of(
@@ -101,9 +134,10 @@ class ThreeLayerObservationTest {
         var pending = new PipelinePreparation("pipeline", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null);
         var params = Map.of("id", "doc-42", "field", "revision");
         var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), pending,
-                Optional.empty(), Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1, params);
+                Optional.empty(), Optional.empty(), false, Optional.of(IoError.DOCUMENT_UNREADABLE), 1, params, false);
         var ids = List.of("pipeline");
-        when(f.configuration.pipelineDisplayHeaders(ids, true)).thenReturn(Map.of("pipeline", header));
+        when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
+                .thenReturn(Map.of("pipeline", header));
 
         var failure = f.port.pipelineCatalogStates(ids).get("pipeline").observation().orElseThrow().failure();
         assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
@@ -138,6 +172,38 @@ class ThreeLayerObservationTest {
 
         assertThat(f.port.observations().readAll(ids)).containsEntry("pipeline", f.observed);
         verify(f.cache, never()).pipelineObservations(any());
+    }
+
+    @Test void aClearingStopAcceptedDuringTheCacheReadSupersedesTheOldReceipt() {
+        var f = new Fixture();
+        var ids = List.of("pipeline");
+        var preparation = f.preparations.read("pipeline").orElseThrow();
+        var completed = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.STOPPED, "hash", false)),
+                Optional.empty(), false, Optional.empty(), 1, Map.of(), true);
+        var clearing = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(), preparation,
+                Optional.of(new DesiredState("pipeline", PipelineState.STOPPED, "hash", true)),
+                Optional.empty(), false, Optional.empty(), 2, Map.of(), false);
+        var structure = new MongoConfigurationDomain.PipelineDisplayHeader(
+                f.mapping.get(), preparation, Optional.empty(), Optional.empty(), false);
+        var before = Map.of("pipeline", structure);
+        var intent = new AtomicReference<>(completed);
+        when(f.configuration.pipelineDisplayHeadersBeforeCache(eq(ids), any(CacheBusinessScope.class)))
+                .thenReturn(before);
+        when(f.configuration.pipelineDisplayHeadersAfterCache(ids, ids, before))
+                .thenAnswer(call -> Map.of("pipeline", intent.get()));
+        var stopped = new Observation("pipeline", PipelineState.STOPPED, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(true))).thenAnswer(call -> {
+            intent.set(clearing);
+            return Map.of("pipeline", new MongoCacheDomain.PipelineObservationReading(
+                    Optional.of(stopped), false, PipelineState.STOPPED));
+        });
+
+        var result = f.port.pipelineCatalogStates(ids).get("pipeline");
+        assertThat(result.desired()).isEqualTo(clearing.desired());
+        assertThat(result.completedStopClear()).isFalse();
+        assertThat(result.observation()).contains(stopped);
+        verify(f.configuration).pipelineDisplayHeadersAfterCache(ids, ids, before);
     }
 
     @Test void aRebuildThatOvertakesAnObservationReadCannotPublishTheOldGeneration() {

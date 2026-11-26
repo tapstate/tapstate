@@ -786,10 +786,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     }
                 }
                 if (failed instanceof RenewalWriteConflict) {
-                    throw new WorkloadClaimRenewalException(owned.released()
-                            ? WorkloadClaimRenewalException.Reason.WRITE_CONFLICT
-                            : WorkloadClaimRenewalException.Reason.UNCONFIRMED,
-                            "Mongo Pipeline renewal WriteConflict code=112");
+                    throw WorkloadClaimRenewalException.writeConflict(owned.released());
                 }
                 if (operations.nodeSessionRenewal() && (retryCommit || failed instanceof MongoException mongo
                         && (committedAck || !owned.released() || mongo.hasErrorLabel("UnknownTransactionCommitResult")))) {
