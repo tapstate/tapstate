@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.hazelcast.core.HazelcastInstance;
@@ -16,6 +18,8 @@ import io.tapstate.core.lifecycle.PipelineRunProgress;
 import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.OperatorRunManifest;
+import io.tapstate.runtime.srs.ChangeStreamReadyObserver;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ConnectorRunBindings;
 import io.tapstate.spi.store.IoError;
@@ -28,6 +32,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -39,6 +44,48 @@ import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.Test;
 
 class NativePipelineRunProgressPublisherTest {
+    @Test
+    void oneCdcNotificationSurvivesATemporaryStoreFailure() throws Exception {
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var intent = new PipelineIntentSnapshot(scope, 4, new DesiredState("orders", PipelineState.RUNNING, "a".repeat(64)));
+        var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
+                new WorkloadOwner("node", "boot"), 1, 2, 3);
+        var original = new ExecutionFence(scope, claim);
+        var engine = mock(Engine.class);
+        var run = mock(Engine.Run.class);
+        when(run.jobId()).thenReturn(23L);
+        when(run.operatorManifest()).thenReturn(new OperatorRunManifest("orders", original, List.of()));
+        when(engine.captureRun("orders")).thenReturn(Optional.of(run));
+        var cache = mock(MongoCacheDomain.class);
+        var store = mock(MongoCachePipelineRunProgressStore.class);
+        when(cache.pipelineRunProgress(eq(scope), eq(claim), any())).thenReturn(store);
+        var intents = mock(PipelineIntentStore.class);
+        when(intents.loadForActuation("orders")).thenReturn(Optional.of(intent));
+        when(intents.executionBindings(scope)).thenReturn(Optional.of(new PipelineIntentStore.ExecutionBindings(
+                new ConnectorRunBindings(scope, 4, List.of(), null), intent.intentRevision())));
+        var context = new ConcurrentHashMap<String, Object>();
+        var member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(context);
+        var written = new CompletableFuture<PipelineRunProgress>();
+        when(store.update(eq(4L), any(), eq(Execution.REQUIRE_BOUND), any()))
+                .thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of(), null))
+                .thenAnswer(call -> {
+                    UnaryOperator<PipelineRunProgress> change = call.getArgument(3);
+                    written.complete(change.apply(call.getArgument(1)));
+                    return true;
+                });
+        Instant ready = Instant.parse("2026-11-26T10:00:00Z");
+        var business = new CacheBusinessScope("cluster", 1, "cache");
+        try (var publisher = new NativePipelineRunProgressPublisher(cache, business, intents, () -> {},
+                member, engine, Clock.fixed(ready, ZoneOffset.UTC))) {
+            var observer = (ChangeStreamReadyObserver) context.get(ChangeStreamReadyObserver.USER_CONTEXT_KEY);
+            observer.ready(original, 23, 29);
+            assertThat(written.get(5, TimeUnit.SECONDS).milestones())
+                    .contains(new PipelineRunProgress.Milestone(PipelineRunStage.CDC_READY, ready));
+            verify(engine, times(2)).captureRun("orders");
+        }
+    }
+
     @Test
     void liveEngineProgressRetriesTheOriginalBindingAfterTheFirstWriteFails() throws Exception {
         var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);

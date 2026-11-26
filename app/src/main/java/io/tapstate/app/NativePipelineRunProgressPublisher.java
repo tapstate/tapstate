@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineRunProgress;
 import io.tapstate.core.lifecycle.PipelineRunStage;
@@ -10,6 +11,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.srs.ChangeStreamReadyObserver;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelineIntentStore;
@@ -193,22 +195,21 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     private void schedule(Object key, boolean remember, int retries, BooleanSupplier operation, long delay) {
         try {
             writer.schedule(() -> {
-                boolean deferred = false;
+                boolean retry = false;
                 try {
                     if (operation.getAsBoolean()) {
                         if (remember) synchronized (recorded) {
                             recorded.put(key, true);
                             if (recorded.size() > MAX_RETAINED) recorded.pollFirstEntry();
                         }
-                    } else if (retries > 0 && !writer.isShutdown()) {
-                        LOG.debug("Run progress is waiting for the original execution binding: {}", key);
-                        deferred = true;
-                        schedule(key, remember, retries - 1, operation, 200);
-                    }
+                    } else retry = true;
                 } catch (RuntimeException unavailable) {
+                    retry = unavailable instanceof TapstateException failure && failure.code() == IoError.STORE_UNAVAILABLE;
                     LOG.debug("Run progress publication was refused or temporarily unavailable for {}", key, unavailable);
                 } finally {
-                    if (!deferred) release(key);
+                    if (retry && retries > 0 && !writer.isShutdown()) {
+                        schedule(key, remember, retries - 1, operation, 200);
+                    } else release(key);
                 }
             }, delay, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException closed) {
