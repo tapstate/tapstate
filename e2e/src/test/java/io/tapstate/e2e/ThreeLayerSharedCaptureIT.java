@@ -421,6 +421,9 @@ class ThreeLayerSharedCaptureIT {
                 assertThat(control.state("reader_c")).contains(PipelineState.RUNNING);assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
                 for(String field:List.of("captureId","captureFence","epoch"))assertThat(cache.getCollection("srs_chains").find(new Document("_id",kept)).first().get(field)).isEqualTo(keptRoot.get(field));
                 assertThat(cache.getCollection("srs_models").find(new Document("_id.chain",kept)).sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(keptModels);
+                var bCheckpoint = cache.getCollection("pipeline_state").find(new Document("_id", "reader_b")).first();
+                assertThat(bCheckpoint).isNotNull();
+                assertThat(bCheckpoint.getString("stateJson")).isEqualTo("STOPPED");
                 for(String id:List.of("reader_a","reader_b")) {
                     control.stop(id,true);
                     Await.until(id+" to finish its separately confirmed clear",BOUND,() -> {
@@ -429,7 +432,24 @@ class ThreeLayerSharedCaptureIT {
                     },() -> String.valueOf(generations.find(new Document("_id",id)).first()));
                     control.lifecycle(id,LifecycleVerb.START);awaitRows(mongo,source,id.equals("reader_a")?a:b,BOUND);
                     if(id.equals("reader_a")) {
-                        awaitRows(mongo,second,a,"items",BOUND);assertThat(control.state("reader_b")).contains(PipelineState.STOPPED);
+                        awaitRows(mongo,second,a,"items",BOUND);
+                        var bClaim = new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", "reader_b");
+                        var claims = cache.getCollection("workload_claims");
+                        var observations = cache.getCollection("pipeline_observation");
+                        Await.until("reader_b to remain STOPPED under its current claim", Duration.ofSeconds(10), () -> {
+                            var claim = claims.find(bClaim).first();
+                            return claim != null && control.state("reader_b").filter(PipelineState.STOPPED::equals).isPresent()
+                                    && observations.find(new Document("pipelineId", "reader_b").append("state", "STOPPED")
+                                            .append("_id.scope", bCheckpoint.get("scope"))
+                                            .append("_id.epoch", bCheckpoint.getLong("epoch"))
+                                            .append("_id.claimGeneration", claim.getLong("claimGeneration"))
+                                            .append("_id.executionGeneration", bExecution)
+                                            .append("_id.topologyRevision", claim.getLong("topologyRevision"))
+                                            .append("_id.node", claim.getString("ownerNodeId"))
+                                            .append("_id.boot", claim.getString("ownerBootId"))).first() != null;
+                        }, () -> "state=" + control.state("reader_b") + ", claim=" + claims.find(bClaim).first());
+                        assertThat(cache.getCollection("pipeline_state").find(new Document("_id", "reader_b")).first())
+                                .containsEntry("scope", bCheckpoint.get("scope")).containsEntry("epoch", bCheckpoint.getLong("epoch"));
                         mongo.update(source,"orders",Map.of("id",2L),Map.of("seq",202L));awaitRows(mongo,source,a,BOUND);
                         mongo.update(second,"items",Map.of("id",3L),Map.of("seq",333L));awaitRows(mongo,second,c,"items",BOUND);
                         assertThat(rows(mongo,b)).isEqualTo(bRows);assertThat(execution(cache,"reader_b")).isEqualTo(bExecution);

@@ -358,7 +358,8 @@ final class ThreeLayerStorePort implements StorePort {
                 if (!scope.equals(captured.scope()) || !desired.revision().equals(captured.inputs().pipelineHash()))
                     throw refused();
                 return switch (configuration.commitRetainedStart(scope, original.revision(), desired, captured.inputs(),
-                        ThreeLayerStorePort.this::active)) {
+                        ThreeLayerStorePort.this::active,
+                        () -> bound.cache().verifyRetainedTableSelection(scope, captured.inputs(), ThreeLayerStorePort.this::active))) {
                     case SAVED -> true;
                     case FALLBACK -> false;
                     case VERSION_CONFLICT -> throw new TapstateException(io.tapstate.control.core.PipelineError.VERSION_CONFLICT,

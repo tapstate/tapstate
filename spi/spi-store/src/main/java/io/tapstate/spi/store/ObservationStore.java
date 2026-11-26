@@ -1,5 +1,6 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import java.util.Optional;
 
@@ -43,6 +44,11 @@ public interface ObservationStore {
      * unsupported or no longer matching; the caller must take an ordinary fresh measurement.
      */
     default Optional<Observation> refreshTerminal(Observation expected, long checkpointEpoch, java.time.Instant at) {
+        return Optional.empty();
+    }
+
+    /** Reissues a settled stop for the same scoped checkpoint and execution under the current claim. */
+    default Optional<Observation> republishStopped(CheckpointDoc checkpoint) {
         return Optional.empty();
     }
 

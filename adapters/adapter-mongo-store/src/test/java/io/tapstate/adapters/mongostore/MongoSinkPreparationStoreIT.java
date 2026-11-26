@@ -373,6 +373,27 @@ class MongoSinkPreparationStoreIT {
     }
 
     @Test
+    void retainedTableSelectionReadsOnlyTheOriginalClaimAndAdmission() {
+        withFixture(f -> {
+            var inputs = authoring(f);
+            var expanded = new PipelinePreparationInputs(inputs.pipelineHash(), inputs.sourceHashes(),
+                    Map.of("input", Set.of("orders", "customers")), List.of());
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                f.domain.verifyRetainedTableSelection(f.scope, inputs, ACTIVE);
+                assertThat(commands).containsExactly("aggregate:cache_identity", "find:workload_claims", "commitTransaction:");
+                commands.clear();
+                assertCode(() -> f.domain.verifyRetainedTableSelection(f.scope, expanded, ACTIVE),
+                        IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED);
+                assertThat(commands).containsExactly("aggregate:cache_identity", "find:workload_claims", "abortTransaction:");
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+        });
+    }
+
+    @Test
     void ordinaryStartupCombinesRetainedSourcesAndSinkModelsInOneReadOnlySnapshot() {
         withFixture(f -> {
             var inputs = authoring(f);
@@ -401,11 +422,10 @@ class MongoSinkPreparationStoreIT {
                 assertThat(commands.stream().filter(e -> e.name().equals("commitTransaction"))).hasSize(2);
                 commands.clear();
                 assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isTrue();
-                assertThat(commands).hasSize(8);
                 assertThat(commands.stream().map(CommandCall::name))
-                        .containsExactly("aggregate", "find", "find", "find", "find", "find", "find",
-                                "commitTransaction");
-                assertThat(commands.stream().filter(e -> finds(e, "workload_claims"))).hasSize(1);
+                        .containsExactly("aggregate", "find", "find", "find", "find", "commitTransaction");
+                assertThat(commands.stream().filter(e -> reads(e, "pipeline_state"))).hasSize(1);
+                assertThat(commands.stream().filter(e -> reads(e, "workload_claims"))).hasSize(1);
                 assertThat(commands.stream().filter(e -> finds(e, "sink_preparations"))).hasSize(1);
                 var transaction = commands.getFirst().command();
                 assertThat(commands).allSatisfy(event -> {
@@ -413,7 +433,6 @@ class MongoSinkPreparationStoreIT {
                     assertThat(event.command().get("txnNumber")).isEqualTo(transaction.get("txnNumber"));
                 });
                 assertThat(f.snapshot()).isEqualTo(before);
-                System.out.println("Combined retained startup CACHE commands 11 -> 8; one commit");
 
                 var expanded = new PipelinePreparationInputs(inputs.pipelineHash(), inputs.sourceHashes(),
                         Map.of("input", Set.of("orders", "customers")), List.of());
@@ -533,7 +552,7 @@ class MongoSinkPreparationStoreIT {
                 } else {
                     assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, requirePass)).isTrue();
                 }
-                var claimReads = commands.stream().filter(e -> finds(e, "workload_claims")).toList();
+                var claimReads = commands.stream().filter(e -> reads(e, "workload_claims")).toList();
                 assertThat(claimReads).hasSize(2);
                 assertThat(claimReads.getFirst().command().get("lsid")).isEqualTo(claimReads.getLast().command().get("lsid"));
                 assertThat(claimReads.getFirst().command().get("txnNumber"))
@@ -555,6 +574,17 @@ class MongoSinkPreparationStoreIT {
     }
 
     private record CommandCall(String name, org.bson.BsonDocument command) {}
+
+    private static boolean reads(CommandCall event, String collection) {
+        if (finds(event, collection)) return true;
+        if (!event.name().equals("aggregate")) return false;
+        var command = event.command();
+        var expected = new org.bson.BsonString(collection);
+        return expected.equals(command.get("aggregate"))
+                || command.getArray("pipeline").stream()
+                        .map(value -> value.asDocument().getDocument("$lookup", new org.bson.BsonDocument()))
+                        .anyMatch(lookup -> expected.equals(lookup.get("from")));
+    }
 
     private static boolean finds(CommandCall event, String collection) {
         return event.name().equals("find") && event.command().get("find") instanceof org.bson.BsonString found

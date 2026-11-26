@@ -83,6 +83,17 @@ class MongoCachePipelineStoresIT {
                         observed.getDatabase(f.database().getName()), SCOPE, f.fence(), ACTIVE));
                 assertThat(store.startupOrder()).isZero();
                 assertThat(commands).containsExactly("aggregate");
+
+                var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+                var stateId = new Document("_id", "orders");
+                assertThat(state.updateOne(stateId, new Document("$set",
+                        new Document("padding", "x".repeat(64 * 1024)))).getModifiedCount()).isOne();
+                commands.clear();
+                assertThat(store.startupOrder()).isZero();
+                assertThat(commands).startsWith("aggregate").contains("find").endsWith("commitTransaction");
+                assertThat(state.updateOne(stateId, new Document("$unset",
+                        new Document("padding", ""))).getModifiedCount()).isOne();
+
                 SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
                         new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
                 assertCode(store::startupOrder, IoError.WORKLOAD_CLAIM_FENCED);
@@ -851,6 +862,41 @@ class MongoCachePipelineStoresIT {
             var restarted = f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders");
             assertThat(restarted.observation()).isEmpty();
             assertThat(restarted.runningObservationUnavailable()).isFalse();
+        });
+    }
+
+    @Test void aSettledStopCanBeRepublishedOnlyForTheSameCheckpointAndExecution() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var checkpoint = states.read("orders").orElseThrow();
+            var original = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            assertThat(original.republishStopped(checkpoint)).isEmpty();
+            var stopped = observation(PipelineState.STOPPED);
+            original.save(stopped, checkpoint.epoch());
+
+            var claims = f.domain().workloadClaims(BUSINESS);
+            assertThat(claims.release(claims.read(KEY).orElseThrow().claim())).isTrue();
+            assertThat(original.republishStopped(checkpoint)).isEmpty();
+            var granted = claims.acquirePipeline(SCOPE, new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30));
+            assertThat(granted.acquired()).isTrue();
+            var next = WorkloadClaimFence.from(granted.claim());
+            assertThat(next.executionGeneration()).isEqualTo(f.fence().executionGeneration());
+            assertThat(next.claimGeneration()).isGreaterThan(f.fence().claimGeneration());
+            var resumed = f.domain().pipelineObservations(SCOPE, next, ACTIVE);
+            assertThat(resumed.read("orders")).isEmpty();
+            assertThat(original.republishStopped(checkpoint)).isEmpty();
+            assertThat(resumed.republishStopped(checkpoint)).contains(stopped);
+            assertThat(resumed.read("orders")).contains(stopped);
+
+            var advanced = claims.advanceExecution(granted.claim(), 1, Set.of("node-b")).orElseThrow();
+            var successor = WorkloadClaimFence.from(advanced);
+            var newObservations = f.domain().pipelineObservations(SCOPE, successor, ACTIVE);
+            assertThat(newObservations.republishStopped(checkpoint)).isEmpty();
+            assertThat(f.domain().pipelineStates(SCOPE, successor, ACTIVE)
+                    .compareAndSwap("orders", checkpoint.epoch(), "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            assertThat(newObservations.republishStopped(checkpoint)).isEmpty();
+            assertThat(newObservations.read("orders")).isEmpty();
         });
     }
 

@@ -32,15 +32,15 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
                 MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "node", nodeId),
                 MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SNAPSHOT_ORDERS, "order", orderId)));
         if (captured == null || !"cluster".equals(captured.get("identity", Document.class).get("_id"))
-                || MongoCaptureStartupRows.get(captured, "schema") == null
-                || MongoCaptureStartupRows.get(captured, "state") == null
-                || MongoCaptureStartupRows.get(captured, "claim") == null
-                || MongoCaptureStartupRows.get(captured, "order") == null
                 || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
                 || MongoCaptureStartupRows.ambiguous(captured, "state", access.scope.pipelineId())
                 || MongoCaptureStartupRows.ambiguous(captured, "claim", claimId)
                 || MongoCaptureStartupRows.ambiguous(captured, "node", nodeId)
-                || MongoCaptureStartupRows.ambiguous(captured, "order", orderId)) return order();
+                || MongoCaptureStartupRows.ambiguous(captured, "order", orderId)
+                || MongoCaptureStartupRows.get(captured, "schema") == null
+                || MongoCaptureStartupRows.get(captured, "state") == null
+                || MongoCaptureStartupRows.get(captured, "claim") == null
+                || MongoCaptureStartupRows.get(captured, "order") == null) return order();
         MongoCacheBusinessIdentity.requireObservedAdmission(captured.get("identity", Document.class),
                 MongoCaptureStartupRows.get(captured, "schema"), business());
         access.validateState(MongoCaptureStartupRows.get(captured, "state"));

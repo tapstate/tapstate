@@ -494,7 +494,8 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
 
     MongoConfigurationDomain.RetainedStart commitRetainedStart(PipelineIntentScope scope, long expected,
-            DesiredState desired, PipelinePreparationInputs inputs, MongoConfigurationArtifactStore artifacts) {
+            DesiredState desired, PipelinePreparationInputs inputs, MongoConfigurationArtifactStore artifacts,
+            Runnable verifyRetainedSources) {
         var fallback = MongoConfigurationDomain.RetainedStart.FALLBACK;
         if (!artifacts.belongsTo(client, database.getName()) || expected < 1 || expected >= Long.MAX_VALUE - 1
                 || !scope.pipelineId().equals(desired.pipelineId()) || desired.targetState() != PipelineState.RUNNING
@@ -562,6 +563,8 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
 
             var version = MongoStartConfigRead.row(snapshot, "version", ConfigurationVersion.ID);
             if (version.isEmpty()) return fallback;
+            // Read the original CACHE generation before committing the guarded CONFIG intent.
+            verifyRetainedSources.run();
             ConfigurationVersion.advanceStart(session, versions, database, version.orElseThrow(), schema.orElse(null), snapshot);
             writeIntent(session, scope, expected, desired, null, current.orElseThrow(), generation, true);
             return MongoConfigurationDomain.RetainedStart.SAVED;

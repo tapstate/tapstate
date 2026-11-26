@@ -69,9 +69,13 @@ class AlertEvaluationHostIT {
                         .filter(row->"alert_cleanup".equals(row.getString("name"))).findFirst().orElseThrow();
                 episodes.dropIndex("alert_cleanup");
                 try {
-                    await().atMost(Duration.ofSeconds(12)).untilAsserted(()->assertThatThrownBy(
-                            ()->f.store().state(key,f.reads())).isInstanceOfSatisfying(TapstateException.class,
-                            error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE)));
+                    assertThat(f.store().state(key, f.reads())).isEmpty();
+                    assertThat(f.configuration().inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                            .anySatisfy(difference -> {
+                                assertThat(difference.collection()).isEqualTo("alert_episodes");
+                                assertThat(difference.index()).isEqualTo("alert_cleanup");
+                                assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                            });
                 } finally {
                     episodes.createIndex(index.get("key",Document.class),new com.mongodb.client.model.IndexOptions().name("alert_cleanup"));
                 }

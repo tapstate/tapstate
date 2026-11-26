@@ -7,6 +7,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -119,6 +120,38 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             var result = collection().replaceOne(session, new Document("_id", id)
                     .append("observedAt", previous.get("observedAt")), captured);
             return result.getMatchedCount() == 1 ? Optional.of(refreshed) : Optional.empty();
+        });
+    }
+
+    @Override public Optional<Observation> republishStopped(CheckpointDoc checkpoint) {
+        access.requirePipeline(checkpoint.pipelineId());
+        var original = access.originalClaim();
+        if (original == null || StateJson.parse(checkpoint.stateJson()) != PipelineState.STOPPED) return Optional.empty();
+        return access.observationTransaction(session -> {
+            var state = access.stateRow(session);
+            if (!checkpoint.equals(MongoStateStore.toCheckpoint(state))) return Optional.empty();
+            var claimId = claimKey(access);
+            var reading = reading(session, access, state, claims(session, access, List.of(claimId)).get(claimId));
+            var id = keyOfFence(access, checkpoint.epoch(), original);
+            if (!reading.live() || !id.equals(reading.key())) return Optional.empty();
+
+            var collection = collection();
+            var exact = collection.find(session, new Document("_id", id)).first();
+            if (exact != null) return decode(access, exact, id).filter(value -> value.state() == PipelineState.STOPPED);
+            var filter = scopeEpoch(access, checkpoint.epoch()).append("state", PipelineState.STOPPED.name())
+                    .append("_id.executionGeneration", original.executionGeneration())
+                    .append("_id.claimGeneration", new Document("$lt", original.claimGeneration()));
+            var retained = collection.find(session, filter).sort(new Document("_id.claimGeneration", -1)).first();
+            if (retained == null) return Optional.empty();
+            var stopped = decode(access, retained, retained.get("_id", Document.class)).orElseThrow();
+            // Serialize the publication with execution changes and takeover of the claim.
+            access.proveClaim(session, true);
+            // Keep the original measurement and timestamp. A simultaneous fresh sample wins.
+            var insert = document(stopped, id);
+            insert.remove("_id");
+            collection.updateOne(session, new Document("_id", id), new Document("$setOnInsert", insert),
+                    new UpdateOptions().upsert(true));
+            return Optional.of(stopped);
         });
     }
 

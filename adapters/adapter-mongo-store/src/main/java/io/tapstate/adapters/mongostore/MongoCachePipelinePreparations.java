@@ -231,6 +231,13 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
 
     private void verifyRetainedSources(ClientSession session, PipelineIntentScope scope, PipelinePreparationInputs expected,
             PipelinePreparationInputs original) {
+        verifyTableSelection(scope, expected, original);
+        MongoPipelineSourcePreparations.verifyAll(session, client, database, scope, original, requireActive);
+        MongoSnapshotStateStore.order(session, database, scope);
+    }
+
+    static void verifyTableSelection(PipelineIntentScope scope, PipelinePreparationInputs expected,
+            PipelinePreparationInputs original) {
         if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
         var added = new java.util.TreeSet<String>();
         expected.selectedTables().forEach((source, tables) -> tables.forEach(table -> {
@@ -239,8 +246,6 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         }));
         if (!added.isEmpty()) throw new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
                 Map.of("pipeline", scope.pipelineId(), "tables", String.join(", ", added)), null);
-        MongoPipelineSourcePreparations.verifyAll(session, client, database, scope, original, requireActive);
-        MongoSnapshotStateStore.order(session, database, scope);
     }
 
     /** Only the verification path above can construct a production completion receipt. */
