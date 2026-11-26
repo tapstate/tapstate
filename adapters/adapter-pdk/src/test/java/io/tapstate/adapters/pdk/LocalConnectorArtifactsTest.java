@@ -11,10 +11,12 @@ import io.tapstate.spi.store.RequiredNoteOrigin;
 import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,6 +35,100 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class LocalConnectorArtifactsTest {
     @TempDir
     Path work;
+
+    @Test
+    void failedUploadKeepsTheReadFailureWhenStagingCleanupAlsoFails() throws IOException {
+        var installer = installer(new Cache(), (hash, output) -> false);
+        var original = new IOException("Upload stream interrupted");
+        var brokenUpload = new InputStream() {
+            @Override public int read() throws IOException {
+                try (var paths = Files.walk(work)) {
+                    var staged = paths.filter(path -> path.getFileName().toString().startsWith(".connector-"))
+                            .findFirst().orElseThrow();
+                    Files.delete(staged);
+                    Files.createDirectory(staged);
+                    Files.createFile(staged.resolve("keep"));
+                }
+                throw original;
+            }
+        };
+
+        assertThatThrownBy(() -> installer.stage(brokenUpload, bytes -> {}))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
+                    assertThat(failure.getCause()).isSameAs(original);
+                    assertThat(original.getSuppressed()).hasOnlyElementsOfType(java.nio.file.DirectoryNotEmptyException.class)
+                            .hasSize(1);
+                });
+    }
+
+    @Test
+    void missingArtifactKeepsTheFileReadCauseForHashingAndDropInstall() {
+        Path missing = work.resolve("missing.jar");
+        var installer = installer(new Cache(), (hash, output) -> false);
+
+        for (ThrowingCallable read : List.<ThrowingCallable>of(
+                () -> ConnectorArtifactRegistrar.hashOf(missing), () -> installer.installDrop(missing))) {
+            assertThatThrownBy(read).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(ConnectorError.ARTIFACT_UNREADABLE);
+                assertThat(failure.args()).containsEntry("artifact", "missing.jar");
+                assertThat(failure.getCause()).isInstanceOf(java.nio.file.NoSuchFileException.class);
+            });
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.NullSource
+    @org.junit.jupiter.params.provider.ValueSource(strings = "orders")
+    void stagingAnArtifactRetainsTheInstallRecordWriteFailure(String expectedId) throws IOException {
+        Path source = artifact("2.9.3");
+        String hash = ContentHash.of(Files.readAllBytes(source));
+        var installer = installer(new Cache(), (id, output) -> false);
+        try (var input = Files.newInputStream(source); var staged = installer.stage(input, bytes -> {})) {
+            Path record = Files.createDirectory(work.resolve("plugins").resolve(hash + ".json"));
+            Files.createFile(record.resolve("keep"));
+            assertThatThrownBy(() -> staged.install(Origin.UPLOAD, expectedId, hash))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
+                        assertThat(failure.args()).containsEntry("connector", expectedId == null ? "upload" : expectedId);
+                        assertThat(failure.getCause()).isInstanceOf(IOException.class);
+                    });
+        }
+    }
+
+    @Test
+    void legacyArtifactReadFailurePreservesCauseAndCleansTheStagingFile() throws IOException {
+        var original = new IOException("Legacy artifact read interrupted");
+        var installer = installer(new Cache(), (hash, output) -> { throw original; });
+        var notes = org.mockito.Mockito.mock(RequiredNoteStore.class);
+        var owner = new RequiredNoteOwner(1, "pdk.chain.chain", RequiredNoteOwner.Kind.CHAIN, "chain", 0);
+        var scope = new RequiredNoteScope(owner, 1);
+        var origin = new RequiredNoteOrigin("orders", "a".repeat(64), new byte[]{1});
+
+        assertThatThrownBy(() -> installer.resolveRetained(notes, scope, origin))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
+                    assertThat(failure.getCause()).isSameAs(original);
+                });
+        try (var files = Files.list(work.resolve("plugins"))) {
+            assertThat(files.map(file -> file.getFileName().toString())).noneMatch(name -> name.startsWith(".legacy-connector-"));
+        }
+    }
+
+    @Test
+    void retainingAnArtifactKeepsTheCauseIfItsBundledCopyDisappears() throws IOException {
+        Path source = artifact("2.9.3");
+        String hash = ContentHash.of(Files.readAllBytes(source));
+        var installer = installer(new Cache(), (id, output) -> false);
+        installer.registerBundle(source, "orders", hash, Files.size(source));
+        var ref = installer.resolve("orders", hash);
+        Files.delete(source);
+
+        assertThatThrownBy(() -> installer.retain(ref)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED);
+            assertThat(failure.getCause()).isInstanceOf(java.nio.file.NoSuchFileException.class);
+        });
+    }
 
     @Test
     void distinctVersionsRemainAvailableByHashAfterAnOfflineCacheRebuild() throws IOException {
@@ -268,6 +364,18 @@ class LocalConnectorArtifactsTest {
         assertThat(runtime.registryView().findAll("orders"))
                 .extracting(io.tapstate.spi.store.ConnectorRegistration::contentHash).containsExactly(hash);
         assertThat(runtime.resolve("orders").contentHash()).isEqualTo(hash);
+
+        supported.set(false);
+        assertThat(runtime.admits("orders")).isFalse();
+        Path replacement = Files.copy(artifact("2.9.12"), work.resolve("replacement.jar"));
+        assertThatThrownBy(() -> runtime.installDrop(replacement)).isInstanceOfSatisfying(
+                TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_OFFICIAL));
+
+        var restarted = new LocalConnectorArtifacts(work.resolve("plugins"), new ConnectorIntrospector(), cache,
+                cache.specs, cache, "node", (digest, output) -> { throw new AssertionError("Unexpected GridFS"); },
+                List::of, "2.0.11-SNAPSHOT");
+        restarted.restore();
+        assertThat(restarted.resolve("orders").contentHash()).isEqualTo(hash);
     }
 
     @Test

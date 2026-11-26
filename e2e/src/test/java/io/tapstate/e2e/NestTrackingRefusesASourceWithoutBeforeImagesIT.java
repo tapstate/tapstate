@@ -128,13 +128,12 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
                         .as("the failure is counted, not only entered")
                         .contains(1L);
 
-                await(() -> control.failureCode(pipelineId).isPresent());
-                assertThat(control.failureCode(pipelineId))
-                        .as("the diagnosis, read from the status face. The connector names the exact server "
-                                + "setting to change; a run reporting the generic engine failure has "
-                                + "dropped that on the way and leaves the operator with logs to read.%n"
-                                + "  logs: %s", control.logs(pipelineId))
-                        .contains(EXPECTED_CODE);
+                await(() -> control.failure(pipelineId).isPresent());
+                var failure = control.failure(pipelineId).orElseThrow();
+                assertThat(failure.code()).isEqualTo(EXPECTED_CODE);
+                assertThat(failure.params().get("detail"))
+                        .asString()
+                        .contains("FULL binlog_row_image");
             }
         }
     }

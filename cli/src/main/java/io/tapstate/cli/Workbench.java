@@ -9,9 +9,11 @@ import dev.tamboui.tui.event.KeyEvent;
 import dev.tamboui.tui.event.MouseEvent;
 import dev.tamboui.tui.event.MouseEventKind;
 import dev.tamboui.tui.event.PasteEvent;
+import io.tapstate.core.common.TapstateException;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
+import java.io.PrintWriter;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -42,37 +44,81 @@ final class Workbench {
 
     /** Opens the initial workbench shell and returns after its runner has restored the terminal. */
     static int run(Repl session) {
-        Terminal terminal = null;
+        return run(session.errorOutput(), () -> TerminalBuilder.builder().system(true).dumb(true).build(),
+                runner -> {
+                    try (var workbench = new Session(
+                            runner, session, session.workbenchDataSource(), session.workbenchActionGateway())) {
+                        runner.runLater(workbench::refresh);
+                        runner.run(workbench::handleEvent, workbench::render);
+                    }
+                });
+    }
+
+    @FunctionalInterface
+    interface TerminalOpener {
+        Terminal open() throws Exception;
+    }
+
+    @FunctionalInterface
+    interface SessionLoop {
+        void run(TuiRunner runner) throws Exception;
+    }
+
+    static int run(PrintWriter err, TerminalOpener opener, SessionLoop loop) {
         try {
-            terminal = TerminalBuilder.builder().system(true).dumb(true).build();
-            if ("dumb".equalsIgnoreCase(terminal.getType())) {
-                terminal.close();
-                Diagnostics.printText(session.errorOutput(), CliError.WORKBENCH_NEEDS_A_TERMINAL, Map.of());
-                return Cli.EXIT_DIAGNOSTIC;
-            }
-            WorkbenchTerminalBackend backend = new WorkbenchTerminalBackend(terminal);
-            terminal = null;
-            TuiRunner runner = createRunner(backend);
-            try {
-                Session workbench = new Session(
-                        runner, session, session.workbenchDataSource(), session.workbenchActionGateway());
-                try {
-                    runner.runLater(workbench::refresh);
-                    runner.run(workbench::handleEvent, workbench::render);
-                } finally {
-                    workbench.close();
-                }
-            } catch (Exception | Error failure) {
-                closeAfterFailure(runner, backend, failure);
-                throw failure;
-            }
-            closeRunner(runner, backend);
-            return Cli.EXIT_OK;
-        } catch (Exception ignored) {
-            closeQuietly(terminal);
-            Diagnostics.printText(session.errorOutput(), CliError.WORKBENCH_UNAVAILABLE, Map.of());
+            return runTerminal(err, opener, loop);
+        } catch (TapstateException failure) {
+            Diagnostics.printText(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
+    }
+
+    private static int runTerminal(PrintWriter err, TerminalOpener opener, SessionLoop loop) {
+        Terminal terminal = null;
+        WorkbenchTerminalBackend backend;
+        TuiRunner runner;
+        try {
+            terminal = opener.open();
+            if ("dumb".equalsIgnoreCase(terminal.getType())) {
+                terminal.close();
+                Diagnostics.printText(err, CliError.WORKBENCH_NEEDS_A_TERMINAL, Map.of());
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+            backend = new WorkbenchTerminalBackend(terminal);
+            terminal = null;
+            runner = createRunner(backend);
+        } catch (RuntimeException | Error failure) {
+            closeAfterFailure(terminal, failure);
+            throw failure;
+        } catch (Exception failure) {
+            closeAfterFailure(terminal, failure);
+            throw terminalFailure(CliError.WORKBENCH_UNAVAILABLE, failure);
+        }
+
+        try {
+            runSession(runner, backend, loop);
+            return Cli.EXIT_OK;
+        } catch (RuntimeException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw terminalFailure(CliError.WORKBENCH_SESSION_FAILED, failure);
+        }
+    }
+
+    private static void runSession(TuiRunner runner, WorkbenchTerminalBackend backend, SessionLoop loop)
+            throws Exception {
+        try {
+            loop.run(runner);
+        } catch (Exception | Error failure) {
+            closeAfterFailure(runner, backend, failure);
+            throw failure;
+        }
+        closeRunner(runner, backend);
+    }
+
+    private static TapstateException terminalFailure(CliError code, Exception failure) {
+        if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+        return new TapstateException(code, Map.of(), failure);
     }
 
     /**
@@ -147,14 +193,14 @@ final class Workbench {
         WorkbenchRenderer.render(frame, WorkbenchState.initial());
     }
 
-    private static void closeQuietly(Terminal terminal) {
+    private static void closeAfterFailure(Terminal terminal, Throwable failure) {
         if (terminal == null) {
             return;
         }
         try {
             terminal.close();
-        } catch (Exception ignored) {
-            // The original terminal initialization failure is the diagnosable outcome.
+        } catch (Exception | Error cleanupFailure) {
+            addSuppressedOnce(failure, cleanupFailure);
         }
     }
 
