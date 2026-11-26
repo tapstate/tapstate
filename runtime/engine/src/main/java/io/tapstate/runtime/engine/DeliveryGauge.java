@@ -1,5 +1,6 @@
 package io.tapstate.runtime.engine;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramValue;
 
 import java.util.Map;
@@ -64,6 +65,10 @@ interface DeliveryGauge {
      * correctly through a lull in which nothing settles at all.
      */
     void took(Map<String, HistogramValue> durationByTable);
+
+    /** Cumulative CDC-only durations, reported with confirmed writes. */
+    default void cdcDelivered(CdcDeliveryTotals totals) {
+    }
 
     /**
      * Takes the reading the two above are only readable against: the moment this sink began counting, as

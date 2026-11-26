@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
@@ -81,6 +82,115 @@ class PipelineObservabilityLiveIT {
     }
 
     @Test
+    void confirmedCdcWritesProduceDeliveryHistoryAfterSnapshot() throws Exception {
+        Instant from = Instant.now().minusSeconds(5);
+        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
+                MongoEndpoints mongo = new MongoEndpoints();
+                PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                RealProcessServer server = start(storage, List.of(
+                        "--tapstate.metrics.history.sample-interval=" + SAMPLE_INTERVAL.toSeconds() + "s"))) {
+            mysql.start();
+            SharedMySql.grantReplication(mysql);
+            seed(mysql);
+            String targetUri = SharedMongo.replicaSetUrl("observability_cdc_delivery_target");
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+
+            Map<String, Object> mysqlConfig = mysqlConfig(mysql);
+            control.apply(resources(mysqlConfig, targetUri));
+            control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            awaitState(control, PipelineState.RUNNING);
+            awaitCustomer(mongo, target, "seeded", "the snapshot to reach the real Mongo target");
+
+            var snapshot = awaitHistory(server.baseUrl(), control.credential(), from,
+                    history -> !lagReadings(history).isEmpty(), "a retained snapshot acknowledgement");
+            assertThat(points(snapshot)).noneMatch(point -> point.containsKey("cdcDelivery"));
+            update(mysql, "moving");
+            awaitCustomer(mongo, target, "moving", "the first CDC update to reach the target");
+            awaitHistory(server.baseUrl(), control.credential(), from,
+                    PipelineObservabilityLiveIT::hasCdcDelivery, "the first confirmed CDC history reading");
+            Instant secondChange = Instant.now();
+            update(mysql, "moving-again");
+            awaitCustomer(mongo, target, "moving-again", "the second CDC update to reach the target");
+
+            var moving = awaitHistory(server.baseUrl(), control.credential(), from,
+                    history -> points(history).stream().anyMatch(point -> positiveOutputDelta(point)
+                            && Instant.parse((String) point.get("intervalEnd")).isAfter(secondChange)),
+                    "a positive output interval after the second CDC update");
+            assertThat(points(moving)).anySatisfy(point -> {
+                assertThat(point.get("cdcDelivery")).isInstanceOf(Map.class);
+                Map<?, ?> delivery = (Map<?, ?>) point.get("cdcDelivery");
+                assertThat(((Number) delivery.get("sampleCount")).longValue()).isPositive();
+                assertThat(((Number) delivery.get("averageMillis")).doubleValue()).isNotNegative();
+            });
+        }
+    }
+
+    @Test
+    void cdcOnlyHistoryCountsTheFirstAcknowledgementInRestAndCli() throws Exception {
+        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
+                MongoEndpoints mongo = new MongoEndpoints();
+                PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                RealProcessServer server = start(storage, List.of(
+                        "--tapstate.metrics.history.sample-interval=" + SAMPLE_INTERVAL.toSeconds() + "s"))) {
+            mysql.start();
+            SharedMySql.grantReplication(mysql);
+            seed(mysql);
+            String targetUri = SharedMongo.replicaSetUrl("observability_cdc_only_target");
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            Map<String, Object> mysqlConfig = mysqlConfig(mysql);
+            var resources = resources(mysqlConfig, targetUri);
+            resources.computeIfPresent("pipeline.tap.yml",
+                    (name, yaml) -> yaml.replace("snapshot_and_cdc", "cdc_only"));
+            control.apply(resources);
+            control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            awaitState(control, PipelineState.RUNNING);
+
+            // Take a fresh window after the sink has initialized, and wait for observations in it.
+            Instant launchedAt = Instant.now().minus(REAL_CONNECTOR_WAIT);
+            awaitHistory(server.baseUrl(), control.credential(), launchedAt,
+                    history -> pointCount(history) >= 2, "idle sink observations");
+            Instant from = Instant.now();
+            var idle = awaitHistory(server.baseUrl(), control.credential(), from,
+                    history -> pointCount(history) >= 2, "a zero baseline inside the selected window");
+            assertThat(points(idle)).noneMatch(point -> point.containsKey("cdcDelivery"));
+            assertThat(mongo.documents(target, TABLE)).isEmpty();
+
+            try (Connection connection = DriverManager.getConnection(
+                    mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());
+                    Statement statement = connection.createStatement()) {
+                statement.execute("INSERT INTO orders (id, customer) VALUES (2, 'first-cdc')");
+            }
+            awaitCustomer(mongo, target, "first-cdc", "the first CDC insert to reach Mongo");
+            var first = awaitHistory(server.baseUrl(), control.credential(), from,
+                    PipelineObservabilityLiveIT::hasCdcDelivery, "the first acknowledgement in CDC-only history");
+            var deliveries = points(first).stream().map(point -> point.get("cdcDelivery"))
+                    .filter(Map.class::isInstance).map(Map.class::cast).toList();
+            assertThat(deliveries).hasSize(1);
+            Map<?, ?> delivery = deliveries.getFirst();
+            assertThat(((Number) delivery.get("sampleCount")).longValue()).isEqualTo(1);
+            Number averageMillis = (Number) delivery.get("averageMillis");
+            assertThat(averageMillis.doubleValue()).isNotNegative();
+
+            CliOnce.Run cliHistory = CliOnce.runWithPassword(PASSWORD,
+                    "-c", server.baseUrl().toString(), "-u", USER, "metrics", PIPELINE_ID,
+                    "--from", from.toString(), "--to", (String) first.get("effectiveTo"),
+                    "--resolution", "raw", "--limit", "1000", "--table", TABLE);
+            assertThat(cliHistory.exitCode()).isZero();
+            assertThat(cliHistory.stdout()).contains("cdc.delivery.avg=" + averageMillis + "ms samples=1");
+        }
+    }
+
+    @Test
     void realRunRestartGapAndCodedFailureAgreeAcrossRestCliAndMcp() throws Exception {
         Instant from = Instant.now().minusSeconds(5);
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
@@ -105,6 +215,8 @@ class PipelineObservabilityLiveIT {
             List<String> serverSettings = List.of(
                     "--tapstate.metrics.history.sample-interval=" + SAMPLE_INTERVAL.toSeconds() + "s");
 
+            // Both processes represent a restart of the same installation.
+            Path connectorStaging = Files.createDirectory(temporaryDirectory.resolve("connector-staging"));
             RealProcessServer first = null;
             RealProcessServer second = null;
             try (CuttableLink targetLink = CuttableLink.open(targetLinkPort, targetAddress.getHost(),
@@ -112,7 +224,7 @@ class PipelineObservabilityLiveIT {
                     Map.of("target", new int[] {0, 65535}));
                     PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD)) {
                 try {
-                    first = start(storage, serverSettings);
+                    first = start(storage, serverSettings, connectorStaging);
                     ControlPlane control = new ControlPlane(first.baseUrl());
                     storage.loginAndAwaitBusiness(control);
                     control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -126,18 +238,19 @@ class PipelineObservabilityLiveIT {
                     awaitCustomer(mongo, target, "seeded", "the snapshot to reach the real Mongo target");
 
                     awaitHistory(first.baseUrl(), control.credential(), from,
-                            history -> pointCount(history) >= 1, "the first retained sample");
+                            history -> !lagReadings(history).isEmpty(), "a retained snapshot acknowledgement");
                     update(mysql, "moving");
                     awaitCustomer(mongo, target, "moving", "a CDC update before the restart");
-                    Map<String, Object> baseline = awaitHistory(first.baseUrl(), control.credential(), from,
-                            history -> startReasons(history).contains("COUNTER_RESET"),
-                            "the first delivery counter baseline");
-                    int resetsBeforeRestart = reasonCount(baseline, "COUNTER_RESET");
+                    awaitHistory(first.baseUrl(), control.credential(), from,
+                            PipelineObservabilityLiveIT::hasCdcDelivery, "the first confirmed CDC history reading");
+                    Instant secondChange = Instant.now();
                     update(mysql, "moving-again");
-                    awaitCustomer(mongo, target, "moving-again", "a second CDC update after the counter baseline");
+                    awaitCustomer(mongo, target, "moving-again", "a second CDC update before the restart");
                     Map<String, Object> moving = awaitHistory(first.baseUrl(), control.credential(), from,
-                            PipelineObservabilityLiveIT::hasPositiveOutputDelta,
-                            "a positive target-acknowledged output interval");
+                            history -> points(history).stream().anyMatch(point -> positiveOutputDelta(point)
+                                    && Instant.parse((String) point.get("intervalEnd")).isAfter(secondChange)),
+                            "a positive output interval after the second CDC update");
+                    int resetsBeforeRestart = reasonCount(moving, "COUNTER_RESET");
                     assertThat(lagReadings(moving)).isNotEmpty();
 
                     Map<String, Object> normal = awaitExplanation(first.baseUrl(), control.credential(),
@@ -159,7 +272,7 @@ class PipelineObservabilityLiveIT {
                     first = null;
                     awaitMissingSampleInterval();
 
-                    second = start(storage, serverSettings);
+                    second = start(storage, serverSettings, connectorStaging);
                     control = new ControlPlane(second.baseUrl());
                     storage.loginAndAwaitBusiness(control);
                     awaitState(control, PipelineState.RUNNING);
@@ -225,7 +338,11 @@ class PipelineObservabilityLiveIT {
     }
 
     private static RealProcessServer start(PreparedNativeStore storage, List<String> settings) {
-        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", port -> {
+        return start(storage, settings, null);
+    }
+
+    private static RealProcessServer start(PreparedNativeStore storage, List<String> settings, Path connectorStaging) {
+        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", connectorStaging, port -> {
             var arguments = new ArrayList<>(settings);
             arguments.add("--tapstate.cluster.id=" + storage.clusterId());
             arguments.add("--tapstate.hz.member-port=0");
@@ -334,9 +451,10 @@ class PipelineObservabilityLiveIT {
             java.util.function.Predicate<Map<String, Object>> condition, String what) {
         AtomicReference<Map<String, Object>> last = new AtomicReference<>(Map.of());
         Await.until(what, REAL_CONNECTOR_WAIT, () -> {
-            Map<String, Object> value = history(base, token, from, Instant.now().plusSeconds(1));
+            Map<String, Object> value = get(base, token, historyPath(from, Instant.now().plusSeconds(1)),
+                    503, ControlError.STORAGE_UNAVAILABLE.code());
             last.set(value);
-            return condition.test(value);
+            return !ControlError.STORAGE_UNAVAILABLE.code().equals(value.get("code")) && condition.test(value);
         }, () -> String.valueOf(last.get()));
         return last.get();
     }
@@ -345,7 +463,8 @@ class PipelineObservabilityLiveIT {
             URI base, String token, java.util.function.Predicate<String> kind, String what) {
         AtomicReference<Map<String, Object>> last = new AtomicReference<>(Map.of());
         Await.until(what, REAL_CONNECTOR_WAIT, () -> {
-            Map<String, Object> value = get(base, token, "/api/pipelines/" + PIPELINE_ID + "/explain", true);
+            Map<String, Object> value = get(base, token, "/api/pipelines/" + PIPELINE_ID + "/explain",
+                    404, MonitorError.NO_OBSERVATION.code());
             last.set(value);
             return kind.test(String.valueOf(value.get("kind")));
         }, () -> String.valueOf(last.get()));
@@ -353,9 +472,12 @@ class PipelineObservabilityLiveIT {
     }
 
     private static Map<String, Object> history(URI base, String token, Instant from, Instant to) {
-        String path = "/api/pipelines/" + PIPELINE_ID + "/metrics/history?from=" + encoded(from.toString())
+        return get(base, token, historyPath(from, to));
+    }
+
+    private static String historyPath(Instant from, Instant to) {
+        return "/api/pipelines/" + PIPELINE_ID + "/metrics/history?from=" + encoded(from.toString())
                 + "&to=" + encoded(to.toString()) + "&resolution=raw&limit=1000&table=" + TABLE;
-        return get(base, token, path);
     }
 
     private static Map<String, Object> explanation(URI base, String token) {
@@ -363,11 +485,12 @@ class PipelineObservabilityLiveIT {
     }
 
     private static Map<String, Object> get(URI base, String token, String path) {
-        return get(base, token, path, false);
+        return get(base, token, path, -1, "");
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> get(URI base, String token, String path, boolean awaitingObservation) {
+    private static Map<String, Object> get(
+            URI base, String token, String path, int retryStatus, String retryCode) {
         HttpRequest request = HttpRequest.newBuilder(base.resolve(path))
                 .timeout(Duration.ofSeconds(20))
                 .header("Authorization", "Bearer " + token)
@@ -376,10 +499,10 @@ class PipelineObservabilityLiveIT {
         try {
             HttpResponse<String> response = HttpClient.newHttpClient()
                     .send(request, HttpResponse.BodyHandlers.ofString());
-            if (awaitingObservation && response.statusCode() == 404
+            if (response.statusCode() == retryStatus
                     && JsonReader.parse(response.body()) instanceof Map<?, ?> refusal
-                    && MonitorError.NO_OBSERVATION.code().equals(refusal.get("code"))) {
-                return Map.of();
+                    && retryCode.equals(refusal.get("code"))) {
+                return (Map<String, Object>) refusal;
             }
             if (response.statusCode() != 200) {
                 throw new AssertionError("GET " + path + " returned " + response.statusCode()
@@ -430,11 +553,14 @@ class PipelineObservabilityLiveIT {
                 .toList();
     }
 
-    private static boolean hasPositiveOutputDelta(Map<String, Object> history) {
-        return points(history).stream().anyMatch(point ->
-                point.get("recordsOut") instanceof Map<?, ?> rate
-                        && rate.get("delta") instanceof Number delta
-                        && delta.doubleValue() > 0);
+    private static boolean hasCdcDelivery(Map<String, Object> history) {
+        return points(history).stream().anyMatch(point -> point.containsKey("cdcDelivery"));
+    }
+
+    private static boolean positiveOutputDelta(Map<String, Object> point) {
+        return point.get("recordsOut") instanceof Map<?, ?> rate
+                && rate.get("delta") instanceof Number delta
+                && delta.doubleValue() > 0;
     }
 
     private static Map<String, Object> explanationContract(Map<String, Object> value) {

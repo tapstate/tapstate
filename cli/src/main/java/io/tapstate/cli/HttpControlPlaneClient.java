@@ -1463,21 +1463,40 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         List<HistoryOutcome.Point> out = new ArrayList<>();
         for (Object item : list) {
-            if (!(item instanceof Map<?, ?> point)
-                    || !(point.get("intervalStart") instanceof String start)
-                    || !(point.get("intervalEnd") instanceof String end)) {
+            HistoryOutcome.Point point = historyPoint(item);
+            if (point == null) {
                 return null;
             }
-            HistoryOutcome.Rate records = rate(point, "recordsOut");
-            HistoryOutcome.Rate bytes = rate(point, "bytesOut");
-            List<HistoryOutcome.Lag> lag = historyLag(point.get("lag"));
-            if (lag == null || point.containsKey("recordsOut") && records == null
-                    || point.containsKey("bytesOut") && bytes == null) {
-                return null;
-            }
-            out.add(new HistoryOutcome.Point(start, end, records, bytes, lag));
+            out.add(point);
         }
         return List.copyOf(out);
+    }
+
+    private static HistoryOutcome.Point historyPoint(Object raw) {
+        if (!(raw instanceof Map<?, ?> point)
+                || !(point.get("intervalStart") instanceof String start)
+                || !(point.get("intervalEnd") instanceof String end)) {
+            return null;
+        }
+        HistoryOutcome.Rate records = rate(point, "recordsOut");
+        HistoryOutcome.Rate bytes = rate(point, "bytesOut");
+        List<HistoryOutcome.Lag> lag = historyLag(point.get("lag"));
+        HistoryOutcome.CdcDelivery cdc = historyCdcDelivery(point.get("cdcDelivery"));
+        if (lag == null || point.containsKey("recordsOut") && records == null
+                || point.containsKey("bytesOut") && bytes == null
+                || point.containsKey("cdcDelivery") && cdc == null) {
+            return null;
+        }
+        return new HistoryOutcome.Point(start, end, records, bytes, lag, cdc);
+    }
+
+    private static HistoryOutcome.CdcDelivery historyCdcDelivery(Object raw) {
+        if (raw instanceof Map<?, ?> delivery
+                && delivery.get("sampleCount") instanceof Long count && count > 0
+                && delivery.get("averageMillis") instanceof Number average && average.doubleValue() >= 0) {
+            return new HistoryOutcome.CdcDelivery(count, average);
+        }
+        return null;
     }
 
     private static HistoryOutcome.Rate rate(Map<?, ?> point, String name) {

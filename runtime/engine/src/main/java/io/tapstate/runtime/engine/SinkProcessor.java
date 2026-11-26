@@ -2,6 +2,9 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -11,8 +14,10 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
@@ -72,7 +77,14 @@ import java.util.concurrent.CompletionException;
  * durable offset is the source's, not Jet's, so a restart replays from the source rather than
  * resuming a sink snapshot.
  */
-public final class SinkProcessor extends AbstractProcessor implements Staged {
+public final class SinkProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext context) {
+        if (supplied instanceof JetDeliveryGauge jobGauge) {
+            jobGauge.collectCdcDelivery(descriptor, context);
+        }
+    }
 
     @Override
     public Stage stage() {
@@ -131,6 +143,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // average: the slow rows are the ones anybody reading a delivery time came for, and an average is
     // where they disappear.
     private final Map<String, DurationTotals> settledDurations = new LinkedHashMap<>();
+    private CdcDeliveryTotals cdcDelivery = CdcDeliveryTotals.ZERO;
     // The clock a row's delivery is measured against, at the moment its write is confirmed. A seam so a
     // duration can be witnessed at a known instant rather than by waiting for real time to pass.
     private final LongSupplier clock;
@@ -422,7 +435,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
         // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
         // so the readings go nowhere instead.
-        if (member != null) return;
+        if (member != null) {
+            if (delivery instanceof JetDeliveryGauge jobGauge) {
+                jobGauge.countingSince(countingSince);
+            }
+            return;
+        }
         if (supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
         }
@@ -535,8 +553,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // Tallied while the rows are still here and counted only once the write settles. Holding the
             // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
             // write; this keeps one number per table and operation in it instead.
-            inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
-                    firstOrder));
+            var positions = positionsOf(batch);
+            var delivered = DeliveredRows.of(batch);
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder));
         }
         // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
         // backpressures upstream until reapSettled frees a slot on a later call.
@@ -782,8 +801,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             if (!batch.future().isDone()) {
                 return false;
             }
+            SettledWrite settled;
             try {
-                settle(batch.future()); // throws on a failed write, before any position advances
+                settled = settle(batch.future()); // throws on a failed write, before any position advances
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
                 // machinery: once the job's terminal result is durable Jet can no longer hand back this
@@ -803,7 +823,13 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // Measured against the clock at this line and no earlier one: a row's delivery is how long it
             // was from the source's stamp until its write was known to have succeeded, and the wait in
             // this processor's queue and in flight at the target is part of that, not noise around it.
-            batch.delivered().foldDurationsInto(settledDurations, clock.getAsLong());
+            long settledAt = clock.getAsLong();
+            batch.delivered().foldDurationsInto(settledDurations, settledAt);
+            // A partial receipt only identifies a count. It cannot tell us which event times to sample.
+            WriteResult result = settled.result();
+            if (result != null && result.acknowledgedRows() == batch.delivered().rowCount()) {
+                cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settled.acknowledgedAtMillis());
+            }
             reportDelivered(batch.delivered().tables());
             return true;
         });
@@ -873,8 +899,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
         }
         delivery.took(durations);
-        // Published with them and never alone: a total is readable only against what it accumulates from,
-        // and the two arriving by different routes is how they come to disagree.
+        delivery.cdcDelivered(cdcDelivery);
+        // Keep the starting point alongside every delivery report.
         delivery.countingSince(countingSince);
     }
 
@@ -887,8 +913,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * The write that settles this batch. A batch always holds a row: words about chains wait apart from the
      * rows rather than riding in a batch, so an external target is never handed an empty call for one.
      */
-    private CompletableFuture<WriteResult> settlementOf(List<Envelope> batch) {
-        return writer.write(batch).toCompletableFuture();
+    private CompletableFuture<SettledWrite> settlementOf(List<Envelope> batch) {
+        return writer.write(batch).toCompletableFuture()
+                .thenApply(result -> new SettledWrite(result, clock.getAsLong()));
     }
 
     /**
@@ -896,9 +923,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * already raised (coded, for a real connector); the cause is rethrown as-is so it fails the job
      * unwrapped rather than buried in a {@link CompletionException}.
      */
-    private static void settle(CompletableFuture<WriteResult> future) {
+    private static SettledWrite settle(CompletableFuture<SettledWrite> future) {
         try {
-            future.join();
+            return future.join();
         } catch (CompletionException wrapper) {
             Throwable cause = wrapper.getCause();
             if (cause instanceof RuntimeException runtime) {
@@ -911,11 +938,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
     }
 
+    private record SettledWrite(WriteResult result, long acknowledgedAtMillis) {
+    }
+
     /**
      * One outstanding write, what its batch contributes to the frontier, what it delivers, and the number of its
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
-    private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
+    private record InFlightBatch(CompletableFuture<SettledWrite> future, List<ChainEntry> positions,
             DeliveredRows delivered, long firstOrder) {
     }
 
@@ -933,7 +963,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * and applied when the write succeeds, so nothing here depends on the envelopes still being reachable.
      */
     private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
-            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes) {
+            Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes, List<Long> cdcTimes,
+            int rowCount) {
 
         /** The tables this batch settled rows of, which are the ones whose readings have moved. */
         Set<String> tables() {
@@ -945,7 +976,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             Map<String, Long> bytes = new LinkedHashMap<>();
             Map<String, Long> newest = new LinkedHashMap<>();
             Map<String, List<Long>> stamps = new LinkedHashMap<>();
+            List<Long> cdcTimes = new ArrayList<>();
+            int rowCount = 0;
             for (Envelope event : batch) {
+                if (event.op() != Op.DDL) {
+                    rowCount++;
+                }
                 rows.computeIfAbsent(event.src(), table -> new LinkedHashMap<>())
                         .merge(event.op().symbol(), 1L, Long::sum);
                 // Weighed while the batch still holds the envelopes, alongside the count, so that what
@@ -957,8 +993,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // write settles, and a batch that kept only its newest stamp would report the whole batch
                 // as fast as its freshest row.
                 stamps.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(event.ts());
+                if (hasCdcTimestamp(event)) {
+                    cdcTimes.add(event.ts());
+                }
             }
-            return new DeliveredRows(rows, bytes, newest, stamps);
+            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount);
+        }
+
+        private static boolean hasCdcTimestamp(Envelope event) {
+            if (event.ts() <= 0 || event.op() == Op.READ || event.op() == Op.DDL || event.positions().size() != 1) {
+                return false;
+            }
+            // A transform can change the operation. The single input position keeps its source order.
+            SourceOrder order = event.positions().values().iterator().next().order();
+            return order != null && order.seq() >= 0;
         }
 
         void foldInto(Map<String, Map<String, Long>> totals, Map<String, Long> bytesByTable,
@@ -968,6 +1016,18 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                             .merge(op, count, Long::sum)));
             bytes.forEach((table, size) -> bytesByTable.merge(table, size, Long::sum));
             newestEventTime.forEach((table, ts) -> newestByTable.merge(table, ts, Math::max));
+        }
+
+        CdcDeliveryTotals addCdcDurations(CdcDeliveryTotals previous, long settledAtMillis) {
+            long count = previous.count();
+            long total = previous.totalMillis();
+            for (long stamp : cdcTimes) {
+                if (stamp <= settledAtMillis) {
+                    count++;
+                    total += settledAtMillis - stamp;
+                }
+            }
+            return new CdcDeliveryTotals(count, total);
         }
 
         /** Buckets every row's age at {@code settledAtMillis} into its table's running distribution. */
