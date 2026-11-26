@@ -33,6 +33,20 @@ class AlertManagementWaitsForStartupIT {
             .withCommand("--replSet", "docker-rs", "--bind_ip_all", "--setParameter", "enableTestCommands=1");
 
     @Test
+    void theClusterCatalogOmitsTheRetiredNodeAvailabilityType() throws Exception {
+        try (PreparedNativeStore storage = PreparedNativeStore.createOn(MONGO);
+                var server = InProcessServer.startPrepared(storage)) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            var types = (List<?>) control.alert("catalog", Map.of()).get("types");
+            assertThat(types.stream().map(value -> (String) ((Map<?, ?>) value).get("id")))
+                    .containsExactlyInAnyOrder("pipeline.failed", "pipeline.observation-stale",
+                            "source.connection-failed", "cluster.storage-unavailable",
+                            "cluster.config-structure-drift", "cluster.cache-structure-drift");
+        }
+    }
+
+    @Test
     void theFirstAuthenticatedAlertRequestWaitsForTheInitialRuleSnapshot() throws Exception {
         try (PreparedNativeStore storage = PreparedNativeStore.createOn(MONGO);
                 var raw = MongoClients.create(storage.configurationUri());

@@ -15,6 +15,7 @@ import org.bson.Document;
 
 /** Composes the three alert fragments in the original CONFIG transaction and rechecks current authority. */
 final class MongoAlertCoordinator implements AlertStore {
+    private static final String CLUSTER_NODE_KIND = "cluster-node";
     private final MongoConfigurationDomain domain;private final MongoDatabase db;private final SourceConfigCipherProvider keys;
     private final MongoConfigurationArtifactStore artifacts;private final MongoConfigurationSecurityStores security;
     private final MongoStorageBindingStore bindings;private final Host host;private final Clock clock;private final AlarmTypeCatalog catalog;
@@ -226,25 +227,32 @@ final class MongoAlertCoordinator implements AlertStore {
     }
     @Override public Optional<RuleCapability> unavailableRule(AlertIntent.Frozen frozen,ReadAccess access){
         access.requireActive().run();scope(frozen.identity().scope());for(var member:frozen.members())visible(member.evaluation().key(),access);
-        var result=tx(null,false,false,session->{
-            for(var member:frozen.members()){
-                var identity=member.ruleIdentity();scope(identity.scope());
-                String frozenType=member.evaluation().key().typeId();
-                if(catalog.types().stream().noneMatch(type->type.id().equals(frozenType)))return Optional.of(new RuleCapability(identity.id(),frozenType,AlarmTypeCatalog.Availability.UNKNOWN_TYPE,null,null,null));
-                var header=SystemCollections.ALERT_RULES.on(db).find(session,new Document("_id",MongoAlertConfigurationCodec.key(host.scope(),identity.id())))
-                        .projection(new Document("_id",1).append("kind",1).append("formatVersion",1)).first();
-                var future=MongoAlertConfigurationCodec.futureRuleFormat(host.scope(),identity.id(),header);
-                if(future.isPresent())return Optional.of(new RuleCapability(identity.id(),member.evaluation().key().typeId(),AlarmTypeCatalog.Availability.UNSUPPORTED_RECORD_VERSION,null,null,future.orElseThrow()));
-                var current=definitions.load(session,Kind.RULE,identity.id()).map(MongoAlertConfigurationCodec.Stored::definition).filter(Rule.class::isInstance).map(Rule.class::cast);
-                if(current.isPresent()&&current.orElseThrow().header().identity().equals(identity)&&current.orElseThrow().evaluationRevision()==member.evaluation().revision()
-                        &&current.orElseThrow().typeId().equals(member.evaluation().key().typeId())){
-                    var unavailable=ruleCapability(current.orElseThrow());if(unavailable.isPresent())return unavailable;
-                }
-            }
-            return Optional.<RuleCapability>empty();
-        });access.requireActive().run();return result;
+        var result=tx(null,false,false,session->unavailableRule(session,frozen.members()));access.requireActive().run();return result;
+    }
+    private Optional<RuleCapability> unavailableRule(ClientSession session,List<AlertIntent.Member> members){
+        for(var member:members){
+            var unavailable=unavailableRule(session,member);
+            if(unavailable.isPresent())return unavailable;
+        }
+        return Optional.empty();
+    }
+    private Optional<RuleCapability> unavailableRule(ClientSession session,AlertIntent.Member member){
+        var identity=member.ruleIdentity();scope(identity.scope());
+        String typeId=member.evaluation().key().typeId();
+        if(BuiltinAlarmTypes.retired(typeId))return Optional.empty();
+        if(catalog.types().stream().noneMatch(type->type.id().equals(typeId)))
+            return Optional.of(new RuleCapability(identity.id(),typeId,AlarmTypeCatalog.Availability.UNKNOWN_TYPE,null,null,null));
+        var header=SystemCollections.ALERT_RULES.on(db).find(session,new Document("_id",MongoAlertConfigurationCodec.key(host.scope(),identity.id())))
+                .projection(new Document("_id",1).append("kind",1).append("formatVersion",1)).first();
+        var future=MongoAlertConfigurationCodec.futureRuleFormat(host.scope(),identity.id(),header);
+        if(future.isPresent())return Optional.of(new RuleCapability(identity.id(),typeId,AlarmTypeCatalog.Availability.UNSUPPORTED_RECORD_VERSION,null,null,future.orElseThrow()));
+        var current=definitions.load(session,Kind.RULE,identity.id()).map(MongoAlertConfigurationCodec.Stored::definition).filter(Rule.class::isInstance).map(Rule.class::cast);
+        if(current.isPresent()&&current.orElseThrow().header().identity().equals(identity)&&current.orElseThrow().evaluationRevision()==member.evaluation().revision()
+                &&current.orElseThrow().typeId().equals(typeId))return ruleCapability(current.orElseThrow());
+        return Optional.empty();
     }
     private Optional<RuleCapability> ruleCapability(Rule rule){
+        if (BuiltinAlarmTypes.retired(rule.typeId())) return Optional.empty();
         var descriptor=catalog.types().stream().filter(type->type.id().equals(rule.typeId())).findFirst();
         if(descriptor.isEmpty())return Optional.of(new RuleCapability(rule.header().identity().id(),rule.typeId(),AlarmTypeCatalog.Availability.UNKNOWN_TYPE,rule.typeVersion(),null,null));
         if(descriptor.orElseThrow().version()!=rule.typeVersion())return Optional.of(new RuleCapability(rule.header().identity().id(),rule.typeId(),AlarmTypeCatalog.Availability.UNSUPPORTED_TYPE_VERSION,rule.typeVersion(),descriptor.orElseThrow().version(),null));
@@ -271,7 +279,12 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->evaluationRules(s,after,limit));}
     private DefinitionPage evaluationRules(ClientSession s,String after,int limit){
         var page=new MongoAlertReads(db,host.scope(),states,clock).definitions(s,Kind.RULE,after,limit);var unavailable=new HashMap<>(page.unavailableRules());var available=new ArrayList<Definition>();
-        for(var value:page.rows()){var issue=ruleCapability((Rule)value);if(issue.isPresent())unavailable.put(value.header().identity().id(),issue.orElseThrow());else available.add(value);}
+        for(var value:page.rows()){
+            var rule = (Rule) value;
+            if (!BuiltinAlarmTypes.retired(rule.typeId())){
+                var issue=ruleCapability(rule);if(issue.isPresent())unavailable.put(value.header().identity().id(),issue.orElseThrow());else available.add(value);
+            }
+        }
         return new DefinitionPage(available,page.nextId(),unavailable);
     }
     @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->evaluationStates(s,after,limit,true));}
@@ -282,7 +295,7 @@ final class MongoAlertCoordinator implements AlertStore {
         for(var row:page.rows()){
             var key=row.value().snapshot().rule().key();
             var resource=key.resource();
-            if(!nodeEvidenceReady && resource.kind().equals("cluster-node"))continue;
+            if (BuiltinAlarmTypes.retired(key.typeId()) || !nodeEvidenceReady && resource.kind().equals(CLUSTER_NODE_KIND)) continue;
             SystemCollections table = switch (resource.kind()) {
                 case "pipeline" -> SystemCollections.OPERATOR_GENERATIONS;
                 case "source" -> SystemCollections.SOURCES;
@@ -431,8 +444,9 @@ final class MongoAlertCoordinator implements AlertStore {
                         if(current.isPresent()&&current.get().definition() instanceof Rule rule&&rule.header().identity().equals(previous.ruleIdentity())
                                 &&rule.matches(v.before().snapshot().rule().key()))throw stale("rule-still-enabled");
                     }else{
-                        var previous=v.before().binding();var rule=definitions.load(s,Kind.RULE,previous.ruleIdentity().id());
-                        boolean retiredRule=rule.isEmpty()||!rule.get().definition().header().identity().equals(previous.ruleIdentity())||!rule.get().definition().header().active();
+                        var previous=v.before().binding();
+                        var rule=definitions.load(s,Kind.RULE,previous.ruleIdentity().id());
+                        boolean retiredRule=retiredRule(v.before(),previous.ruleIdentity(),rule);
                         if(!retiredRule && !(sourceBindingSuperseded(s,v.before())))requireResourceRemoved(s,v.before().snapshot().rule().key().resource());
                     }
                 }
@@ -587,6 +601,12 @@ final class MongoAlertCoordinator implements AlertStore {
         return head.operationalEvidence()!=null && head.operationalEvidence().version()==2
                 && AlertOperationDomain.supported(head.snapshot().rule().key()) && sourceBindingChanged(session,head);
     }
+    private static boolean retiredRule(AlertStateRecord.Head head,AlertConfiguration.Identity identity,
+            Optional<MongoAlertConfigurationCodec.Stored> rule){
+        if(BuiltinAlarmTypes.retired(head.snapshot().rule().key().typeId()))return true;
+        return rule.isEmpty()||!rule.orElseThrow().definition().header().identity().equals(identity)
+                ||!rule.orElseThrow().definition().header().active();
+    }
     private boolean sourceBindingChanged(ClientSession session,AlertStateRecord.Head head) {
         return sourceBindingChanged(session, head, null);
     }
@@ -654,6 +674,7 @@ final class MongoAlertCoordinator implements AlertStore {
             validateMember(s,member,grant);
             if(member.episode()>0){var episode=states.episodeEnvelope(s,member.evaluation().key(),member.episode()).orElseThrow(()->stale("episode"));
                 if(!episode.originalBinding().equals(member.evaluation()))throw stale("episode-binding");
+                requireCloudNotificationSeverity(episode.value().severity());
                 if(grant&&f.identity() instanceof AlertIntent.Business business){
                     var kind=business.key().notification().kind();
                     if(kind==DeliveryKey.Kind.FAULT||kind==DeliveryKey.Kind.REMINDER){var head=states.loadEnvelope(s,member.evaluation().key()).orElseThrow(()->stale("current-episode")).value();
@@ -673,11 +694,15 @@ final class MongoAlertCoordinator implements AlertStore {
         validateMember(s,member,fence,definitions.load(s,Kind.RULE,member.ruleIdentity().id()).orElseThrow(()->stale("rule")),null,false);
     }
     private void validateMember(ClientSession s,AlertIntent.Member member,boolean fence,MongoAlertConfigurationCodec.Stored current,MongoAlertWriteFacts facts,boolean reuse) {
-        if(!(current.definition() instanceof Rule r)||!r.header().identity().equals(member.ruleIdentity())||!r.header().active()||!r.enabled()
+        if(!(current.definition() instanceof Rule r)||BuiltinAlarmTypes.retired(r.typeId())||!r.header().identity().equals(member.ruleIdentity())||!r.header().active()||!r.enabled()
                 ||!AlertOperationDomain.belongs(member.ruleIdentity().incarnation(),member.evaluation().key())||r.evaluationRevision()!=member.evaluation().revision()||!r.matches(member.evaluation().key())||!(reuse?definitions.fenceChecked(s,r,current):definitions.fence(s,r)))throw stale("rule-binding");
         resource(s,member.evaluation().key().resource(),member.sourceBindingRevision(),fence,facts);
         if(member.evaluation().key().resource().kind().equals("cluster-node")){var proof=host.resourceEvidence().apply(member.evaluation().key().resource()).orElseThrow(()->stale("member-proof"));
             if(!(proof instanceof NodeEvidence n)||!n.producerIncarnation().equals(member.evaluation().producerIncarnation()))throw stale("member-producer");nodeResource(s,member.evaluation().key().resource(),n);}
+    }
+    private void requireCloudNotificationSeverity(AlarmSeverity severity){
+        if(host.deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED&&severity==AlarmSeverity.WARNING)
+            throw stale("cloud-warning-local-only");
     }
     private void requireDomainCapacity(ClientSession session,AlertStateRecord.Head head) {
         var key=head.snapshot().rule().key();String rule=head.binding().ruleIdentity().incarnation();

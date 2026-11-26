@@ -21,17 +21,23 @@ public interface StorePort {
     record PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
             java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
             java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
-            io.tapstate.core.lifecycle.PipelineState checkpoint, PipelineIntentScope scope) {
+            io.tapstate.core.lifecycle.PipelineState checkpoint, PipelineIntentScope scope, boolean completedStopClear) {
+        public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+                java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
+                io.tapstate.core.lifecycle.PipelineState checkpoint, PipelineIntentScope scope) {
+            this(observation, desired, intentFailure, runningObservationUnavailable, checkpoint, scope, false);
+        }
         public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
                 java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
                 java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
                 io.tapstate.core.lifecycle.PipelineState checkpoint) {
-            this(observation, desired, intentFailure, runningObservationUnavailable, checkpoint, null);
+            this(observation, desired, intentFailure, runningObservationUnavailable, checkpoint, null, false);
         }
         public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
                 java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
                 java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable) {
-            this(observation, desired, intentFailure, runningObservationUnavailable, null, null);
+            this(observation, desired, intentFailure, runningObservationUnavailable, null, null, false);
         }
     }
 

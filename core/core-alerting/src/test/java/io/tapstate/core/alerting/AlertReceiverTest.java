@@ -28,6 +28,8 @@ class AlertReceiverTest {
         assertThatThrownBy(()->descriptor.parameters(java.util.Map.of("topic","x".repeat(65)))).isInstanceOf(TapstateException.class);
         assertThatThrownBy(()->descriptor.parameters(java.util.Map.of("topic",new String(Character.toChars(0x1f680)).repeat(17)))).isInstanceOf(TapstateException.class);
         var endpoint=URI.create("https://notify.example.test/private-path?token=private-query");
+        assertThatThrownBy(() -> HttpsJson.fromEndpoint(AlertChannelPolicy.CLOUD_EMAIL.typeId(), 1, endpoint,
+                Authentication.NONE, null, Trust.SYSTEM, java.util.Map.of())).isInstanceOf(TapstateException.class);
         var first=HttpsJson.fromEndpoint("test.sink",1,endpoint,Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of("topic","orders"));
         var changed=HttpsJson.fromEndpoint("test.sink",1,endpoint,Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of("topic","other"));
         assertThat(first.toString()).doesNotContain("private-path","private-query");
