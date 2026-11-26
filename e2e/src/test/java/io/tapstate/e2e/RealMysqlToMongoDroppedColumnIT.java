@@ -166,10 +166,10 @@ class RealMysqlToMongoDroppedColumnIT {
             var key = new Document("_id", PIPELINE_ID);
             var admin = client.getDatabase("admin");
             long entered = admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", new Document("times", 1))
+                    .append("mode", "alwaysOn")
                     .append("data", new Document("failCommands", List.of("update"))
                             .append("namespace", storage.cacheDatabase() + ".operator_cleanup")
-                            .append("blockConnection", true).append("blockTimeMS", 5000)))
+                            .append("errorCode", 13)))
                     .get("count", Number.class).longValue();
             try {
                 control.stop(PIPELINE_ID, true);

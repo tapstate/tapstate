@@ -246,7 +246,8 @@ final class ThreeLayerStorePort implements StorePort {
     }
     @Override public boolean pipelineRecoveryRequired(String pipeline) {
         var mapping = currentMapping(pipeline);
-        if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return false;
+        if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING
+                || mapping.phase() == PipelineStateMapping.Phase.RETIRING) return false;
         var original = activeScope(pipeline, mapping);
         var recoveries = configuration.cacheRecoveries();
         var summary = recoveries.read(pipeline);
@@ -500,11 +501,12 @@ final class ThreeLayerStorePort implements StorePort {
                     throw refused();
                 }
                 var mapping = retained.orElseThrow();
-                if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return Optional.empty();
+                if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING
+                        || mapping.phase() == PipelineStateMapping.Phase.RETIRING) return Optional.empty();
                 var original = activeScope(pipeline, mapping);
                 try {
                     var observation = readObservation(pipeline, original);
-                    // A display read never carries an old observation across a concurrent state rebuild.
+                    // A display read never carries an old observation across a state transition.
                     return mapping.equals(currentMapping(pipeline)) ? observation : Optional.empty();
                 } catch (TapstateException failure) {
                     boolean retiredScope = failure.code() == IoError.WORKLOAD_CLAIM_FENCED
