@@ -1,7 +1,8 @@
 package io.tapstate.control.core;
 
-import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -139,68 +140,107 @@ public final class PipelineCatalogService {
     private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact, PipelineCatalogState stateFacts,
             PipelineState engineState) {
         boolean hasArtifact = artifact != null;
+        var status = statusOf(id, hasArtifact, stateFacts, engineState);
+        String description = draft != null ? draft.description() : descriptionOf(artifact);
+        String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
+        String name = draft != null && draft.name() != null && !draft.name().isBlank() ? draft.name() : id;
+        return new PipelineCatalogItem(id, name, description, mode, draft == null ? null : draft.revision(),
+                draft == null ? null : draft.updatedAt(), artifact == null ? null : artifact.contentHash(),
+                hasArtifact, status);
+    }
+
+    private PipelineCatalogItem.Status statusOf(String id, boolean hasArtifact, PipelineCatalogState stateFacts,
+            PipelineState engineState) {
         boolean needsRecovery = stateFacts == null && hasArtifact && recoveryRequired.test(id);
-        PipelineStatus observation = stateFacts != null
-                ? stateFacts.observation().map(observations::statusOf).orElse(null)
-                : hasArtifact ? observations.findStatus(id).orElse(null) : null;
+        PipelineStatus observation = readObservation(id, hasArtifact, stateFacts);
         PipelineState observed = observation == null ? null : observation.observedState();
-        PipelineState effective = observation == null ? null : observation.state();
         PipelineState checkpoint = stateFacts == null ? null : stateFacts.checkpoint();
-        if (engineState != null) effective = engineState;
+        PipelineState effective = effectiveState(engineState, observation, stateFacts, checkpoint);
+        var intent = readIntent(id, hasArtifact, stateFacts);
+        PipelineState target = intent.desired() == null ? null : intent.desired().targetState();
+        // Deferred preparation can be stopped before it creates any runtime state to converge.
+        boolean stoppedBeforeFirstRun = target == PipelineState.STOPPED && !intent.desired().purgeState()
+                && stateFacts != null && stateFacts.scope() == null && checkpoint == PipelineState.NEW
+                && observation == null;
+        boolean recoveryAtRest = needsRecovery
+                && (observed == null || observed == PipelineState.NEW || observed == PipelineState.STOPPED);
+        PipelineCatalogItem.DisplayState state = recoveryAtRest ? asDisplayState(observed)
+                : displayState(target, effective, intent.failure() == null);
+        if (stoppedBeforeFirstRun) {
+            state = PipelineCatalogItem.DisplayState.NEW;
+        }
+
+        return new PipelineCatalogItem.Status(
+                runtimeState(engineState, observation, stateFacts, checkpoint, effective, state),
+                recoveryAtRest ? PipelineCatalogItem.UiState.RECOVERY_REQUIRED
+                        : PipelineCatalogItem.UiState.of(state, hasArtifact),
+                target, observed, observation == null ? null : observation.failure(),
+                observation == null ? null : observation.observedAt(),
+                intent.failure(), stopState(intent.desired(), stateFacts, state, recoveryAtRest));
+    }
+
+    private PipelineStatus readObservation(String id, boolean hasArtifact, PipelineCatalogState stateFacts) {
+        if (stateFacts != null) {
+            return stateFacts.observation().map(observations::statusOf).orElse(null);
+        }
+        return hasArtifact ? observations.findStatus(id).orElse(null) : null;
+    }
+
+    private static PipelineState effectiveState(PipelineState engineState, PipelineStatus observation,
+            PipelineCatalogState stateFacts, PipelineState checkpoint) {
+        if (engineState != null) return engineState;
+        PipelineState effective = observation == null ? null : observation.state();
         if (effective == null && stateFacts != null && stateFacts.runningObservationUnavailable()
-                && checkpoint == PipelineState.RUNNING) effective = checkpoint;
-        PipelineState target;
-        PipelineCatalogItem.IntentReadFailure intentReadFailure = null;
+                && checkpoint == PipelineState.RUNNING) return checkpoint;
+        return effective;
+    }
+
+    private CatalogIntent readIntent(String id, boolean hasArtifact, PipelineCatalogState stateFacts) {
         try {
-            if (stateFacts != null && stateFacts.intentFailure().isPresent()) throw stateFacts.intentFailure().orElseThrow();
-            target = stateFacts != null ? stateFacts.desired().map(state -> state.targetState()).orElse(null)
-                    : hasArtifact ? desired.read(id).map(state -> state.targetState()).orElse(null) : null;
+            if (stateFacts != null) {
+                if (stateFacts.intentFailure().isPresent()) throw stateFacts.intentFailure().orElseThrow();
+                return new CatalogIntent(stateFacts.desired().orElse(null), null);
+            }
+            return new CatalogIntent(hasArtifact ? desired.read(id).orElse(null) : null, null);
         } catch (TapstateException unreadable) {
             if (unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
                 throw unreadable;
             }
             LOG.log(Level.WARNING, "Unable to read desired state for Pipeline {0}", id);
-            target = null;
-            intentReadFailure = new PipelineCatalogItem.IntentReadFailure(
-                    unreadable.code().code(), unreadable.args());
+            return new CatalogIntent(null,
+                    new PipelineCatalogItem.IntentReadFailure(unreadable.code().code(), unreadable.args()));
         }
-        boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
-        PipelineCatalogItem.DisplayState state = recoveryAtRest
-                ? observed == null ? null : PipelineCatalogItem.DisplayState.valueOf(observed.name())
-                : displayState(target, effective, intentReadFailure == null);
+    }
 
-        String description = draft != null ? draft.description() : descriptionOf(artifact);
-        String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
-        String name = draft != null && draft.name() != null && !draft.name().isBlank() ? draft.name() : id;
-
+    private static PipelineCatalogItem.DisplayState runtimeState(PipelineState engineState, PipelineStatus observation,
+            PipelineCatalogState stateFacts, PipelineState checkpoint, PipelineState effective,
+            PipelineCatalogItem.DisplayState state) {
         // The current failure and the later intent projection remain separate even if STOP arrived
         // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
-        PipelineCatalogItem.DisplayState runtimeState = engineState != null
-                ? PipelineCatalogItem.DisplayState.valueOf(engineState.name())
-                : observation == null && stateFacts != null && stateFacts.scope() != null
-                        && !stateFacts.runningObservationUnavailable()
-                        && (checkpoint == PipelineState.RUNNING || checkpoint == PipelineState.PAUSED) ? state
-                : observation != null && observed != effective
-                ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name())
-                : checkpoint == null ? state : PipelineCatalogItem.DisplayState.valueOf(checkpoint.name());
-        return new PipelineCatalogItem(
-                id,
-                name,
-                description,
-                mode,
-                draft == null ? null : draft.revision(),
-                draft == null ? null : draft.updatedAt(),
-                artifact == null ? null : artifact.contentHash(),
-                hasArtifact,
-                new PipelineCatalogItem.Status(
-                        runtimeState,
-                        recoveryAtRest ? PipelineCatalogItem.UiState.RECOVERY_REQUIRED
-                                : PipelineCatalogItem.UiState.of(state, hasArtifact),
-                        target,
-                        observed,
-                        observation == null ? null : observation.failure(),
-                        observation == null ? null : observation.observedAt(),
-                        intentReadFailure));
+        if (engineState != null) return asDisplayState(engineState);
+        if (observation == null && stateFacts != null && stateFacts.scope() != null
+                && !stateFacts.runningObservationUnavailable()
+                && (checkpoint == PipelineState.RUNNING || checkpoint == PipelineState.PAUSED)) return state;
+        if (observation != null && observation.observedState() != effective) {
+            return asDisplayState(observation.state());
+        }
+        return checkpoint == null ? state : asDisplayState(checkpoint);
+    }
+
+    private static PipelineCatalogItem.DisplayState asDisplayState(PipelineState state) {
+        return state == null ? null : PipelineCatalogItem.DisplayState.valueOf(state.name());
+    }
+
+    private record CatalogIntent(DesiredState desired, PipelineCatalogItem.IntentReadFailure failure) {
+    }
+
+    private static PipelineCatalogItem.StopState stopState(DesiredState intent,
+            PipelineCatalogState facts, PipelineCatalogItem.DisplayState state, boolean recovering) {
+        if (recovering || intent == null || intent.targetState() != PipelineState.STOPPED) return null;
+        if (intent.purgeState()) return PipelineCatalogItem.StopState.CLEARING;
+        if (facts == null || facts.checkpoint() != PipelineState.STOPPED
+                || state != PipelineCatalogItem.DisplayState.STOPPED) return null;
+        return facts.completedStopClear() ? PipelineCatalogItem.StopState.CLEARED : PipelineCatalogItem.StopState.RETAINED;
     }
 
     private static String descriptionOf(ArtifactSummary artifact) {

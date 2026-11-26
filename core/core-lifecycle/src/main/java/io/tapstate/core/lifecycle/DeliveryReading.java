@@ -34,7 +34,8 @@ import java.util.Optional;
  */
 public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
         Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
-        Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable) {
+        Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable,
+        CdcDeliveryTotals cdcDelivery) {
 
     /** A reading from a run reporting nothing — no live job, or one that has settled nothing yet. */
     public static final DeliveryReading NONE =
@@ -51,13 +52,21 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
                 newestEventTimeByTable == null ? Map.of() : Map.copyOf(newestEventTimeByTable);
         deliveryDurationByTable =
                 deliveryDurationByTable == null ? Map.of() : Map.copyOf(deliveryDurationByTable);
-        if ((!rowsByTableAndOp.isEmpty() || !bytesByTable.isEmpty() || !deliveryDurationByTable.isEmpty())
+        if ((!rowsByTableAndOp.isEmpty() || !bytesByTable.isEmpty() || !deliveryDurationByTable.isEmpty()
+                || cdcDelivery != null)
                 && countingSince == null) {
             throw new IllegalArgumentException(
                     "a reading with totals in it says what it counted them from: totals without a start"
                             + " hand every consumer a stream in which a restart and a decrease are the"
                             + " same observation");
         }
+    }
+
+    /** A reading carrying the original delivery distribution. */
+    public DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
+            Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
+            Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable) {
+        this(rowsByTableAndOp, bytesByTable, newestEventTimeByTable, countingSince, deliveryDurationByTable, null);
     }
 
     /** A reading carrying no distribution of delivery durations — the shape callers used before it was measured. */
@@ -75,6 +84,6 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
     /** Whether this run reported nothing at all, as opposed to reporting nothing delivered. */
     public boolean isEmpty() {
         return rowsByTableAndOp.isEmpty() && bytesByTable.isEmpty()
-                && newestEventTimeByTable.isEmpty() && deliveryDurationByTable.isEmpty();
+                && newestEventTimeByTable.isEmpty() && deliveryDurationByTable.isEmpty() && cdcDelivery == null;
     }
 }

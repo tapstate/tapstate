@@ -121,7 +121,7 @@ class CloudConfigurationWriteConcernIT {
                     .containsEntry("operationId", OPERATION).containsEntry("installedVersion", 7);
             var rules = SystemCollections.ALERT_RULES.on(target).find().into(new java.util.ArrayList<>());
             assertThat(rules).extracting(row -> row.get("_id", Document.class).getString("id"))
-                    .containsExactlyInAnyOrder("builtin-cluster.node-unavailable", "builtin-cluster.storage-unavailable",
+                    .containsExactlyInAnyOrder("builtin-cluster.storage-unavailable",
                             "builtin-pipeline.failed", "builtin-pipeline.observation-stale", "builtin-source.connection-failed",
                             "builtin-cluster.config-structure-drift", "builtin-cluster.cache-structure-drift");
             assertThat(rules).allSatisfy(row -> assertThat(row.get("_id", Document.class))

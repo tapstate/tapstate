@@ -27,7 +27,7 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
             Authentication authentication, String principal, Trust trust, Map<String,String> parameters) implements Transport {
         public HttpsJson {
             new AlertChannelPolicy.Capability(channelType,1,AlertChannelPolicy.Family.OP_EXTERNAL);
-            AlertValidation.require(!java.util.Set.of("email","webhook","cloud-sdk").contains(channelType),"channelType","reserved-id");
+            AlertValidation.require(!java.util.Set.of("email","webhook","cloud-sdk","cloud-sdk-email").contains(channelType),"channelType","reserved-id");
             AlertValidation.require(transportVersion==1,"transportVersion","unsupported");
             new Webhook(origin,endpointDigest,authentication,principal,trust);
             if (parameters == null) { throw AlertValidation.invalid("parameters", "too-many"); }

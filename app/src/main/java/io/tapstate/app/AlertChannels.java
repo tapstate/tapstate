@@ -57,7 +57,7 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
                 || origin.getRawQuery()!=null || origin.getRawFragment()!=null || !(origin.getPath().isEmpty()||origin.getPath().equals("/"))
                 || token==null || token.isBlank() || token.length()>4096 || token.codePoints().anyMatch(Character::isISOControl)
                 || !cloud.clusterId().matches("[a-fA-F0-9]{24}"))return Set.of();
-        return Set.of(new AlertChannelPolicy.Capability("cloud-sdk",2,AlertChannelPolicy.Family.CLOUD_SDK));
+        return Set.of(AlertChannelPolicy.CLOUD_EVENTS, AlertChannelPolicy.CLOUD_EMAIL);
     }
     @Override public boolean supports(AlertIntent.Frozen frozen){return outboundEnabled && frozen.retention().deployment()==deployment
             && capabilities(deployment,cloud,registry).contains(frozen.channel())

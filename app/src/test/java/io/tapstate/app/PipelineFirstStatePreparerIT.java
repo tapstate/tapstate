@@ -177,6 +177,15 @@ class PipelineFirstStatePreparerIT {
                 assertThat(intentStore.load(id).orElseThrow().intentRevision()).isEqualTo(2);
                 assertThat(intentStore.pendingStart(id)).isEmpty();
                 assertThat(f.state()).isNull();
+                var artifacts = new io.tapstate.control.core.ArtifactQueryService(port.artifacts());
+                var catalog = new io.tapstate.control.core.PipelineCatalogService(artifacts,
+                        new io.tapstate.control.core.PipelineDraftService(org.mockito.Mockito.mock(io.tapstate.spi.store.PipelineDraftStore.class)),
+                        new io.tapstate.control.core.PipelineObservationQueryService(artifacts, port.observations()), port);
+                var detail = catalog.find(id).orElseThrow();
+                assertThat(detail.status().displayState()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.UiState.NOT_STARTED);
+                assertThat(detail.status().state()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.DisplayState.NEW);
+                assertThat(detail.status().stopState()).isNull();
+                assertThat(catalog.list()).containsExactly(detail);
             } else {
                 assertThat(preparation).isEqualTo(PipelinePreparation.Phase.COMPLETE);
                 Throwable cause=org.assertj.core.api.Assertions.catchThrowable(() -> service.stop("operator",id,false));

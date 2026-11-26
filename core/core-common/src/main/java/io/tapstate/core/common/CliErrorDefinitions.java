@@ -141,6 +141,9 @@ public final class CliErrorDefinitions {
     public static final ProductErrorDefinition WORKBENCH_UNAVAILABLE =
             DEFINITIONS.define(65, Severity.ERROR, Set.of());
 
+    public static final ProductErrorDefinition WORKBENCH_SESSION_FAILED =
+            DEFINITIONS.define(66, Severity.ERROR, Set.of());
+
     private CliErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

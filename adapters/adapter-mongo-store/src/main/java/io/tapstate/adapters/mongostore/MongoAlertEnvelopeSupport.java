@@ -6,7 +6,7 @@ import org.bson.Document;
 /** Recognizes typed optional envelopes before decoding, including unknown-reference protection. */
 final class MongoAlertEnvelopeSupport {
     private static final String CHANNEL_ID="^(?=.{1,64}$)[a-z][a-z0-9]*+([.-][a-z0-9]++)*+$";
-    private static final List<String> RESERVED=List.of("email","webhook","cloud-sdk");
+    private static final List<String> RESERVED=List.of("email","webhook","cloud-sdk","cloud-sdk-email");
     private MongoAlertEnvelopeSupport() { }
     static Document intentFilter(){
         return new Document("$and",List.of(new Document("formatVersion",new Document("$type","int")),new Document("$or",List.of(new Document("formatVersion",new Document("$in",List.of(1,2))),

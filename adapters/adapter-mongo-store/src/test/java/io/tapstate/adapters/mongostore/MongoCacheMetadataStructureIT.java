@@ -117,16 +117,24 @@ class MongoCacheMetadataStructureIT {
     @Test void missingGridFsIndexesAndUnexpectedTtlAreNotRepairedByOpenOrPreparationReplay() {
         withFixture(f -> {
             f.prepare(() -> {});
-            SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(f.database).dropIndex("files_id_1_n_1");
+            var structure = f.structure();
+            var artifacts = SystemCollections.CACHE_CONNECTOR_ARTIFACTS;
+            structure.verifyFacet(artifacts);
+            artifacts.chunksOn(f.database).dropIndex("files_id_1_n_1");
             var before = f.snapshot();
-            assertUnreadable(f.structure()::verify); assertUnreadable(() -> f.prepare(() -> {}));
+            assertUnreadable(() -> structure.verifyFacet(artifacts), "index");
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertUnreadable(f::prepareLegacyConnectorArtifacts, "index");
             assertThat(f.snapshot()).isEqualTo(before);
         });
         withFixture(f -> {
             f.prepare(() -> {});
             SystemCollections.CACHE_CONNECTOR_CATALOG.on(f.database).createIndex(new Document("expiresAt", 1),
                     new com.mongodb.client.model.IndexOptions().expireAfter(60L, java.util.concurrent.TimeUnit.SECONDS));
-            var before = f.snapshot(); assertUnreadable(f.structure()::verify);
+            var before = f.snapshot();
+            assertUnreadable(f.structure()::verify, "ttl-index");
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertUnreadable(() -> f.prepare(() -> {}), "ttl-index");
             assertThat(f.snapshot()).isEqualTo(before);
         });
     }
@@ -159,6 +167,12 @@ class MongoCacheMetadataStructureIT {
     private static void assertUnreadable(org.assertj.core.api.ThrowableAssert.ThrowingCallable action) {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
+    private static void assertUnreadable(org.assertj.core.api.ThrowableAssert.ThrowingCallable action, String field) {
+        assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+            assertThat(failure.args()).containsEntry("field", field);
+        });
+    }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cache-metadata", "field", "guard"), null); }
     private static void withFixture(Scenario scenario) {
         try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
@@ -171,6 +185,14 @@ class MongoCacheMetadataStructureIT {
         MongoCacheMetadataStructure structure() { return new MongoCacheMetadataStructure(database, RETENTION); }
         void prepare(Runnable active) {
             try (var session = client.startSession()) { session.withTransaction(() -> { structure().prepareInTransaction(session, active); return null; }, DDL); }
+        }
+        void prepareLegacyConnectorArtifacts() {
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    structure().prepareLegacyConnectorArtifactsInTransaction(session, () -> {});
+                    return null;
+                }, DDL);
+            }
         }
         List<String> names() { return database.listCollectionNames().into(new ArrayList<>()); }
         Map<String, List<Document>> snapshot() {

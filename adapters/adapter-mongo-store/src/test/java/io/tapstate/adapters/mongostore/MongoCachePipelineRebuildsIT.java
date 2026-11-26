@@ -786,7 +786,9 @@ class MongoCachePipelineRebuildsIT {
     @Test void aCompletedExplicitFullCanBeReadWithItsOriginalInputsAfterAControllerRestart() {
         withFixture(f -> {
             var request = modelFullRequest(f);
+            assertThat(f.configuration.pipelineDisplayHeaders(List.of("flow"), true).get("flow").completedStopClear()).isFalse();
             var pending = f.configuration.rebuilds().begin(request);
+            assertThat(f.configuration.pipelineDisplayHeaders(List.of("flow"), true)).doesNotContainKey("flow");
             String digest = CanonicalHash.ofText(io.tapstate.core.common.JsonWriter.write(
                     new Document("targetInputs", MongoPipelineSourcePreparations.encode(request.inputs()))
                             .append("dependencyHashes", new java.util.TreeMap<>(request.dependencyHashes()))));
@@ -796,6 +798,9 @@ class MongoCachePipelineRebuildsIT {
             var prepared = f.configuration.rebuilds().complete(receipt);
             var settings = new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()), null, Duration.ofSeconds(5));
             try (var reopened = MongoConfigurationDomain.open(settings, f.scope.clusterId())) {
+                var header = reopened.pipelineDisplayHeaders(List.of("flow"), true).get("flow");
+                assertThat(header.desired().orElseThrow().purgeState()).isFalse();
+                assertThat(header.completedStopClear()).isTrue();
                 var proof = reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes());
                 assertThat(proof).isPresent();
                 assertThat(proof.orElseThrow().targetScope()).isEqualTo(prepared.scope());
@@ -810,6 +815,10 @@ class MongoCachePipelineRebuildsIT {
                 assertCode(proof.orElseThrow()::requireCurrent, IoError.PIPELINE_INTENT_FENCED);
                 reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes()).orElseThrow().requireCurrent();
                 assertThat(f.mapping().get("stateRebuild", Document.class).get("inputClosureHash")).isEqualTo(digest);
+                var running = reopened.intents().load("flow").orElseThrow();
+                assertThat(reopened.intents().compareAndSet(prepared.scope(), running.intentRevision(),
+                        new DesiredState("flow", PipelineState.STOPPED, request.inputs().pipelineHash(), false))).isTrue();
+                assertThat(reopened.pipelineDisplayHeaders(List.of("flow"), true).get("flow").completedStopClear()).isFalse();
             }
             long version = f.version();
             f.domain.close();
@@ -1034,6 +1043,99 @@ class MongoCachePipelineRebuildsIT {
             assertCode(() -> f.configuration.requiredNotes().read(token,"late"),IoError.NOTE_SCOPE_UNAVAILABLE);
         });
     }
+    @Test void connectorVersionsRemainReadableDuringRetirement() {
+        withFixture(f -> {
+            var pipeline = f.configuration.artifacts().get("flow").orElseThrow();
+            var intents = f.configuration.intents();
+            var desired = new io.tapstate.core.lifecycle.DesiredState("flow",
+                    io.tapstate.core.lifecycle.PipelineState.STOPPED, CanonicalHash.of(pipeline), false);
+            long revision = intents.load("flow").orElseThrow().intentRevision();
+            assertThat(intents.compareAndSet(f.scope, revision, desired)).isTrue();
+            var request = new PipelineRetirementRequest("delete-while-observing", f.scope,
+                    CanonicalHash.of(pipeline), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(f.advance("flow"), 0)));
+            var pending = f.configuration.retirements().begin(request);
+
+            var bindings = intents.connectorBindings();
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.config);
+            var key = new Document("_id", "flow");
+            var retiring = f.mapping();
+            mappings.updateOne(key, new Document("$set", new Document("operationId", "different-retirement")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.PIPELINE_INTENT_FENCED);
+            mappings.replaceOne(key, retiring);
+            mappings.updateOne(key, new Document("$set", new Document("connectorBindings", "damaged")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
+            mappings.updateOne(key, new Document("$unset", new Document("connectorBindings", "")));
+            assertCode(() -> intents.compareAndSet(f.scope, revision + 1, desired), IoError.PIPELINE_INTENT_FENCED);
+
+            f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business, ACTIVE).retire(pending, f.node));
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+        });
+    }
+
+    @Test void connectorVersionsRemainReadableDuringRebuildAndRejectDamagedWitnesses() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var bindings = intents.connectorBindings();
+            assertThat(bindings.loadCurrent("missing-pipeline")).isEmpty();
+            var original = intents.load("flow").orElseThrow();
+            var active = bindings.seed(original, List.of());
+            assertThat(bindings.loadCurrent("flow")).contains(active);
+            assertThat(bindings.loadAll()).containsEntry("flow", active);
+
+            var pending = f.pending(0);
+            var request = pending.request();
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+            assertThat(f.configuration.rebuilds().pending("flow", request.inputs(), request.dependencyHashes()))
+                    .hasValueSatisfying(value -> assertThat(value.preparationId()).isEqualTo(pending.preparationId()));
+
+            var table = SystemCollections.OPERATOR_GENERATIONS.on(f.config);
+            var key = new Document("_id", "flow");
+            var rebuilding = f.mapping();
+            var annex = rebuilding.get("stateRebuild", Document.class);
+            var claim = annex.get("originalClaim", Document.class);
+            var badScope = MongoPipelinePreparationFacts.scope(request.targetScope());
+            var badTarget = MongoPipelinePreparationFacts.scope(request.originalScope());
+            var changes = Map.<String, Object>ofEntries(
+                    Map.entry("operationId", "different-rebuild"),
+                    Map.entry("intentRevision", original.intentRevision() + 1),
+                    Map.entry("originalScope", badScope),
+                    Map.entry("targetScope", badTarget),
+                    Map.entry("confirmationHash", "invalid"),
+                    Map.entry("originalStateEpoch", -1L),
+                    Map.entry("preparationId", "invalid"),
+                    Map.entry("previousPreparationId", UUID.randomUUID().toString()),
+                    Map.entry("formatVersion", 3),
+                    Map.entry("inputClosureHash", "invalid"),
+                    Map.entry("originalClaim", new Document(claim).append("clusterId", "other-cluster")));
+            for (var change : changes.entrySet()) {
+                var damaged = new Document(annex).append(change.getKey(), change.getValue());
+                table.updateOne(key, new Document("$set", new Document("stateRebuild", damaged)));
+                assertThatThrownBy(() -> bindings.loadCurrent("flow"))
+                        .as("invalid rebuild witness field %s", change.getKey())
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            }
+            for (String field : List.of("claimGeneration", "executionGeneration", "topologyRevision")) {
+                var damagedClaim = new Document(claim).append(field, "invalid");
+                var damaged = new Document(annex).append("originalClaim", damagedClaim);
+                table.updateOne(key, new Document("$set", new Document("stateRebuild", damaged)));
+                assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
+            }
+            table.updateOne(key, new Document("$unset", new Document("stateRebuild", "")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.DOCUMENT_UNREADABLE);
+            table.replaceOne(key, rebuilding);
+            table.updateOne(key, new Document("$set", new Document("stateGeneration", f.scope.stateGeneration() + 1))
+                    .append("$unset", new Document("connectorBindings", "")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.PIPELINE_INTENT_FENCED);
+            table.replaceOne(key, rebuilding);
+            table.updateOne(key, new Document("$set", new Document("phase", "RETIRED")));
+            assertCode(() -> bindings.loadCurrent("flow"), IoError.PIPELINE_INTENT_FENCED);
+            table.replaceOne(key, rebuilding);
+            assertThat(bindings.loadCurrent("flow")).isEmpty();
+        });
+    }
+
     @Test void deletionClearsOnlyTheRetiringGenerationOfConfigurationDeadLetters() {
         withFixture(f -> {
             var deadLetters = SystemCollections.CONFIG_NEST_DEAD_LETTERS.on(f.config);

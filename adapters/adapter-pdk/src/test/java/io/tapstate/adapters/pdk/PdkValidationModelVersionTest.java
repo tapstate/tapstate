@@ -38,6 +38,23 @@ class PdkValidationModelVersionTest {
         assertThatThrownBy(()->PdkValidationModelVersion.scopeVersion(first,artifact)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void atlasReadScopesIgnoreCollectionStatsAndRetainPreviouslySavedProfiles() {
+        var atlas = new ConnectorRef(List.of(), PdkBsonDecimal.ATLAS, "2.0.8", null, null, "a".repeat(64), false);
+        var before = table();
+        var after = table();
+        before.setTableAttr(Map.of("size", 100L, "storageSize", 1024L, "avgObjSize", 50, "indexSize", 64));
+        after.setTableAttr(Map.of("size", 240L, "storageSize", 2048L, "avgObjSize", 80, "indexSize", 128));
+        String scope = PdkValidationModelVersion.structuralScopeVersion(before, atlas);
+        assertThat(PdkValidationReads.ModelScope.forSavedVersion(scope).version(after, atlas)).isEqualTo(scope);
+        assertThat(PdkValidationModelVersion.of(after, atlas)).isEqualTo(PdkValidationModelVersion.of(before, atlas));
+        for (String saved : List.of(PdkValidationModelVersion.declaredStructuralVersion(before),
+                PdkValidationModelVersion.of(before))) {
+            assertThat(PdkValidationReads.ModelScope.forSavedVersion(saved).version(before, atlas)).isEqualTo(saved);
+        }
+        after.setTableAttr(Map.of("capped", true));
+        assertThat(PdkValidationModelVersion.structuralScopeVersion(after, atlas)).isNotEqualTo(scope);
+    }
+
     @Test void structuralScopeIgnoresStatisticsButRetainsFieldAndKeyChanges(){
         var artifact = new ConnectorRef(List.of(),"example.Connector","2.0.8",null,null,"a".repeat(64),false);
         var first = table();
@@ -46,8 +63,8 @@ class PdkValidationModelVersionTest {
         second.setTableAttr(Map.of("storageSize", 2L));
         var saved = PdkValidationModelVersion.structuralScopeVersion(first, artifact);
         var legacy = PdkValidationModelVersion.scopeVersion(first, artifact);
-        assertThat(PdkValidationReads.ModelScope.forSavedVersion(saved)).isEqualTo(PdkValidationReads.ModelScope.STRUCTURAL);
-        assertThat(PdkValidationReads.ModelScope.forSavedVersion(legacy)).isEqualTo(PdkValidationReads.ModelScope.LEGACY);
+        assertThat(PdkValidationReads.ModelScope.forSavedVersion(saved).version(first,artifact)).isEqualTo(saved);
+        assertThat(PdkValidationReads.ModelScope.forSavedVersion(legacy).version(first,artifact)).isEqualTo(legacy);
         assertThat(PdkValidationModelVersion.structuralScopeVersion(second, artifact)).isEqualTo(saved);
         assertThat(PdkValidationModelVersion.scopeVersion(second, artifact)).isNotEqualTo(legacy);
         second.setTableAttr(null);

@@ -246,7 +246,8 @@ final class ThreeLayerStorePort implements StorePort {
     }
     @Override public boolean pipelineRecoveryRequired(String pipeline) {
         var mapping = currentMapping(pipeline);
-        if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return false;
+        if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING
+                || mapping.phase() == PipelineStateMapping.Phase.RETIRING) return false;
         var original = activeScope(pipeline, mapping);
         var recoveries = configuration.cacheRecoveries();
         var summary = recoveries.read(pipeline);
@@ -439,37 +440,65 @@ final class ThreeLayerStorePort implements StorePort {
         active();
         var result = new HashMap<String, PipelineCatalogState>();
         for (int offset = 0; offset < ids.size(); offset += 200) {
-            var page = ids.subList(offset, Math.min(offset + 200, ids.size()));
-            var headers = configuration.pipelineDisplayHeaders(page, includeIntents);
-            var scopes = new ArrayList<PipelineIntentScope>();
-            for (var entry : headers.entrySet()) {
-                var header = entry.getValue();
-                if (includeIntents && header.recovering()) continue;
-                if (header.preparation().phase() == PipelinePreparation.Phase.COMPLETE) {
-                    var original = activeScope(entry.getKey(), header.mapping());
-                    if (original.equals(header.preparation().scope())) scopes.add(original);
-                } else {
-                    result.put(entry.getKey(), new PipelineCatalogState(startFailure(entry.getKey(), header), header.desired(), header.intentFailure(), false,
-                            io.tapstate.core.lifecycle.PipelineState.NEW));
-                }
-            }
-            if (!scopes.isEmpty()) {
-                var cached = bound.cache().pipelineObservationBatch(scopes, this::active, includeIntents);
-                var after = configuration.pipelineDisplayHeaders(scopes.stream().map(PipelineIntentScope::pipelineId).toList(), false);
-                for (var entry : cached.entrySet()) {
-                    var header = headers.get(entry.getKey());
-                    var current = after.get(entry.getKey());
-                    if (current != null && current.mapping().equals(header.mapping())
-                            && current.preparation().equals(header.preparation())) {
-                        result.put(entry.getKey(), new PipelineCatalogState(entry.getValue().observation(),
-                                header.desired(), header.intentFailure(), entry.getValue().runningObservationUnavailable(),
-                                entry.getValue().checkpoint(), activeScope(entry.getKey(), header.mapping())));
-                    }
-                }
-            }
+            collectDisplayPage(ids.subList(offset, Math.min(offset + 200, ids.size())), includeIntents, result);
         }
         active();
         return Map.copyOf(result);
+    }
+
+    private void collectDisplayPage(List<String> page, boolean includeIntents, Map<String, PipelineCatalogState> result) {
+        var before = includeIntents ? configuration.pipelineDisplayHeadersBeforeCache(page, business())
+                : configuration.pipelineDisplayHeaders(page, false);
+        var scopes = displayCacheScopes(before, includeIntents);
+        if (scopes.isEmpty()) {
+            collectUnpreparedDisplayStates(before, includeIntents, result);
+            return;
+        }
+        var cached = bound.cache().pipelineObservationBatch(scopes, this::active, includeIntents);
+        // One intent read per page, after CACHE when a second CONFIG snapshot is needed.
+        var cacheIds = scopes.stream().map(PipelineIntentScope::pipelineId).toList();
+        var after = includeIntents ? configuration.pipelineDisplayHeadersAfterCache(page, cacheIds, before)
+                : configuration.pipelineDisplayHeaders(cacheIds, false);
+        collectUnpreparedDisplayStates(includeIntents ? after : before, includeIntents, result);
+        for (var entry : cached.entrySet()) {
+            String id = entry.getKey();
+            var original = before.get(id);
+            var current = after.get(id);
+            if (current != null && current.mapping().equals(original.mapping())
+                    && current.preparation().equals(original.preparation())
+                    && (!includeIntents || !current.recovering())) {
+                var observed = entry.getValue();
+                result.put(id, new PipelineCatalogState(observed.observation(), current.desired(), current.intentFailure(),
+                        observed.runningObservationUnavailable(), observed.checkpoint(),
+                        current.preparation().scope(), current.completedStopClear()));
+            }
+        }
+    }
+
+    private List<PipelineIntentScope> displayCacheScopes(
+            Map<String, MongoConfigurationDomain.PipelineDisplayHeader> headers, boolean includeIntents) {
+        var scopes = new ArrayList<PipelineIntentScope>();
+        for (var entry : headers.entrySet()) {
+            var header = entry.getValue();
+            if (includeIntents && header.recovering()) continue;
+            if (header.preparation().phase() == PipelinePreparation.Phase.COMPLETE) {
+                var scope = activeScope(entry.getKey(), header.mapping());
+                if (scope.equals(header.preparation().scope())) scopes.add(scope);
+            }
+        }
+        return scopes;
+    }
+
+    private static void collectUnpreparedDisplayStates(
+            Map<String, MongoConfigurationDomain.PipelineDisplayHeader> headers, boolean includeIntents,
+            Map<String, PipelineCatalogState> result) {
+        headers.forEach((id, header) -> {
+            if (includeIntents && header.recovering()) return;
+            if (header.preparation().phase() != PipelinePreparation.Phase.COMPLETE) {
+                result.put(id, new PipelineCatalogState(startFailure(id, header), header.desired(),
+                        header.intentFailure(), false, io.tapstate.core.lifecycle.PipelineState.NEW));
+            }
+        });
     }
 
     @Override public ObservationStore observations() {
@@ -500,11 +529,12 @@ final class ThreeLayerStorePort implements StorePort {
                     throw refused();
                 }
                 var mapping = retained.orElseThrow();
-                if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return Optional.empty();
+                if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING
+                        || mapping.phase() == PipelineStateMapping.Phase.RETIRING) return Optional.empty();
                 var original = activeScope(pipeline, mapping);
                 try {
                     var observation = readObservation(pipeline, original);
-                    // A display read never carries an old observation across a concurrent state rebuild.
+                    // A display read never carries an old observation across a state transition.
                     return mapping.equals(currentMapping(pipeline)) ? observation : Optional.empty();
                 } catch (TapstateException failure) {
                     boolean retiredScope = failure.code() == IoError.WORKLOAD_CLAIM_FENCED

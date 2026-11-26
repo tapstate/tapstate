@@ -15,9 +15,9 @@ import java.util.Objects;
  * on the same numbers.
  *
  * <p>{@code counters} holds the pipeline-level totals the flat metrics face carries — records and bytes per
- * direction, errors per code, the driven count — and {@code lag} the per-table delay in seconds. Both are
- * a subset of that face on purpose: what is kept is what a line can be drawn from, and a sample is taken
- * once a minute for fifteen days, so every key in it is paid for twenty thousand times over.
+ * direction, errors per code, the driven count — plus the CDC delivery count and elapsed-time total.
+ * {@code lag} holds the per-table event age in seconds. A sample stores only what a line can be drawn
+ * from. It is taken once a minute for fifteen days, so each key is kept twenty thousand times over.
  *
  * <p>{@code countingSince} says what the counters accumulate from. Two samples with different starts
  * straddle a restart, and a reader differencing them must notice that first: a total that dropped with the

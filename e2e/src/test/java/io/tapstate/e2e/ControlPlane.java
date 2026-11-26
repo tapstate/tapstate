@@ -900,7 +900,11 @@ final class ControlPlane {
 
     /** The merged catalog that backs the Web list. */
     List<String> pipelineCatalogIds() {
-        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=0"));
+        return pipelineCatalogIds(0);
+    }
+
+    List<String> pipelineCatalogIds(int offset) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=" + offset));
         expect(response, 200, "read the Pipeline catalog");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("items") instanceof List<?> items)) {

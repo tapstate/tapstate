@@ -91,6 +91,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.bytes",
                         "tapstate.pipeline.lag",
                         "tapstate.pipeline.record.delivery.duration",
+                        "tapstate.pipeline.cdc.delivery.count",
+                        "tapstate.pipeline.cdc.delivery.total_millis",
                         "tapstate.pipeline.process.duration",
                         "tapstate.pipeline.snapshot.rows",
                         "tapstate.pipeline.snapshot.rows.current_run",

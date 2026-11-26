@@ -258,5 +258,9 @@
   "TS0330065": {
     "message": "The full-screen workbench could not initialize this terminal.",
     "solution": "Use a supported interactive terminal and retry."
+  },
+  "TS0330066": {
+    "message": "The full-screen workbench could not complete its terminal session.",
+    "solution": "Reopen the workbench in a supported interactive terminal."
   }
 }
