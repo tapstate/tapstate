@@ -438,7 +438,6 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
         if (member != null) {
             if (delivery instanceof JetDeliveryGauge jobGauge) {
                 jobGauge.countingSince(countingSince);
-                jobGauge.cdcDelivered(CdcDeliveryTotals.ZERO);
             }
             return;
         }

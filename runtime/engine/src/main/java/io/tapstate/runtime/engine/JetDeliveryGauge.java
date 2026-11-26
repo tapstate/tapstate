@@ -66,8 +66,7 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> waitingByName = new HashMap<>();
     static final String CDC_COUNT = "cdcDeliveryCount";
     static final String CDC_TOTAL_MILLIS = "cdcDeliveryTotalMillis";
-    private final AtomicReference<CdcDeliveryTotals> cdcDelivery = new AtomicReference<>();
-    private JobStatistic since;
+    private final AtomicReference<CdcSnapshot> cdcDelivery = new AtomicReference<>();
 
     @Override
     public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {
@@ -110,17 +109,22 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     @Override
     public void cdcDelivered(CdcDeliveryTotals totals) {
-        cdcDelivery.set(totals);
+        CdcSnapshot current = cdcDelivery.get();
+        cdcDelivery.set(new CdcSnapshot(current.startMillis(), totals));
     }
 
     void collectCdcDelivery(MetricDescriptor descriptor, MetricsCollectionContext context) {
-        // Jet samples on another thread. Use one immutable reading for both numbers in this scrape.
-        CdcDeliveryTotals snapshot = cdcDelivery.get();
+        // The collector can run on another thread. Read the start and both totals together.
+        CdcSnapshot snapshot = cdcDelivery.get();
         if (snapshot != null) {
             descriptor.withTag(MetricTags.USER, "true");
-            context.collect(descriptor, CDC_COUNT, ProbeLevel.INFO, ProbeUnit.COUNT, snapshot.count());
-            context.collect(descriptor, CDC_TOTAL_MILLIS, ProbeLevel.INFO, ProbeUnit.MS, snapshot.totalMillis());
+            context.collect(descriptor, SINCE_METRIC, ProbeLevel.INFO, ProbeUnit.MS, snapshot.startMillis());
+            context.collect(descriptor, CDC_COUNT, ProbeLevel.INFO, ProbeUnit.COUNT, snapshot.totals().count());
+            context.collect(descriptor, CDC_TOTAL_MILLIS, ProbeLevel.INFO, ProbeUnit.MS, snapshot.totals().totalMillis());
         }
+    }
+
+    private record CdcSnapshot(long startMillis, CdcDeliveryTotals totals) {
     }
 
     @Override
@@ -146,10 +150,10 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     @Override
     public void countingSince(long epochMillis) {
-        if (since == null) {
-            since = new JobStatistic(SINCE_METRIC);
+        if (cdcDelivery.get() == null) {
+            // Cooperative processors can initialize before Jet binds the thread-local metrics API.
+            cdcDelivery.set(new CdcSnapshot(epochMillis, CdcDeliveryTotals.ZERO));
         }
-        since.set(epochMillis);
     }
 
     /**
