@@ -467,7 +467,7 @@ final class StorageRoot implements AutoCloseable {
     }
 
     private StorageRuntime.Bound prepareInitialSetup( // NOSONAR java:S3776 — method predates this PR; one-line condition edit did not change its structure.
-            StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
+            StorageBindingCommit committed, StorageSetupService.DefaultTarget _target) {
         setupInvocation = committed;
         var original = runtime.loadBound().orElseThrow(StorageRuntime::unavailable);
         Runnable active = () -> {
