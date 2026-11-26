@@ -81,7 +81,7 @@ final class SinkLaneClaims implements java.io.Serializable {
             claim(keys, target.keyColumns(), image, e, false);
             fences.add(RoutingKeys.writerLane(node, target, e, image));
             for (var columns : secondary) {
-                if (!generated(columns, e)) claim(keys, columns, image, e, !reserved);
+                if (!generated(columns, e)) claim(keys, columns, image, e, true);
             }
         }
         if (e.op() == Op.UPDATE && (hasId(e.before()) || hasId(e.after()))
@@ -115,7 +115,7 @@ final class SinkLaneClaims implements java.io.Serializable {
         if (image == null) return false;
         Object v = ConvertedValue.unwrap(image.get(column));
         var type = constraints.fieldTypes().get(column);
-        // A stable update can preserve an explicit null. Moves still require non-null scalar claims.
+        // An explicit null occupies a unique index entry. An omitted column has no known value.
         if (v == null) return allowExplicitNull && !column.equals("_id") && image.containsKey(column)
                 && (type == TapstateType.STRING || type == TapstateType.INT64);
         return type == TapstateType.STRING && v instanceof String || type == TapstateType.INT64

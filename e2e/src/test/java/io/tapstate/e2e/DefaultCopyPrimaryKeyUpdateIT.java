@@ -165,6 +165,21 @@ class DefaultCopyPrimaryKeyUpdateIT {
                 assertThat(mongo.fetch(target, COMPOSITE, UPDATED_KEY)).isEmpty();
                 return;
             }
+            assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET OWNER='released' WHERE K1=4")).isEqualTo(1);
+            assertThat(sql.executeUpdate("INSERT INTO ACC_COMPOSITE VALUES (5, 'next', 50, NULL)")).isEqualTo(1);
+            Await.until("the inserted row to acquire the released null unique value", () -> {
+                assertThat(control.failure(PIPELINE)).isEmpty();
+                return physical.countDocuments(new Document("K1", 5).append("OWNER", null)) == 1
+                        && physical.countDocuments(new Document("K1", 4).append("OWNER", "released")) == 1;
+            }, () -> control.pipelineStatus(PIPELINE).toString());
+            assertThat(sql.executeUpdate("DELETE FROM ACC_COMPOSITE WHERE K1=5")).isEqualTo(1);
+            assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET OWNER=NULL WHERE K1=4")).isEqualTo(1);
+            Await.until("the original row to reacquire the null unique value after deletion", () -> {
+                assertThat(control.failure(PIPELINE)).isEmpty();
+                return physical.countDocuments(new Document("K1", 4).append("OWNER", null)) == 1
+                        && physical.countDocuments(new Document("K1", 5)) == 0;
+            }, () -> control.pipelineStatus(PIPELINE).toString());
+
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET OWNER='free' WHERE K1=3")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET K2='r1', OWNER='claimed' WHERE K1=2 AND K2='k1'")).isEqualTo(1);
             assertThat(sql.executeUpdate("UPDATE ACC_COMPOSITE SET VAL=22 WHERE K1=2 AND K2='r1'")).isEqualTo(1);

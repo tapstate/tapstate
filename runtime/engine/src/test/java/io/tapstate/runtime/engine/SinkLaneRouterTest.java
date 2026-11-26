@@ -102,6 +102,32 @@ class SinkLaneRouterTest {
     }
 
     @Test
+    void reusingANullUniqueValueWaitsForItsPreviousOwnerToCommit() throws Exception {
+        try (var f = fixture(true, 32)) {
+            var release = update(10, 1, null, 1, "released");
+            var acquire = insert(11, 2, null);
+            var unrelated = update(12, 3, "other", 3, "other");
+            f.router.process(0, new TestInbox(List.of(release, acquire, unrelated)));
+
+            var initial = f.drain(SinkRouter.BY_KEY);
+            assertThat(initial).hasSize(2);
+            assertThat(initial.getLast()).isSameAs(unrelated);
+            f.ack((SinkLaneCommand.Fence) initial.getFirst());
+            var releasing = f.onlyMove();
+            assertThat(releasing.row()).isSameAs(release);
+            f.ack(releasing);
+
+            var fences = f.drain(SinkRouter.BY_KEY);
+            assertThat(fences).hasSize(1);
+            f.ack((SinkLaneCommand.Fence) fences.getFirst());
+            var acquiring = f.onlyMove();
+            assertThat(acquiring.row()).isSameAs(acquire);
+            f.ack(acquiring);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
     void aPartialOrDifferentlyTypedKeyStopsBeforeAnyTargetCommand() throws Exception {
         try (var f = fixture(false, 1)) {
             for (var oldRow : List.<Map<String, Object>>of(Map.of("label", "unknown"), Map.of("id", "01"))) {
@@ -304,7 +330,10 @@ class SinkLaneRouterTest {
     }
 
     private static Map<String, Object> image(int id, String email) {
-        return Map.of("id", id, "email", email);
+        var image = new HashMap<String, Object>();
+        image.put("id", id);
+        image.put("email", email);
+        return image;
     }
 
     private static Config config(String cluster) {
