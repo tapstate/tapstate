@@ -7,6 +7,7 @@ import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -27,7 +28,7 @@ class AClaimCannotRecreateItsDroppedCacheCollectionIT {
         try (var installed = PreparedNativeStore.create();
              var config = MongoConfigurationDomain.open(
                      new MongoConnectionSettings(installed.configurationUri(), null, timeout), installed.clusterId());
-             var cache = MongoCacheDomain.connect(config.bindings().load().orElseThrow().cache(), timeout, "claim-witness");
+             var cache = MongoCacheDomain.connect(standardUuid(config.bindings().load().orElseThrow().cache()), timeout, "claim-witness");
              var setupClient = MongoClients.create(installed.cacheUri())) {
             var scope = config.bindings().cachePreparation().orElseThrow().businessScope();
             var claims = cache.workloadClaims(scope);
@@ -46,5 +47,12 @@ class AClaimCannotRecreateItsDroppedCacheCollectionIT {
             assertThat(database.listCollectionNames()).doesNotContain(table.collectionName());
             assertThat(identity.find().first()).isEqualTo(before);
         }
+    }
+
+    private static StorageBinding.Connection standardUuid(StorageBinding.Connection original) {
+        String uri = original.uri();
+        String separator = uri.contains("?") ? "&" : "?";
+        return new StorageBinding.Connection(original.kind(), uri + separator + "uuidRepresentation=standard",
+                original.database(), original.caPem());
     }
 }

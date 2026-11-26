@@ -22,8 +22,10 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
+import org.bson.BsonBinary;
+import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.Document;
-import org.bson.types.Binary;
 
 import java.time.Duration;
 import java.util.Collection;
@@ -844,19 +846,21 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         claimCollection(database);
     }
 
-    private Binary claimCollectionId() {
+    private BsonBinary claimCollectionId() {
         var budget = operations.budget();
         var scopedDatabase = budget == null ? database : budget.database(database);
-        var info = claimCollection(scopedDatabase).get("info", Document.class);
+        var metadata = claimCollection(scopedDatabase);
         if (budget != null) budget.remainingMillis();
-        if (info == null || !(info.get("uuid") instanceof Binary id)) throw unreadableClaimCollection();
+        // Compare the catalog identity in BSON regardless of the client's UUID representation.
+        if (!(metadata.get("info") instanceof BsonDocument info) || !(info.get("uuid") instanceof BsonBinary id))
+            throw unreadableClaimCollection();
         return id;
     }
 
-    private static Document claimCollection(MongoDatabase database) {
+    private static BsonDocument claimCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
-        Document found = database.listCollections().filter(new Document("name", table.collectionName())).first();
-        if (found == null || !"collection".equals(found.get("type"))) throw unreadableClaimCollection();
+        var found = database.listCollections(BsonDocument.class).filter(new Document("name", table.collectionName())).first();
+        if (found == null || !new BsonString("collection").equals(found.get("type"))) throw unreadableClaimCollection();
         return found;
     }
 

@@ -1879,16 +1879,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             if (!scope.session().hasActiveTransaction())
                 return fenceWrite(scope, keyId, keys.find(scope.session(), new Document("_id", "cluster")).first());
             if (!cipher.activeKeyId().equals(keyId)) throw invalidKey();
-            // A missing legacy counter initializes on first use. A bounded integer always advances by one.
-            var fenceType = new Document("$type", "$sourceWriteFence");
-            var advanceable = new Document("$or", List.of(
-                    new Document("$eq", List.of(fenceType, "missing")),
-                    new Document("$and", List.of(
-                            new Document("$in", List.of(fenceType, List.of("int", "long"))),
-                            new Document("$gte", List.of("$sourceWriteFence", 0L)),
-                            new Document("$lt", List.of("$sourceWriteFence", Long.MAX_VALUE))))));
-            var original = keys.findOneAndUpdate(scope.session(),
-                    new Document("_id", "cluster").append("keyId", keyId).append("$expr", advanceable),
+            var original = keys.findOneAndUpdate(scope.session(), writeFenceFilter(keyId),
                     new Document("$inc", new Document("sourceWriteFence", 1L)));
             // Validate the exact key that advanced in this transaction. An invalid pre-image aborts it.
             if (!keyId.equals(decode(original).activeKeyId())) throw invalidKey();
@@ -1898,8 +1889,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private boolean fenceWrite(SourceConfigWriteScope scope,String keyId,Document checkedKey) {
             SourceConfigCipher observed = decode(checkedKey);
             if (!cipher.activeKeyId().equals(keyId) || !keyId.equals(observed.activeKeyId())) throw invalidKey();
-            return keys.updateOne(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
+            return keys.updateOne(scope.session(), writeFenceFilter(keyId),
                     new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() == 1;
+        }
+
+        private static Document writeFenceFilter(String keyId) {
+            // A missing legacy counter initializes on first use. A bounded integer always advances by one.
+            var fenceType = new Document("$type", "$sourceWriteFence");
+            var advanceable = new Document("$or", List.of(
+                    new Document("$eq", List.of(fenceType, "missing")),
+                    new Document("$and", List.of(
+                            new Document("$in", List.of(fenceType, List.of("int", "long"))),
+                            new Document("$gte", List.of("$sourceWriteFence", 0L)),
+                            new Document("$lt", List.of("$sourceWriteFence", Long.MAX_VALUE))))));
+            return new Document("_id", "cluster").append("keyId", keyId).append("$expr", advanceable);
         }
 
         private SourceConfigCipher decode(Document document) {
