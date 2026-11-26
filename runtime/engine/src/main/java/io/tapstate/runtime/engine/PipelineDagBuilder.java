@@ -402,6 +402,7 @@ public final class PipelineDagBuilder {
             }
         }
         Set<String> rawSources = Set.copyOf(byKey.keySet());
+        Map<String, SourcePreflightStart.SerialPort> serialPorts = new HashMap<>();
         // The numbering comes from the binding rather than from what was accumulated here, because the
         // assembler stamping at its sources needs the same answer: an axis meaning one chain in the graph
         // and another at a source would have unrelated promises combined as though they were one.
@@ -516,7 +517,7 @@ public final class PipelineDagBuilder {
                     continue;
                 }
                 List<String> upstream = resolveClause(step.from(), bindings);
-                Vertex vertex = transformVertex(dag, step, bindings, axes,
+                Vertex vertex = transformVertex(dag, step, bindings, serialPorts, axes,
                         chains == null ? null : chains.perOrdinal(upstream), shape);
                 byKey.put(step.id(), vertex);
                 drawn.add(step.id(), vertex.getName());
@@ -562,7 +563,7 @@ public final class PipelineDagBuilder {
             connect(dag, verticesOf(sink.upstream(), byKey), vertex, outboundOrdinal, inboundOrdinal, shape);
         }
 
-        bindSourcePreflights(dag, rawSources, sinks, shape);
+        bindSourcePreflights(dag, rawSources, sinks, shape, serialPorts);
         // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
         // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
         boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
@@ -583,11 +584,12 @@ public final class PipelineDagBuilder {
     }
 
     private static void bindSourcePreflights(DAG dag, Set<String> rawSources, List<SinkNode> sinks,
-            ExecutionShape shape) {
+            ExecutionShape shape, Map<String, SourcePreflightStart.SerialPort> serialPorts) {
         for (String source : rawSources) {
             var routes = new ArrayList<com.hazelcast.function.FunctionEx<Object, Object>>();
             var targets = new ArrayList<SourcePreflightStart.Target>();
-            for (var edge : dag.getOutboundEdges(source)) {
+            var prefix = serialPrefix(dag, source, serialPorts);
+            for (var edge : dag.getOutboundEdges(prefix.terminal())) {
                 String destination = edge.getDestName();
                 if (shape.isNative(destination) && shape.inputKeys().containsKey(destination)) {
                     routes.add(RoutingKeys.forNode(destination, shape.inputKeysOf(destination)));
@@ -603,10 +605,28 @@ public final class PipelineDagBuilder {
                 }
             }
             dag.getVertex(source).updateMetaSupplier(delegate -> {
-                var checked = SourcePreflightStart.of(delegate, routes, targets);
+                var checked = SourcePreflightStart.of(delegate, routes, targets,
+                        prefix.ports().isEmpty() || routes.isEmpty() && targets.isEmpty() ? null : prefix);
                 return targets.isEmpty() ? checked : PlannedMembersGuard.of(checked, shape.plannedMembers());
             });
         }
+    }
+
+    /** Preserve the original source guard before the first fork, fan-in or state mutation. */
+    private static SourcePreflightStart.Prefix serialPrefix(DAG dag, String source,
+            Map<String, SourcePreflightStart.SerialPort> serialPorts) {
+        String current = source;
+        var ports = new ArrayList<SourcePreflightStart.SerialPort>();
+        var edges = dag.getOutboundEdges(current);
+        while (edges.size() == 1) {
+            String next = edges.getFirst().getDestName();
+            var port = serialPorts.get(next);
+            if (port == null || dag.getInboundEdges(next).size() != 1) break;
+            ports.add(port);
+            current = next;
+            edges = dag.getOutboundEdges(current);
+        }
+        return new SourcePreflightStart.Prefix(current, ports);
     }
 
     /**
@@ -901,7 +921,8 @@ public final class PipelineDagBuilder {
      * neither does a {@code join}, for the same reason. An unresolved {@code use:} reference is out of
      * this builder's scope and is refused.
      */
-    private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings, ChainAxes axes,
+    private static Vertex transformVertex(DAG dag, Step step, DagBindings bindings,
+            Map<String, SourcePreflightStart.SerialPort> serialPorts, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal, ExecutionShape shape) {
         if (!(step instanceof Step.Inline inline)) {
             throw new IllegalArgumentException(
@@ -920,6 +941,10 @@ public final class PipelineDagBuilder {
             return stepVertex(dag, step.id(), InputBatches.around(merge, batch), shape);
         }
         var port = bindings.transformPorts().apply(step);
+        if (!wide) {
+            boolean canExpand = !(body instanceof TransformBody.MapProjection || body instanceof TransformBody.Filter);
+            serialPorts.put(step.id(), new SourcePreflightStart.SerialPort(port, canExpand));
+        }
         ProcessorMetaSupplier transform = wide
                 ? TransformProcessor.nativeMetaSupplier(step.id(), port, axes, chainsByOrdinal, shape.plannedMembers())
                 : TransformProcessor.metaSupplier(step.id(), port, axes, chainsByOrdinal);

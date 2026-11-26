@@ -2,12 +2,14 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.cluster.Address;
 import com.hazelcast.function.FunctionEx;
+import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceKeyMovePreflight;
 import io.tapstate.spi.sink.TargetKeyConstraints;
+import io.tapstate.spi.transform.TransformPort;
 import java.io.Serializable;
 import java.security.Permission;
 import java.util.ArrayList;
@@ -17,27 +19,37 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 
-/** Binds first-hop routing checks and prepared target evidence to this execution's source. */
+/** Binds downstream routing checks and prepared target evidence to this execution's source. */
 final class SourcePreflightStart implements ProcessorMetaSupplier {
     private static final long serialVersionUID = 1L;
     private final ProcessorMetaSupplier delegate;
     private final List<FunctionEx<Object, Object>> routes;
     private final List<Target> targets;
+    private final Prefix prefix;
     private transient SourceKeyMovePreflight.Check prepared;
     private transient Context context;
 
     record Target(String node, Map<String, SinkTarget> streams, PreparesTargets preparation) implements Serializable {}
 
+    record SerialPort(SupplierEx<? extends TransformPort> factory, boolean canExpand) implements Serializable {}
+
+    record Prefix(String terminal, List<SerialPort> ports) implements Serializable {
+        Prefix {
+            ports = List.copyOf(ports);
+        }
+    }
+
     private SourcePreflightStart(ProcessorMetaSupplier delegate, List<FunctionEx<Object, Object>> routes,
-            List<Target> targets) {
+            List<Target> targets, Prefix prefix) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.routes = List.copyOf(routes);
         this.targets = List.copyOf(targets);
+        this.prefix = prefix;
     }
 
     static ProcessorMetaSupplier of(ProcessorMetaSupplier delegate, List<FunctionEx<Object, Object>> routes,
-            List<Target> targets) {
-        return new SourcePreflightStart(delegate, routes, targets);
+            List<Target> targets, Prefix prefix) {
+        return new SourcePreflightStart(delegate, routes, targets, prefix);
     }
 
     @Override public void init(Context context) throws Exception {
@@ -61,7 +73,8 @@ final class SourcePreflightStart implements ProcessorMetaSupplier {
     @Override public Function<? super Address, ? extends ProcessorSupplier> get(List<Address> addresses) {
         var suppliers = delegate.get(addresses);
         var check = Objects.requireNonNull(prepared, "source preflight is unprepared");
-        return address -> new Checked(suppliers.apply(address), check);
+        var serial = prefix;
+        return address -> new Checked(suppliers.apply(address), check, serial);
     }
 
     @Override public int preferredLocalParallelism() { return delegate.preferredLocalParallelism(); }
@@ -93,10 +106,12 @@ final class SourcePreflightStart implements ProcessorMetaSupplier {
         private static final long serialVersionUID = 1L;
         private final ProcessorSupplier delegate;
         private final SourceKeyMovePreflight.Check check;
+        private final Prefix prefix;
 
-        private Checked(ProcessorSupplier delegate, SourceKeyMovePreflight.Check check) {
+        private Checked(ProcessorSupplier delegate, SourceKeyMovePreflight.Check check, Prefix prefix) {
             this.delegate = delegate;
             this.check = check;
+            this.prefix = prefix;
         }
 
         @Override public void init(Context context) throws Exception { delegate.init(context); }
@@ -104,7 +119,10 @@ final class SourcePreflightStart implements ProcessorMetaSupplier {
         @Override public Collection<? extends Processor> get(int count) {
             var processors = delegate.get(count);
             for (var processor : processors) {
-                if (processor instanceof SourceKeyMovePreflight source) source.withKeyMovePreflight(check);
+                if (processor instanceof SourceKeyMovePreflight source) {
+                    source.withKeyMovePreflight(prefix == null ? check
+                            : new SerialTransformPreflight(prefix.ports(), check));
+                }
             }
             return processors;
         }

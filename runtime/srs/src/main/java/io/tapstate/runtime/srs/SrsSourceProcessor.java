@@ -88,9 +88,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final SourceChangeGuard.Factory changeGuardFactory;
     private SourceChangeGuard changeGuard;
     private SourceKeyMovePreflight.Check preflight;
+    private SourceKeyMovePreflight.PreparedRows preparedRows;
+    private Object pendingEmission;
 
     @Override public void withKeyMovePreflight(SourceKeyMovePreflight.Check check) {
         preflight = Objects.requireNonNull(check);
+        if (check instanceof SourceKeyMovePreflight.PreparedRows rows) preparedRows = rows;
     }
     private int admittedRows;
     private final boolean bounded;
@@ -344,6 +347,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         var observer = initialObserver; initialObserver = null;
         if (observer != null) try { observer.ended(observedJob, observedExecution, src, observedIndex, completedInput); }
         catch (RuntimeException failedObservation) { System.getLogger(SrsSourceProcessor.class.getName()).log(System.Logger.Level.WARNING, "initial-load end observation failed", failedObservation); }
+        if (preparedRows != null) preparedRows.close();
     }
 
     /**
@@ -594,7 +598,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
         while (admittedRows > 0) {
             Envelope row = pending.peek();
-            if (!tryEmit(row)) return false;
+            if (preparedRows != null) {
+                if (pendingEmission == null) pendingEmission = preparedRows.emission(row);
+                if (!tryEmit(pendingEmission)) return false;
+                pendingEmission = null;
+            } else if (!tryEmit(row)) return false;
             pending.remove();
             admittedRows--;
             boolean epochEnded = admittedRows == 0 && !pending.isEmpty();
