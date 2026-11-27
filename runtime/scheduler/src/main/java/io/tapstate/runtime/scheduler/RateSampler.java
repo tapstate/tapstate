@@ -173,6 +173,10 @@ public final class RateSampler {
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
     public static RateSample sampleOf(Observation observation) {
+        return sampleOf(observation, null);
+    }
+
+    public static RateSample sampleOf(Observation observation, RateSample.StartupEvidence startupEvidence) {
         if (observation.observedAt() == null || observation.state() == PipelineState.COMPLETED) {
             return null;
         }
@@ -194,7 +198,7 @@ public final class RateSampler {
             return null;
         }
         return new RateSample(observation.pipelineId(), observation.observedAt(), counters, lag,
-                countingSince(observation.facts()));
+                countingSince(observation.facts()), startupEvidence);
     }
 
     /**

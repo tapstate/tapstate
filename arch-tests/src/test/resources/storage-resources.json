@@ -3721,15 +3721,15 @@
     },
     {
       "id": "mongo.cache.pipeline_rate_history",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "pipeline_rate_history"
       ],
-      "responsibility": "Reconstructable observed rate-history samples.",
+      "responsibility": "Observed rate-history samples with optional execution identity and verified outbound zero-baseline evidence. Rows without that evidence remain readable.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheRateHistoryStore"
       ],
@@ -3738,7 +3738,7 @@
       ],
       "recovery": "derived-cache",
       "consistency": "cache",
-      "growth": "Observed samples use configured TTL/indexes; no promise to reconstruct old curves.",
+      "growth": "Configured sampling cadence, TTL and indexes bound row count; new rows carry only constant-size optional startup evidence. Old curves are not reconstructed.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheRateHistoryStoreIT.java"
       ]

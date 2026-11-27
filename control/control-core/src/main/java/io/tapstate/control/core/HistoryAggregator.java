@@ -159,8 +159,9 @@ public final class HistoryAggregator {
         }
 
         StartReason boundary = boundary(a, b, elapsed);
-        if (boundary == null) {
-            addCounterInterval(left.key(), a, b, elapsed);
+        Instant startup = startupBaseline(a, b, from, boundary);
+        if (boundary == null || startup != null) {
+            addCounterInterval(left.key(), a, b, startup);
         } else {
             startSegment(left.key(), a.observedAt(), b.observedAt(), boundary);
         }
@@ -188,12 +189,14 @@ public final class HistoryAggregator {
         }
     }
 
-    private void addCounterInterval(Key leftKey, RateSample left, RateSample right, Duration elapsed) {
-        Instant intervalStart = max(resumeFrom, max(from, left.observedAt()));
+    private void addCounterInterval(Key leftKey, RateSample left, RateSample right, Instant startup) {
+        Instant baseline = startup == null ? left.observedAt() : startup;
+        Instant intervalStart = max(resumeFrom, max(from, baseline));
         Instant intervalEnd = min(to, right.observedAt());
         if (intervalStart.isBefore(intervalEnd)) {
-            CounterInterval records = counter(left, right, RECORDS_OUT, elapsed);
-            CounterInterval bytes = counter(left, right, BYTES_OUT, elapsed);
+            Duration elapsed = Duration.between(baseline, right.observedAt());
+            CounterInterval records = counter(outboundGrowth(left, right, RECORDS_OUT, startup), elapsed);
+            CounterInterval bytes = counter(outboundGrowth(left, right, BYTES_OUT, startup), elapsed);
             if (records != null || bytes != null) {
                 addInterval(leftKey, intervalStart, intervalEnd, records, bytes);
             }
@@ -216,6 +219,35 @@ public final class HistoryAggregator {
         Long before = left.counters().get(name);
         Long after = right.counters().get(name);
         return before != null && after != null && after < before;
+    }
+
+    /** A verified counter origin or a retained zero from the same counter series. */
+    static Instant startupBaseline(RateSample left, RateSample right, Instant from, StartReason boundary) {
+        if (left == null || boundary == StartReason.GAP || left.countingSince() != null
+                || right.countingSince() == null || left.startupEvidence() == null
+                || !left.startupEvidence().sameExecution(right.startupEvidence())
+                || left.counters().containsKey(RECORDS_OUT) || left.counters().containsKey(BYTES_OUT)
+                || right.counters().getOrDefault(RECORDS_OUT, -1L) <= 0
+                || right.counters().getOrDefault(BYTES_OUT, -1L) < 0) {
+            return null;
+        }
+        Instant origin = right.startupEvidence().zeroAt();
+        Instant previousOrigin = left.startupEvidence().zeroAt();
+        if (origin == null || origin.isAfter(right.countingSince())
+                || right.countingSince().isAfter(right.observedAt())
+                || previousOrigin != null && !previousOrigin.equals(origin)) {
+            return null;
+        }
+        Instant baseline = origin;
+        if (origin.isBefore(left.observedAt())) {
+            if (previousOrigin == null) return null;
+            baseline = left.observedAt();
+        }
+        return !baseline.isBefore(from) && baseline.isBefore(right.observedAt()) ? baseline : null;
+    }
+
+    static Long outboundGrowth(RateSample left, RateSample right, String name, Instant startup) {
+        return startup == null ? growth(left, right, name) : right.counters().get(name);
     }
 
     /**
@@ -287,8 +319,7 @@ public final class HistoryAggregator {
                 .divide(BigDecimal.valueOf(count), INTERNAL_SCALE, RoundingMode.HALF_EVEN));
     }
 
-    private static CounterInterval counter(RateSample left, RateSample right, String name, Duration elapsed) {
-        Long growth = growth(left, right, name);
+    private static CounterInterval counter(Long growth, Duration elapsed) {
         if (elapsed.isZero() || growth == null) {
             return null;
         }

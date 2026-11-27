@@ -705,8 +705,7 @@ final class ConvergenceDriver implements AutoCloseable {
                 .map(value -> new ObservationPublisher.Publication(value, true));
         boolean terminal = actual == PipelineState.STOPPED || actual == PipelineState.FAILED;
         if (scoped.observations() != null) {
-            if (!terminal) return scoped.observations().publish(publisher, pass, result, config, failure)
-                    .map(value -> new ObservationPublisher.Publication(value, true));
+            if (!terminal) return scoped.observations().publish(publisher, pass, result, config, failure);
             scoped.observations().forget(pipelineId);
         }
         boolean allowTerminalReuse = !finalStopSample(pass, actual) && !refreshTerminal
@@ -745,9 +744,9 @@ final class ConvergenceDriver implements AutoCloseable {
         if (scoped != null) alert(() -> scoped.alerts().published(pass, published, result.failure().orElse(null), reading.measured()));
         if (!reading.measured()) return;
         if (scoped == null || scoped.writes() == null) {
-            sample(published, pass);
+            sample(reading, pass);
         } else {
-            var history = history(published, pass);
+            var history = history(reading, pass);
             if (history != null) scoped.writes().offerHistory(history.guardedBy(pass.guardOriginal(pass.claim())));
         }
     }
@@ -858,14 +857,14 @@ final class ConvergenceDriver implements AutoCloseable {
                         : scoped.observations().publishRunning(publisher, pass, checkpoint, config, current,
                                 requireCurrentTicket, () -> publisher.publishRunningScoped(scope, checkpoint, destination, current), deferred);
             });
-            projection.ifPresent(published -> {
+            projection.ifPresent(reading -> {
                 if (stage == null) {
-                    periodicCommitted(pass, checkpoint, published, admitted, current);
+                    periodicCommitted(pass, checkpoint, reading, admitted, current);
                 } else {
                     scoped.writes().submit(stage, () -> {
                         if (scoped.observations() != null) scoped.observations().recordPublishedRunning(pass, checkpoint);
-                        periodicCommitted(pass, checkpoint, published, admitted, current);
-                    }, history(published, pass), () -> alert(() -> scoped.alerts().unavailableIfExpected(pass)));
+                        periodicCommitted(pass, checkpoint, reading, admitted, current);
+                    }, history(reading, pass), () -> alert(() -> scoped.alerts().unavailableIfExpected(pass)));
                 }
             });
         } catch (RuntimeException unavailable) {
@@ -881,8 +880,9 @@ final class ConvergenceDriver implements AutoCloseable {
         }
     }
 
-    private void periodicCommitted(PipelineConvergencePass pass, CheckpointDoc checkpoint, Observation published,
+    private void periodicCommitted(PipelineConvergencePass pass, CheckpointDoc checkpoint, ObservationPublisher.Publication reading,
             BooleanSupplier admitted, BooleanSupplier current) {
+        var published = reading.observation();
         String pipelineId = pass.scope().pipelineId();
         if (unavailableObservations.remove(pipelineId, pass.scope())) {
             LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);
@@ -893,13 +893,13 @@ final class ConvergenceDriver implements AutoCloseable {
             return pass.state().read(pipelineId).filter(checkpoint::equals).isPresent() && admitted.getAsBoolean();
         };
         alert(() -> scoped.alerts().publishedPeriodic(pass, published, alertCurrent));
-        if (scoped.writes() == null) sample(published, pass);
+        if (scoped.writes() == null) sample(reading, pass);
         if (current.getAsBoolean()) export(published, admitted);
     }
 
-    private ProcessObservationWriter.History history(Observation published, PipelineConvergencePass pass) {
+    private ProcessObservationWriter.History history(ObservationPublisher.Publication reading, PipelineConvergencePass pass) {
         if (sampler == null) return null;
-        var sample = RateSampler.sampleOf(published);
+        var sample = RateSampler.sampleOf(reading.observation(), reading.startupEvidence());
         if (sample == null) return null;
         return new ProcessObservationWriter.History(sample,
                 remaining -> sampler.offerPrepared(sample, pass.scope(), pass.rateHistory(remaining)));
@@ -956,15 +956,21 @@ final class ConvergenceDriver implements AutoCloseable {
      * history a record kept beside it: a history that cannot be written must not cost a pipeline the read
      * face that says it is alive at all.
      */
-    private void sample(io.tapstate.core.lifecycle.Observation published, PipelineConvergencePass pass) {
+    private void sample(ObservationPublisher.Publication reading, PipelineConvergencePass pass) {
         if (sampler == null) {
             return;
         }
         try {
-            if (pass == null) sampler.offer(published);
-            else sampler.offer(published, pass.scope(), pass.rateHistory());
+            if (pass == null) {
+                sampler.offer(reading.observation());
+            } else if (reading.startupEvidence() == null) {
+                sampler.offer(reading.observation(), pass.scope(), pass.rateHistory());
+            } else {
+                var sample = RateSampler.sampleOf(reading.observation(), reading.startupEvidence());
+                if (sample != null) sampler.offerPrepared(sample, pass.scope(), pass.rateHistory());
+            }
         } catch (RuntimeException unsampled) {
-            LOG.warn("Could not sample the history of pipeline {}", published.pipelineId(), unsampled);
+            LOG.warn("Could not sample the history of pipeline {}", reading.observation().pipelineId(), unsampled);
         }
     }
 }

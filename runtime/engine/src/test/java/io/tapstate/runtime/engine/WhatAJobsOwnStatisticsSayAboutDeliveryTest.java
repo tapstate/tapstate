@@ -10,6 +10,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.LinkedHashMap;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -56,6 +57,28 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
                 List.of(firstTotal, Measurement.of(millis, 400, 599, second)))))).isNull();
         assertThat(Engine.cdcDeliveryIn(JobMetrics.of(Map.of(count, counts, millis,
                 List.of(firstTotal, Measurement.of(millis, 600, 600, first)))))).isNull();
+    }
+
+    @Test
+    void theOutboundZeroMustCoverEveryContributingWriterInThisExecution() {
+        String start = JetDeliveryGauge.SINCE_METRIC;
+        String rows = "recordsOut.i.orders";
+        String bytes = "bytesOut.orders";
+        Map<String, String> first = Map.of(MetricTags.MEMBER, "member", MetricTags.EXECUTION, "live",
+                MetricTags.VERTEX, "sink", MetricTags.PROCESSOR, "0");
+        Map<String, String> second = Map.of(MetricTags.MEMBER, "member", MetricTags.EXECUTION, "live",
+                MetricTags.VERTEX, "sink", MetricTags.PROCESSOR, "1");
+        var starts = List.of(Measurement.of(start, 100, 500, first), Measurement.of(start, 110, 500, second));
+        var records = List.of(Measurement.of(rows, 10, 500, first));
+        var payload = List.of(Measurement.of(bytes, 90, 500, second));
+        var metrics = JobMetrics.of(Map.of(start, starts, rows, records, bytes, payload));
+
+        assertThat(Engine.outboundZeroAt(metrics, "live")).isEqualTo(Instant.ofEpochMilli(100));
+        assertThat(Engine.outboundZeroAt(metrics, "previous")).isNull();
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(Map.of(start, List.of(starts.getFirst()),
+                rows, records, bytes, payload)), "live")).isNull();
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(Map.of(start, starts, rows,
+                List.of(Measurement.of(rows, 10, 499, first)))), "live")).isNull();
     }
 
     @Test

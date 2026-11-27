@@ -18,6 +18,7 @@ import java.util.Optional;
 
 /** Bounded history reads and claim-fenced samples for one original Pipeline state generation. */
 final class MongoCacheRateHistoryStore implements RateHistoryStore {
+    private static final String STARTUP_EVIDENCE = "startupEvidence";
     private final MongoCachePipelineAccess access;
     private final MongoCollection<Document> rows;
     private final Duration retention;
@@ -40,7 +41,7 @@ final class MongoCacheRateHistoryStore implements RateHistoryStore {
     private Document capture(RateSample sample) {
         Objects.requireNonNull(sample, "sample"); access.requirePipeline(sample.pipelineId());
         // Identity and bytes belong to this invocation, including every transaction retry.
-        Document captured = MongoRateHistoryStore.toDocument(sample).append("_id", new ObjectId())
+        Document captured = encode(sample).append("_id", new ObjectId())
                 .append("scope", MongoPipelinePreparationFacts.scope(access.scope));
         decode(captured);
         return captured;
@@ -91,10 +92,31 @@ final class MongoCacheRateHistoryStore implements RateHistoryStore {
             if (!(document.get("_id") instanceof ObjectId id) || !access.scope.pipelineId().equals(document.get("pipelineId"))
                     || !(document.get("scope") instanceof Document scope) || !access.scope.equals(MongoPipelinePreparationFacts.scope(scope))) throw unreadable();
             Document payload = new Document(document); payload.remove("_id"); payload.remove("scope");
-            RateSample sample = MongoRateHistoryStore.toSample(payload);
-            if (!payload.equals(MongoRateHistoryStore.toDocument(sample))) throw unreadable();
+            RateSample sample = decodeSample(payload);
+            if (!payload.equals(encode(sample))) throw unreadable();
             return new Entry(new Key(sample.observedAt(), id.toHexString()), sample);
         } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+    }
+    private static Document encode(RateSample sample) {
+        Document payload = MongoRateHistoryStore.toDocument(sample);
+        var evidence = sample.startupEvidence();
+        if (evidence != null) {
+            Document startup = new Document("jobId", evidence.jobId()).append("executionId", evidence.executionId());
+            if (evidence.zeroAt() != null) startup.append("zeroAt", Date.from(evidence.zeroAt()));
+            payload.append(STARTUP_EVIDENCE, startup);
+        }
+        return payload;
+    }
+
+    private RateSample decodeSample(Document payload) {
+        RateSample sample = MongoRateHistoryStore.toSample(payload);
+        if (!payload.containsKey(STARTUP_EVIDENCE)) return sample;
+        if (!(payload.get(STARTUP_EVIDENCE) instanceof Document startup)
+                || !(startup.get("jobId") instanceof Long jobId)
+                || !(startup.get("executionId") instanceof Long executionId)) throw unreadable();
+        Instant zeroAt = startup.containsKey("zeroAt") ? startup.getDate("zeroAt").toInstant() : null;
+        return new RateSample(sample.pipelineId(), sample.observedAt(), sample.counters(), sample.lag(),
+                sample.countingSince(), new RateSample.StartupEvidence(jobId, executionId, zeroAt));
     }
     private static ObjectId id(Key key) { try { return new ObjectId(key.internalKey()); }
         catch (IllegalArgumentException malformed) { throw new IllegalArgumentException("a Mongo rate-history key is not an ObjectId"); } }

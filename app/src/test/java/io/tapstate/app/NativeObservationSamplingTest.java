@@ -82,7 +82,7 @@ class NativeObservationSamplingTest {
 
         assertThat(f.publish(CONFIG)).isEmpty();
 
-        verify(f.publisher).publishScoped(SCOPE, f.state, f.observations, null);
+        verify(f.publisher).publishScopedReading(SCOPE, f.state, f.observations, null, false);
         verify(f.publisher, never()).publishRunning(any(), any(), any(), any(), any());
     }
 
@@ -93,7 +93,7 @@ class NativeObservationSamplingTest {
 
         assertThat(f.publish(CONFIG)).contains(f.running);
 
-        verify(f.publisher, times(2)).publishScoped(SCOPE, f.state, f.observations, null);
+        verify(f.publisher, times(2)).publishScopedReading(SCOPE, f.state, f.observations, null, false);
         verifyNoInteractions(f.configuration);
     }
 
@@ -104,7 +104,7 @@ class NativeObservationSamplingTest {
         assertThat(f.publish(CONFIG)).contains(f.running);
         assertThat(f.publish(new PipelineIntentStore.ActuationReading(null, OptionalLong.empty()))).contains(f.running);
 
-        verify(f.publisher, times(3)).publishScoped(SCOPE, f.state, f.observations, null);
+        verify(f.publisher, times(3)).publishScopedReading(SCOPE, f.state, f.observations, null, false);
         verifyNoInteractions(f.cache, f.captures, f.configuration);
     }
 
@@ -125,12 +125,13 @@ class NativeObservationSamplingTest {
         var projected = new Observation(PIPELINE, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
         when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any())).thenAnswer(call -> {
             call.<ObservationStore>getArgument(2).save(projected, CHECKPOINT.epoch());
-            return Optional.of(projected);
+            return Optional.of(new ObservationPublisher.Publication(projected, true));
         });
         when(f.pass.guardOriginal(CLAIM)).thenReturn(() -> {});
         try (var writer = new ProcessObservationWriter(f.cache, false)) {
             var stage = writer.stage(f.pass);
-            assertThat(f.sampling.publish(f.publisher, f.pass, f.result, CONFIG, null, stage::wrap)).contains(projected);
+            assertThat(f.sampling.publish(f.publisher, f.pass, f.result, CONFIG, null, stage::wrap))
+                    .map(ObservationPublisher.Publication::observation).contains(projected);
             assertThat(writer.submit(stage, () -> {}, () -> {})).isTrue();
             boolean retained = retainsRead(stage.write().active(), reading, 3);
             System.out.println("OBSERVATION_SCHEMA_RETAINED " + retained + " columns=" + fields.size()
@@ -178,7 +179,7 @@ class NativeObservationSamplingTest {
         }).when(writer).save(f.running, CHECKPOINT.epoch());
         when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any())).thenAnswer(call -> {
             call.<ObservationStore>getArgument(2).save(f.running, CHECKPOINT.epoch());
-            return Optional.of(f.running);
+            return Optional.of(new ObservationPublisher.Publication(f.running, true));
         });
 
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.sampling.publishRunning(f.publisher, f.pass, CHECKPOINT,
@@ -209,7 +210,8 @@ class NativeObservationSamplingTest {
             when(pass.observationSample()).thenReturn(observations);
             when(result.checkpoint()).thenReturn(Optional.of(CHECKPOINT));
             when(running.state()).thenReturn(PipelineState.RUNNING);
-            when(publisher.publishScoped(SCOPE, state, observations, null)).thenReturn(Optional.of(running));
+            when(publisher.publishScopedReading(SCOPE, state, observations, null, false))
+                    .thenReturn(Optional.of(new ObservationPublisher.Publication(running, true)));
         }
 
         void warm() { assertThat(publish(CONFIG)).contains(running); }
@@ -224,7 +226,7 @@ class NativeObservationSamplingTest {
         }
 
         Optional<Observation> publish(PipelineIntentStore.ActuationReading config) {
-            return sampling.publish(publisher, pass, result, config, null);
+            return sampling.publish(publisher, pass, result, config, null).map(ObservationPublisher.Publication::observation);
         }
     }
 }

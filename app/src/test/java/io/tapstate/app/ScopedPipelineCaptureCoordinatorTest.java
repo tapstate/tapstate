@@ -1420,23 +1420,25 @@ class ScopedPipelineCaptureCoordinatorTest {
             var observation = mock(Observation.class);
             when(observation.state()).thenReturn(PipelineState.RUNNING);
             var publisher = mock(io.tapstate.runtime.scheduler.ObservationPublisher.class);
-            when(publisher.publishScoped(SCOPE, state, observations, null)).thenAnswer(call -> {
+            when(publisher.publishScopedReading(SCOPE, state, observations, null, false)).thenAnswer(call -> {
                 f.authorization.require(ORIGINAL);
-                return Optional.of(observation);
+                return Optional.of(new io.tapstate.runtime.scheduler.ObservationPublisher.Publication(observation, true));
             });
             var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
             var sampling = new NativeObservationSampling(
                     mock(io.tapstate.adapters.mongostore.MongoConfigurationDomain.class), cache, f.coordinator,
                     id -> Optional.of(ORIGINAL), id -> null, "views", Clock.systemUTC());
             var config = new PipelineIntentStore.ActuationReading(null, OptionalLong.of(1));
-            assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            assertThat(sampling.publish(publisher, pass, result, config, null))
+                    .map(io.tapstate.runtime.scheduler.ObservationPublisher.Publication::observation).contains(observation);
             when(f.authorization.requireLocal(ORIGINAL)).thenThrow(new TapstateException(
                     io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "flow"), null));
             assertThat(f.authorization.require(ORIGINAL)).isEqualTo(PIPELINE);
             clearInvocations(f.authorization);
-            assertThat(sampling.publish(publisher, pass, result, config, null)).contains(observation);
+            assertThat(sampling.publish(publisher, pass, result, config, null))
+                    .map(io.tapstate.runtime.scheduler.ObservationPublisher.Publication::observation).contains(observation);
             verify(f.authorization).requireLocal(ORIGINAL);
-            verify(publisher, times(2)).publishScoped(SCOPE, state, observations, null);
+            verify(publisher, times(2)).publishScopedReading(SCOPE, state, observations, null, false);
             verifyNoInteractions(cache);
             assertThat(f.coordinator.observationSelection(ORIGINAL)).isEmpty();
             var fenced = new TapstateException(io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED,

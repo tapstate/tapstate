@@ -35,7 +35,7 @@ import java.util.Optional;
 public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
         Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
         Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable,
-        CdcDeliveryTotals cdcDelivery) {
+        CdcDeliveryTotals cdcDelivery, RateSample.StartupEvidence startupEvidence) {
 
     /** A reading from a run reporting nothing — no live job, or one that has settled nothing yet. */
     public static final DeliveryReading NONE =
@@ -60,6 +60,14 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
                             + " hand every consumer a stream in which a restart and a decrease are the"
                             + " same observation");
         }
+    }
+
+    public DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
+            Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
+            Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable,
+            CdcDeliveryTotals cdcDelivery) {
+        this(rowsByTableAndOp, bytesByTable, newestEventTimeByTable, countingSince, deliveryDurationByTable,
+                cdcDelivery, null);
     }
 
     /** A reading carrying the original delivery distribution. */

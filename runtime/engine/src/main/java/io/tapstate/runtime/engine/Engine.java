@@ -15,7 +15,9 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestOrigin;
@@ -948,17 +950,49 @@ public final class Engine {
      */
     public OptionalLong countingSince(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return OptionalLong.empty();
+        return job == null ? OptionalLong.empty() : deliveryStart(job.getMetrics());
+    }
+
+    private static OptionalLong deliveryStart(JobMetrics metrics) {
+        return metrics.get(JetDeliveryGauge.SINCE_METRIC).stream().mapToLong(Measurement::value).max();
+    }
+
+    /** Reads the outbound facts and their startup provenance from the same job metrics collection. */
+    public DeliveryReading deliveryReading(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) return DeliveryReading.NONE;
+        long jobId = job.getId();
+        OptionalLong execution = JetLiveExecution.forHistory(member, jobId);
+        JobMetrics metrics = job.getMetrics();
+        OptionalLong since = deliveryStart(metrics);
+        var evidence = execution.isPresent() && execution.equals(JetLiveExecution.forHistory(member, jobId))
+                ? new RateSample.StartupEvidence(jobId, execution.getAsLong(),
+                        outboundZeroAt(metrics, com.hazelcast.jet.Util.idToString(execution.getAsLong())))
+                : null;
+        if (since.isEmpty()) {
+            return evidence == null ? DeliveryReading.NONE
+                    : new DeliveryReading(Map.of(), Map.of(), Map.of(), null, Map.of(), null, evidence);
         }
-        JobMetrics collected = job.getMetrics();
-        OptionalLong latest = OptionalLong.empty();
-        for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
-            latest = latest.isPresent()
-                    ? OptionalLong.of(Math.max(latest.getAsLong(), measurement.value()))
-                    : OptionalLong.of(measurement.value());
+        return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics), highestIn(metrics, JetDeliveryGauge::reachedTableOf),
+                Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics), evidence);
+    }
+
+    static Instant outboundZeroAt(JobMetrics metrics, String execution) {
+        Map<CdcWriterScrape, Long> starts = new HashMap<>();
+        for (Measurement point : metrics.get(JetDeliveryGauge.SINCE_METRIC)) {
+            var writer = CdcWriterScrape.of(point);
+            if (!execution.equals(writer.execution()) || writer.member() == null
+                    || writer.vertex() == null || writer.processor() == null || point.value() <= 0
+                    || starts.putIfAbsent(writer, point.value()) != null) return null;
         }
-        return latest;
+        for (String name : metrics.metrics()) {
+            if (JetDeliveryGauge.deliveredOf(name) == null && JetDeliveryGauge.carriedTableOf(name) == null) continue;
+            for (Measurement point : metrics.get(name)) {
+                if (!starts.containsKey(CdcWriterScrape.of(point))) return null;
+            }
+        }
+        // At the earliest initialization all writers that contribute to these totals were still at zero.
+        return starts.values().stream().min(Long::compareTo).map(Instant::ofEpochMilli).orElse(null);
     }
 
     /**

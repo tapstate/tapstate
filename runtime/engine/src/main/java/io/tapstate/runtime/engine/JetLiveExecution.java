@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.instance.impl.HazelcastInstanceImpl;
 import com.hazelcast.instance.impl.HazelcastInstanceProxy;
+import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.impl.JetServiceBackend;
 import java.io.Serializable;
 import java.util.OptionalLong;
@@ -21,6 +22,20 @@ public final class JetLiveExecution {
         if (actual == null) return OptionalLong.empty();
         Long execution = jetService(actual).getJobExecutionService().getExecutionIdForJobId(jobId);
         return execution == null ? OptionalLong.empty() : OptionalLong.of(execution);
+    }
+
+    /** A coordinator has an exact attempt before the local writer execution context has opened. */
+    static OptionalLong forHistory(HazelcastInstance member, long jobId) {
+        var local = current(member, jobId);
+        if (local.isPresent()) return local;
+        var actual = localMember(member);
+        if (actual == null) return OptionalLong.empty();
+        var context = jetService(actual).getJobCoordinationService().getMasterContext(jobId);
+        if (context == null) return OptionalLong.empty();
+        var status = context.jobStatus();
+        long execution = context.executionId();
+        return execution != 0 && (status == JobStatus.STARTING || status == JobStatus.RUNNING)
+                ? OptionalLong.of(execution) : OptionalLong.empty();
     }
 
     enum StartupPhase { PROCESSOR, PLANNING }

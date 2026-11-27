@@ -82,12 +82,9 @@ import java.util.stream.Stream;
  *
  * <h2>What its tail can and cannot see</h2>
  *
- * <p>No read position is ever handed to a connector - the product passes a null offset to both reads -
- * so this tail has nowhere to resume from and replays the table from the beginning on its first poll.
- * The rows the snapshot already carried are therefore delivered twice. That is not a defect to paper
- * over here: it is the same overlap the product's own snapshot-to-cdc seam leaves, and an idempotent
- * upsert on the discovered key is what absorbs it. A specification that counts rows after both phases
- * is asserting exactly that absorption.
+ * <p>By default the tail replays the table from the beginning. The snapshot and tail overlap, and an
+ * idempotent upsert on the discovered key absorbs the repeated rows. A scenario that needs snapshot
+ * output followed by an idle tail can opt in to starting at the file's current high-water mark.
  *
  * <p>The tail sees rows appear; it does not see rows change or vanish. Detecting those in a flat file
  * would mean diffing every row on every poll, and no specification needs it yet.
@@ -207,6 +204,9 @@ public class CsvConnector implements TapConnector {
      * waits outside the table's lock, so the table's other writers are not held with it.
      */
     private static final String HOLD = "hold";
+
+    /** Lets a static source fixture start its live tail after the snapshot's existing rows. */
+    private static final String START_AFTER_EXISTING_ROWS = "start_after_existing_rows";
 
     /** The column every table a case seeds is named by. */
     private static final String ID_COLUMN = "id";
@@ -452,6 +452,10 @@ public class CsvConnector implements TapConnector {
      */
     private void tail(TapConnectionContext context, List<String> tables, StreamReadConsumer consumer) {
         Map<String, Long> delivered = new LinkedHashMap<>();
+        var connection = context.getConnectionConfig();
+        if (connection != null && Boolean.parseBoolean(String.valueOf(connection.getObject(START_AFTER_EXISTING_ROWS)))) {
+            delivered.putAll(highWaterMarks(context));
+        }
         consumer.streamReadStarted();
         if (cdcRejected(context)) {
             // The stream started, then dies - the read-side mirror of a rejected write. The product wraps
