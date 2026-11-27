@@ -135,14 +135,22 @@ class ManagedMongoStoreIsolationIT {
             String prepared; String importId; Map<?,?> receipt;
             try (var application = transferRoot(to)) {
                 var client = transferClient(application, to.username(), to.password());
+                var runtime = application.getBean(StorageRoot.class).runtime();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).until(runtime::businessStarted);
                 assertThatThrownBy(() -> client.post().uri("/api/configuration/import/preflight").body(Map.of("transfer", exported.get("transfer"),
                         "transferKey", key, "defaultSourceMapping", Map.of())).retrieve().toBodilessEntity())
-                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
+                            assertThat(failure.getStatusCode()).isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+                            var error = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(failure.getResponseBodyAsString());
+                            assertThat(error.get("code")).isEqualTo(IoError.CONFIGURATION_IMPORT_REFUSED.code());
+                            assertThat(error.get("params")).isEqualTo(Map.of("reason", "original-import-conditions-not-satisfied"));
+                        });
                 assertThat(destinationConfig.getCollection("configuration_imports").countDocuments()).isZero();
                 var preflight = client.post().uri("/api/configuration/import/preflight").body(Map.of("transfer", exported.get("transfer"),
                         "transferKey", key, "defaultSourceMapping", Map.of("views", "views"))).retrieve().body(Map.class);
                 prepared = (String)preflight.get("preparedTransfer");
                 importId = (String)((Map<?,?>)((Map<?,?>)preflight.get("operation")).get("ticket")).get("id");
+                assertThat(importId).isNotBlank();
                 assertThat(destinationConfig.getCollection("pipelines").countDocuments()).isZero();
                 var confirmation = Map.of("importId", importId, "transfer", prepared, "transferKey", key, "defaultSourceMapping", Map.of("views", "views"));
                 receipt = client.post().uri("/api/configuration/import/commit").body(confirmation).retrieve().body(Map.class);
@@ -515,6 +523,10 @@ class ManagedMongoStoreIsolationIT {
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             createUser(admin, user, List.of(config, cache, master)); seedOpBoundary(files, user, config, cache, master, "complete");
             try (var process = installationProcess(files, seeds, "admin-response")) {
+                var client = process.publicClient();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() ->
+                        assertThat(client.get().uri("/auth/storage-entry").retrieve().body(Map.class))
+                                .containsEntry("entry", "FIRST_ADMIN_REQUIRED"));
                 var issued = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 var database = admin.getDatabase(config);
                 var administratorAudit = new Document("operationId", io.tapstate.control.core.ControlOperations.USER_CREATE.id());

@@ -9,6 +9,9 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.*;
 import java.time.Clock;
 import java.util.*;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,7 +53,9 @@ final class StorageRoot implements AutoCloseable {
     private final Object recoveryWorkerLock = new Object();
     private java.util.concurrent.ExecutorService recoveryWorker;
     private final Object activationLock = new Object();
-    private java.util.concurrent.ExecutorService activationWorker;
+    private ScheduledExecutorService activationWorker;
+    private record RetainedInstallationOwner(StorageRuntime runtime, StorageRuntime.Bound bound, StorageRuntime.Business business) {}
+    private RetainedInstallationOwner retainedInstallationOwner;
     private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pendingActivation = new java.util.concurrent.atomic.AtomicReference<>();
     private record InstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete,
             java.util.function.BooleanSupplier deliveryPending, Runnable deliver) {}
@@ -305,10 +310,62 @@ final class StorageRoot implements AutoCloseable {
     }
 
     private void completeRetainedInstallation() {
-        try { completeInstallationIfReady(null); }
-        catch (TapstateException unavailable) {
+        try {
+            var original = runtime;
+            if (installationCompletionPending() && !original.businessStarted()) {
+                if (original.cleanupRequired()) return;
+                var business = original.businessForLiveness();
+                if (business.isPresent()) {
+                    var bound = original.boundForObservation().orElseThrow(StorageRuntime::unavailable);
+                    observeRetainedInstallation(new RetainedInstallationOwner(original, bound, business.orElseThrow()));
+                }
+                return;
+            }
+            completeInstallationIfReady(null);
+        } catch (TapstateException unavailable) {
             LOG.warn("Retained installation completion failed [{}]", unavailable.code().code());
         }
+    }
+
+    // Keep the published member alive while it waits for admission. Only the same owner may resume the handoff.
+    private void observeRetainedInstallation(RetainedInstallationOwner original) {
+        synchronized (activationLock) {
+            requireOpen();
+            if (original.equals(retainedInstallationOwner)) return;
+            retainedInstallationOwner = original;
+            activationWorker().schedule(() -> continueRetainedInstallation(original), 250, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void continueRetainedInstallation(RetainedInstallationOwner original) {
+        try {
+            lifecycle(() -> {
+                synchronized (activationLock) {
+                    if (retainedInstallationOwner != original) return null;
+                    retainedInstallationOwner = null;
+                }
+                if (runtime == original.runtime()
+                        && runtime.boundForObservation().orElse(null) == original.bound()
+                        && runtime.businessForLiveness().orElse(null) == original.business())
+                    completeRetainedInstallation();
+                return null;
+            });
+        } catch (TapstateException unavailable) {
+            if (!closeRequested) LOG.warn("Retained installation continuation failed [{}]", unavailable.code().code());
+        } catch (RuntimeException | Error failure) {
+            LOG.error("Retained installation continuation failed [{}]", failure.getClass().getName());
+            throw failure;
+        }
+    }
+
+    private ScheduledExecutorService activationWorker() {
+        if (activationWorker == null) {
+            var worker = new ScheduledThreadPoolExecutor(1,
+                    Thread.ofPlatform().daemon(true).name("tapstate-initial-cache-activation").factory());
+            worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+            activationWorker = worker;
+        }
+        return activationWorker;
     }
 
     /** One original setup handoff; HTTP callers and their capabilities do not own its lifetime. */
@@ -341,13 +398,11 @@ final class StorageRoot implements AutoCloseable {
             Runnable continuation;
             try { continuation = preparation.get(); }
             catch (RuntimeException | Error failure) { activationFailed = true; throw failure; }
-            if (activationWorker == null) activationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
-                var thread = new Thread(task, "tapstate-initial-cache-activation"); thread.setDaemon(true); return thread;
-            });
+            var worker = activationWorker();
             var completion = new java.util.concurrent.CompletableFuture<Void>();
             pendingActivation.set(completion);
             try {
-                activationWorker.execute(() -> {
+                worker.execute(() -> {
                     try {
                         if (installationCompletionPending() && runtime.business().isPresent()) {
                             if (!runtime.businessStarted()) throw StorageRuntime.unavailable();
@@ -1096,6 +1151,7 @@ final class StorageRoot implements AutoCloseable {
             if (authenticationWorker != null) authenticationWorker.shutdown();
         }
         synchronized (activationLock) {
+            retainedInstallationOwner = null;
             var activation = pendingActivation.get();
             if (activation != null) activation.completeExceptionally(StorageRuntime.unavailable());
             if (activationWorker != null) activationWorker.shutdown();

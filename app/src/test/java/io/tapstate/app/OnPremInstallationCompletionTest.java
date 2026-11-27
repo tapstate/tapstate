@@ -150,14 +150,12 @@ class OnPremInstallationCompletionTest {
         }
     }
 
-    private static final class InlineExecutor extends java.util.concurrent.AbstractExecutorService {
-        private boolean closed;
-        @Override public void shutdown() { closed = true; }
-        @Override public List<Runnable> shutdownNow() { closed = true; return List.of(); }
-        @Override public boolean isShutdown() { return closed; }
-        @Override public boolean isTerminated() { return closed; }
-        @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
-        @Override public void execute(Runnable task) { if (closed) throw new java.util.concurrent.RejectedExecutionException(); task.run(); }
+    private static final class InlineExecutor extends java.util.concurrent.ScheduledThreadPoolExecutor {
+        InlineExecutor() { super(1); }
+        @Override public void execute(Runnable task) {
+            if (isShutdown()) throw new java.util.concurrent.RejectedExecutionException();
+            task.run();
+        }
     }
 
     private static final class EntryBridge implements AutoCloseable {
@@ -511,6 +509,29 @@ class OnPremInstallationCompletionTest {
             verify(f.configuration, never()).prepareInitialValidationSchema(any(), any(), any());
         }
     }
+    @Test void retainedInstallationCompletesWhenItsPublishedOwnerBecomesAvailable() {
+        try (var f = new Fixture(directory.resolve("retained-owner-readiness"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            assertThat(f.completions).hasValue(0);
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
+            verify(f.business, never()).awaitAvailability();
+            verify(f.business, never()).close();
+
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            f.root.loadExisting(ignored -> { throw new AssertionError("retained owner was replaced"); });
+            assertThat(f.completions).hasValue(1);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
         try (var f = new Fixture(directory.resolve("retained-catalog"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
