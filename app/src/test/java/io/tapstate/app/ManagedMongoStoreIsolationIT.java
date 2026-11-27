@@ -2873,7 +2873,7 @@ class ManagedMongoStoreIsolationIT {
     private static void awaitOriginalNodeClaimExpiry(MongoDatabase cache, Document originalNodeClaim) {
         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             var claims = cache.getCollection("workload_claims").aggregate(List.of(
-                    new Document("$match", new Document("_id.resourceType", "NODE_SESSION")),
+                    new Document("$match", new Document("_id", new Document("$ne", "business-preparation"))),
                     new Document("$project", new Document("ownerNodeId", 1).append("ownerBootId", 1)
                             .append("claimGeneration", 1).append("executionGeneration", 1)
                             .append("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
