@@ -39,8 +39,9 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     private record EventKey(PipelineIntentScope scope, WorkloadClaimFence claim, Object fact) {}
     private record BindingKey(PipelineIntentScope scope, WorkloadClaimFence claim) {}
     private record Binding(long startRevision, PipelineRunProgress.Mode mode, Instant planReady, Instant connectorsReady) {
-        PipelineRunProgress applyTo(PipelineRunProgress progress) {
-            return progress.beginExecution(mode)
+        PipelineRunProgress applyTo(PipelineRunProgress progress, boolean terminal) {
+            var current = terminal ? progress : progress.beginExecution(mode);
+            return current
                     .reach(PipelineRunStage.EXECUTION_PLAN_PREPARED, planReady)
                     .reach(PipelineRunStage.CONNECTORS_READY, connectorsReady);
         }
@@ -120,7 +121,8 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
                             progress -> progress.reach(PipelineRunStage.RUN_COMPLETED, at)));
             case STOPPED, FAILED -> offer(new EventKey(intent.scope(), claim, List.of(intent.intentRevision(), observation.state())),
                     true, 2, () -> update(intent, claim, 0, Execution.KEEP,
-                            observation.state() == PipelineState.FAILED ? PipelineRunProgress::markRunFailed : PipelineRunProgress::inactive));
+                            observation.state() == PipelineState.FAILED ? PipelineRunProgress::markRunFailed : PipelineRunProgress::inactive,
+                            true));
             default -> { }
         }
     }
@@ -145,10 +147,15 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
 
     private boolean update(PipelineIntentSnapshot intent, WorkloadClaimFence claim, long originalStart,
             Execution execution, UnaryOperator<PipelineRunProgress> change) {
+        return update(intent, claim, originalStart, execution, change, false);
+    }
+
+    private boolean update(PipelineIntentSnapshot intent, WorkloadClaimFence claim, long originalStart,
+            Execution execution, UnaryOperator<PipelineRunProgress> change, boolean terminal) {
         var key = new BindingKey(intent.scope(), claim);
         Binding binding;
         synchronized (pendingBindings) {
-            binding = execution == Execution.KEEP ? null : pendingBindings.get(key);
+            binding = execution == Execution.KEEP && !terminal ? null : pendingBindings.get(key);
         }
         if (execution == Execution.BIND && binding == null) return true;
         active.run();
@@ -175,9 +182,10 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
                 || current.bindings().handoff() != null && anchor != start) return false;
         // If the asynchronous startup write was dropped or failed, a subsequent fact can retry it.
         // The binding is only taken from the exact original claim and the transaction proves that claim.
+        // A terminal observation records the prepared timestamps without reopening the execution or clearing its failure stage.
         boolean written = store.update(start, NativePipelineRunProgressQuery.accepted(intent.scope(), start, null, 3),
-                binding == null ? execution : Execution.BIND,
-                binding == null ? change : previous -> change.apply(binding.applyTo(previous)));
+                binding == null || terminal ? execution : Execution.BIND,
+                binding == null ? change : previous -> change.apply(binding.applyTo(previous, terminal)));
         if (written && binding != null) synchronized (pendingBindings) { pendingBindings.remove(key, binding); }
         return written;
     }

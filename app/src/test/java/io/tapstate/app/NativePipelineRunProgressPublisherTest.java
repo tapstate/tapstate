@@ -51,6 +51,75 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 class NativePipelineRunProgressPublisherTest {
     @ParameterizedTest
+    @EnumSource(value = PipelineState.class, names = {"FAILED", "STOPPED"})
+    void terminalObservationRetainsPreparationAfterTheMilestoneAndBindingWritesFail(PipelineState terminal) throws Exception {
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var key = new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var owner = new WorkloadOwner("node", "boot");
+        var planning = new WorkloadClaimFence(key, owner, 1, 0, 3);
+        var execution = new WorkloadClaimFence(key, owner, 1, 2, 3);
+        var start = new PipelineIntentSnapshot(scope, 4,
+                new DesiredState("orders", PipelineState.RUNNING, "a".repeat(64)));
+        var stopped = new PipelineIntentSnapshot(scope, 5,
+                new DesiredState("orders", PipelineState.STOPPED, "a".repeat(64)));
+        var terminalIntent = terminal == PipelineState.STOPPED ? stopped : start;
+        var cache = mock(MongoCacheDomain.class);
+        var planningStore = mock(MongoCachePipelineRunProgressStore.class);
+        var executionStore = mock(MongoCachePipelineRunProgressStore.class);
+        when(cache.pipelineRunProgress(eq(scope), eq(planning), any())).thenReturn(planningStore);
+        when(cache.pipelineRunProgress(eq(scope), eq(execution), any())).thenReturn(executionStore);
+        var intents = mock(PipelineIntentStore.class);
+        var bindings = new ConnectorRunBindings(scope, 4, List.of(), null);
+        when(intents.executionBindings(scope)).thenReturn(Optional.of(new PipelineIntentStore.ExecutionBindings(bindings, 4)));
+        var member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
+        var unavailable = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of(), null);
+        when(planningStore.update(eq(4L), any(), eq(Execution.KEEP), any())).thenThrow(unavailable);
+        var bindingAttempt = new CountDownLatch(1);
+        when(executionStore.update(eq(4L), any(), eq(Execution.BIND), any())).thenAnswer(call -> {
+            bindingAttempt.countDown();
+            throw unavailable;
+        });
+        var planned = Instant.parse("2026-11-26T10:00:00Z");
+        var connectors = planned.plusSeconds(1);
+        var captureStage = PipelineRunStage.SOURCE_CAPTURE_PREPARING;
+        var started = NativePipelineRunProgressQuery.accepted(scope, 4, null, 3);
+        var preparing = started.enter(captureStage, connectors);
+        var previous = terminal == PipelineState.FAILED ? preparing.leave(captureStage, connectors, true) : preparing;
+        when(executionStore.latest()).thenReturn(Optional.of(new MongoCachePipelineRunProgressStore.Snapshot(4, previous)));
+        var terminalWrite = new CompletableFuture<PipelineRunProgress>();
+        when(executionStore.update(eq(4L), any(), eq(Execution.KEEP), any()))
+                .thenThrow(unavailable)
+                .thenAnswer(call -> {
+                    UnaryOperator<PipelineRunProgress> change = call.getArgument(3);
+                    terminalWrite.complete(change.apply(previous));
+                    return true;
+                });
+        try (var publisher = new NativePipelineRunProgressPublisher(cache, new CacheBusinessScope("cluster", 1, "cache"),
+                intents, () -> {}, member, mock(Engine.class))) {
+            publisher.publish(new PipelineRunProgressEvents.Event(start, planning, PipelineRunStage.EXECUTION_PLAN_PREPARED,
+                    PipelineRunProgressEvents.Edge.REACHED, planned, 4));
+            publisher.publish(new PipelineRunProgressEvents.Event(start, planning, PipelineRunStage.CONNECTORS_READY,
+                    PipelineRunProgressEvents.Edge.REACHED, connectors, 4));
+            publisher.bind(start, execution, 4, PipelineRunProgress.Mode.SNAPSHOT_ONLY, planned, connectors);
+            assertThat(bindingAttempt.await(5, TimeUnit.SECONDS)).isTrue();
+            verify(planningStore, times(2)).update(eq(4L), any(), eq(Execution.KEEP), any());
+            when(intents.executionBindings(scope)).thenReturn(
+                    Optional.of(new PipelineIntentStore.ExecutionBindings(bindings, terminalIntent.intentRevision())));
+            publisher.observation(terminalIntent, execution, new Observation(
+                    "orders", terminal, Map.of(), Map.of(), Map.of(), null, connectors.plusSeconds(1)));
+
+            var progress = terminalWrite.get(5, TimeUnit.SECONDS);
+            assertThat(progress.milestones()).containsExactly(started.milestones().getFirst(),
+                    new PipelineRunProgress.Milestone(PipelineRunStage.EXECUTION_PLAN_PREPARED, planned),
+                    new PipelineRunProgress.Milestone(PipelineRunStage.CONNECTORS_READY, connectors));
+            assertThat(progress.active()).isEmpty();
+            assertThat(progress.runFailed()).isEqualTo(terminal == PipelineState.FAILED);
+            assertThat(progress.failedStage()).isEqualTo(previous.failedStage());
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(ints = {1, 7})
     void cdcReadinessSurvivesTemporaryStoreFailures(int failures) throws Exception {
         var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
