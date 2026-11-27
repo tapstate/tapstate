@@ -3,17 +3,22 @@ package io.tapstate.e2e;
 import io.tapstate.app.Bootstrap;
 import io.tapstate.app.IsolatedConnectionDiagnostics;
 import io.tapstate.app.ObservationWorkerFixture;
+import io.tapstate.testsupport.MongoRenewedTopology;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.boot.web.server.context.WebServerInitializedEvent;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
+import org.springframework.web.util.UriComponentsBuilder;
 
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The product booted inside the test JVM, from its real assembly root.
@@ -42,6 +47,23 @@ final class InProcessServer implements ServerHandle {
         this.refreshedContexts = refreshedContexts;
         this.baseUrl = baseUrl;
         this.stagingDirectory = stagingDirectory;
+    }
+
+    void inspectStorageNow() throws ReflectiveOperationException {
+        Class<?> rootType = Class.forName("io.tapstate.app.StorageRoot");
+        var root = context.getBean(rootType);
+        var runtimeMethod = rootType.getDeclaredMethod("runtime");
+        runtimeMethod.setAccessible(true);
+        var runtime = runtimeMethod.invoke(root);
+        var businessMethod = runtime.getClass().getDeclaredMethod("business");
+        businessMethod.setAccessible(true);
+        var business = ((java.util.Optional<?>) businessMethod.invoke(runtime)).orElseThrow();
+        var field = business.getClass().getDeclaredField("storageInspection");
+        field.setAccessible(true);
+        var inspection = field.get(business);
+        var run = inspection.getClass().getDeclaredMethod("runOnce");
+        run.setAccessible(true);
+        run.invoke(inspection);
     }
 
     /** Boots the assembly against the given store and returns once its surface is listening. */
@@ -110,18 +132,22 @@ final class InProcessServer implements ServerHandle {
             throw e;
         }
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
-        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
-        // one of those is the address bound below.
-        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory, refreshed);
+        String address = context.getEnvironment().getProperty("server.address", "127.0.0.1");
+        URI endpoint = UriComponentsBuilder.newInstance().scheme("http").host(address).port(port).build().toUri();
+        return new InProcessServer(context, endpoint, stagingDirectory, refreshed);
     }
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
             Path stagingDirectory, List<String> additionalArguments,
             java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
             io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
-        java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
-                "--server.address=127.0.0.1", "--server.port=0"));
-        arguments.addAll(additionalArguments);
+        var arguments = new java.util.ArrayList<>(additionalArguments);
+        if (arguments.stream().noneMatch(value -> value.startsWith("--server.address="))) {
+            arguments.add("--server.address=127.0.0.1");
+        }
+        if (arguments.stream().noneMatch(value -> value.startsWith("--server.port="))) {
+            arguments.add("--server.port=0");
+        }
         var defaults = new java.util.ArrayList<>(List.of(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
@@ -133,6 +159,16 @@ final class InProcessServer implements ServerHandle {
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
         var builder = new SpringApplicationBuilder(Bootstrap.class);
+        String advertiseSetting = "--" + MongoRenewedTopology.CONTROL_ADVERTISE_URL + "=";
+        if (arguments.stream().anyMatch(argument -> argument.startsWith(advertiseSetting) && argument.endsWith(":0"))) {
+            builder.listeners((ApplicationListener<WebServerInitializedEvent>) event -> {
+                var environment = ((ConfigurableApplicationContext) event.getApplicationContext()).getEnvironment();
+                var url = MongoRenewedTopology.controlUrl(environment.getRequiredProperty("server.address"),
+                        event.getWebServer().getPort());
+                environment.getPropertySources().addFirst(new MapPropertySource("fixtureControlEndpoint",
+                        Map.of(MongoRenewedTopology.CONTROL_ADVERTISE_URL, url.toString())));
+            });
+        }
         if (diagnostics != null) {
             builder.initializers(context -> context.getBeanFactory().registerSingleton("isolatedConnectionDiagnostics", diagnostics));
         }

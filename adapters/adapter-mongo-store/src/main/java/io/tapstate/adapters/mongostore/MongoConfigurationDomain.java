@@ -46,6 +46,7 @@ import java.util.concurrent.TimeUnit;
  * run the old shared-database migrations or infer a new installation from missing records.
  */
 public final class MongoConfigurationDomain implements AutoCloseable {
+    private static final String CLUSTER_ROW_ID = "cluster";
     static final String LAYOUT = "three-layer-v1";
     static final int SCHEMA_VERSION = 3;
     private final MongoConnection connection;
@@ -79,7 +80,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         if (identity == null || !clusterId.equals(identity.get("clusterId"))
                 || !LAYOUT.equals(identity.get("layoutId"))
                 || !(identity.get("bindingVersion") instanceof Long binding) || binding < 0) {
-            throw unreadable("cluster", "identity");
+            throw unreadable(CLUSTER_ROW_ID, "identity");
         }
         Document schema = facts.schema();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer installed) || installed < 1) {
@@ -129,10 +130,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     private static OpeningFacts openingFacts(com.mongodb.client.MongoClient client, MongoDatabase database, MongoReadBudget budget) {
         return budget.transaction(client, session -> new OpeningFacts(
-                SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first(),
+                SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", CLUSTER_ROW_ID)).first(),
                 SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first(),
                 SystemCollections.CONFIGURATION_VERSION.on(database).find(session, new Document("_id", ConfigurationVersion.ID)).first(),
-                SystemCollections.CLUSTER_KEYS.on(database).find(session, new Document("_id", "cluster")).first()));
+                SystemCollections.CLUSTER_KEYS.on(database).find(session, new Document("_id", CLUSTER_ROW_ID)).first()));
     }
 
     /**
@@ -167,7 +168,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return budget.transaction(connection.client(), session -> {
             var database = connection.database();
             var currentIdentity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database)
-                    .find(session, new Document("_id", "cluster")).first();
+                    .find(session, new Document("_id", CLUSTER_ROW_ID)).first();
             if (!identity.equals(currentIdentity)) throw MongoValidationSchema.componentIdentityUnverified();
             var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
             var current = schemas.find(session, new Document("_id", "config")).first();
@@ -199,9 +200,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         try {
             connection.verifyConnectivity();
             Document identity = StoreIo.call(() -> durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(connection.database()))
-                    .find(new Document("_id", "cluster")).first());
+                    .find(new Document("_id", CLUSTER_ROW_ID)).first());
             if (identity == null || !(identity.get("clusterId") instanceof String clusterId) || clusterId.isBlank())
-                throw unreadable("cluster", "identity");
+                throw unreadable(CLUSTER_ROW_ID, "identity");
             return new MongoConfigurationDomain(connection, clusterId);
         } catch (RuntimeException | Error failure) {
             connection.close(); throw failure;
@@ -695,13 +696,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
         private void requireOriginal(com.mongodb.client.ClientSession session) {
             if (initialRecovery != null) {
-                var row = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
+                var row = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", CLUSTER_ROW_ID)).first();
                 if (row == null || MongoStorageRecoveryCommands.pending(row).filter(initialRecovery::equals).isEmpty()) throw MongoCachePipelineAccess.fenced();
                 MongoInitialOpRecovery.requireManifest(connection.client(), session, database, bindings,
                         new MongoConfigurationArtifactStore(connection.client(), database, configurationKey),
                         initialRecovery.originalScope(), initialRecovery.manifest(), true);
             } else if (initial != null) bindings.requireOriginalInitialPreparation(session, initial);
-            var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+            var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", CLUSTER_ROW_ID)).first();
             if (identity == null || !clusterId.equals(identity.get("clusterId")) || !LAYOUT.equals(identity.get("layoutId"))
                     || !bindings.cachePreparationForTransaction(session).map(value -> scope.equals(value.businessScope())).orElse(false)) throw MongoValidationSchema.refused();
         }
@@ -1245,7 +1246,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     private void requireInitialOpOperation(com.mongodb.client.ClientSession session, io.tapstate.spi.store.StorageRecoveryCommands.Plan original) {
-        var row = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+        var row = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", CLUSTER_ROW_ID)).first();
         if (row == null || MongoStorageRecoveryCommands.pending(row).filter(original::equals).isEmpty()) throw MongoCachePipelineAccess.fenced();
         MongoInitialOpRecovery.requireManifest(connection.client(), session, connection.database(), bindings, artifacts,
                 original.originalScope(), original.manifest(), true);
@@ -1355,7 +1356,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     private void requireInitialCloudRecovery(com.mongodb.client.ClientSession session, io.tapstate.spi.store.StorageRecoveryCommands.Plan running) {
-        var root = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+        var root = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", CLUSTER_ROW_ID)).first();
         if (root == null || !MongoStorageRecoveryCommands.pending(root).filter(running::equals).isPresent()
                 || running.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING) throw MongoCachePipelineAccess.fenced();
         MongoInitialCloudRecovery.requireManifest(session, connection.database(), bindings, artifacts, running.originalScope(), running.manifest());
@@ -1395,7 +1396,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         if (candidate.emptyForAuthenticationRecovery()) {
             candidate.verifyRecoveryPermissions(); active.run(); return true;
         }
-        candidate.loadAuthScope(original.preparation().authScope());
+        candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
         bindings.requireAuthenticationPublished(original.preparation()); active.run(); return false;
     }
 
@@ -1406,17 +1407,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         var original = bindings.authenticationRecovery();
         var bound = bindings.load().orElseThrow(MongoCachePipelineAccess::fenced);
         candidate.requireRecoveryTarget(bound);
-        if (!original.pending()) {
-            if (!candidate.emptyForAuthenticationRecovery()) {
-                candidate.loadAuthScope(original.preparation().authScope());
-                bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
-            }
+        if (!original.pending() && candidate.emptyForAuthenticationRecovery()) {
             candidate.verifyRecoveryPermissions(); active.run();
             original = bindings.reserveAuthenticationRecovery(original.preparation());
-            if (!original.pending()) {
-                candidate.loadAuthScope(original.preparation().authScope());
-                bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
-            }
+        }
+        if (!original.pending()) {
+            candidate.verifyPublishedAuthenticationRecovery(original.preparation().authScope());
+            bindings.requireAuthenticationPublished(original.preparation()); active.run(); return original.preparation();
         }
         var expected = original.preparation();
         Runnable pending = () -> { requireOpen(); active.run(); bindings.requireAuthenticationRecoveryPending(expected); };
@@ -1454,12 +1451,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public RetainedStart commitRetainedStart(io.tapstate.spi.store.PipelineIntentScope scope, long expected,
             io.tapstate.core.lifecycle.DesiredState desired, io.tapstate.spi.store.PipelinePreparationInputs inputs,
-            Runnable active) {
+            Runnable active, Runnable verifyRetainedSources) {
         requireOpen();
         if (MongoValidationClaimObservation.lacksSnapshotRead(connection.client())) return RetainedStart.FALLBACK;
         var store = new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings);
         return ((MongoPipelineIntentStore) store.guardedBy(() -> { requireOpen(); active.run(); }))
-                .commitRetainedStart(scope, expected, desired, inputs, artifacts);
+                .commitRetainedStart(scope, expected, desired, inputs, artifacts, verifyRetainedSources);
     }
 
     public record ObservationCapture(String sourceId, String captureId) {
@@ -1498,6 +1495,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 return ObservationCheck.fallback();
             throw failure;
         }
+    }
+
+    public io.tapstate.spi.store.PipelineKeyMoveWindows keyMoveWindows() {
+        requireOpen();
+        return new MongoKeyMoveWindowStore(connection.database(), this::requireOpen);
     }
 
     public io.tapstate.spi.store.PipelineIntentStore intents() {
@@ -1891,6 +1893,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     /** One persistent key, with no node-session ACK, rotation state or cache access. */
     private static final class PersistentKey implements SourceConfigCipherProvider.Snapshot {
+        private static final String SOURCE_WRITE_FENCE = "sourceWriteFence";
         private final MongoCollection<Document> keys;
         private final String clusterId;
         private final SourceConfigCipher cipher;
@@ -1907,7 +1910,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
 
         SourceConfigCipher readCurrent(ClientSession session){
-            return requireCurrent(keys.find(session,new Document("_id","cluster")).first());
+            return requireCurrent(keys.find(session,new Document("_id",CLUSTER_ROW_ID)).first());
         }
 
         @Override public SourceConfigCipher requireCurrent(Document row) {
@@ -1921,7 +1924,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
         @Override
         public SourceConfigCipher refresh() {
-            SourceConfigCipher observed = StoreIo.call(() -> decode(keys.find(new Document("_id", "cluster")).first()));
+            SourceConfigCipher observed = StoreIo.call(() -> decode(keys.find(new Document("_id", CLUSTER_ROW_ID)).first()));
             if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
             return observed;
         }
@@ -1929,7 +1932,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override public SourceConfigCipher refresh(MongoReadBudget budget) {
             SourceConfigCipher observed = StoreIo.call(() -> {
                 SourceConfigCipher value = decode(keys.withTimeout(budget.operationMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
-                        .find(new Document("_id", "cluster")).first());
+                        .find(new Document("_id", CLUSTER_ROW_ID)).first());
                 budget.remainingMillis();
                 return value;
             });
@@ -1945,11 +1948,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override
         public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
             if (!scope.session().hasActiveTransaction())
-                return fenceWrite(scope, keyId, keys.find(scope.session(), new Document("_id", "cluster")).first());
+                return fenceWrite(scope, keyId, keys.find(scope.session(), new Document("_id", CLUSTER_ROW_ID)).first());
             if (!cipher.activeKeyId().equals(keyId)) throw invalidKey();
-            // Validate the exact key that this write fenced. An invalid pre-image aborts the transaction.
-            var original = keys.findOneAndUpdate(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
-                    new Document("$inc", new Document("sourceWriteFence", 1L)));
+            var original = keys.findOneAndUpdate(scope.session(), writeFenceFilter(keyId),
+                    new Document("$inc", new Document(SOURCE_WRITE_FENCE, 1L)));
+            // Validate the exact key that advanced in this transaction. An invalid pre-image aborts it.
             if (!keyId.equals(decode(original).activeKeyId())) throw invalidKey();
             return true;
         }
@@ -1957,8 +1960,21 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private boolean fenceWrite(SourceConfigWriteScope scope,String keyId,Document checkedKey) {
             SourceConfigCipher observed = decode(checkedKey);
             if (!cipher.activeKeyId().equals(keyId) || !keyId.equals(observed.activeKeyId())) throw invalidKey();
-            return keys.updateOne(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
-                    new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() == 1;
+            return keys.updateOne(scope.session(), writeFenceFilter(keyId),
+                    new Document("$inc", new Document(SOURCE_WRITE_FENCE, 1L))).getModifiedCount() == 1;
+        }
+
+        private static Document writeFenceFilter(String keyId) {
+            // A missing legacy counter initializes on first use. A bounded integer always advances by one.
+            String fenceField = "$" + SOURCE_WRITE_FENCE;
+            var fenceType = new Document("$type", fenceField);
+            var advanceable = new Document("$or", List.of(
+                    new Document("$eq", List.of(fenceType, "missing")),
+                    new Document("$and", List.of(
+                            new Document("$in", List.of(fenceType, List.of("int", "long"))),
+                            new Document("$gte", List.of(fenceField, 0L)),
+                            new Document("$lt", List.of(fenceField, Long.MAX_VALUE))))));
+            return new Document("_id", CLUSTER_ROW_ID).append("keyId", keyId).append("$expr", advanceable);
         }
 
         private SourceConfigCipher decode(Document document) {
@@ -2079,7 +2095,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 try (var session = connection.client().startSession()) {
                     return session.withTransaction(() -> {
                         if (closed) throw MongoValidationSchema.refused();
-                        var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+                        var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(connection.database()).find(session, new Document("_id", CLUSTER_ROW_ID)).first();
                         if (identity == null || !cluster.equals(identity.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                                 || !bindings.cachePreparationForTransaction(session).filter(preparation::equals).isPresent()) throw MongoValidationSchema.refused();
                         MongoValidationSchema.verify(connection.database(), MongoValidationSchema.CONFIG);

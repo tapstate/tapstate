@@ -27,6 +27,27 @@ import org.junit.jupiter.api.io.TempDir;
 class PdkSinkWriterConcurrencyTest {
 
     @Test
+    void twoWritersUsingOneConnectorHaveDistinctStableSessionNames(@TempDir Path directory) throws Throwable {
+        Path jar = Synthetic.countingSink(directory);
+        ConnectorRef ref = new ConnectorRef(List.of(jar), "synthetic.CountingSink", "2.0.8", null);
+        TargetTable target = new TargetTable("t1", List.of(new TargetField("id", "int", true)));
+        SinkConfig config = new SinkConfig("demo", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, target);
+        var calls = new java.util.ArrayList<String>();
+        WriteRecordFunction write = (ctx, events, table, result) -> {
+            calls.add(Thread.currentThread().getName());
+            result.accept(new WriteListResult<>(1L, 0L, 0L));
+        };
+        try (var connector = PdkConnector.open("demo", ref, Map.of());
+             var first = new PdkSinkWriter(connector, write, config, Map.of("t1", target), null, true, () -> {});
+             var second = new PdkSinkWriter(connector, write, config, Map.of("t1", target), null, true, () -> {})) {
+            first.write(batch(1)).toCompletableFuture().get(5, TimeUnit.SECONDS);
+            second.write(batch(2)).toCompletableFuture().get(5, TimeUnit.SECONDS);
+            first.write(batch(3)).toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertThat(calls.getFirst()).isNotEqualTo(calls.get(1)).isEqualTo(calls.getLast());
+        }
+    }
+
+    @Test
     void blockingTargetWritesLeaveSharedAsyncWorkAvailable(@TempDir Path directory) throws Throwable {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);

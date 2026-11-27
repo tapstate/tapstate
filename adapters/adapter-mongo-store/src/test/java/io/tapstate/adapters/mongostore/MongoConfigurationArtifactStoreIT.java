@@ -913,7 +913,8 @@ class MongoConfigurationArtifactStoreIT {
                             "alert_rules", "alert_receivers", "alert_subscriptions", "alert_silences", "alert_instances",
                             "alert_episodes", "alert_transitions", "alert_notification_schedules", "alert_delivery_intents",
                             "alert_target_limits", "alert_test_quotas", "alert_node_lifecycles", "ai_provider_settings",
-                            "retry_settings");
+                            "retry_settings", "pipeline_key_move_windows");
+            assertThat(SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();

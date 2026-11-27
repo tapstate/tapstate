@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.runtime.engine.StageTimer;
+import com.hazelcast.jet.datamodel.Tuple2;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
@@ -243,6 +244,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * gone is ever recorded here.
      */
     private final Map<ParkedSubtree.At, Owed> owed = new LinkedHashMap<>();
+    private final Map<ParkedSubtree.At, RootMoveAcks.Ticket> awaitingRoot = new LinkedHashMap<>();
+    private com.hazelcast.core.HazelcastInstance member;
 
     /**
      * A document owed a hand-over: which key it is, and the source's time for the change that made it owed.
@@ -625,6 +628,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         this.logger = context.logger();
     }
 
+    AssemblerProcessor withRootHandoverTransport(com.hazelcast.core.HazelcastInstance originalMember) {
+        member = originalMember;
+        return this;
+    }
+
     // Times each drain of arrivals, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.NEST);
 
@@ -700,7 +708,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched,
             boolean ownedSnapshot) {
-        handle(edge, item, touched);
+        if (item instanceof Tuple2<?, ?> mail && mail.f0() instanceof RootMoveAcks.Ticket ticket) {
+            handleRootHandover(edge, mail.f1(), ticket, touched);
+        } else {
+            handle(edge, item, touched);
+        }
         inbox.remove();
         // Append settles each version; folding keeps at most one bounded drain of distinct roots.
         if (!sending.foldingAllowed() || touched.size() >= DrainFolding.MAX_KEYS_HELD) {
@@ -709,6 +721,35 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return flush();
         }
         return true;
+    }
+
+    private void handleRootHandover(NestInbound edge, Object payload, RootMoveAcks.Ticket ticket,
+            Map<Object, Touched> touched) {
+        boolean leaving = payload instanceof Tuple2<?, ?>;
+        Envelope event = leaving ? (Envelope) ((Tuple2<?, ?>) payload).f1() : (Envelope) payload;
+        var destination = NestKeys.valuesOf(event.after(), vertex.partitionKey(), vertex.mapName());
+        Object local = leaving ? ((Tuple2<?, ?>) payload).f0() : destination;
+        var order = NestKeys.orderOf(event);
+        Touched document = movedRoot(local, event, order, touched);
+        if (document == null) {
+            // The later root may still be part of the current drain. Return its credit only once
+            // that state is durable; never detach the replacement's children during replay.
+            var later = touched.get(local);
+            if (later == null) RootMoveAcks.acknowledge(member, vertex, ticket, leaving);
+            else later.confirmAfterSave(ticket, leaving);
+            return;
+        }
+        handle(edge, payload, touched);
+        if (!(leaving ? document.assembly.rootDeletedAt(order) : document.assembly.hasRootAt(order))) {
+            throw RootMoveAcks.unconfirmed(vertex);
+        }
+        var address = ParkedSubtree.At.ofRoot(destination);
+        if (!leaving && owed.containsKey(address)) {
+            awaitingRoot.put(address, ticket);
+        } else {
+            if (leaving) handedOver.remove(address);
+            document.confirmAfterSave(ticket, leaving);
+        }
     }
 
     /** Every namespace a slot with alternatives reads from, at any depth of the tree. */
@@ -1243,12 +1284,13 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             settle(arrived.key(), document, arrived.element());
             return;
         }
-        Envelope event = (Envelope) item;
-        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event, comparedOn(edge));
+        boolean rootDeparture = item instanceof Tuple2<?, ?>;
+        Envelope event = item instanceof Tuple2<?, ?> departure ? (Envelope) departure.f1() : (Envelope) item;
+        NestKeys.requireBeforeImageWhereKeysAreTracked(edge, event, vertex.trackedColumns(edge));
         Map<String, Object> row = NestKeys.rowOf(event);
         SourceOrder order = NestKeys.orderOf(event);
         if (edge.pathId().isEmpty()) {
-            handleRoot(edge, event, row, order, touched);
+            handleRoot(edge, rootDeparture || edge.carriesDepartures(), event, row, order, touched);
             return;
         }
         ElementRef ref = new ElementRef(edge.pathId(), null,
@@ -1300,41 +1342,20 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * here, the ordinary edge keyed by where the row now is and its twin keyed by where it was, so the
      * instance holding each side does its own half and neither reaches across.
      */
-    /**
-     * The columns this vertex reads off the row an update replaces, for the edge it arrived on - which is
-     * what a source tracking key changes on that edge has to send, and all it has to send.
-     *
-     * <p>Named per edge rather than as one set for the vertex, because the two edges read different rows
-     * for different reasons: the root's own rows are compared on the key that identifies a document, and a
-     * child's on the key that says which document it belongs to plus the one that says which element it is.
-     * A single set would refuse a source over a column the edge it arrived on never looks at.
-     */
-    private List<String> comparedOn(NestInbound edge) {
-        if (edge.pathId().isEmpty()) {
-            return vertex.partitionKey();
-        }
-        // A set: the two overlap on a table whose rows are identified by what they hang from, and naming
-        // a column twice in the failure would read as two different columns being absent.
-        Set<String> compared = new LinkedHashSet<>(edge.keyFields());
-        compared.addAll(edge.elementKey());
-        return List.copyOf(compared);
-    }
-
-    private void handleRoot(NestInbound edge, Envelope event, Map<String, Object> row, SourceOrder order,
+    private void handleRoot(NestInbound edge, boolean departure, Envelope event, Map<String, Object> row, SourceOrder order,
             Map<Object, Touched> touched) {
         List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName());
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
         List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, vertex.partitionKey(), vertex.mapName());
         boolean movedKey = leaving != null && !leaving.equals(key);
-        if (edge.carriesDepartures()) {
-            // Every root row travels the twin edge, not only the ones that moved - an edge cannot filter.
-            // One that is leaving nowhere landed beside its twin, which has the row in hand already.
+        if (departure) {
             if (movedKey) {
                 letGoOfTheWholeDocument(leaving, key, order, event, touched);
             }
             return;
         }
-        Touched document = touched(key, touched);
+        Touched document = movedKey ? movedRoot(key, event, order, touched) : touched(key, touched);
+        if (document == null) return;
         document.inputBytes = Math.max(document.inputBytes, PayloadBytes.of(event));
         document.ts = event.ts();
         if (NestKeys.isDeletion(event)) {
@@ -1342,13 +1363,15 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             document.rootDeleted = true;
             return;
         }
+        boolean previouslySent = movedKey && document.assembly.rootSentAt(order);
         document.assembly.applyRoot(row, order, event.positions());
         if (movedKey && parking != null) {
             // The half that has never seen this document before. What it was is somewhere both halves can
             // reach, addressed by the key that arrived - which is the only thing this side knows.
             ParkedSubtree.At at = ParkedSubtree.At.ofRoot(key);
-            if (!collect(key, document.assembly, at)) {
-                owed.put(at, new Owed(key, document.ts, clock.millis(), event.positions()));
+            if (previouslySent) document.assembly.coverRootReplay(event.positions());
+            if (!collect(key, document.assembly, at) && !previouslySent) {
+                owed.putIfAbsent(at, new Owed(key, document.ts, clock.millis(), event.positions()));
             }
         }
     }
@@ -1371,10 +1394,16 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (parking == null) {
             return;
         }
-        Touched document = touched(leaving, touched);
+        Touched document = movedRoot(leaving, event, order, touched);
+        if (document == null) return;
         document.ts = event.ts();
-        hand(ParkedSubtree.At.ofRoot(arriving), document.assembly.detachEverything(), event.positions());
-        document.assembly.deleteRoot(order, event.positions());
+        if (document.assembly.rootDeletedAt(order)) {
+            // Children that arrived after this deletion belong to a future reuse of the old key.
+            document.assembly.coverRootReplay(event.positions());
+        } else {
+            hand(ParkedSubtree.At.ofRoot(arriving), document.assembly.detachEverything(), event.positions());
+            document.assembly.deleteRoot(order, event.positions());
+        }
         document.rootDeleted = true;
     }
 
@@ -1427,7 +1456,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * running and no error anywhere.
      */
     private void hand(ParkedSubtree.At at, List<NestElement> subtree, Map<String, ChainPosition> since) {
-        if (subtree.isEmpty()) {
+        if (subtree.isEmpty() && !at.pathId().isEmpty()) {
             return;
         }
         ParkedSubtree held = parking.load(at);
@@ -1537,6 +1566,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 // half that would complete it may never be worked at all, and a document held for something
                 // that is not coming is one nothing ever sends - the same silence holding it back was for.
                 if (now - entry.getValue().awaitedSince() >= migrationProtection) {
+                    if (awaitingRoot.containsKey(entry.getKey())) throw RootMoveAcks.unconfirmed(vertex);
                     RootAssembly asItStands = store.load(key);
                     if (asItStands != null) {
                         Touched document = landed.computeIfAbsent(key,
@@ -1575,7 +1605,11 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         // Only once the documents holding those rows have been stored, for the reason collect gives: between
         // the two writes the rows exist in one place, and it must not be the one being emptied.
-        taken.forEach(this::letGoOf);
+        taken.forEach((address, pieces) -> {
+            letGoOf(address, pieces);
+            var ticket = awaitingRoot.remove(address);
+            if (ticket != null) RootMoveAcks.acknowledge(member, vertex, ticket, false);
+        });
     }
 
     /**
@@ -1678,6 +1712,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             }
         });
         writes.flush();
+        for (var document : touched.values()) {
+            if (document.handover != null) {
+                RootMoveAcks.acknowledge(member, vertex, document.handover, document.leaving);
+                document.handover = null;
+            }
+        }
     }
 
     private void settleRendered(Object key, Touched document, Map<String, Object> rendered,
@@ -2188,6 +2228,16 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         return row;
     }
 
+    /** A replay behind a replacement root has no subtree to move and no target row to emit. */
+    private Touched movedRoot(Object key, Envelope event, SourceOrder order, Map<Object, Touched> touched) {
+        boolean alreadyTouched = touched.containsKey(key);
+        Touched document = touched(key, touched);
+        if (!document.assembly.rootHasPassed(order)) return document;
+        if (!alreadyTouched) touched.remove(key);
+        SettledPositions.fold(settledAhead, event.positions());
+        return null;
+    }
+
     private Touched touched(Object key, Map<Object, Touched> touched) {
         ReferenceState known = recentReferenceStates.remove(key);
         return touched.computeIfAbsent(key, k -> {
@@ -2248,9 +2298,16 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         private final boolean heldNothing;
 
         private boolean rootDeleted;
+        private RootMoveAcks.Ticket handover;
+        private boolean leaving;
         private long emissionBytes = -1;
         private long inputBytes = -1;
         private long ts;
+
+        private void confirmAfterSave(RootMoveAcks.Ticket ticket, boolean departure) {
+            handover = ticket;
+            leaving = departure;
+        }
 
         private Touched(RootAssembly assembly, boolean heldNothing) {
             this.assembly = assembly;

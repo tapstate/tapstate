@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.SourceKeyMovePreflight;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.lifecycle.HoldsChangesForLoads;
@@ -63,7 +64,7 @@ import java.util.function.LongConsumer;
  * log and read-cursor sink are resolved on the
  * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads, SourceKeyMovePreflight {
 
     @Override
     public Stage stage() {
@@ -84,6 +85,17 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final long epoch;
     private final SourceBoundStamp stamp;
     private final RingTail ringTail;
+    private final SourceChangeGuard.Factory changeGuardFactory;
+    private SourceChangeGuard changeGuard;
+    private SourceKeyMovePreflight.Check preflight;
+    private SourceKeyMovePreflight.PreparedRows preparedRows;
+    private Object pendingEmission;
+
+    @Override public void withKeyMovePreflight(SourceKeyMovePreflight.Check check) {
+        preflight = Objects.requireNonNull(check);
+        if (check instanceof SourceKeyMovePreflight.PreparedRows rows) preparedRows = rows;
+    }
+    private int admittedRows;
     private final boolean bounded;
     // The most changes one pass reads from the ring and sends on before yielding: the batch the source's author
     // asked for, which is how many rows it hands on at a time - never how many the connector fetches.
@@ -104,6 +116,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private long refusedSinceNanos;
     private SourceOrder read;
     private Watermark unannounced;
+    private int directRowsSinceBound;
     private long announced;
     // Whether anything has been announced at all, kept apart from the value rather than encoded in it. The
     // lowest long is a real bound - it is what the reserved snapshot position packs to under some stampings
@@ -139,7 +152,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private long nextLookNanos;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
-            SourceBoundStamp stamp, RingTail ringTail, int readBatch, boolean bounded) {
+            SourceBoundStamp stamp, RingTail ringTail, int readBatch, boolean bounded, SourceChangeGuard.Factory guard) {
+        this.changeGuardFactory = guard;
         this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
@@ -174,6 +188,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             }
         }
         try {
+            if (changeGuardFactory != null) changeGuard = changeGuardFactory.open(context, preflight);
             initialize(context);
         } catch (RuntimeException | Error failure) {
             if (failures != null) failures.accept(failure);
@@ -266,6 +281,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     @Override
     public boolean complete() {
         try {
+            if (changeGuard != null) changeGuard.poll();
             return drain();
         } catch (RuntimeException | Error failure) {
             if (failures != null) failures.accept(failure);
@@ -278,7 +294,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // fill reads, so a change the outbox refused stays buffered until it is taken, never re-read nor lost.
         // A bound the outbox refused is offered again the same way, before anything more is read: it was
         // already recorded as announced, so it has to leave rather than be worked out afresh.
-        if (!emitPending() || !announce()) {
+        if (!announce() || (!pending.isEmpty() && !emitBatch())) {
             return false;
         }
         // Every seeded snapshot row has left, so the bound covering them can be promised now. Waiting for a
@@ -334,10 +350,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (pending.size() > pendingBefore) {
             timer.end(started);
         }
-        if (emitPending()) {
-            stampWhatHasLeft();
-            announce();
-        }
+        emitBatch();
         // Only an explicitly bounded read ends. A direct CDC source also has no ring reader and can
         // remain quiet indefinitely. A missing or partially consumed declaration is not proof of EOF.
         completedInput = bounded && buffered != null && buffered.snapshotState(pipelineId, ringName).declared()
@@ -349,6 +362,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         var observer = initialObserver; initialObserver = null;
         if (observer != null) try { observer.ended(observedJob, observedExecution, src, observedIndex, completedInput); }
         catch (RuntimeException failedObservation) { System.getLogger(SrsSourceProcessor.class.getName()).log(System.Logger.Level.WARNING, "initial-load end observation failed", failedObservation); }
+        if (preparedRows != null) preparedRows.close();
     }
 
     /**
@@ -605,15 +619,56 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         return true;
     }
 
-    /** Emits buffered envelopes until the outbox refuses one; true when the buffer is fully drained. */
-    private boolean emitPending() {
-        while (!pending.isEmpty()) {
-            if (!tryEmit(pending.peek())) {
-                return false;
-            }
-            pending.remove();
+    /** Finishes this read and its bound before another read can replace the covered position. */
+    private boolean emitBatch() {
+        // A private hand-off can supply several output batches in one drain. Its read position
+        // already names the last of them, so intermediate bounds must come from emitted rows.
+        boolean directCdc = ringTail == null && !bounded && stamp != null && !awaitingSnapshot && !snapshotBoundDue;
+        if (!pending.isEmpty() && admittedRows == 0) {
+            admittedRows = changeGuard == null ? pending.size() : admitEpoch();
         }
-        return true;
+        while (admittedRows > 0) {
+            Envelope row = pending.peek();
+            if (preparedRows != null) {
+                if (pendingEmission == null) pendingEmission = preparedRows.emission(row);
+                if (!tryEmit(pendingEmission)) return false;
+                pendingEmission = null;
+            } else if (!tryEmit(row)) return false;
+            pending.remove();
+            admittedRows--;
+            boolean epochEnded = admittedRows == 0 && !pending.isEmpty();
+            if (epochEnded || directCdc && ++directRowsSinceBound == readBatch) {
+                directRowsSinceBound = 0;
+                if (!snapshotBoundDue && row.position() != null && row.position().order() != null) stampAt(row.position().order());
+                if (!announce() || epochEnded) return false;
+            }
+        }
+        directRowsSinceBound = 0;
+        stampWhatHasLeft();
+        return announce();
+    }
+
+    /** A watermark for the first capture generation must leave before a later generation is admitted. */
+    private int admitEpoch() {
+        var first = pending.getFirst().position();
+        var last = pending.getLast().position();
+        if (first != null && last != null && first.order() != null && last.order() != null
+                && first.order().epoch() == last.order().epoch()) {
+            changeGuard.beforeBatch(pending);
+            return pending.size();
+        }
+        var prefix = new java.util.ArrayList<Envelope>();
+        SourceOrder boundary = null;
+        for (var row : pending) {
+            var position = row.position();
+            if (position != null && position.order() != null) {
+                if (boundary != null && position.order().epoch() != boundary.epoch()) break;
+                boundary = position.order();
+            }
+            prefix.add(row);
+        }
+        changeGuard.beforeBatch(prefix);
+        return prefix.size();
     }
 
     /**
@@ -667,6 +722,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
             SourceBoundStamp stamp, SourcePlacement placement, int readBatch) {
+        return metaSupplier(pipelineId, ringName, src, start, resumeAfter, epoch, publisherFactory, stamp, placement, readBatch, null);
+    }
+
+    public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
+            StartFrom start, Long resumeAfter, long epoch, SrsReadCursorPublisherFactory publisherFactory,
+            SourceBoundStamp stamp, SourcePlacement placement, int readBatch, SourceChangeGuard.Factory guard) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -680,7 +741,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a source reads at least one change a pass, got " + readBatch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp,
-                new RingTail(start, resumeAfter, publisherFactory), readBatch, false);
+                new RingTail(start, resumeAfter, publisherFactory), readBatch, false, guard);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -694,12 +755,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
             String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
             SourcePlacement placement) {
-        return bufferMetaSupplier(pipelineId, ringName, src, epoch, stamp, placement, true);
+        return bufferMetaSupplier(pipelineId, ringName, src, epoch, stamp, placement, BatchSpec.DEFAULT_MAX_RECORDS, true, null);
     }
 
     private static ProcessorMetaSupplier bufferMetaSupplier(
             String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
-            SourcePlacement placement, boolean bounded) {
+            SourcePlacement placement, int readBatch, boolean bounded, SourceChangeGuard.Factory guard) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -708,14 +769,26 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null,
-                BatchSpec.DEFAULT_MAX_RECORDS, bounded);
+                readBatch, bounded, guard);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /** An unbounded direct source drains its private hand-off without opening an SRS recovery reader. */
     public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
             long epoch, SourceBoundStamp stamp, SourcePlacement placement) {
-        return bufferMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, false);
+        return directMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, BatchSpec.DEFAULT_MAX_RECORDS);
+    }
+
+    /** A direct source using the configured CDC output batch size. */
+    public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
+            long epoch, SourceBoundStamp stamp, SourcePlacement placement, int readBatch) {
+        return directMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, readBatch, null);
+    }
+
+    public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
+            long epoch, SourceBoundStamp stamp, SourcePlacement placement, int readBatch, SourceChangeGuard.Factory guard) {
+        if (readBatch < 1) throw new IllegalArgumentException("a source reads at least one change a pass");
+        return bufferMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, readBatch, false, guard);
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */

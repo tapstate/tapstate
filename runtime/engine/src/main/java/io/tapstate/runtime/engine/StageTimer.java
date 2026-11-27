@@ -68,13 +68,16 @@ public final class StageTimer {
     public static StageTimer of(Stage stage, Processor.Context context, Publication publication) {
         Objects.requireNonNull(publication, "publication");
         boolean inAJob = context != null && context.hazelcastInstance() != null;
-        StageGauge gauge = StageGauge.none();
-        if (inAJob) {
-            var bound = new JetStageGauge(publication == Publication.WORKER);
-            if (publication == Publication.WORKER) bound.bind(stage, BOUNDS.buckets());
-            gauge = bound;
-        }
+        if (!inAJob) return none(stage);
+        if (publication == Publication.PROCESSOR) return onProcessor(stage);
+        var gauge = new JetStageGauge(true);
+        gauge.bind(stage, BOUNDS.buckets());
         return new StageTimer(stage, gauge, System::nanoTime, System.currentTimeMillis());
+    }
+
+    /** A stage being executed on the current Jet processor's thread. */
+    static StageTimer onProcessor(Stage stage) {
+        return new StageTimer(stage, new JetStageGauge(false), System::nanoTime, System.currentTimeMillis());
     }
 
     /** A timer that counts and reports to nobody, for a processor not yet initialised. */

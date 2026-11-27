@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.function.FunctionEx;
+import com.hazelcast.jet.datamodel.Tuple2;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Processor;
@@ -101,7 +102,17 @@ public final class NestDag {
                     frontier == null ? null : frontier.axes(), chains)));
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
-                connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
+                if (spec.isAssembler() && edge.pathId().isEmpty() && edge.tracksKeyChanges()) {
+                    if (!edge.carriesDepartures()) {
+                        NestInbound departure = spec.inbound().stream()
+                                .filter(other -> other.pathId().isEmpty() && other.carriesDepartures())
+                                .findFirst().orElseThrow();
+                        connectRoot(dag, vertex, edge, departure, upstream, nextOutbound, frontier, width,
+                                spec, binding.settings(), binding.clock());
+                    }
+                } else {
+                    connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
+                }
             }
             if (!spec.isAssembler() && binding.stores().hasReleaseRecovery()) {
                 String name = spec.name() + ":recovery";
@@ -160,8 +171,8 @@ public final class NestDag {
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
-        draw(dag, source, vertex, LookupProcessor.ROWS,
-                fieldKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
+        connectRowOwners(dag, vertex, source, lookup.partitionKey(), lookup.mapName(), LookupProcessor.ROWS,
+                ":row-owners", nextOutbound, width);
 
         List<Vertex> referrers = upstream.apply(lookup.referrerAlias());
         if (referrers == null || referrers.isEmpty()) {
@@ -181,14 +192,6 @@ public final class NestDag {
         // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
         draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
                 leavingKey(lookup.referenceFields(), lookup.mapName()), nextOutbound, width);
-        if (lookup.alternative()) {
-            // Keyed by the alternative value each row held before, so a row that moved to another value is
-            // taken out from under the one it left by the instance holding that entry. Only an alternative
-            // needs it: everywhere else rows are filed by what identifies them, which an edit does not move.
-            draw(dag, source, vertex, LookupProcessor.DEPARTED_ROWS,
-                    leavingKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
-        }
-
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
             throw new IllegalStateException("nothing was built for the level pointing at "
@@ -251,6 +254,50 @@ public final class NestDag {
         }
         carried.put(spec.pathId(), List.copyOf(reaching));
         return byOrdinal;
+    }
+
+    private static void connectRoot(DAG dag, Vertex destination, NestInbound rows, NestInbound departures,
+            Function<String, List<Vertex>> upstream, ToIntFunction<Vertex> nextOutbound,
+            NestFrontier frontier, NodeWidth width, NestVertex spec, NestSettings settings, NestClock clock) {
+        List<Vertex> sources = upstream.apply(rows.alias());
+        if (sources == null || sources.isEmpty()) {
+            throw new IllegalStateException("nest alias '" + rows.alias() + "' resolved to no vertex");
+        }
+        Vertex source = sources.size() == 1 ? sources.get(0)
+                : merged(dag, destination, rows, sources, nextOutbound, frontier);
+        String ownerName = destination.getName() + ":root-owners";
+        ChainAxes axes = frontier == null ? null : frontier.axes();
+        Map<Integer, List<String>> chains = frontier == null ? null : Map.of(0, frontier.chainsOfAlias(rows.alias()));
+        var single = NodeWidth.totalOne(ownerName, null);
+        Vertex owners = dag.newVertex(ownerName, single.metaSupplier(ownerName,
+                ProcessorSupplier.of(() -> new RootMoveDispatcher(spec, settings, clock, axes, chains)), axes, chains));
+        dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(owners).distributed().allToOne(ownerName));
+        routeOwners(dag, owners, destination, rows.ordinal(), rows.keyFields(), spec.mapName(), width);
+        // Retain the logical control input and its frontier coverage. Data uses only output zero.
+        dag.edge(width.into(Edge.from(owners, 1).to(destination, departures.ordinal()),
+                destination.getName(), (Object item) -> SETTLED_POSITIONS_LANE));
+    }
+
+    private static Vertex connectRowOwners(DAG dag, Vertex destination, Vertex source, List<String> keyFields,
+            String namespace, int ordinal, String suffix, ToIntFunction<Vertex> nextOutbound, NodeWidth width) {
+        Vertex owners = dag.newVertex(destination.getName() + suffix,
+                ProcessorMetaSupplier.of(source.getMetaSupplier().preferredLocalParallelism(),
+                        () -> new NestRowOwners(keyFields, namespace)))
+                .localParallelism(source.getLocalParallelism());
+        dag.edge(Edge.from(source, nextOutbound.applyAsInt(source)).to(owners).isolated());
+        routeOwners(dag, owners, destination, ordinal, keyFields, namespace, width);
+        return owners;
+    }
+
+    private static void routeOwners(DAG dag, Vertex owners, Vertex destination, int ordinal,
+            List<String> keyFields, String namespace, NodeWidth width) {
+        FunctionEx<Object, Object> key = wrapped -> {
+            Object item = RootMoveAcks.payload(wrapped);
+            if (item instanceof SettledPositions) return SETTLED_POSITIONS_LANE;
+            if (item instanceof Tuple2<?, ?> departure) return departure.f0();
+            return NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), keyFields, namespace);
+        };
+        dag.edge(width.into(Edge.from(owners, 0).to(destination, ordinal), destination.getName(), key));
     }
 
     private static void connect(DAG dag, Vertex destination, NestInbound edge, Map<List<String>, Vertex> built,
@@ -528,6 +575,7 @@ public final class NestDag {
         private static final long serialVersionUID = 1L;
 
         private final NestVertex spec;
+        private transient com.hazelcast.core.HazelcastInstance member;
         private final List<EmbedSlot> slots;
         private final NestBinding.NestStores stores;
         private final NestDeadLetter deadLetter;
@@ -568,7 +616,8 @@ public final class NestDag {
 
         @Override
         public void init(Context context) {
-            floor = replayFloor.resolve(context.hazelcastInstance());
+            member = context.hazelcastInstance();
+            floor = replayFloor.resolve(member);
             // Metered from here and nowhere else: this is the one place a job is what the stores are
             // being bound for, and a reading can only be left from a thread running its processors.
             bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new);
@@ -585,7 +634,7 @@ public final class NestDag {
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
                                 bound.forParking(spec), boundDeadLetter, referenced(),
-                                settleMissingReferencesOnComplete, lookupSnapshots)
+                                settleMissingReferencesOnComplete, lookupSnapshots).withRootHandoverTransport(member)
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
                                 chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
             }

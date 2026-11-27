@@ -409,6 +409,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             });
             require();
         }
+        if (pass.intent().desired().targetState() == PipelineState.STOPPED) {
+            // Loss of a cleanup proof leaves the interlock intact; capture still needs to stop.
+            try {
+                dags.retireCoveredKeyMoves(pass);
+            } catch (TapstateException unavailable) {
+                System.getLogger(ScopedEngineLifecycleActuator.class.getName()).log(System.Logger.Level.WARNING,
+                        "Could not reconcile the key move interval before stopping {0}: {1}", id(), unavailable.code().code());
+            }
+        }
         if (run == null && pass.displacedExecution() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
             // An absent Jet handle cannot supply the old capture fence. The successor may retire only
             // local sessions in the original scope at or below its admitted fence.

@@ -131,6 +131,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         current.transaction(session -> { pending.run(); current.fence(session); pending.run(); return null; });
         loadAuthScope(original.authScope()); pending.run();
     }
+    void verifyPublishedAuthenticationRecovery(CacheAuthScope expected) {
+        loadAuthScope(expected);
+        verifyAuthPresence(expected.mode());
+    }
+
     void verifyRecoveryPermissions() { businessActive(); connection.verifyStoragePermissions(); }
     /** Initial OP preflight has no formal session and must observe a genuinely empty target. */
     public void verifyEmptyInitialRecovery() {
@@ -796,6 +801,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             Runnable requireActive) {
         return pipelineAccess(scope, null, requireActive).startCheckpoint();
     }
+    /** Verifies the retained selection without loading cursor or batch data. */
+    public void verifyRetainedTableSelection(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.spi.store.PipelinePreparationInputs expected, Runnable requireActive) {
+        pipelineAccess(scope, null, requireActive).transaction(session -> {
+            var retained = MongoPipelineSourcePreparations.retained(session, database, scope);
+            MongoCachePipelinePreparations.verifyTableSelection(scope, expected, retained);
+            return null;
+        });
+    }
+
     /** Only the original prepared control header, without positions or operator state materialization. */
     public io.tapstate.core.lifecycle.CheckpointDoc validationPipelineState(io.tapstate.spi.store.PipelineIntentScope scope,Runnable local){
         return pipelineAccess(scope,null,Objects.requireNonNull(local)).validationControlTransaction(

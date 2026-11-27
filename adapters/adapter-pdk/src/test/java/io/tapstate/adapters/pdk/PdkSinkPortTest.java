@@ -296,6 +296,20 @@ class PdkSinkPortTest {
     }
 
     @Test
+    void aRejectedRowPreventsTheBatchFromAcknowledgingItsSourcePosition(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.partiallyRejectedSink(dir);
+        var port = new PdkSinkPort(provisioner(jar, "synthetic.PartiallyRejected"));
+        try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.IGNORE))) {
+            assertThatThrownBy(() -> await(writer, List.of(insert(1), insert(2))))
+                    .isInstanceOf(ExecutionException.class)
+                    .cause().isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED);
+                        assertThat(failure).hasRootCauseMessage("target rejected the row");
+                    });
+        }
+    }
+
+    @Test
     void writeAccumulatesCountsAcrossMultipleConnectorFlushes(@TempDir Path dir) throws Exception {
         // A connector may report a batch in several flushes, one consumer callback each; the writer must
         // sum the accepted counts, not report only the last flush's.
@@ -326,7 +340,8 @@ class PdkSinkPortTest {
                     Envelope.delete(2L, "t1", Map.of("id", 2), null),
                     Envelope.ddl(3L, "t1", Map.of()));
             assertThat(await(writer, batch)).isEqualTo(new WriteResult(0, 2));
-            assertThat(await(writer, batch)).isEqualTo(new WriteResult(2, 0));
+            assertThatThrownBy(() -> await(writer, batch)).isInstanceOf(ExecutionException.class)
+                    .hasRootCauseMessage("row rejected");
             assertThat(await(writer, batch)).isEqualTo(new WriteResult(0, 0));
         }
     }
@@ -482,7 +497,9 @@ class PdkSinkPortTest {
         Path jar = Synthetic.fieldCountingSink(dir);
         PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.FieldCounting"));
         try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.FAIL))) {
-            assertThat(await(writer, List.of(insert(1))).written()).isEqualTo(0);
+            var receipt = await(writer, List.of(insert(1)));
+            assertThat(receipt.written()).isZero();
+            assertThat(receipt.acknowledgedRows()).isEqualTo(1);
         }
     }
 }

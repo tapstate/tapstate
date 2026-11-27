@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.spi.store.StorageBinding;
@@ -20,55 +21,93 @@ import org.junit.jupiter.params.provider.EnumSource;
 @io.tapstate.testsupport.RequiresDocker
 class NativeAuthenticationStoreOutageIT {
     enum Layer { CONFIG, CACHE }
-    enum LateFault { CREDENTIAL_RECORD, CUMULATIVE_CHECKS }
+    enum LateFault {
+        CREDENTIAL_RECORD(20000, 0, false),
+        WITHIN_SHARED_BUDGET(0, 4000, true),
+        EXCEEDS_SHARED_BUDGET(3000, 4000, false);
+
+        final int credentialDelay;
+        final int scopeDelay;
+        final boolean succeeds;
+
+        LateFault(int credentialDelay, int scopeDelay, boolean succeeds) {
+            this.credentialDelay = credentialDelay;
+            this.scopeDelay = scopeDelay;
+            this.succeeds = succeeds;
+        }
+    }
 
     @ParameterizedTest
     @EnumSource(LateFault.class)
     void credentialReadsAndRepeatedChecksShareTheAuthenticationDeadline(LateFault fault) throws Exception {
-        try (NetworkedMongo mongo = NetworkedMongo.startWithTestCommands();
-             PreparedNativeStore storage = PreparedNativeStore.createOn(mongo);
-             var raw = MongoClients.create(storage.configurationUri());
-             RealProcessServer server = RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
-                     port -> List.of("--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0",
-                             "--tapstate.hz.jet.cooperative-thread-count=2"));
-             HttpClient http = HttpClient.newHttpClient()) {
-            var control = new ControlPlane(server.baseUrl());
-            storage.loginAndAwaitBusiness(control);
-            String machine = control.mintToken("ADMIN");
-            var configuration = raw.getDatabase(storage.configurationDatabase());
-            var cache = raw.getDatabase(storage.cacheDatabase());
-            Document token = SystemCollections.CONFIG_TOKENS.on(configuration).find().first();
-            Document auth = authIdentity(SystemCollections.CACHE_IDENTITY.on(cache).find().first());
-            var admin = raw.getDatabase("admin");
-            boolean credentialRead = fault == LateFault.CREDENTIAL_RECORD;
-            String namespace = credentialRead
-                    ? storage.configurationDatabase() + "." + SystemCollections.CONFIG_TOKENS.collectionName()
-                    : storage.cacheDatabase() + "." + SystemCollections.CACHE_IDENTITY.collectionName();
-            long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
-                            .append("namespace", namespace).append("blockConnection", true)
-                            .append("blockTimeMS", credentialRead ? 20000 : 4000))).get("count")).longValue();
-            try {
-                if (credentialRead) {
-                    // Original-scope checks are healthy: only the machine-token record is blocked.
-                    assertThat(control.storageStatus().get("clusterId")).isEqualTo(storage.clusterId());
+        String cluster = "auth-budget-" + UUID.randomUUID();
+        try (var configMongo = NetworkedMongo.startWithTestCommands();
+             var cacheMongo = NetworkedMongo.startWithTestCommands()) {
+            String configUri = configMongo.uriForThisHost("configuration");
+            String cacheUri = cacheMongo.uriForThisHost("cache");
+            var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, cacheUri, "cache", null);
+            NativeMongoStorageFixture.prepare(configUri, binding, configMongo.uriForThisHost("master"), cluster);
+            try (var rawConfig = MongoClients.create(configUri);
+                 var rawCache = MongoClients.create(cacheUri);
+                 var server = RealProcessServer.startPrepared(configUri, "127.0.0.1",
+                         port -> List.of("--tapstate.cluster.id=" + cluster, "--tapstate.hz.member-port=0",
+                                 "--tapstate.hz.jet.cooperative-thread-count=2"));
+                 var http = HttpClient.newHttpClient()) {
+                var control = new ControlPlane(server.baseUrl());
+                control.login(NativeMongoStorageFixture.USER, NativeMongoStorageFixture.PASSWORD);
+                Await.until("the installation to be ready for the same authenticated request",
+                        () -> "READY".equals(control.storageStatus().get("businessPhase")),
+                        () -> String.valueOf(control.storageStatus()));
+                String machine = control.mintToken("ADMIN");
+                var tokens = SystemCollections.CONFIG_TOKENS.on(rawConfig.getDatabase("configuration"));
+                var cacheIdentity = SystemCollections.CACHE_IDENTITY.on(rawCache.getDatabase("cache"));
+                Document token = tokens.find().first();
+                Document auth = authIdentity(cacheIdentity.find().first());
+                assertThat(members(http, server, machine).statusCode()).isEqualTo(200);
+
+                try (var credential = holdReads(rawConfig.getDatabase("admin"),
+                             "configuration." + SystemCollections.CONFIG_TOKENS.collectionName(), fault.credentialDelay, 1);
+                     var scope = holdReads(rawCache.getDatabase("admin"),
+                             "cache." + SystemCollections.CACHE_IDENTITY.collectionName(), fault.scopeDelay, 2)) {
+                    if (fault == LateFault.CREDENTIAL_RECORD) {
+                        assertThat(members(http, server, control.credential()).statusCode()).isEqualTo(200);
+                    }
+                    var response = members(http, server, machine);
+                    if (fault.succeeds) {
+                        assertThat(response.statusCode()).isEqualTo(200);
+                    } else {
+                        assertThat(response.statusCode()).isEqualTo(503);
+                        assertThat(ControlPlane.interpretClusterRefusal(response.statusCode(), response.body()))
+                                .contains(ControlError.STORAGE_UNAVAILABLE.code());
+                    }
                 }
-                var response = http.send(HttpRequest.newBuilder(server.baseUrl().resolve("/api/cluster/members"))
-                        .timeout(Duration.ofSeconds(20))
-                        .header("Authorization", "Bearer " + (credentialRead ? machine : control.credential()))
-                        .GET().build(), HttpResponse.BodyHandlers.ofString());
-                assertThat(response.statusCode()).isEqualTo(503);
-                assertThat(ControlPlane.interpretClusterRefusal(response.statusCode(), response.body()))
-                        .contains(ControlError.STORAGE_UNAVAILABLE.code());
-            } finally {
-                long finished = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
-                        .append("mode", "off")).get("count")).longValue();
-                assertThat(finished - entered).isGreaterThanOrEqualTo(credentialRead ? 1L : 2L);
+
+                assertThat(members(http, server, machine).statusCode()).isEqualTo(200);
+                assertThat(tokens.find().first()).isEqualTo(token);
+                assertThat(authIdentity(cacheIdentity.find().first())).isEqualTo(auth);
             }
-            assertThat(control.storageStatus().get("clusterId")).isEqualTo(storage.clusterId());
-            assertThat(SystemCollections.CONFIG_TOKENS.on(configuration).find().first()).isEqualTo(token);
-            assertThat(authIdentity(SystemCollections.CACHE_IDENTITY.on(cache).find().first())).isEqualTo(auth);
         }
+    }
+
+    private static HttpResponse<String> members(HttpClient http, RealProcessServer server, String credential)
+            throws Exception {
+        return http.send(HttpRequest.newBuilder(server.baseUrl().resolve("/api/cluster/members"))
+                .timeout(Duration.ofSeconds(20))
+                .header("Authorization", "Bearer " + credential)
+                .GET().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static AutoCloseable holdReads(MongoDatabase admin, String namespace, int delayMillis, int count) {
+        if (delayMillis == 0) return () -> {};
+        long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                        .append("namespace", namespace).append("blockConnection", true)
+                        .append("blockTimeMS", delayMillis))).get("count")).longValue();
+        return () -> {
+            long finished = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", "off")).get("count")).longValue();
+            assertThat(finished - entered).as("blocked Mongo reads on %s", namespace).isGreaterThanOrEqualTo(count);
+        };
     }
 
     @ParameterizedTest

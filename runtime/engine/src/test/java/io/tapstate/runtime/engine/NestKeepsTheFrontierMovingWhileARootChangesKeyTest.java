@@ -37,12 +37,16 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * A root that tracks its own key changes compiles a second edge for its own stream, and the level may say
@@ -79,6 +83,9 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
 
     /** Every row that got past the nest, as {@code op:customer_id:policyCount}. */
     private static final List<String> DOCUMENTS = Collections.synchronizedList(new ArrayList<>());
+    private static final Map<String, String> NAMES = new ConcurrentHashMap<>();
+    private static final Map<String, List<String>> POLICY_IDS = new ConcurrentHashMap<>();
+    private static final AtomicBoolean RELEASE_DEPARTURE = new AtomicBoolean();
 
     /** What the member is configured with, and so the default parallelism every vertex is left at. */
     private static final int COOPERATIVE_THREADS = 4;
@@ -93,6 +100,9 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
     void startMember() {
         SEEN.clear();
         DOCUMENTS.clear();
+        NAMES.clear();
+        POLICY_IDS.clear();
+        RELEASE_DEPARTURE.set(false);
         Config config = new Config();
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(COOPERATIVE_THREADS);
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -178,6 +188,24 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
                 .isEqualTo("INSERT:C2:1");
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {0, COOPERATIVE_THREADS})
+    void reusingTheOldKeyDoesNotSendItsNewChildThroughTheOldDeparture(int width) {
+        run(true, true, true, width);
+        await(() -> "replacement".equals(NAMES.get("C1")) && POLICY_IDS.getOrDefault("C1", List.of()).contains("P2"));
+        RELEASE_DEPARTURE.set(true);
+        await(() -> reached(CUSTOMERS, FAR_ABOVE) && documentFor("C2") != null);
+
+        assertThat(documentFor("C2"))
+                .as("only the original child moves through the delayed departure")
+                .isEqualTo("INSERT:C2:1");
+        assertThat(documentFor("C1"))
+                .as("the replacement root keeps the child seen before the delayed departure")
+                .isEqualTo("INSERT:C1:1");
+        assertThat(POLICY_IDS.get("C1")).containsExactly("P2");
+        assertThat(POLICY_IDS.get("C2")).containsExactly("P1");
+    }
+
     // ---- the job under test ------------------------------------------------------------
 
     /**
@@ -185,6 +213,10 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
      * through, which is the whole of what the last test adds.
      */
     private void run(boolean tracked, boolean renames) {
+        run(tracked, renames, false, COOPERATIVE_THREADS);
+    }
+
+    private void run(boolean tracked, boolean renames, boolean delayDeparture, int width) {
         Embed policies = new Embed("p", Map.of("customer_id", "customer_id"), EmbedAs.ARRAY, "policies",
                 List.of("policy_id"), null, null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
@@ -208,20 +240,35 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
 
         DAG dag = new DAG();
         Map<String, Vertex> byAlias = new LinkedHashMap<>();
-        byAlias.put("c", dag.newVertex(CUSTOMERS, source(CUSTOMERS, customers)));
-        byAlias.put("p", dag.newVertex(POLICIES, source(POLICIES,
-                List.of(Row.insert(row("policy_id", "P1", "customer_id", "C1"), new SourceOrder(1, 2))))));
+        byAlias.put("c", dag.newVertex(CUSTOMERS, delayDeparture
+                ? ProcessorMetaSupplier.forceTotalParallelismOne(
+                        ProcessorSupplier.of((SupplierEx<Processor>) DelayedDepartureSource::new))
+                : source(CUSTOMERS, customers)));
+        List<Row> policyRows = new ArrayList<>();
+        policyRows.add(Row.insert(row("policy_id", "P1", "customer_id", "C1"), new SourceOrder(1, 2)));
+        if (delayDeparture) {
+            policyRows.add(Row.insert(row("policy_id", "P2", "customer_id", "C1"),
+                    new SourceOrder(1, 6)).onceC1IsReused());
+        }
+        byAlias.put("p", dag.newVertex(POLICIES, source(POLICIES, policyRows)));
 
         Map<String, String> chainOfAlias = Map.of("c", CUSTOMERS, "p", POLICIES);
         Map<Vertex, Integer> outbound = new HashMap<>();
-        assembled = NestDag.attach(dag,
-                NestTopology.compile("p", "doc", body, tables::get),
+        NestTopology topology = NestTopology.compile("p", "doc", body, tables::get);
+        assembled = NestDag.attach(dag, topology,
                 "doc", "c", "doc",
                 alias -> List.of(byAlias.get(alias)),
                 new NestBinding(tables::get, HeapNestStores.onHeap(), (from, released) -> { }),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
                 new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))),
-                new NodeWidth("doc", 4, 1, null));
+                new NodeWidth("doc", width, 1, null));
+        if (delayDeparture) {
+            int departure = topology.assembler().inbound().stream()
+                    .filter(edge -> edge.carriesDepartures()).findFirst().orElseThrow().ordinal();
+            assertThat(dag.getInboundEdges(assembled.getName()).stream()
+                    .filter(edge -> edge.getDestOrdinal() == departure).findFirst().orElseThrow()
+                    .getSourceOrdinal()).isEqualTo(1);
+        }
 
         Vertex collector = dag.newVertex("collector", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)));
@@ -236,29 +283,72 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
      * of ordering two chains that the engine deliberately does not order.
      */
     private record Row(Op op, Map<String, Object> before, Map<String, Object> after, SourceOrder order,
-            boolean held) implements Serializable {
+            boolean held, boolean afterReuse) implements Serializable {
 
         static Row insert(Map<String, Object> after, SourceOrder order) {
-            return new Row(Op.INSERT, null, after, order, false);
+            return new Row(Op.INSERT, null, after, order, false, false);
         }
 
         static Row update(Map<String, Object> before, Map<String, Object> after, SourceOrder order) {
-            return new Row(Op.UPDATE, before, after, order, false);
+            return new Row(Op.UPDATE, before, after, order, false, false);
         }
 
         Row onceC1Holds() {
-            return new Row(op, before, after, order, true);
+            return new Row(op, before, after, order, true, false);
+        }
+
+        Row onceC1IsReused() {
+            return new Row(op, before, after, order, false, true);
         }
 
         boolean mayGo() {
             String latest = held ? documentFor("C1") : null;
-            return !held || (latest != null && !latest.endsWith(":0"));
+            return (!held || (latest != null && !latest.endsWith(":0")))
+                    && (!afterReuse || "replacement".equals(NAMES.get("C1")));
         }
 
         Envelope asEvent(long ts, String stream) {
             return (op == Op.INSERT
                     ? Envelope.insert(ts, stream, after, null)
                     : Envelope.update(ts, stream, before, after, null)).withOrder(order);
+        }
+    }
+
+    /** Delays only the departure queue. Each queue still receives the same rows in source order. */
+    private static final class DelayedDepartureSource extends AbstractProcessor {
+        private final List<Row> rows = List.of(
+                Row.insert(row("customer_id", "C1", "name", "original"), new SourceOrder(1, 1)),
+                Row.update(row("customer_id", "C1", "name", "original"),
+                        row("customer_id", "C2", "name", "original"), new SourceOrder(1, 5)).onceC1Holds(),
+                Row.insert(row("customer_id", "C1", "name", "replacement"), new SourceOrder(1, 6)));
+        private int[] next;
+        private long bound = FAR_ABOVE;
+
+        @Override
+        public boolean isCooperative() {
+            return false;
+        }
+
+        @Override
+        public boolean complete() {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5));
+            if (next == null) next = new int[getOutbox().bucketCount()];
+            for (int edge = 0; edge < next.length; edge++) {
+                while (next[edge] < rows.size()) {
+                    if (edge == 1 && next[edge] > 0 && !RELEASE_DEPARTURE.get()) {
+                        break;
+                    }
+                    Row row = rows.get(next[edge]);
+                    if (!row.mayGo() || !tryEmit(edge, row.asEvent(next[edge] + 1L, CUSTOMERS))) {
+                        return false;
+                    }
+                    next[edge]++;
+                }
+            }
+            if (next[next.length - 1] == rows.size() && tryEmit(new Watermark(bound, AXES.axisOf(CUSTOMERS)))) {
+                bound++;
+            }
+            return false;
         }
     }
 
@@ -325,6 +415,14 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
             Envelope event = (Envelope) item;
             Map<String, Object> row = event.after() != null ? event.after() : event.before();
             Object policies = row == null ? null : row.get("policies");
+            if (event.after() != null && row.get("name") instanceof String name) {
+                String customer = (String) row.get("customer_id");
+                NAMES.put(customer, name);
+                if (policies instanceof List<?> children) {
+                    POLICY_IDS.put(customer, children.stream()
+                            .map(child -> (String) ((Map<?, ?>) child).get("policy_id")).toList());
+                }
+            }
             DOCUMENTS.add(event.op() + ":" + (row == null ? null : row.get("customer_id")) + ":"
                     + (policies instanceof List<?> held ? held.size() : 0));
             return true;
