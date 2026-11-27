@@ -91,7 +91,8 @@ public final class MongoCachePipelineRunProgressStore {
                 .append("milestones", progress.milestones().stream().map(m -> item(m.stage(), m.reachedAt())).toList())
                 .append("initialLoad", load == null ? null : new Document("landed", load.landed()).append("total", load.total()))
                 .append("failedStage", progress.failedStage() == null ? null : progress.failedStage().name())
-                .append("readMode", progress.readMode() == null ? null : progress.readMode().name());
+                .append("readMode", progress.readMode() == null ? null : progress.readMode().name())
+                .append("runFailed", progress.runFailed());
     }
 
     private PipelineRunProgress decode(Document row) {
@@ -108,7 +109,7 @@ public final class MongoCachePipelineRunProgressStore {
                     milestones.stream().map(m -> new PipelineRunProgress.Milestone(stage(m), at(m))).toList(),
                     load == null ? null : new PipelineRunProgress.LoadProgress(load.getLong("landed"), load.getLong("total")),
                     failed == null ? null : PipelineRunStage.valueOf(failed),
-                    mode == null ? null : PipelineRunProgress.Mode.valueOf(mode));
+                    mode == null ? null : PipelineRunProgress.Mode.valueOf(mode), Boolean.TRUE.equals(row.getBoolean("runFailed")));
         } catch (IllegalArgumentException | ClassCastException | NullPointerException | java.time.DateTimeException unreadable) {
             throw access.unreadable("runProgress");
         }

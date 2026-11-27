@@ -453,7 +453,7 @@ class SrsSourceProcessorTest {
         String output = "out-ready-empty";
         var cdcReady = new java.util.concurrent.CompletableFuture<Long>();
         hz.getUserContext().put(ChangeStreamReadyObserver.USER_CONTEXT_KEY,
-                (ChangeStreamReadyObserver) (identity, job, execution) -> cdcReady.complete(job));
+                (ChangeStreamReadyObserver) (identity, job, execution, at) -> cdcReady.complete(job));
         Job job = hz.getJet().newJob(projectedDag(ring, "orders", output, 1024, SrsReadCursorPublisherFactory.NONE));
         var rows = hz.getList(output);
         try {
@@ -475,7 +475,7 @@ class SrsSourceProcessorTest {
         var initialModes = new CopyOnWriteArrayList<String>();
         var cdcReady = new java.util.concurrent.CompletableFuture<Long>();
         hz.getUserContext().put(ChangeStreamReadyObserver.USER_CONTEXT_KEY,
-                (ChangeStreamReadyObserver) (identity, job, execution) -> cdcReady.complete(job));
+                (ChangeStreamReadyObserver) (identity, job, execution, at) -> cdcReady.complete(job));
         hz.getUserContext().put(SourceInitialLoadObserver.USER_CONTEXT_KEY, (SourceInitialLoadObserver) (member, identity, job, execution, stream, index, mode, epoch) -> {
             assertThat(member.getCluster().getLocalMember().getUuid()).isEqualTo(hz.getCluster().getLocalMember().getUuid()); assertThat(stream).isEqualTo("orders"); assertThat(epoch).isEqualTo(1);
             assertThat(job).isNotZero(); assertThat(execution).isNotZero(); initialModes.add(mode);

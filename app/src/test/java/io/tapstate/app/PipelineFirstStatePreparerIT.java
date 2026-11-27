@@ -111,6 +111,11 @@ class PipelineFirstStatePreparerIT {
             try (var secondMember = MongoCacheDomain.connect(f.cacheConnection, Duration.ofSeconds(5), "run-progress-member-b")) {
                 var reader = secondMember.pipelineRunProgress(f.scope, null, ACTIVE);
                 assertThat(reader.latest().orElseThrow().progress().runId()).isEqualTo("first");
+                assertThat(first.update(1, seed, requireBound, PipelineRunProgress::markRunFailed)).isTrue();
+                var failed = reader.latest().orElseThrow().progress();
+                assertThat(failed.awaitingMilestones()).isFalse();
+                assertThat(failed.milestones()).extracting(PipelineRunProgress.Milestone::stage)
+                        .containsExactly(PipelineRunStage.ENGINE_RUNNING);
                 var secondClaim = claims.advanceExecution(firstClaim, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
                 var second = secondMember.pipelineRunProgress(f.scope, WorkloadClaimFence.from(secondClaim), ACTIVE);
                 assertCode(() -> first.update(1, seed, requireBound,

@@ -121,7 +121,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private boolean vouchesForSnapshot = true;
     private String initialMode = "UNPROVEN";
     private SourceInitialLoadObserver initialObserver;
-    private Runnable onChangeStreamReady;
+    private java.util.function.Predicate<java.time.Instant> onChangeStreamReady;
+    private java.time.Instant changeStreamReadyAt;
+    private long nextChangeStreamReadyNanos;
     private long observedJob, observedExecution;
     private int observedIndex;
     private boolean completedInput;
@@ -242,7 +244,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                     io.tapstate.core.lifecycle.ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT);
             long jobId = context.jobId();
             long executionId = context.executionId();
-            onChangeStreamReady = () -> changeStream.ready(identity, jobId, executionId);
+            onChangeStreamReady = at -> changeStream.ready(identity, jobId, executionId, at);
         }
         if (observer instanceof SourceInitialLoadObserver receipt) {
             try {
@@ -519,10 +521,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private void reportChangeStreamReady() {
         var report = onChangeStreamReady;
         if (report == null) return;
-        onChangeStreamReady = null;
+        long now = System.nanoTime();
+        if (changeStreamReadyAt == null) changeStreamReadyAt = java.time.Instant.now();
+        else if (now - nextChangeStreamReadyNanos < 0) return;
+        nextChangeStreamReadyNanos = now + LOOK_INTERVAL_NANOS;
         try {
-            report.run();
+            if (report.test(changeStreamReadyAt)) onChangeStreamReady = null;
         } catch (RuntimeException failedObservation) {
+            onChangeStreamReady = null;
             System.getLogger(SrsSourceProcessor.class.getName())
                     .log(System.Logger.Level.WARNING, "change-stream observation failed", failedObservation);
         }

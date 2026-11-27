@@ -19,7 +19,6 @@ import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
-import java.time.Clock;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -41,7 +40,7 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     private record BindingKey(PipelineIntentScope scope, WorkloadClaimFence claim) {}
     private record Binding(long startRevision, PipelineRunProgress.Mode mode, Instant planReady, Instant connectorsReady) {
         PipelineRunProgress applyTo(PipelineRunProgress progress) {
-            return progress.inactive().withMode(mode)
+            return progress.beginExecution(mode)
                     .reach(PipelineRunStage.EXECUTION_PLAN_PREPARED, planReady)
                     .reach(PipelineRunStage.CONNECTORS_READY, connectorsReady);
         }
@@ -54,7 +53,6 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     private final Runnable active;
     private final HazelcastInstance member;
     private final Engine engine;
-    private final Clock clock;
     private final ChangeStreamReadyObserver cdcObserver = this::cdcReady;
     private final ScheduledThreadPoolExecutor writer = new ScheduledThreadPoolExecutor(1,
             Thread.ofPlatform().daemon().name("tapstate-run-progress").factory());
@@ -65,14 +63,13 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     private boolean prepared;
 
     NativePipelineRunProgressPublisher(MongoCacheDomain cache, CacheBusinessScope scope, PipelineIntentStore intents,
-            Runnable active, HazelcastInstance member, Engine engine, Clock clock) {
+            Runnable active, HazelcastInstance member, Engine engine) {
         this.cache = cache;
         this.scope = scope;
         this.intents = intents;
         this.active = active;
         this.member = member;
         this.engine = engine;
-        this.clock = clock;
         member.getUserContext().put(ChangeStreamReadyObserver.USER_CONTEXT_KEY, cdcObserver);
         writer.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
     }
@@ -122,18 +119,20 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
                     () -> update(intent, claim, 0, Execution.REQUIRE_BOUND,
                             progress -> progress.reach(PipelineRunStage.RUN_COMPLETED, at)));
             case STOPPED, FAILED -> offer(new EventKey(intent.scope(), claim, List.of(intent.intentRevision(), observation.state())),
-                    true, 0, () -> update(intent, claim, 0, Execution.KEEP, PipelineRunProgress::inactive));
+                    true, 2, () -> update(intent, claim, 0, Execution.KEEP,
+                            observation.state() == PipelineState.FAILED ? PipelineRunProgress::markRunFailed : PipelineRunProgress::inactive));
             default -> { }
         }
     }
 
-    private void cdcReady(Object identity, long jobId, long executionId) {
-        if (!(identity instanceof ExecutionFence original) || original.scope() == null || executionId == 0) return;
+    private boolean cdcReady(Object identity, long jobId, long executionId, Instant at) {
+        if (!(identity instanceof ExecutionFence original) || original.scope() == null || executionId == 0) return true;
         var claim = new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(),
                 WorkloadClaimType.PIPELINE_ACTUATION, original.pipelineId()), new WorkloadOwner(original.ownerNodeId(), original.ownerBootId()),
                 original.claimGeneration(), original.executionGeneration(), original.topologyRevision());
-        Instant at = clock.instant();
-        offer(new EventKey(original.scope(), claim, PipelineRunStage.CDC_READY), true, 6, () -> {
+        var key = new EventKey(original.scope(), claim, PipelineRunStage.CDC_READY);
+        synchronized (recorded) { if (recorded.containsKey(key)) return true; }
+        offer(key, true, 6, () -> {
             var live = engine.captureRun(original.pipelineId()).orElse(null);
             if (live == null || live.jobId() != jobId || !original.equals(live.operatorManifest().executionIdentity())) return false;
             var intent = intents.loadForActuation(original.pipelineId()).filter(i -> i.scope().equals(original.scope())).orElse(null);
@@ -141,6 +140,7 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
             return update(intent, claim, 0, Execution.REQUIRE_BOUND,
                     progress -> progress.reach(PipelineRunStage.CDC_READY, at));
         });
+        return false;
     }
 
     private boolean update(PipelineIntentSnapshot intent, WorkloadClaimFence claim, long originalStart,

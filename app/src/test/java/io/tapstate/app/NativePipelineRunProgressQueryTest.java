@@ -49,6 +49,16 @@ class NativePipelineRunProgressQueryTest {
     }
 
     @Test
+    void aStoppedRunWithoutAProjectionDoesNotAwaitMilestones() {
+        when(intents.loadForActuation("orders")).thenReturn(Optional.of(intent(5, PipelineState.STOPPED)));
+        when(intents.executionBindings(SCOPE)).thenReturn(Optional.of(bindings(4, 5)));
+        var stopped = query.find("orders").orElseThrow();
+        assertThat(stopped.awaitingMilestones()).isFalse();
+        assertThat(stopped.progress().milestones()).extracting(PipelineRunProgress.Milestone::stage)
+                .containsExactly(PipelineRunStage.START_ACCEPTED);
+    }
+
+    @Test
     void rejectsAConcurrentReplacementAndUsesItsOwnStartRevisionOnceTheReadAgrees() {
         when(intents.loadForActuation("orders")).thenReturn(Optional.of(intent(4, PipelineState.RUNNING)));
         when(intents.executionBindings(SCOPE)).thenReturn(Optional.of(bindings(4, 4)));

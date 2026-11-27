@@ -55,6 +55,7 @@ final class NativePipelineRunProgressQuery implements PipelineRunProgressQuery {
             }
             long start = startRevision(current);
             if (start > current.intentRevision()) return Optional.empty();
+            boolean stopping = intent.desired().targetState() == PipelineState.STOPPED;
             if (cache != null) {
                 // CONFIG and CACHE are independent. The second CONFIG read must still name the
                 // same committed Start (and valid state generation) before exposing the CACHE row.
@@ -66,15 +67,14 @@ final class NativePipelineRunProgressQuery implements PipelineRunProgressQuery {
                             : saved.startRevision() >= start && saved.startRevision() <= current.intentRevision();
                     if (acceptedStart) {
                         var progress = saved.progress();
-                        boolean stopping = intent.desired().targetState() == PipelineState.STOPPED;
                         if (!stopping) return Optional.of(new Read(progress, progress.awaitingMilestones()));
                         return Optional.of(new Read(new PipelineRunProgress(progress.runId(), progress.version(),
                                 List.of(), progress.milestones(), progress.initialLoad(), progress.failedStage(),
-                                progress.readMode()), false));
+                                progress.readMode(), progress.runFailed()), false));
                     }
                 }
             }
-            return start < 1 ? Optional.empty() : Optional.of(new Read(accepted(intent.scope(), start, null, 3), true));
+            return start < 1 ? Optional.empty() : Optional.of(new Read(accepted(intent.scope(), start, null, 3), !stopping));
         } catch (TapstateException unavailable) {
             if (unavailable.code() == IoError.PIPELINE_INTENT_FENCED
                     || unavailable.code() == IoError.STORE_UNAVAILABLE) return Optional.empty();

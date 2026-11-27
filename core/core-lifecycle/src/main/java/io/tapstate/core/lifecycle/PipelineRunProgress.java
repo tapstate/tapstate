@@ -13,7 +13,8 @@ public record PipelineRunProgress(
         List<Milestone> milestones,
         LoadProgress initialLoad,
         PipelineRunStage failedStage,
-        Mode readMode) {
+        Mode readMode,
+        boolean runFailed) {
 
     public record Activity(PipelineRunStage stage, Instant since) {}
     public record Milestone(PipelineRunStage stage, Instant reachedAt) {}
@@ -26,7 +27,7 @@ public record PipelineRunProgress(
 
     public PipelineRunProgress(String runId, long version, List<Activity> active, List<Milestone> milestones,
             LoadProgress initialLoad, PipelineRunStage failedStage) {
-        this(runId, version, active, milestones, initialLoad, failedStage, null);
+        this(runId, version, active, milestones, initialLoad, failedStage, null, false);
     }
 
     public PipelineRunProgress {
@@ -42,12 +43,13 @@ public record PipelineRunProgress(
 
     public PipelineRunProgress enter(PipelineRunStage stage, Instant since) {
         Objects.requireNonNull(since, "since");
+        if (runFailed) return this;
         var next = new ArrayList<>(active);
         var current = next.stream().filter(activity -> activity.stage() == stage).findFirst().orElse(null);
         if (current != null && current.since() != null && !since.isAfter(current.since())) return this;
         if (current != null) next.remove(current);
         next.add(new Activity(stage, since));
-        return new PipelineRunProgress(runId, version + 1, next, milestones, initialLoad, null, readMode);
+        return new PipelineRunProgress(runId, version + 1, next, milestones, initialLoad, null, readMode, false);
     }
 
     /** An exit with a start time can only close that specific occurrence of the activity. */
@@ -57,7 +59,7 @@ public record PipelineRunProgress(
                 .toList();
         if (active.equals(next)) return this;
         return new PipelineRunProgress(runId, version + 1, next, milestones, initialLoad,
-                failed ? stage : failedStage, readMode);
+                failed ? stage : failedStage, readMode, runFailed);
     }
 
     public PipelineRunProgress reach(PipelineRunStage stage, Instant at) {
@@ -72,7 +74,7 @@ public record PipelineRunProgress(
             default -> active;
         };
         if (remaining.equals(active) && next.equals(milestones)) return this;
-        return new PipelineRunProgress(runId, version + 1, remaining, next, initialLoad, failedStage, readMode);
+        return new PipelineRunProgress(runId, version + 1, remaining, next, initialLoad, failedStage, readMode, runFailed);
     }
 
     /** Accept only an already-proved snapshot of this execution's required destination confirmations. */
@@ -86,7 +88,7 @@ public record PipelineRunProgress(
             return this;
         }
         var withCounts = counts.equals(initialLoad) ? this
-                : new PipelineRunProgress(runId, version + 1, active, milestones, counts, failedStage, readMode);
+                : new PipelineRunProgress(runId, version + 1, active, milestones, counts, failedStage, readMode, runFailed);
         if (counts.landed() == counts.total()) {
             return withCounts.reach(PipelineRunStage.INITIAL_LOAD_COMPLETED, observedAt);
         }
@@ -94,19 +96,24 @@ public record PipelineRunProgress(
                 ? withCounts.enter(PipelineRunStage.INITIAL_LOAD_IN_PROGRESS, observedAt) : withCounts;
     }
 
-    public PipelineRunProgress withMode(Mode mode) {
-        return readMode == mode ? this
-                : new PipelineRunProgress(runId, version + 1, active, milestones, initialLoad, failedStage, mode);
+    public PipelineRunProgress beginExecution(Mode mode) {
+        return readMode == mode && active.isEmpty() && failedStage == null && !runFailed ? this
+                : new PipelineRunProgress(runId, version + 1, List.of(), milestones, initialLoad, null, mode, false);
     }
 
     public PipelineRunProgress inactive() {
         return active.isEmpty() ? this
-                : new PipelineRunProgress(runId, version + 1, List.of(), milestones, initialLoad, failedStage, readMode);
+                : new PipelineRunProgress(runId, version + 1, List.of(), milestones, initialLoad, failedStage, readMode, runFailed);
+    }
+
+    public PipelineRunProgress markRunFailed() {
+        return runFailed ? this
+                : new PipelineRunProgress(runId, version + 1, List.of(), milestones, initialLoad, failedStage, readMode, true);
     }
 
     public boolean awaitingMilestones() {
         var reached = milestones.stream().map(Milestone::stage).collect(java.util.stream.Collectors.toSet());
-        return failedStage == null && !reached.contains(PipelineRunStage.RUN_COMPLETED)
+        return !runFailed && failedStage == null && !reached.contains(PipelineRunStage.RUN_COMPLETED)
                 && (!reached.contains(PipelineRunStage.ENGINE_RUNNING)
                 || readMode != Mode.CDC_ONLY && !reached.contains(PipelineRunStage.INITIAL_LOAD_COMPLETED)
                 || readMode != Mode.SNAPSHOT_ONLY && !reached.contains(PipelineRunStage.CDC_READY));

@@ -974,9 +974,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.configuration.intents(), owner.configuration.preparations(), owner.active::get, owner.original.cache());
         }
         @Bean(destroyMethod = "close") NativePipelineRunProgressPublisher pipelineRunProgressPublisher(
-                NativeBusinessContext owner, HazelcastInstance member, Engine engine, Clock clock) {
+                NativeBusinessContext owner, HazelcastInstance member, Engine engine) {
             return new NativePipelineRunProgressPublisher(owner.original.cache(), owner.original.preparation().businessScope(),
-                    owner.configuration.intents(), owner.memberStorage::requireNode, member, engine, clock);
+                    owner.configuration.intents(), owner.memberStorage::requireNode, member, engine);
         }
         @Bean(initMethod = "start", destroyMethod = "")
         RetiredPipelinePayloadCleanup retiredPipelinePayloadCleanup(NativeBusinessContext owner, NodeSessionLease node) {

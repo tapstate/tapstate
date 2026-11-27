@@ -30,9 +30,8 @@ import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
-import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,12 +39,16 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class NativePipelineRunProgressPublisherTest {
-    @Test
-    void oneCdcNotificationSurvivesATemporaryStoreFailure() throws Exception {
+    @ParameterizedTest
+    @ValueSource(ints = {1, 7})
+    void cdcReadinessSurvivesTemporaryStoreFailures(int failures) throws Exception {
         var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
         var intent = new PipelineIntentSnapshot(scope, 4, new DesiredState("orders", PipelineState.RUNNING, "a".repeat(64)));
         var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
@@ -67,9 +70,12 @@ class NativePipelineRunProgressPublisherTest {
         var member = mock(HazelcastInstance.class);
         when(member.getUserContext()).thenReturn(context);
         var written = new CompletableFuture<PipelineRunProgress>();
+        var remainingFailures = new AtomicInteger(failures);
         when(store.update(eq(4L), any(), eq(Execution.REQUIRE_BOUND), any()))
-                .thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of(), null))
                 .thenAnswer(call -> {
+                    if (remainingFailures.getAndDecrement() > 0) {
+                        throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of(), null);
+                    }
                     UnaryOperator<PipelineRunProgress> change = call.getArgument(3);
                     written.complete(change.apply(call.getArgument(1)));
                     return true;
@@ -77,12 +83,16 @@ class NativePipelineRunProgressPublisherTest {
         Instant ready = Instant.parse("2026-11-26T10:00:00Z");
         var business = new CacheBusinessScope("cluster", 1, "cache");
         try (var publisher = new NativePipelineRunProgressPublisher(cache, business, intents, () -> {},
-                member, engine, Clock.fixed(ready, ZoneOffset.UTC))) {
+                member, engine)) {
             var observer = (ChangeStreamReadyObserver) context.get(ChangeStreamReadyObserver.USER_CONTEXT_KEY);
-            observer.ready(original, 23, 29);
+            assertThat(observer.ready(original, 23, 29, ready)).isFalse();
+            if (failures > 1) {
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(8))
+                        .until(() -> observer.ready(original, 23, 29, ready));
+            }
             assertThat(written.get(5, TimeUnit.SECONDS).milestones())
                     .contains(new PipelineRunProgress.Milestone(PipelineRunStage.CDC_READY, ready));
-            verify(engine, times(2)).captureRun("orders");
+            verify(engine, times(failures + 1)).captureRun("orders");
         }
     }
 
@@ -117,7 +127,7 @@ class NativePipelineRunProgressPublisherTest {
         Instant ready = prepared.plusSeconds(1);
         Instant running = ready.plusSeconds(1);
         try (var publisher = new NativePipelineRunProgressPublisher(cache, business, intents, () -> {},
-                member, mock(Engine.class), Clock.systemUTC())) {
+                member, mock(Engine.class))) {
             publisher.bind(intent, claim, 4, PipelineRunProgress.Mode.SNAPSHOT_ONLY, prepared, ready);
             assertThat(firstWrite.await(5, TimeUnit.SECONDS)).isTrue();
             publisher.publish(new PipelineRunProgressEvents.Event(intent, claim, PipelineRunStage.ENGINE_RUNNING,
