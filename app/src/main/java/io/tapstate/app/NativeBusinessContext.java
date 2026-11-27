@@ -45,8 +45,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private ThreeLayerStorePort port;
     private NativeMemberStorage memberStorage;
     private RetiredPipelinePayloadCleanup payloadCleanup;
+    private ManagedStorageInspection storageInspection;
     private final java.util.concurrent.atomic.AtomicReference<PipelineAlertRuntime> alertRuntime = new java.util.concurrent.atomic.AtomicReference<>();
     private final ShutdownAwait shutdown = new ShutdownAwait();
+    private ShutdownOwners shutdownOwners;
+    private final java.util.concurrent.atomic.AtomicReference<MemberStop> memberStop = new java.util.concurrent.atomic.AtomicReference<>();
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicReference<Thread> initialTestCaller = new java.util.concurrent.atomic.AtomicReference<>();
@@ -71,7 +74,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context.getDefaultListableBeanFactory();
         beans.setConversionService(org.springframework.boot.convert.ApplicationConversionService.getSharedInstance());
         beans.registerSingleton("nativeBusinessContext", this);
-        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline, true);
+        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::prepareStartIntent, true);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         var diagnosticCandidate = parent.getBeanProvider(IsolatedConnectionDiagnostics.class).getIfAvailable();
@@ -131,7 +134,40 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         AnnotationAwareOrderComparator.sort(ordered); handlers = List.copyOf(ordered);
         original.requireBusiness(); active.set(true);
         context.getBean(NativeValidationScheduler.class).start();
+        startStorageInspection();
+    }
 
+    private void startStorageInspection() {
+        var member = context.getBean(HazelcastInstance.class);
+        var membership = context.getBean(ClusterMembershipGate.class);
+        var auth = original.preparation().authScope();
+        var setup = original.binding().setup();
+        var resource = new io.tapstate.core.alerting.AlarmKey.Resource("cluster", setup.clusterId(), setup.installationId());
+        var cache = original.cache();
+        storageInspection = new ManagedStorageInspection(context.getBean(Clock.class),
+                () -> inspectionOwner(member, membership),
+                List.of(new ManagedStorageInspection.Domain(io.tapstate.adapters.mongostore.SystemCollections.Database.CONFIG,
+                                configuration::inspectStructure),
+                        new ManagedStorageInspection.Domain(io.tapstate.adapters.mongostore.SystemCollections.Database.CACHE,
+                                budget -> cache.inspectStructure(auth, budget))),
+                observation -> alertRuntime.get().structureInspection(resource, this::requireAlertHost, observation.observedAt(),
+                        observation.domain(), observation.differences(), observation.complete()));
+        storageInspection.start();
+    }
+
+    private boolean inspectionOwner(HazelcastInstance member, ClusterMembershipGate membership) {
+        try {
+            if (!active.get() || !member.getLifecycleService().isRunning() || !membership.businessEligible()) return false;
+            var committed = membership.committed();
+            if (committed == null) return false;
+            var local = context.getBean(NodeSessionLease.class).currentFence();
+            var members = ClusterMembershipGate.dataMembersIfReadable(member);
+            return members.stream().filter(committed.activeNodeIds()::contains).findFirst()
+                    .filter(id -> local.filter(fence -> fence.owner().nodeId().equals(id)).isPresent()).isPresent();
+        } catch (RuntimeException changing) {
+            if (!HazelcastLivePipelineRuns.theClusterIsChanging(changing)) throw changing;
+            return false;
+        }
     }
 
     @Override public void afterInitialReady() {
@@ -170,6 +206,19 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         return runtime instanceof PipelineAlertRuntime alerts?Optional.of(alerts.health()):Optional.empty();
     }
 
+    /** A local preparation hint never grants storage or Jet submission authority. */
+    static boolean localCapturePreparationLease(boolean cloud, ClusterProperties.Profile profile,
+            HazelcastProperties.DiscoveryMode discovery, StorageBinding.Mode mode, HazelcastInstance member,
+            ClusterMembershipGate membership, PipelineActuationOwnership ownership, ExecutionFence original) {
+        if (cloud || profile != ClusterProperties.Profile.SINGLE || discovery != HazelcastProperties.DiscoveryMode.NONE
+                || mode != StorageBinding.Mode.OP || original == null || original.scope() == null || original.executionGeneration() < 1) return false;
+        var expected = new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, original.pipelineId()),
+                new WorkloadOwner(original.ownerNodeId(), original.ownerBootId()), original.claimGeneration(), original.executionGeneration(), original.topologyRevision());
+        return NativeStoppedTerminalRecheck.localEvidence(member, membership, expected)
+                && original.ownerBootId().equals(member.getCluster().getLocalMember().getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE))
+                && ownership.hasLocalWriterLease(original);
+    }
+
     private void preparePipeline(PipelineIntentScope scope) {
         original.requireBusiness();
         var snapshot = ReadOnlyArtifactSnapshot.capture(context.getBean(ArtifactStore.class));
@@ -185,6 +234,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private void preparePipeline(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
         original.requireBusiness();
         context.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
+    }
+    private void prepareStartIntent(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
+        original.requireBusiness();
+        context.getBean(PipelineFirstStatePreparer.class).prepareForStartIntent(scope, inputs);
     }
     private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership) {
         return modelCommand(pipeline, ownership, false);
@@ -270,9 +323,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         return available() ? context.getBean(DefaultSourceVerification.class).snapshot()
                 : DefaultSourceVerification.Verification.unknown();
     }
-    private boolean recoveryPinned(PipelineIntentScope scope) {
-        original.requireBusiness();return configuration.cacheRecoveries().read(scope.pipelineId()).filter(value -> value.targetScope().equals(scope)).isPresent();
+    private boolean captureRecoveryPinned(PipelineIntentScope scope) {
+        original.requireBusiness();
+        return configuration.cacheRecoveries().readForCaptureStartup(scope.pipelineId())
+                .filter(value -> value.targetScope().equals(scope)).isPresent();
     }
+
     @Override public HandlerExecutionChain handlerFor(HttpServletRequest request) throws Exception {
         if (!active.get()) return null;
         for (var mapping : handlers) {
@@ -280,49 +336,142 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         return null;
     }
-    @Override public void beforeOrderlyClose() {
-        if(!active.get() || context==null)return;
-        Object source=context.getBeanFactory().getSingleton("clusterNodeAlertSource");
-        if(source instanceof ClusterNodeAlertSource nodes)nodes.orderlyShutdown();
-    }
     @Override public void close() { close(ShutdownAwait.deadline()); }
     void close(long deadline) {
         shutdown.complete(deadline, () -> closeOwned(deadline));
     }
     private void closeOwned(long deadline) {
         active.set(false); handlers = List.of();
-        Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
-        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
-        var beans = context == null ? null : context.getBeanFactory();
-        var periodic = beans == null ? null : (PeriodicObservations) beans.getSingleton("periodicObservations");
-        var convergence = beans == null ? null : (PipelineConvergences) beans.getSingleton("pipelineConvergences");
-        var observationWrites = beans == null ? null : (ProcessObservationWriter) beans.getSingleton("processObservationWriter");
-        if (convergence != null) convergence.close();
-        if (periodic != null) periodic.close();
-        var alerts = alertRuntime.get();
-        if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
-        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
-        if (convergence != null) convergence.awaitStopped(deadline);
-        if (periodic != null) periodic.awaitStopped(deadline);
-        if (observationWrites != null) observationWrites.close();
-        var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
-        Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
-        Throwable failure = null;
-        try { if (payloadCleanup != null) { payloadCleanup.close(); payloadCleanup = null; } }
-        catch (RuntimeException | Error cleanup) { failure = cleanup; }
-        try { if (memberStorage != null) memberStorage.close(); } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+        boolean retrying = shutdownOwners != null;
+        var owners = shutdownOwners;
+        if (owners == null) {
+            owners = ShutdownOwners.capture(context);
+            // Spring removes its singletons on close. Retain them until cleanup has succeeded.
+            if (context != null) shutdownOwners = owners;
         }
-        try { if (context != null) context.close(); } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
-        }
+
+        boolean drained = false;
         try {
-            if (member instanceof HazelcastInstance actual && actual.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
-        } catch (RuntimeException | Error cleanup) {
-            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+            var retained = owners;
+            ShutdownAwait.stage("business worker drain", () -> drainWorkers(retained, deadline));
+            drained = true;
+        } finally {
+            if (!drained) stopMemberAfterFailedClose(owners);
         }
-        if (failure instanceof Error error) throw error;
-        if (failure instanceof RuntimeException error) throw error;
+
+        if (memberStop.get() != null) {
+            var stopping = startMemberStop(owners);
+            ShutdownAwait.future(stopping.result(), Math.min(deadline, stopping.deadline()));
+        }
+        closeWorkerResources(owners.member(), retrying);
+        shutdownOwners = null;
+    }
+
+    void stopMemberAfterFailedClose() {
+        stopMemberAfterFailedClose(ShutdownOwners.capture(context));
+    }
+
+    private void stopMemberAfterFailedClose(ShutdownOwners owners) {
+        if (owners.member() == null) return;
+        try {
+            var stop = startMemberStop(owners);
+            ShutdownAwait.future(stop.result().handle((ignored, failure) -> null), stop.deadline());
+        } catch (RuntimeException failed) {
+            // The fallback must never replace the worker failure or close resources used by live workers.
+            org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).warn("Member stop during failed shutdown did not complete", failed);
+        }
+    }
+
+    private MemberStop startMemberStop(ShutdownOwners owners) {
+        var stop = memberStop.updateAndGet(previous ->
+                previous == null || previous.result().isCompletedExceptionally() ? new MemberStop() : previous);
+        stop.start(owners);
+        return stop;
+    }
+
+    private record MemberStop(java.util.concurrent.CompletableFuture<Void> result, AtomicBoolean started, long deadline) {
+        MemberStop() {
+            this(new java.util.concurrent.CompletableFuture<>(), new AtomicBoolean(),
+                    System.nanoTime() + Duration.ofSeconds(7).toNanos());
+        }
+
+        void start(ShutdownOwners owners) {
+            if (started.compareAndSet(false, true)) {
+                result.completeAsync(() -> {
+                    ShutdownAwait.stage("member and node-session close", () -> stopMember(owners.member(), owners.lease()));
+                    return null;
+                }, Thread::startVirtualThread);
+            }
+        }
+    }
+
+    private void drainWorkers(ShutdownOwners owners, long deadline) {
+        var pipelines = owners.pipelines();
+        var periodic = owners.periodic();
+        var convergence = owners.convergence();
+        var observationWrites = owners.observationWrites();
+        var alerts = alertRuntime.get();
+        var initial = initialTestCaller.get();
+        var drain = new ArrayList<Runnable>();
+        var driver = owners.driver();
+        if (driver != null) drain.add(driver::stopForShutdown);
+        if (pipelines != null) drain.add(pipelines::stopForShutdown);
+        if (convergence != null) drain.add(convergence::close);
+        if (periodic != null) drain.add(periodic::close);
+        if (storageInspection != null) {
+            drain.add(storageInspection::close);
+            drain.add(() -> storageInspection.awaitStopped(deadline));
+        }
+        if (alerts != null) {
+            drain.add(alerts::close);
+            drain.add(() -> alerts.awaitStopped(deadline));
+        }
+        if (driver != null) drain.add(() -> driver.awaitStopped(deadline));
+        if (pipelines != null) drain.add(() -> pipelines.awaitStopped(deadline));
+        if (convergence != null) drain.add(() -> convergence.awaitStopped(deadline));
+        if (periodic != null) drain.add(() -> periodic.awaitStopped(deadline));
+        if (observationWrites != null) drain.add(observationWrites::close);
+        if (initial != null) drain.add(initial::interrupt);
+        ShutdownAwait.all(drain);
+    }
+
+    private void closeWorkerResources(HazelcastInstance member, boolean retrying) {
+        var cleanup = new ArrayList<Runnable>();
+        if (payloadCleanup != null) cleanup.add(() -> { payloadCleanup.close(); payloadCleanup = null; });
+        if (memberStorage != null) cleanup.add(memberStorage::close);
+        if (context != null) cleanup.add(context::close);
+        if (member != null) cleanup.add(() -> {
+            if (retrying) stopMember(member, null);
+            else requireStopped(member);
+        });
+        ShutdownAwait.all(cleanup);
+    }
+
+    private static void stopMember(HazelcastInstance member, NodeSessionLease lease) {
+        if (lease != null) lease.close();
+        if (member.getLifecycleService().isRunning()) member.shutdown();
+        requireStopped(member);
+    }
+
+    private static void requireStopped(HazelcastInstance member) {
+        if (member.getLifecycleService().isRunning()) throw StorageRuntime.unavailable();
+    }
+
+    private record ShutdownOwners(PipelineActuationOwnership pipelines, PeriodicObservations periodic,
+            PipelineConvergences convergence, ProcessObservationWriter observationWrites, HazelcastInstance member,
+            NodeSessionLease lease, ConvergenceDriver driver) {
+        static ShutdownOwners capture(GenericApplicationContext context) {
+            if (context == null) return new ShutdownOwners(null, null, null, null, null, null, null);
+            var beans = context.getBeanFactory();
+            return new ShutdownOwners(
+                    (PipelineActuationOwnership) beans.getSingleton("pipelineActuationOwnership"),
+                    (PeriodicObservations) beans.getSingleton("periodicObservations"),
+                    (PipelineConvergences) beans.getSingleton("pipelineConvergences"),
+                    (ProcessObservationWriter) beans.getSingleton("processObservationWriter"),
+                    (HazelcastInstance) beans.getSingleton("hazelcastMember"),
+                    (NodeSessionLease) beans.getSingleton("nodeSessionLease"),
+                    (ConvergenceDriver) beans.getSingleton("convergenceDriver"));
+        }
     }
 
     static final class ChildOnly implements Condition {
@@ -361,8 +510,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 if(observer instanceof BuiltinResourceSignals signals)signals.cacheOperation(write,failure);
             });
         }
-        @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims, SrsStores sources) {
-            owner.memberStorage = new NativeMemberStorage(owner.original, owner.configuration, cluster, claims, sources);
+        @Bean ClusterProperties.WorkloadLeases workloadLeases(NativeBusinessContext owner, ClusterProperties cluster,
+                CloudRuntimeSettings cloud) {
+            return cluster.workloadLeases(cloud.cloud(), owner.original.binding().mode() == StorageBinding.Mode.OP);
+        }
+        @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims,
+                SrsStores sources, ClusterProperties.WorkloadLeases leases) {
+            owner.memberStorage = new NativeMemberStorage(owner.original, owner.configuration, cluster, claims, sources, leases);
             return owner.memberStorage;
         }
         @Bean ClusterMembershipStore clusterMembershipStore(NativeBusinessContext owner) {
@@ -471,27 +625,32 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean PipelineActuationOwnership pipelineActuationOwnership(HazelcastInstance member,
                 NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims,
-                CloudRuntimeSettings cloud) {
+                CloudRuntimeSettings cloud, ClusterProperties.WorkloadLeases leases) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
-            if (cluster.explicitSingle()) {
+            if (leases == ClusterProperties.WorkloadLeases.NODE_BACKED) {
                 return PipelineActuationOwnership.nodeBacked(owner.original.preparation().businessScope(),
                         WorkloadClaimFence.from(node), membership, claims, cluster.pipelineClaimTtl(cloud.cloud()),
                         cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
             }
-            return PipelineActuationOwnership.scoped(owner.original.preparation().businessScope(), node.owner(), membership, claims,
+            var ownership = PipelineActuationOwnership.scoped(owner.original.preparation().businessScope(), node.owner(), membership, claims,
                     cluster.pipelineClaimTtl(cloud.cloud()), cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
+            if (!cloud.cloud() && cluster.getProfile() == ClusterProperties.Profile.SINGLE) {
+                owner.memberStorage.authorization().useLocalWriterLease(ownership::hasLocalWriterLease);
+            }
+            return ownership;
         }
         @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster,
-                CloudRuntimeSettings cloud) {
-            return cluster.explicitSingle() ? ActuationClaimRenewer.inactive()
+                CloudRuntimeSettings cloud, ClusterProperties.WorkloadLeases leases) {
+            return leases == ClusterProperties.WorkloadLeases.NODE_BACKED ? ActuationClaimRenewer.inactive()
                     : new ActuationClaimRenewer(ownership, cluster.pipelineClaimRenewInterval(cloud.cloud()));
         }
         @Bean CaptureOwnership captureOwnership(HazelcastInstance member, ClusterProperties cluster,
-                ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
+                ClusterMembershipGate membership, ClusterWorkloadClaims claims, ClusterProperties.WorkloadLeases leases) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
-            return new CaptureOwnership(node.key().clusterId(), node.owner(), membership, claims, cluster.getWorkloadClaimTtl());
+            return new CaptureOwnership(node.key().clusterId(), node.owner(), membership, claims, cluster.getWorkloadClaimTtl(),
+                    leases == ClusterProperties.WorkloadLeases.NODE_BACKED ? WorkloadClaimFence.from(node) : null);
         }
         @Bean PipelineFirstStatePreparer pipelineFirstStatePreparer(NativeBusinessContext owner, NodeSessionLease node,
                 ClusterProperties cluster, Clock clock) {
@@ -515,7 +674,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean PipelineConnectorExecutions pipelineConnectorExecutions(NativeBusinessContext owner,
                 ConnectorProvisioner connectors) {
             return new PipelineConnectorExecutions(owner.configuration.intents(), owner.configuration.capturePreparations(),
-                    owner.configuration.requiredNotes(), owner.memberStorage.sourceViews(), connectors, owner::recoveryPinned);
+                    owner.configuration.requiredNotes(), owner.memberStorage.sourceViews(), connectors, owner::captureRecoveryPinned);
         }
         @Bean(destroyMethod = "close") PipelineCaptureCoordinator pipelineCaptureCoordinator(NativeBusinessContext owner,
                 NodeSessionLease node, ExecutionAuthorization authorization, CaptureOwnership ownership, ClusterProperties cluster,
@@ -524,10 +683,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var scope = owner.original.preparation().businessScope();
             return new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(scope, owner.original.cache(),
                     owner.memberStorage.sourceViews(), owner.configuration.capturePreparations(),
-                    owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads,
+                    owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::captureRecoveryPinned,boundedLoads,
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding, signals::source)
+                    .withSharedStartupSourceIdentities(owner.configuration::retainedCaptureSourceBinding)
                     .withConnectorExecutions(connectorExecutions)
                     .withReadRetries(new RetryPolicies(owner.configuration.retrySettings())::policy);
         }
@@ -559,7 +719,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery, ValidationPipelineInitials initialLoads, PipelineConnectorExecutions connectorExecutions) {
             return StoreBackedDagSource.scopedRoot(owner.port, nests, StoreReachability.probing(tester, Duration.ofSeconds(10)),
                     SourcePlacement.on(member.getCluster().getLocalMember().getAddress()), cloud.cloud(),
-                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery.capturedStartGuard()).observedInitialLoads(initialLoads::decorate).withConnectorExecutions(connectorExecutions);
+                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::captureRecoveryPinned,boundedLoads::forRun,recovery.capturedStartGuard()).observedInitialLoads(initialLoads::decorate).withRuntimeBindings(connectorExecutions, owner.original.binding().defaultSourceId());
         }
         @Bean(destroyMethod = "close") BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(StorePort store, ConnectorProvisioner connectors,
                 HazelcastInstance member, NestSettings nests, Clock clock) {
@@ -629,40 +789,33 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new BuiltinResourceSignals(runtime::getObject,owner.original::binding,owner.original.preparation().authScope(),
                     owner::requireAlertHost,clock,diagnostics);
         }
-        @Bean(destroyMethod="close") ClusterNodeAlertSource clusterNodeAlertSource(NativeBusinessContext owner,HazelcastInstance member,
-                ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
-                NodeSessionLease node,CloudRuntimeSettings cloud){
-            ScopedSinkStateProvider.of(member).observeOperations((run,config,slot,guard,local)->{
-                var source=owner.configuration.artifacts().sourceBinding(owner.original.binding().defaultSourceId());
-                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
-                        source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
-                        source.map(value->value.source().config().equals(config.settings())).orElse(false),
-                        source.map(value->run.source()!=null && run.source().matches(value)).orElse(false));
-                return source.filter(s->s.source().connector().equals(config.connectorId())&&s.source().config().equals(config.settings()))
-                        .filter(s->run.source()!=null && run.source().matches(s))
-                        .map(s->signals.source(s,"target:"+run.original().pipelineId()+":"+run.original().scope().stateGeneration()+":"+run.node().nodeId()+":"+run.purpose()+":"+run.original().topologyRevision()+":"+slot,
-                                guard,slot.equals("assessment")?()->{
-                                    owner.memberStorage.requireNode();owner.context.getBean(ExecutionAuthorization.class).requireLocal(run.original());
-                                }:local)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+        @Bean ScopedSinkStateProvider scopedSinkResourceAlerts(NativeBusinessContext owner, HazelcastInstance member,
+                PipelineAlertRuntime runtime, BuiltinResourceSignals signals) {
+            var provider = ScopedSinkStateProvider.of(member);
+            provider.observeOperations((run,config,slot,guard,local,startup)->{
+                if (run.source() == null) return io.tapstate.spi.capture.SourceOperationObserver.NONE;
+                var dependency = runtime.pipelineGuard(run.original(), guard);
+                boolean transferred = false;
+                try {
+                    String sourceId = owner.original.binding().defaultSourceId();
+                    var source = startup.monitoredSource(() -> owner.configuration.sourceBindingForSinkStartup(sourceId));
+                    org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
+                            source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
+                            source.map(value->value.source().config().equals(config.settings())).orElse(false),
+                            source.map(value->run.source()!=null && run.source().matches(value)).orElse(false));
+                    var observer = source.filter(s->s.source().connector().equals(config.connectorId())&&s.source().config().equals(config.settings()))
+                            .filter(s->run.source()!=null && run.source().matches(s))
+                            .map(s->signals.source(s,"target:"+run.original().pipelineId()+":"+run.original().scope().stateGeneration()+":"+run.node().nodeId()+":"+run.purpose()+":"+run.original().topologyRevision()+":"+slot,
+                                    dependency,slot.equals("assessment")?()->{
+                                        owner.memberStorage.requireNode();owner.context.getBean(ExecutionAuthorization.class).requireLocal(run.original());
+                                    }:local)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+                    transferred = observer != io.tapstate.spi.capture.SourceOperationObserver.NONE;
+                    return observer;
+                } finally {
+                    if (!transferred) dependency.close();
+                }
             });
-            java.util.function.Supplier<AlertNodeLifecycleStore.Registration> registration=()->{
-                owner.memberStorage.requireNode();var committed=membership.committed();
-                if(committed==null || !membership.businessEligible())throw ThreeLayerStorePort.refused();
-                var fence=node.currentFence().orElseThrow(ThreeLayerStorePort::refused);
-                return new AlertNodeLifecycleStore.Registration(new AlertNodeLifecycleStore.Key(alertScope(owner,cloud),fence.owner().nodeId(),fence.owner().bootId()),
-                        owner.original.binding().setup(),owner.original.preparation().authScope(),fence,
-                        member.getCluster().getLocalMember().getUuid().toString(),committed.revision());
-            };
-            var source=new ClusterNodeAlertSource(member,membership,runtime,signals,owner.memberStorage::requireNode,clock,
-                    ()->owner.configuration.alertNodeLifecycles(alertScope(owner,cloud),owner.original.binding().setup(),owner.memberStorage::requireNode),
-                    registration,original->()->{
-                        owner.memberStorage.requireNode();
-                        if(!node.currentFence().filter(original.session()::equals).isPresent()
-                                || !member.getCluster().getLocalMember().getUuid().toString().equals(original.memberId())
-                                || !original.setup().equals(owner.original.binding().setup())
-                                || !original.cache().equals(owner.original.preparation().authScope()))throw ThreeLayerStorePort.refused();
-                    });
-            runtime.observerTick(source::tick);return source;
+            return provider;
         }
         private static io.tapstate.core.alerting.AlarmKey.Scope alertScope(NativeBusinessContext owner,CloudRuntimeSettings cloud) {
             var setup=owner.original.binding().setup();
@@ -739,14 +892,26 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new PipelineConvergences();
         }
 
-        @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
+        @Bean(destroyMethod = "close") ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
-                HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
+                HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster, HazelcastProperties hz,
                 ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
-                ClusterNodeAlertSource resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
-                PipelineConvergences pipelineConvergences, PipelineConnectorExecutions connectorExecutions) {
+                ScopedSinkStateProvider resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
+                PipelineConvergences pipelineConvergences, CloudRuntimeSettings cloud, PipelineConnectorExecutions connectorExecutions) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
+            HazelcastOperatorReadiness.bindTerminalRead(member,
+                    original -> !actuator.hasPendingSubmission(original.pipelineId()), owner.memberStorage::requireNode);
+            var nativeRecheck = new NativeStoppedTerminalRecheck(owner.configuration, owner.original.cache(), engine,
+                    plans, operators, owner.memberStorage::requireNode);
+            // Completion receipts belong to this process. A peer may still own asynchronous reporting.
+            StoppedTerminalRecheck stopped = cluster.getProfile() != ClusterProperties.Profile.SINGLE
+                    || hz.getDiscovery().getMode() != HazelcastProperties.DiscoveryMode.NONE ? null :
+                    (intent, checkpoint, original, tenure) -> {
+                        if (!NativeStoppedTerminalRecheck.localEvidence(member, membership, original)
+                                || !nativeRecheck.unchanged(intent, checkpoint, original, tenure)) return false;
+                        return NativeStoppedTerminalRecheck.localEvidence(member, membership, original);
+                    };
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
             if (!(captures instanceof ScopedPipelineCaptureCoordinator scopedCaptures)) throw ThreeLayerStorePort.refused();
@@ -766,7 +931,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var ports = new ScopedEngineLifecycleActuator.Ports(operators::prepare, operators::releaseHot,
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();
-                    }), connectorExecutions);
+                    }), original -> localCapturePreparationLease(cloud.cloud(), cluster.getProfile(), hz.getDiscovery().getMode(), owner.original.binding().mode(),
+                            member, membership, ownership, original), connectorExecutions);
             var observationSampling = new NativeObservationSampling(owner.configuration, owner.original.cache(), scopedCaptures,
                     pipeline -> engine.captureRun(pipeline).map(run -> {
                         if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();
@@ -792,7 +958,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    }), observationSampling, observationWrites), periodicObservations, pipelineConvergences);
+                                    }), observationSampling, observationWrites, stopped), periodicObservations, pipelineConvergences);
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {

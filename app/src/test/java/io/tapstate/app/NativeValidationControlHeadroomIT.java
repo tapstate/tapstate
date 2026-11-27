@@ -2,12 +2,13 @@ package io.tapstate.app;
 
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.*;
-import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
+import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.core.model.*;
 import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
@@ -49,7 +50,10 @@ class NativeValidationControlHeadroomIT {
                     "--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),"--tapstate.connectors.plugins-dir="+work.resolve("plugins"),
                     "--tapstate.control.auth.jwt-secret=validation-headroom-fixture-signing-key")){
                 NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
-                var connector=child.getBean(ConnectorArtifactRegistrar.class).register(Path.of(Objects.requireNonNull(System.getProperty("tapstate.pdk.it.mongodb-jar"))),RegistrationSource.REGISTER).registration().connectorId();
+                var connector=child.getBean(LocalConnectorArtifacts.class)
+                        .register(Files.readAllBytes(Path.of(Objects.requireNonNull(System.getProperty("tapstate.pdk.it.mongodb-jar")))),
+                                RegistrationSource.REGISTER)
+                        .registration().connectorId();
                 var artifacts=child.getBean(ArtifactStore.class);
                 artifacts.create(new SourceResource("input",null,connector,Map.of("uri",BUSINESS.getReplicaSetUrl(data),"database",data,"isUri",true),SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null));
                 artifacts.create(new SourceResource("target",null,connector,Map.of("uri",BUSINESS.getReplicaSetUrl(data),"database",data,"isUri",true),null,null,null,null));

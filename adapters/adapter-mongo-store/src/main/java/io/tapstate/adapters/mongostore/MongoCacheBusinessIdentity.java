@@ -11,6 +11,9 @@ import java.util.List;
 
 /** Business readiness is independent from authentication-only generation changes. */
 final class MongoCacheBusinessIdentity {
+    private static final String SCHEMA = "schema";
+    private static final String CAPTURE = "capture";
+
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     MongoCacheBusinessIdentity(MongoDatabase database, CacheBusinessScope scope) { this.database = database; this.scope = scope; }
@@ -21,11 +24,11 @@ final class MongoCacheBusinessIdentity {
         var result = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
                 MongoPipelineObservationRead.match(new Document("_id", "cluster")),
                 MongoPipelineObservationRead.boundedRow(), MongoPipelineObservationRead.originalRow(),
-                MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"))).first();
-        if (result != null && !MongoPipelineObservationRead.overflow(result, "schema", 1)) {
+                MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"))).first();
+        if (result != null && !MongoPipelineObservationRead.overflow(result, SCHEMA, 1)) {
             var identity = result.get("body", Document.class);
             if (identity.containsKey("_id")) {
-                requireObservedReady(identity, MongoPipelineObservationRead.single(result, "schema"), scope);
+                requireObservedReady(identity, MongoPipelineObservationRead.single(result, SCHEMA), scope);
                 return;
             }
         }
@@ -37,11 +40,30 @@ final class MongoCacheBusinessIdentity {
     void requireValidationPreparation(ClientSession session, String operation) { readyIdentity(session, java.util.Objects.requireNonNull(operation)); }
 
     private Document readyIdentity(ClientSession session, String maintenance) {
-        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        // Keep both facts in the original transaction snapshot without a second round trip.
+        var row = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT")),
+                new Document("$lookup", new Document("from", SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())
+                        .append("pipeline", List.of(new Document("$match", new Document("_id", "business"))))
+                        .append("as", SCHEMA)))).first();
+        Document identity = row == null ? null : row.get("identity", Document.class);
         requireReadyIdentity(identity, scope);
-        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        var schemas = row.getList(SCHEMA, Document.class);
+        Document schema = schemas.isEmpty() ? null : schemas.getFirst();
         requireReadySchema(identity, schema, scope, maintenance);
         return identity;
+    }
+
+    Document readReadyIdentity(ClientSession session) {
+        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        requireReadyIdentity(identity, scope);
+        return identity;
+    }
+
+    void requireAdmissionState(ClientSession session, Document identity) {
+        var schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        requireObservedAdmission(identity, schema, scope);
     }
 
     static void requireObservedAdmission(Document identity, Document schema, CacheBusinessScope scope) {
@@ -77,7 +99,36 @@ final class MongoCacheBusinessIdentity {
 
     /** Claim admission is infrequent; protected event writes continue to contend on their own claim. */
     void admitClaim(ClientSession session) {
-        Document row = readyIdentity(session);
+        admitClaim(session, readyIdentity(session));
+    }
+
+    /** A Capture claim and CACHE admission share the same original transaction snapshot. */
+    Document admitRetainedCapture(ClientSession session, io.tapstate.spi.store.WorkloadClaimKey key) {
+        var id = MongoWorkloadClaimStore.id(key);
+        var captured = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT")),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, CAPTURE, id,
+                        List.of(MongoWorkloadClaimStore.leaseRemaining(true))))).first();
+        var identity = captured == null ? null : captured.get("identity", Document.class);
+        if (identity != null && "cluster".equals(identity.get("_id"))
+                && !MongoCaptureStartupRows.ambiguous(captured, SCHEMA, "business")
+                && !MongoCaptureStartupRows.ambiguous(captured, CAPTURE, id)) {
+            var schema = MongoCaptureStartupRows.get(captured, SCHEMA);
+            var claim = MongoCaptureStartupRows.get(captured, CAPTURE);
+            if (schema != null && claim != null) {
+                requireObservedReady(identity, schema, scope);
+                admitClaim(session, identity);
+                return claim;
+            }
+        }
+        admitClaim(session);
+        return new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                .inStrictSession(session).readWithRemainingLease(key);
+    }
+
+    void admitClaim(ClientSession session, Document row) {
         long revision = admissionRevision(row);
         if (revision == Long.MAX_VALUE - 1) throw businessFenced();
         if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session,
@@ -109,10 +160,8 @@ final class MongoCacheBusinessIdentity {
                 .getMatchedCount() != 1) {
             throw new IllegalStateException("cache retirement changed within its transaction snapshot");
         }
-        // Address the canonical key, including claims whose duplicated payload fields are damaged.
-        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateMany(session,
-                new Document("_id.clusterId", scope.clusterId()),
-                List.of(new Document("$set", new Document("leaseUntil", "$$NOW"))));
+        new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session)
+                .revokeCacheLeases(scope.clusterId());
     }
 
     private Document identityFilter() {

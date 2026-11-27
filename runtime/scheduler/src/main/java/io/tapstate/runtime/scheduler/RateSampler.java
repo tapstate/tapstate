@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -150,6 +151,12 @@ public final class RateSampler {
         }
     }
 
+    /** A final publication waits for every retained append of this Pipeline, including an older scope. */
+    public boolean idle(io.tapstate.spi.store.PipelineIntentScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        synchronized (appending) { return !appending.containsKey(scope.pipelineId()); }
+    }
+
     /** Drops cadence and pending work for deleted Pipelines without waiting for their active append. */
     public void forgetPipelinesOutside(Collection<String> live) {
         var kept = Set.copyOf(live);
@@ -178,6 +185,11 @@ public final class RateSampler {
                 lag.put(key.substring(LAG_PREFIX.length()), value);
             }
         });
+        for (MetricFact fact : observation.facts()) {
+            if (CdcDeliveryTotals.COUNT_METRIC.equals(fact.name()) || CdcDeliveryTotals.TOTAL_MILLIS_METRIC.equals(fact.name())) {
+                counters.put(fact.name(), fact.points().getFirst().value());
+            }
+        }
         if (counters.isEmpty() && lag.isEmpty()) {
             return null;
         }

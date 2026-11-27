@@ -39,6 +39,7 @@ final class MongoOperatorInventory {
     }
 
     static void requireInitial(ClientSession session, MongoDatabase database, PipelineIntentScope scope, String preparationId) {
+        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
         Document root = require(session, database, scope);
         if (!preparationId.equals(root.get("preparationId")) || !Long.valueOf(0).equals(root.get("revision"))
                 || !root.getList("databases", Document.class).isEmpty() || !root.getList("shapes", Document.class).isEmpty() || !root.getList("placements", Document.class).isEmpty())
@@ -46,7 +47,6 @@ final class MongoOperatorInventory {
     }
 
     static Document require(ClientSession session, MongoDatabase database, PipelineIntentScope scope) {
-        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
         Document root = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first();
         return decode(session, database, scope, root, true);
     }
@@ -183,6 +183,27 @@ final class MongoOperatorInventory {
                 new Document("scope", root.get("_id")).append("preparationId", root.get("preparationId"))
                         .append("revision", root.get("revision")).append("databases", root.get("databases")).append("shapes", root.get("shapes"))
                         .append("placements", root.get("placements")).append("retirement", marker)));
+    }
+
+    static Set<String> registeredDatabases(ClientSession session, MongoDatabase database,
+            io.tapstate.spi.store.CacheBusinessScope scope) {
+        var filter = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())
+                .append("_id.cacheIncarnation", scope.cacheIncarnation()).append("databases.0", new Document("$exists", true));
+        var registered = new java.util.TreeMap<String, String>();
+        try (var rows = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, filter).batchSize(64).iterator()) {
+            while (rows.hasNext()) {
+                var row = rows.next();
+                var owner = MongoPipelinePreparationFacts.scope(row.get("_id", Document.class));
+                decode(session, database, owner, row, !row.containsKey("retirement"), false);
+                for (var entry : row.getList("databases", Document.class)) {
+                    var name = entry.getString("database");
+                    var operation = entry.getString("operationId");
+                    var previous = registered.putIfAbsent(name, operation);
+                    if (previous != null && !previous.equals(operation)) throw unreadable(owner);
+                }
+            }
+        }
+        return java.util.Collections.unmodifiableSet(registered.navigableKeySet());
     }
 
     /** Historical identity facts do not borrow another Pipeline's current execution authority. */

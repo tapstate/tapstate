@@ -21,15 +21,18 @@ if ! grep -Eq '^\[ERROR\].*(Cannot access .* in offline mode|has not been downlo
 fi
 
 echo '::notice::The restored Maven repository is missing Join dependencies. Preparing only missing files.'
-if run_join; then
+# Retry Central downloads in place before considering a second Maven invocation.
+if run_join -Daether.transport.http.retryHandler.count.central=5 \
+    -Daether.transport.http.retryHandler.interval.central=10000; then
   :
 else
   status=$?
-  if ! grep -Eq '^\[ERROR\].*Non-resolvable import POM:.*from/to central .*status code: 429([, ]|$)' run.log; then
+  if ! grep -Eq '^\[ERROR\].*Non-resolvable import POM:.*from/to central .*([Ss]tatus code|HTTP Status):[[:space:]]*429([^[:digit:]]|$)' run.log; then
     exit "$status"
   fi
   echo '::warning::Maven Central rate limited dependency preparation. Retrying once in 15 seconds.'
   sleep 15
+  # Keep the second invocation on Maven's default download retry budget.
   run_join -U
 fi
 

@@ -77,8 +77,14 @@ public final class MapJoinStores implements JoinStores {
     }
 
     @Override
-    public void removeDimensionRow(String source, String dimensionKey) {
-        dimension(source).remove(dimensionKey);
+    public boolean removeDimensionRow(String source, String dimensionKey, List<String> identityColumns,
+            String expectedIdentity) {
+        Map<String, Map<String, Object>> rows = dimension(source);
+        if (JoinKeys.isDifferentRow(rows.get(dimensionKey), identityColumns, expectedIdentity)) {
+            return false;
+        }
+        rows.remove(dimensionKey);
+        return true;
     }
 
     @Override

@@ -76,7 +76,7 @@ final class MongoConfigurationImportStore implements ConfigurationImportStore {
     @Override public Status preflight(Scope scope,Payload payload) {
         Objects.requireNonNull(scope,"scope"); var frozen = new ConfigurationImportPayload(Objects.requireNonNull(payload,"payload"));
         String id = UUID.randomUUID().toString();
-        return StoreIo.call(() -> withSlotRetry(session -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> withSlotRetry(session -> {
             var binding = requireScope(session,scope,frozen);
             Instant now = serverNow(session); var rows = all(session);
             for (var row : rows) {
@@ -94,11 +94,11 @@ final class MongoConfigurationImportStore implements ConfigurationImportStore {
             frozen.receipt(ticket);
             var result = new Stored(new Status(ticket,Phase.PENDING,0,null),slot,null);
             operations.insertOne(session,encode(result)); return result.status();
-        }));
+        })));
     }
     @Override public Optional<Status> find(Scope scope,String id) {
         Objects.requireNonNull(scope,"scope"); requireId(id);
-        return StoreIo.call(() -> transaction(session -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> transaction(session -> {
             requireScope(session,scope,null);
             Document row = operations.find(session,new Document("_id",id)).first();
             if (row == null) return Optional.empty();
@@ -107,13 +107,13 @@ final class MongoConfigurationImportStore implements ConfigurationImportStore {
             if (status.phase() == Phase.PENDING && !serverNow(session).isBefore(status.ticket().expiresAt()))
                 status = new Status(status.ticket(),Phase.EXPIRED,0,null);
             return Optional.of(status);
-        }));
+        })));
     }
     @Override public Receipt commit(Ticket original,Payload payload) {
         Objects.requireNonNull(original,"original"); var frozen = new ConfigurationImportPayload(Objects.requireNonNull(payload,"payload"));
         if (!original.inputHash().equals(frozen.inputHash) || !original.mappingHash().equals(frozen.mappingHash)) throw refused("input-mismatch");
         Receipt candidate = frozen.receipt(original);
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             Stored attempt = withSlotRetry(session -> {
                 requireScope(session,original.scope(),frozen);
                 Stored current = original(session,original);
@@ -153,7 +153,7 @@ final class MongoConfigurationImportStore implements ConfigurationImportStore {
                 }
                 throw failure;
             }
-        });
+        }));
     }
     private void abortKnown(Ticket original,int attempt) {
         transaction(session -> {
@@ -256,19 +256,9 @@ final class MongoConfigurationImportStore implements ConfigurationImportStore {
         requireActive.run();
         try (var session = client.startSession()) {
             return session.withTransaction(() -> {
-                requireActive.run(); verifyStructure(); requireActive.run(); T result = body.apply(session); requireActive.run(); return result;
+                MongoStructureFailureScope.beginCallback();
+                requireActive.run(); T result = body.apply(session); requireActive.run(); return result;
             },TRANSACTION);
-        }
-    }
-    private void verifyStructure() {
-        if (!database.listCollectionNames().into(new ArrayList<>()).contains(SystemCollections.CONFIGURATION_IMPORTS.collectionName())) throw unreadable();
-        var indexes = operations.listIndexes().into(new ArrayList<>());
-        if (indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadable();
-        for (var expected : SystemCollections.CONFIGURATION_IMPORTS.indexes()) {
-            var actual = indexes.stream().filter(index -> expected.indexName().equals(index.get("name"))).findFirst().orElse(null);
-            if (actual == null || !new Document(expected.keys().getFirst(),1).equals(actual.get("key"))
-                    || !Boolean.TRUE.equals(actual.get("unique")) || Boolean.TRUE.equals(actual.get("sparse")) || Boolean.TRUE.equals(actual.get("hidden"))
-                    || !Document.parse(expected.partialFilterJson()).equals(actual.get("partialFilterExpression"))) throw unreadable();
         }
     }
     private record Stored(Status status,Integer activeSlot,Integer historySlot) {}

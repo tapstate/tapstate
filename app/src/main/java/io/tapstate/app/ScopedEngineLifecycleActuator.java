@@ -19,6 +19,7 @@ import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.Phase;
 
 /** One fixed convergence command and its captured concrete job, never a later same-name execution. */
 final class ScopedEngineLifecycleActuator implements LifecycleActuator {
@@ -29,15 +30,22 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     record Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
             BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
             BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans,
-            PipelineConnectorExecutions connectorExecutions) {
+            java.util.function.Predicate<ExecutionFence> capturePreparationLease, PipelineConnectorExecutions connectorExecutions) {
         Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
                 BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
                 BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
-            this(operators,releaseHot,rebuild,plans,null);
+            this(operators, releaseHot, rebuild, plans, ignored -> false, null);
+        }
+        Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
+                BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
+                BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans,
+                java.util.function.Predicate<ExecutionFence> capturePreparationLease) {
+            this(operators, releaseHot, rebuild, plans, capturePreparationLease, null);
         }
         Ports {
             Objects.requireNonNull(operators,"operators"); Objects.requireNonNull(releaseHot,"releaseHot");
             Objects.requireNonNull(rebuild,"rebuild"); Objects.requireNonNull(plans,"plans");
+            Objects.requireNonNull(capturePreparationLease,"capturePreparationLease");
         }
     }
     /** At most one unresolved submission per Pipeline in this assembly; no absence is inferred from a timeout. */
@@ -46,6 +54,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         void attempting(OperatorRunManifest original) {
             if (pending.putIfAbsent(original.pipelineId(),original) != null) throw fenced();
         }
+        boolean hasPending(String pipeline) { return pending.containsKey(pipeline); }
         void returned(OperatorRunManifest original) { pending.remove(original.pipelineId(),original); }
         void observed(String pipeline,OperatorRunManifest actual) {
             var original = pending.get(pipeline);
@@ -82,16 +91,17 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         this.ownership = Objects.requireNonNull(ownership,"ownership"); this.defaultDatabase = Objects.requireNonNull(defaultDatabase,"defaultDatabase");
         this.connectors = Objects.requireNonNull(connectors,"connectors"); this.clock = Objects.requireNonNull(clock,"clock");
         this.ports = Objects.requireNonNull(ports,"ports"); this.submissions = Objects.requireNonNull(submissions,"submissions");
-        this.command = pass.claim(); require();
-        run = engine.captureRun(id()).orElse(null); require();
+        this.command = pass.claim(); requireRead(id());
+        run = engine.captureRun(id()).orElse(null); requireLocal();
         if (run != null) {
             manifest = run.operatorManifest();
             if (!(manifest.executionIdentity() instanceof ExecutionFence fixed)) throw fenced();
             requireEarlier(fixed); original = fixed;
         } else if (command.executionGeneration() > 0) original = new ExecutionFence(pass.scope(),command);
-        submissions.observed(id(),manifest); require();
+        submissions.observed(id(),manifest);
         if (run != null && !isCurrentRun() && original.scope().equals(pass.scope())
                 && command.executionGeneration() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+            require();
             var attempted = new ExecutionFence(pass.scope(), command);
             if (scoped.directRetry(attempted).isPresent() && run.status().isTerminal()) {
                 // A failed replacement can leave its cancelled predecessor discoverable by name.
@@ -102,20 +112,42 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             }
         }
         if (original != null && !engine.isLost()) capture = boundCapture(original);
-        require();
+        requireLocal();
     }
 
     private String id() { return pass.scope().pipelineId(); }
     private void requireId(String pipeline) { if (!id().equals(pipeline)) throw fenced(); require(); }
-    private void require() {
+    private void requireLocal() {
         if (invalidated) throw fenced();
         pass.requirePipeline(id());
         if (!command.equals(pass.claim())) throw fenced();
+    }
+    private void require() {
+        requireLocal();
         boolean proved = checkingStart ? ownership.proveStartClaim(pass.scope(), command)
                 : ownership.proveClaim(pass.scope(), command);
         if (!proved) throw fenced();
-        pass.requirePipeline(id());
-        if (!command.equals(pass.claim())) throw fenced();
+        requireLocal();
+    }
+    /** Inspecting the existing Jet handle does not grant a new engine action or a storage write. */
+    private void requireRead(String pipeline) {
+        if (!id().equals(pipeline)) throw fenced();
+        if (!ownership.processOwnsClaims()) {
+            require();
+            return;
+        }
+        requireLocal();
+        if (!ownership.proveStartClaim(pass.scope(), command)) throw fenced();
+        requireLocal();
+    }
+    /** Preparation may use this process's confirmed lease; later reads and durable writes retain their fences. */
+    private void requireCapturePreparation() {
+        requireLocal();
+        if (original != null && isCurrentRun() && ports.capturePreparationLease().test(original)) {
+            requireLocal();
+            return;
+        }
+        require();
     }
     private void requireEarlier(ExecutionFence fixed) {
         var scope = fixed.scope(); var current = pass.scope();
@@ -131,7 +163,10 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                 && original.equals(new ExecutionFence(pass.scope(),command));
     }
     private PipelineCaptureCoordinator boundCapture(ExecutionFence fixed) {
-        require(); var bound = Objects.requireNonNull(captures.forRun(pass.scope(),command,fixed),"fixed capture view"); require(); return bound;
+        requireLocal();
+        var bound = Objects.requireNonNull(captures.forRun(pass.scope(),command,fixed),"fixed capture view");
+        requireLocal();
+        return bound;
     }
 
     private io.tapstate.core.common.FailureFact openingFailure;
@@ -148,7 +183,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         openingFailure = null;
         checkingStart = true;
         try {
-            startOwned(pipeline);
+            PipelineDiagnostics.measure(pipeline, Phase.PIPELINE_START, () -> { startOwned(pipeline); return null; });
         } finally {
             checkingStart = false;
         }
@@ -158,58 +193,107 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         requireId(pipeline); engine.refuseIfLost(id());
         DagSource.StartPreparation prepared;
         Set<String> shared;
-        try {
-            prepared = dags.prepareStart(pass,defaultDatabase); require();
-            if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
-            var hashes = prepared.connectorHashes();
-            if (hashes.isEmpty() && original != null && ports.connectorExecutions() != null) {
-                hashes = ports.connectorExecutions().retainedSinkHashes(pass.intent(), prepared.connectorNodes(), this::require);
+        try (var readiness = new PipelineStartWork<Set<String>>()) {
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_DAG_PREPARE)) {
+                prepared = dags.prepareStart(pass, defaultDatabase, (ids, hashes) -> {
+                    if (!ids.isEmpty() && (!hashes.isEmpty() || original == null || ports.connectorExecutions() == null)) {
+                        readiness.tryStart(PipelineDiagnostics.branch(Phase.PIPELINE_CONNECTORS,
+                                () -> checkConnectors(ids, hashes)));
+                    }
+                });
+                requireLocal();
+                if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
             }
-            var sinks = Set.copyOf(prepared.sinkConnectors().values());
-            shared = Set.copyOf(hashes.isEmpty() ? connectors.requireEveryMemberCanLoad(id(), sinks)
-                    : connectors.requireEveryMemberCanLoad(id(), sinks, hashes));
-            require();
+            shared = readiness.awaitOrRun(() -> PipelineDiagnostics.measure(id(), Phase.PIPELINE_CONNECTORS,
+                    () -> {
+                        var hashes = prepared.connectorHashes();
+                        if (hashes.isEmpty() && original != null && ports.connectorExecutions() != null)
+                            hashes = ports.connectorExecutions().retainedSinkHashes(pass.intent(), prepared.connectorNodes(), this::require);
+                        return checkConnectors(Set.copyOf(prepared.sinkConnectors().values()), hashes);
+                    }));
+            requireLocal();
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
         var originalBeforeStart = original;
-        stopOriginal(); require();
-        var execution = ownership.beginExecution(pass.scope(),command);
-        if (!execution.allowed()) throw fenced();
-        pass.advancedSubmission(execution); command = execution.claimFence(); require();
-        original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
-        if (captures instanceof ScopedPipelineCaptureCoordinator scoped) {
-            if (recoveringSource) scoped.carryDirectRetries(originalBeforeStart, original);
-            else scoped.clearDirectRetries(pass.scope());
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_STOP_PREVIOUS)) {
+            if (run != null || capture != null || manifest != null || original != null || pass.displacedExecution() > 0) {
+                stopOriginal();
+            }
         }
-        run = null; capture = boundCapture(original);
+        PipelineActuationOwnership.Execution execution;
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_EXECUTION_CLAIM)) {
+            execution = ownership.beginExecution(pass.scope(),command);
+            if (!execution.allowed()) throw fenced();
+            pass.advancedSubmission(execution); command = execution.claimFence(); requireLocal();
+            original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
+            if (captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+                if (recoveringSource) scoped.carryDirectRetries(originalBeforeStart, original);
+                else scoped.clearDirectRetries(pass.scope());
+            }
+            run = null; capture = boundCapture(original);
+            PipelineDiagnostics.execution(original);
+        }
         boolean submissionAttempted = false;
         try {
             if (ports.connectorExecutions() != null)
                 ports.connectorExecutions().prepare(pass.intent(), prepared.connectorNodes(), command, this::require);
-            pass.prepareOperatorDatabases(command,
-                    prepared.operatorPlan().orElseThrow().nestDatabases().values(), this::require); require();
-            var planned = prepared.plan(); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_OPERATOR_DATABASES)) {
+                var databases = prepared.operatorPlan().orElseThrow().nestDatabases().values();
+                if (!databases.isEmpty()) pass.prepareOperatorDatabases(command, databases, this::require);
+            }
+            var planned = prepared.plan(); requireLocal();
             var members = planned.members();
-            ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require); require();
-            try { capture.startCapture(id(),prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow()); }
-            catch (RingNotOpenYet waiting) {
+            Runnable openCapture;
+            try (var captureInputs = new PipelineStartWork<Runnable>()) {
+                java.util.function.Supplier<Runnable> prepareCapture = () -> capture.prepareCaptureStart(id(),
+                        prepared.artifactSnapshot().orElseThrow(), prepared.sourceModels().orElseThrow());
+                captureInputs.tryStart(PipelineDiagnostics.branch(Phase.PIPELINE_CAPTURE_INPUTS, prepareCapture));
+                try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_OPERATOR_MAPS)) {
+                    ports.operators().prepare(manifest, prepared.operatorPlan().orElseThrow().capacities(), members, this::require);
+                }
+                openCapture = captureInputs.awaitOrRun(() ->
+                        PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_INPUTS, prepareCapture));
+            }
+            try {
+                requireCapturePreparation();
+                PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_START, () -> {
+                    openCapture.run();
+                    return null;
+                });
+            } catch (RingNotOpenYet waiting) {
                 ports.releaseHot().accept(manifest);
                 manifest = null;
+                PipelineDiagnostics.event("waiting_for_capture_ring");
                 return;
             }
-            require(); pass.bindCapture(command,capture.captureBindings()); require();
-            var built = planned.build(original); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CAPTURE_BIND)) {
+                var bindings = capture.captureBindings();
+                require();
+                pass.bindCapture(command, bindings);
+            }
+            DagSource.StartPlan built;
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_DAG_BUILD)) { built = planned.build(original); requireLocal(); }
             if (!members.equals(built.planned().members())) throw new IllegalStateException("topology changed its prepared members");
             if (ports.connectorExecutions() != null)
                 ports.connectorExecutions().publish(pass.intent(), prepared.connectorNodes(), command, this::require);
-            var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder"); require();
-            var previous = recorder.last(id()); require();
-            recorder.record(EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared).replacing(previous)); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PLAN_RECORD)) {
+                var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder");
+                var previous = recorder.last(id());
+                var plan = EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared)
+                        .replacing(previous);
+                require();
+                recorder.record(plan);
+            }
             checkingStart = false;
-            submissions.attempting(manifest); submissionAttempted = true;
-            run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
-            submissions.returned(manifest); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_JET_SUBMIT)) {
+                require();
+                submissions.attempting(manifest); submissionAttempted = true;
+                run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
+                submissions.returned(manifest); require();
+                PipelineDiagnostics.job(run.jobId());
+                PipelineDiagnostics.event("jet_submission_returned");
+            }
         } catch (RuntimeException | Error failed) {
             if (!(failed instanceof VirtualMachineError) && capture != null) {
                 openingFailure = capture.openingFailureFact(pipeline, failed);
@@ -226,6 +310,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             }
             throw failed;
         }
+    }
+
+    private Set<String> checkConnectors(Set<String> ids, java.util.Map<String, String> hashes) {
+        return Set.copyOf(hashes.isEmpty() ? connectors.requireEveryMemberCanLoad(id(), ids)
+                : connectors.requireEveryMemberCanLoad(id(), ids, hashes));
     }
 
     /** Failed-start cleanup uses only the handles captured by that start, even after command revocation. */
@@ -252,6 +341,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             });
             require();
         }
+        if (pass.intent().desired().targetState() == PipelineState.STOPPED) {
+            // Loss of a cleanup proof leaves the interlock intact; capture still needs to stop.
+            try {
+                dags.retireCoveredKeyMoves(pass);
+            } catch (TapstateException unavailable) {
+                System.getLogger(ScopedEngineLifecycleActuator.class.getName()).log(System.Logger.Level.WARNING,
+                        "Could not reconcile the key move interval before stopping {0}: {1}", id(), unavailable.code().code());
+            }
+        }
         if (run == null && pass.displacedExecution() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
             // An absent Jet handle cannot supply the old capture fence. The successor may retire only
             // local sessions in the original scope at or below its admitted fence.
@@ -259,17 +357,18 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                     () -> scoped.retireScope(pass.scope(), command));
             require();
         } else if (capture != null) {
-            stopStep(trackOnStopWorker, "PipelineCaptureCoordinator.stopCapture", () -> {
-                if (trackOnStopWorker) awaitCaptureClose();
-                else capture.stopCapture(id(), false);
-            });
-            require();
+            if (trackOnStopWorker) {
+                stopStep(true, "PipelineCaptureCoordinator.stopCapture", this::awaitCaptureClose);
+                require();
+            } else if (capture.stopCaptureIfPresent(id(), false) || !checkingStart) require();
         }
         if (manifest != null && !engine.isLost()) {
             stopStep(trackOnStopWorker, "releaseHot", () -> ports.releaseHot().accept(manifest));
             require();
         }
-        if (original != null) { ports.plans().apply(original, command).forget(id()); require(); }
+        if (original != null) {
+            if (ports.plans().apply(original, command).forgetIfPresent(id()) || !checkingStart) require();
+        }
     }
 
     private void awaitCaptureClose() {
@@ -349,12 +448,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     @Override public synchronized Optional<SourceRecovery> recoverSource(
             String pipeline, java.util.function.BooleanSupplier currentIntent) {
-        requireId(pipeline);
+        requireRead(pipeline);
         if (original == null || !isCurrentRun() || !(captures instanceof ScopedPipelineCaptureCoordinator scoped)) {
             return Optional.empty();
         }
         var episode = scoped.directRetry(original);
         if (episode.isEmpty()) return Optional.empty();
+        // A missing local retry is only an observation. Reprove storage authority before driving a real episode.
+        if (ownership.processOwnsClaims()) require();
         var retry = episode.orElseThrow();
         var pending = retry.decision(scoped.streamRetryPolicy());
         if (pending == null) return Optional.empty();
@@ -381,7 +482,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized Optional<Throwable> terminalLeaseFailure(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         return pass.renewalFailure().map(Throwable.class::cast);
     }
 
@@ -389,14 +490,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         long displaced = pass.displacedExecution();
         if (displaced > 0 && displaced == command.executionGeneration()
                 && (run == null || original != null && pass.scope().equals(original.scope()) && !run.completed())) {
-            requireId(pipeline);
+            requireRead(pipeline);
             return Optional.of(new LeaseLoss(displaced,
                     new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
         }
         if (run == null || original == null || !pass.scope().equals(original.scope())) return Optional.empty();
         if (run.isCarryingAJob()) {
             if (original.claimGeneration() >= command.claimGeneration()) return Optional.empty();
-            requireId(pipeline);
+            requireRead(pipeline);
             // The successor can fence this old execution even before its Jet tasks notice the loss.
             return Optional.of(new LeaseLoss(original.executionGeneration(),
                     new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
@@ -404,7 +505,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         var failure = run.failure();
         for (Throwable cause = failure.orElse(null); cause != null; cause = cause.getCause()) {
             if (cause instanceof TapstateException coded && coded.code() == EngineError.EXECUTION_NOT_AUTHORIZED) {
-                requireId(pipeline);
+                requireRead(pipeline);
                 return Optional.of(new LeaseLoss(original.executionGeneration(), coded));
             }
         }
@@ -412,7 +513,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized boolean recoveredJobRunning(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         return run != null && isCurrentRun() && run.status() == com.hazelcast.jet.core.JobStatus.RUNNING;
     }
 
@@ -420,32 +521,35 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         return failureFact(pipeline).map(io.tapstate.core.common.FailureFact::cause);
     }
     @Override public synchronized Optional<io.tapstate.core.common.FailureFact> failureFact(String pipeline) {
-        requireId(pipeline);
-        if (engine.isLost()) { var lost = engine.lost(id()).map(io.tapstate.core.common.FailureFact::new); require(); return lost; }
-        Optional<io.tapstate.core.common.FailureFact> failure = run != null && isCurrentRun() ? run.failureFact() : Optional.empty(); require();
+        requireRead(pipeline);
+        if (engine.isLost()) { var lost = engine.lost(id()).map(io.tapstate.core.common.FailureFact::new); requireRead(pipeline); return lost; }
+        Optional<io.tapstate.core.common.FailureFact> failure = run != null && isCurrentRun() ? run.failureFact() : Optional.empty(); requireRead(pipeline);
         // An earlier capture stays bound for cleanup, not for the current run's failure diagnosis.
         if (failure.isPresent() || capture == null || !isCurrentRun()) return failure;
-        var captured = capture.captureFailureFact(id()); require(); return captured;
+        var captured = capture.captureFailureFact(id()); requireRead(pipeline); return captured;
     }
     @Override public synchronized Optional<Throwable> lost(String pipeline) {
-        requireId(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost;
+        requireRead(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); requireRead(pipeline); return lost;
     }
     @Override public synchronized boolean isCarryingAJob(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         // A successful bounded job still owns completion while its target receipts arrive.
         boolean carrying = (run != null && isCurrentRun() && run.isCarryingAJob()) || successfulBoundedJob(pipeline);
-        require();
+        requireRead(pipeline);
         return carrying;
     }
     @Override public synchronized void settleCompleted(String pipeline) { retryCompletion(pipeline); }
     @Override public synchronized boolean completed(String pipeline) {
-        requireId(pipeline);
+        requireRead(pipeline);
         if (!successfulBoundedJob(pipeline)) {
             return false;
         }
-        boolean complete = capture.loadDelivered(pipeline)
-                && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
-        require();
+        boolean complete;
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_TARGET_CONFIRM)) {
+            complete = capture.loadDelivered(pipeline) && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
+            requireRead(pipeline);
+        }
+        if (complete) PipelineDiagnostics.event("bounded_confirmation_observed");
         return complete;
     }
 
@@ -455,7 +559,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     @Override public synchronized Optional<Completion> completion(String pipeline) {
         if (!completed(pipeline)) return Optional.empty();
-        var proof = new Completion(Long.toString(run.jobId()),command); require(); return Optional.of(proof);
+        var proof = new Completion(Long.toString(run.jobId()),command); requireRead(pipeline); return Optional.of(proof);
     }
     @Override public synchronized void complete(String pipeline) {
         complete(pipeline,completion(pipeline).orElseThrow(ScopedEngineLifecycleActuator::fenced));

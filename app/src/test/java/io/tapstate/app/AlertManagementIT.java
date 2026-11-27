@@ -41,10 +41,11 @@ class AlertManagementIT {
     }
     @Test void everyBuiltinSeverityAndAuthorizedOverrideUsesTheCatalogInBothDeployments(){
         var expected=Map.of("pipeline.failed","MAJOR","pipeline.observation-stale","WARNING","source.connection-failed","MAJOR",
-                "cluster.node-unavailable","MAJOR","cluster.storage-unavailable","CRITICAL");
+                "cluster.storage-unavailable","CRITICAL",
+                "cluster.config-structure-drift","MAJOR","cluster.cache-structure-drift","MAJOR");
         for(boolean cloud:List.of(false,true))AlertEvaluationHostIT.withFixture(false,cloud,f->{
             var service=service(f);var types=(List<?>)call(service,"catalog",Map.of()).get("types");
-            assertThat(types).hasSize(5);
+            assertThat(types).hasSize(6);
             for(Object value:types){var type=object(value);String id=text(type,"id");
                 assertThat(type).containsEntry("severity",expected.get(id));
                 var form=map("name",id,"typeId",id,"resourceKinds",type.get("resourceKinds"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true);

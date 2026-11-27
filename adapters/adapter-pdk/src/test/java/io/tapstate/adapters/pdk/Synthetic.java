@@ -1241,6 +1241,20 @@ final class Synthetic {
                 dir, "synthetic.IdentifierRejecting", source("IdentifierRejecting", "", register));
     }
 
+    /** Reports a rejected row through the callback, then successfully flushes the remaining rows. */
+    static Path partiallyRejectedSink(Path dir) {
+        String register = """
+                functions.supportWriteRecord((context, events, table, consumer) -> {
+                    var failed = new io.tapdata.pdk.apis.entity.WriteListResult<io.tapdata.entity.event.dml.TapRecordEvent>();
+                    failed.addError(events.get(0), new IllegalArgumentException("target rejected the row"));
+                    consumer.accept(failed);
+                    consumer.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>(events.size() - 1, 0, 0));
+                });
+                """;
+        return SyntheticJar.compileToJar(dir, "synthetic.PartiallyRejected",
+                source("PartiallyRejected", "", register));
+    }
+
     /** A sink connector whose writeRecord reports each batch in two flushes — proves count accumulation. */
     static Path multiFlushSink(Path dir) {
         String register = "functions.supportWriteRecord((context, events, table, consumer) -> {"

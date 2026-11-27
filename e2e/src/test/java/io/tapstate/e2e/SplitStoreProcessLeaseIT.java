@@ -121,8 +121,9 @@ class SplitStoreProcessLeaseIT {
                     .singleElement().satisfies(row -> assertThat(row.bootId()).isEqualTo(oldBoot));
             MongoDatabase admin = observer.getDatabase("admin");
             long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", new Document("times", 1))
+                    .append("mode", "alwaysOn")
                     .append("data", new Document("failCommands", List.of("findAndModify"))
+                            .append("namespace", prepared.cacheDb() + ".workload_claims")
                             .append("blockConnection", true).append("blockTimeMS", 120000).append("appName", appName)))
                     .get("count")).longValue();
             try {

@@ -4,9 +4,16 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.Set;
 
-/** The initial five type descriptions. Actual provider capabilities must be supplied separately. */
+/** The built-in type descriptions. Actual provider capabilities must be supplied separately. */
 public final class BuiltinAlarmTypes {
+    private static final String RETIRED_NODE_UNAVAILABLE = "cluster.node-unavailable";
+
     private BuiltinAlarmTypes() { }
+
+    /** A known retired type is still recognizable in historical configuration and delivery records. */
+    public static boolean retired(String typeId) {
+        return RETIRED_NODE_UNAVAILABLE.equals(typeId);
+    }
     public static AlarmTypeCatalog catalog() {
         return new AlarmTypeCatalog(List.of(
                 state("pipeline.failed", "pipeline", "pipeline-lifecycle", "condition", AlarmSeverity.MAJOR),
@@ -15,8 +22,9 @@ public final class BuiltinAlarmTypes {
                         seconds("startup-grace", 0, 3600, 120)), AlarmSeverity.WARNING, true,
                         "pipeline.observation-stale.condition", "pipeline.observation-stale.recovery", "pipeline.observation-stale.guidance"),
                 state("source.connection-failed", "source", "source-operational-health", "condition", AlarmSeverity.MAJOR),
-                state("cluster.node-unavailable", "cluster-node", "cluster-member-health", "condition", AlarmSeverity.MAJOR),
-                state("cluster.storage-unavailable", "cluster-storage", "cluster-storage-health", "condition", AlarmSeverity.CRITICAL)));
+                state("cluster.storage-unavailable", "cluster-storage", "cluster-storage-health", "condition", AlarmSeverity.CRITICAL),
+                state("cluster.config-structure-drift", "cluster", "cluster-structure-inspection", "condition", AlarmSeverity.MAJOR),
+                state("cluster.cache-structure-drift", "cluster", "cluster-structure-inspection", "condition", AlarmSeverity.MAJOR)));
     }
     private static AlarmTypeCatalog.Type state(String id, String resource, String provider, String evaluator, AlarmSeverity severity) {
         return new AlarmTypeCatalog.Type(id, 1, AlarmTypeCatalog.Kind.STATEFUL, Set.of(resource), provider, evaluator,

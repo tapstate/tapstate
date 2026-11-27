@@ -70,7 +70,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             Runnable requireStructure,MongoSrsLease appendLease,MongoSrsControlProofs proofs){
         this.controlProofs=proofs;
         this.appendLease = Objects.requireNonNull(appendLease, "appendLease");
-        this.controlLease = requireStructure instanceof MongoStructureProof.Check ? appendLease.fork() : MongoSrsLease.perTransaction();
+        this.controlLease = appendLease.fork();
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
@@ -111,7 +111,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 if (hasRetainedFacts(session, chain)) throw unproven(chain);
                 return Optional.empty();
             }
-            return Optional.of(readState(session,row,false));
+            return Optional.of(readState(session,row,true));
         });
     }
     @Override public SrsChainState requestTables(String chain, Set<String> tables, WorkloadClaimFence fence) {
@@ -140,14 +140,29 @@ public final class MongoSrsChainStore implements SrsChainStore {
         }));
     }
     @Override public Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, Set<String> tables, WorkloadClaimFence fence) {
+        return openServingEpoch(chain, expectedEpoch, OptionalLong.empty(), tables, fence);
+    }
+
+    @Override public Optional<SrsChainState> openServingEpochForStartup(String chain, long expectedEpoch,
+            long expectedConsumerRevision, Set<String> tables, WorkloadClaimFence fence) {
+        if (expectedConsumerRevision < 0) throw new IllegalArgumentException("invalid expected consumer revision");
+        return openServingEpoch(chain, expectedEpoch, OptionalLong.of(expectedConsumerRevision), tables, fence);
+    }
+
+    private Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, OptionalLong expectedConsumerRevision,
+            Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain);
         if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
         Set<String> captured = tables(tables);
-        return changingChain(() -> transaction(session -> {
+        return changingChain(() -> transaction(!expectedConsumerRevision.isPresent(), session -> {
+            Document capturedRoot = expectedConsumerRevision.isPresent() ? startupRoot(session, chain) : null;
             prove(session, fence);
-            Document row = requireRoot(session, chain);
+            Document row = capturedRoot == null ? requireRoot(session, chain) : capturedRoot;
+            MongoSrsRecoveryControls.requireOrdinary(row);
             requireCapture(row, fence);
-            var held = state(session, row);
+            var held = expectedConsumerRevision.isPresent() ? startupState(session, row, true) : state(session, row);
+            if (expectedConsumerRevision.isPresent() && held.consumerRevision() != expectedConsumerRevision.getAsLong())
+                return Optional.empty();
             var requested = new TreeSet<>(held.requestedTables());
             requested.addAll(captured);
             long epoch = expectedEpoch + 1;
@@ -167,6 +182,23 @@ public final class MongoSrsChainStore implements SrsChainStore {
             replace(session, row, replacement);
             return Optional.of(decode(replacement));
         }));
+    }
+
+    private Document startupRoot(ClientSession session, String chain) {
+        var captured = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT")),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.SRS_CHAINS, "chain", chain))).first();
+        if (captured == null || !"cluster".equals(captured.get("identity", Document.class).get("_id"))
+                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
+                || MongoCaptureStartupRows.ambiguous(captured, "chain", chain)) {
+            new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+            return null;
+        }
+        MongoCacheBusinessIdentity.requireObservedReady(captured.get("identity", Document.class),
+                MongoCaptureStartupRows.get(captured, "schema"), scope);
+        return MongoCaptureStartupRows.get(captured, "chain");
     }
 
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
@@ -230,11 +262,11 @@ public final class MongoSrsChainStore implements SrsChainStore {
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
                                     WorkloadClaimFence fence, boolean writing) {
-        validateCheckpoint(session, root, checkpoint, fence, writing, false, null, false);
+        validateCheckpoint(session, root, checkpoint, fence, writing, false, null, null, false);
     }
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
-                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked, Set<SrsModelKey> provedForPins, boolean batchReferences) {
+                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked, MongoSrsReadFacts facts, Set<SrsModelKey> provedForPins, boolean batchReferences) {
         String chain = root.getString("_id");
         for (var at : checkpoint.tables().values()) {
             var key = at.model();
@@ -246,22 +278,22 @@ public final class MongoSrsChainStore implements SrsChainStore {
         var current = batchReferences ? models.currentReferences(session, root, keys, businessChecked, collected) : Optional.<Map<SrsModelKey, MongoSrsModelStore.ModelReference>>empty();
         if (current.isEmpty()) {
             if (batchReferences) collected.clear();
-            current = models.currentReferences(session, root, keys, businessChecked);
+            current = models.currentReferences(session, root, keys, businessChecked, facts);
         }
         var boundsByRing = !collected.isEmpty() ? collected : current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
                 : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
-                        .collect(java.util.stream.Collectors.toSet()));
+                        .collect(java.util.stream.Collectors.toSet()), facts);
         for (var entry : checkpoint.tables().entrySet()) {
             var at = entry.getValue(); var key = at.model();
-            var reference = current.isPresent() ? current.orElseThrow().get(key) : models.requireReference(session, key);
+            var reference = current.isPresent() ? current.orElseThrow().get(key) : models.requireReference(session, key, facts);
             var range = reference.range(); String ring = reference.model().ringName();
             if ((writing && !fence.equals(reference.fence())) || at.sequence() < range.firstSequence() - 1
                     || (range.nextSequence() != null && at.sequence() >= range.nextSequence())) throw unproven(chain);
             var bounds = boundsByRing.get(ring);
-            if (bounds == null) bounds = log.boundsInSession(session, ring);
+            if (bounds == null) bounds = log.boundsInSession(session, ring, facts);
             if (at.sequence() > bounds.largestSequence()) throw unproven(chain);
             if (at.sequence() >= 0 && at.sequence() > bounds.trimmedThrough()) {
-                var event = log.loadInSession(session, ring, at.sequence()).orElseThrow(() -> unproven(chain));
+                var event = log.loadInSession(session, ring, at.sequence(), writing ? null : facts).orElseThrow(() -> unproven(chain));
                 if (at.sequence() >= range.firstSequence() && (event.epoch() != key.captureEpoch() || event.schemaVer() != key.modelVersion()
                         || !reference.fence().equals(event.captureFence()))) throw unproven(chain);
             }
@@ -291,13 +323,13 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
     void invalidateControlProofs(){controlProofs.clear();}
     SrsChainState readState(ClientSession session,Document row,boolean businessChecked){
-        if (!controlLease.enabled()) return state(session, row, businessChecked);
+        if (!controlLease.enabled()) return startupState(session, row, businessChecked);
         var decoded=decode(row);String fingerprint=controlFingerprint(row);
         if(referencesProved(row,fingerprint)){
             if(!businessChecked)new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             return decoded;
         }
-        var check=beginReferences();var state=state(session,row,businessChecked);
+        var check=beginReferences();var state=startupState(session,row,businessChecked);
         rememberReferences(session,row,fingerprint,check);return state;
     }
     Document readRoot(ClientSession session,String chain){
@@ -309,23 +341,41 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
 
     SrsChainState state(ClientSession session, Document row, boolean businessChecked) {
-        return state(session, row, businessChecked, null, false);
+        return state(session, row, businessChecked, new MongoSrsReadFacts(session, database, scope, row, businessChecked));
+    }
+
+    SrsChainState startupState(ClientSession session, Document row, boolean businessChecked) {
+        return startupState(session, row, new MongoSrsReadFacts(session, database, scope, row, businessChecked), businessChecked);
+    }
+
+    SrsChainState startupState(ClientSession session, Document row, MongoSrsReadFacts facts) {
+        return startupState(session, row, facts, true);
+    }
+
+    private SrsChainState startupState(ClientSession session, Document row, MongoSrsReadFacts facts, boolean businessChecked) {
+        var control = decode(row);
+        facts.prefetchStartupCheckpoint(row, control.checkpoint());
+        return state(session, row, businessChecked, facts);
+    }
+
+    SrsChainState state(ClientSession session, Document row, boolean businessChecked, MongoSrsReadFacts facts) {
+        return state(session, row, businessChecked, facts, null, false);
     }
 
     record ReclaimState(SrsChainState state, Set<SrsModelKey> checkpointModels) {}
 
     ReclaimState stateForReclaim(ClientSession session, Document row, boolean batchReferences) {
         var models = new HashSet<SrsModelKey>();
-        var state = state(session, row, true, models, batchReferences);
+        var state = state(session, row, true, new MongoSrsReadFacts(session, database, scope, row, true), models, batchReferences);
         return new ReclaimState(state, Set.copyOf(models));
     }
 
-    private SrsChainState state(ClientSession session, Document row, boolean businessChecked, Set<SrsModelKey> provedForPins, boolean batchReferences) {
+    private SrsChainState state(ClientSession session, Document row, boolean businessChecked, MongoSrsReadFacts facts, Set<SrsModelKey> provedForPins, boolean batchReferences) {
         SrsChainState state = decode(row);
         if (state.checkpoint() != null)
-            validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked, provedForPins, batchReferences);
+            validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked, facts, provedForPins, batchReferences);
         if (state.pendingFreshFull() != null)
-            models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()));
+            models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()), facts);
         return state;
     }
     private Document root(ClientSession session, String chain) {
@@ -335,7 +385,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
         Document row = root(session, chain); if (row == null) throw unproven(chain);
         MongoSrsRecoveryControls.requireOrdinary(row); return row;
     }
-    private boolean hasRetainedFacts(ClientSession session, String chain) {
+    boolean hasRetainedFacts(ClientSession session, String chain) {
         for (var table : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
             if (table.on(database).find(session, new Document("_id.chain", chain)).limit(1).first() != null) return true;
         }
@@ -344,7 +394,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     void prove(ClientSession session, WorkloadClaimFence fence) {
         Objects.requireNonNull(fence, "originalCaptureFence");
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())
-                || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence),
+                || WorkloadClaimDocuments.proveCapture(session, SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), fence,
                 new Document("$inc", new Document("fencedChainWrites", 1L))).getMatchedCount() != 1) throw fenced();
     }
     void requireCapture(Document row, WorkloadClaimFence fence) {
@@ -449,17 +499,22 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private static List<String> sorted(Set<String> tables) { return new ArrayList<>(new TreeSet<>(tables)); }
     private static void requireName(String chain) { if (chain == null || chain.isBlank()) throw new IllegalArgumentException("blank mining chain"); }
     private <T> T transaction(Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+        return transaction(true, action);
+    }
+    private <T> T transaction(boolean validateBusiness, Function<ClientSession, T> action) {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
-                        requireActive.run(); requireStructure.run(); requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+                        MongoStructureFailureScope.beginCallback();
+                        requireActive.run(); requireStructure.run(); requireActive.run();
+                        if (validateBusiness) new MongoCacheBusinessIdentity(database, scope).requireReady(session);
                         T result = action.apply(session); requireActive.run(); return result;
                     }, TRANSACTION);
                 }
-            } catch (RuntimeException failure) { controlLease.drop();controlProofs.clear(); MongoStructureProof.invalidate(requireStructure); requireActive.run(); throw failure; }
-        });
+            } catch (RuntimeException failure) { controlLease.drop(); controlProofs.clear(); MongoStructureProof.invalidate(requireStructure); requireActive.run(); throw failure; }
+        }));
     }
     private static TapstateException unproven(String chain) { return new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null); }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-chain", "field", "chain-control"), null); }

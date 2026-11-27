@@ -12,7 +12,9 @@ import static io.tapstate.core.alerting.AlarmTypeCatalog.*;
 class AlarmTypeCatalogTest {
     @Test void registrationDoesNotInventAProviderOrHideAnUnsupportedVersion() {
         AlarmTypeCatalog catalog = BuiltinAlarmTypes.catalog();
-        assertThat(catalog.types()).hasSize(5);
+        assertThat(catalog.types()).extracting(Type::id).containsExactlyInAnyOrder(
+                "pipeline.failed", "pipeline.observation-stale", "source.connection-failed", "cluster.storage-unavailable",
+                "cluster.config-structure-drift", "cluster.cache-structure-drift");
         assertThat(catalog.availability("source.connection-failed", 1, 1, Set.of(), Set.of("condition"))).isEqualTo(Availability.INPUT_UNAVAILABLE);
         assertThat(catalog.availability("source.connection-failed", 1, 1, Set.of("source-operational-health"), Set.of())).isEqualTo(Availability.EVALUATOR_UNAVAILABLE);
         assertThat(catalog.availability("source.connection-failed", 1, 1, Set.of("source-operational-health"), Set.of("condition"))).isEqualTo(Availability.AVAILABLE);

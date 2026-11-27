@@ -4,7 +4,6 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.sql.Expressions;
-import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinKind;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
@@ -320,14 +319,15 @@ public final class JoinDriver {
             // carrying both images is asked for too: it carries its own key but not necessarily the
             // rest of itself, so the mirror is still read for it, and being read here is what keeps
             // that one trip rather than one per row.
-            if (event.after() != null && carriesTheWholeRow(event.before())) {
+            Map<String, Object> before = previousFactImage(change);
+            if (event.after() != null && carriesTheWholeRow(before)) {
                 // Both images and the first one whole: the change carries its own previous, so nothing
                 // is asked for it. The predicate is the one absorbFact decides by, and it has to be:
                 // a key skipped here that is then wanted there is read on its own, which is the one
                 // shape this read ahead exists to prevent.
                 continue;
             }
-            String key = event.before() == null ? null : keyOf(event.before(), factKeyColumns);
+            String key = before == null ? null : keyOf(before, factKeyColumns);
             if (key == null && event.after() != null) {
                 key = keyOf(event.after(), factKeyColumns);
             }
@@ -369,17 +369,18 @@ public final class JoinDriver {
             // The rows absorbFact confirms: mirrored under the key they arrive with, read from the
             // mirror rather than from a whole before image, and mirrored by a batch not known to have
             // finished.
-            if (!change.source().equals(factSource) || event.after() == null
-                    || carriesTheWholeRow(event.before())) {
+            if (!change.source().equals(factSource) || event.after() == null) continue;
+            Map<String, Object> before = previousFactImage(change);
+            if (carriesTheWholeRow(before)) {
                 continue;
             }
             String key = keyOf(event.after(), factKeyColumns);
-            String previousKey = event.before() == null ? null : keyOf(event.before(), factKeyColumns);
+            String previousKey = before == null ? null : keyOf(before, factKeyColumns);
             if (key == null || (previousKey != null && !previousKey.equals(key))) {
                 continue;
             }
             Map<String, Object> mirroredRow = primed.get(key);
-            if (mirroredRow == null || indexedWith(mirroredRow, event.op())) {
+            if (mirroredRow == null || indexedWith(mirroredRow, factOperation(change, before))) {
                 continue;
             }
             for (Dimension dimension : dimensions) {
@@ -569,16 +570,29 @@ public final class JoinDriver {
         return !pending.isEmpty();
     }
 
+    /** An arriving fact is new at this owner even though its input carries the old owner's image. */
+    private Map<String, Object> previousFactImage(SourceChange change) {
+        if (change.ownerKey() != null && change.ownerKey().equals(keyOf(change.event().after(), factKeyColumns))) {
+            return null;
+        }
+        return change.event().before();
+    }
+
+    /** The arrival must confirm its index if an earlier attempt stopped after writing its mirror. */
+    private static Op factOperation(SourceChange change, Map<String, Object> before) {
+        return change.ownerKey() != null && before == null ? Op.INSERT : change.event().op();
+    }
+
     private void absorb(SourceChange change) {
         if (change.source().equals(factSource)) {
-            absorbFact(change.event());
+            absorbFact(change);
             return;
         }
         Dimension dimension = dimensionNamed(change.source());
         if (dimension == null) {
             throw new IllegalArgumentException("this join reads no source called " + change.source());
         }
-        absorbDimension(dimension, change.event());
+        absorbDimension(dimension, change.event(), change.ownerKey());
     }
 
     /**
@@ -590,9 +604,10 @@ public final class JoinDriver {
      * the new one are two different rows, and writing the new one leaves the old one behind: one order
      * showing under two customers at once, with nothing reporting anything.
      */
-    private void absorbFact(Envelope event) {
+    private void absorbFact(SourceChange change) {
+        Envelope event = change.event();
         Map<String, Object> after = event.after();
-        Map<String, Object> before = event.before();
+        Map<String, Object> before = previousFactImage(change);
         if (after == null) {
             if (before == null) {
                 // A change carrying neither image says nothing about which row it is about.
@@ -636,12 +651,13 @@ public final class JoinDriver {
         // says whether that batch finished, whatever kind of change this is - a load read again, an
         // insert or an update delivered again, or an ordinary edit.
         boolean unconfirmed = mirroredRow != null && previousKey.equals(key)
-                && !indexedWith(mirroredRow, event.op());
+                && !indexedWith(mirroredRow, factOperation(change, before));
         if (previous != null && !previousKey.equals(key)) {
             // The row's own identity moved, so what was published under the old one is a different
             // row and nothing else will ever remove it.
             queueRow(previous, event.ts(), true, event.positions());
             forget(previousKey, previous);
+            if (change.ownerKey() != null) return;
             previous = null;
         }
         // Publish the row before its index entries. A dimension processor can walk a new entry
@@ -778,18 +794,20 @@ public final class JoinDriver {
      * those rows are supposed to become matches, and they can only be found again because they were
      * written into the bucket when they missed.
      */
-    private void absorbDimension(Dimension dimension, Envelope event) {
+    private void absorbDimension(Dimension dimension, Envelope event, String owner) {
         Map<String, Object> after = event.after();
         Map<String, Object> before = event.before();
         String was = before == null ? null : keyOfDimensionRow(before, dimension);
         String now = after == null ? null : keyOfDimensionRow(after, dimension);
         boolean keyMoved = !Objects.equals(was, now);
 
-        if (was != null && keyMoved) {
-            stores.removeDimensionRow(dimension.source(), was);
-            queueRecompute(dimension, was, event.ts(), event.positions());
+        if (was != null && keyMoved && (owner == null || owner.equals(was))) {
+            String previousIdentity = identityOfDimensionRow(before, dimension);
+            if (stores.removeDimensionRow(dimension.source(), was, dimension.rowKeyColumns(), previousIdentity)) {
+                queueRecompute(dimension, was, event.ts(), event.positions());
+            }
         }
-        if (after == null || now == null) {
+        if (after == null || now == null || (owner != null && !owner.equals(now))) {
             // A dimension row whose join key holds a null matches nothing, by the same rule that makes
             // a null key on the other side match nothing. Keeping it would give it a bucket no fact row
             // can ever name.
@@ -1174,8 +1192,7 @@ public final class JoinDriver {
      * made of rows that should not have matched at all.
      */
     private static String keyOf(Map<String, Object> row, List<String> columns) {
-        JoinKey key = JoinKey.of(JoinKeys.valuesOf(row, columns));
-        return key.matchable() ? key.name() : null;
+        return JoinKeys.nameOf(row, columns);
     }
 
     /**

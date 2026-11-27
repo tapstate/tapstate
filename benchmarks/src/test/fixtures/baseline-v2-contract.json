@@ -1,0 +1,465 @@
+{
+  "description": "Synthetic evidence shapes and values for reader and publisher tests.",
+  "expected": {
+    "changed": [
+      "nest.snapshot.basic.standard"
+    ],
+    "current_nest_median": 402653184,
+    "first_nest_median": 432013312,
+    "unchanged": [
+      "copy.snapshot.basic.standard",
+      "copy.live.basic.standard",
+      "join.snapshot.basic.standard"
+    ]
+  },
+  "initial": {
+    "cases": {
+      "copy.live.basic.standard": {
+        "case_id": "copy.live.basic.standard",
+        "case_version": 1,
+        "evidence": [
+          "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/missing-batch.json"
+        ],
+        "last_stage": "batch",
+        "measurement": {
+          "attempt": 1,
+          "code_sha": "1111111111111111111111111111111111111111",
+          "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "measured_on": "2026-01-01",
+          "run_id": 1
+        },
+        "operators": [
+          "copy"
+        ],
+        "raw_status": "missing",
+        "reason": "The batch did not publish a repeat result.",
+        "status": "measurement-incomplete"
+      },
+      "copy.snapshot.basic.standard": {
+        "case_id": "copy.snapshot.basic.standard",
+        "case_version": 1,
+        "current": {
+          "arms": {
+            "single": {
+              "metrics": {
+                "completion_ms": [
+                  {
+                    "availability": "unavailable",
+                    "reason": "Only an upper bound was observed."
+                  }
+                ],
+                "startup.rss_peak_bytes": [
+                  {
+                    "availability": "measured",
+                    "conditions": {
+                      "effective_input_rows": {
+                        "records": 10000
+                      },
+                      "op_heap_limit_mib": 768,
+                      "sampling_interval_ms": 500
+                    },
+                    "samples": [
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/copy.snapshot.basic.standard/1.json",
+                        "repeat": 1,
+                        "value": 241172480
+                      },
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/copy.snapshot.basic.standard/2.json",
+                        "repeat": 2,
+                        "value": 242221056
+                      },
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/copy.snapshot.basic.standard/3.json",
+                        "repeat": 3,
+                        "value": 243269632
+                      }
+                    ],
+                    "scope": "OP process",
+                    "source": "procfs process status",
+                    "summary": {
+                      "count": 3,
+                      "max": 243269632,
+                      "median": 242221056,
+                      "min": 241172480,
+                      "range": 2097152
+                    },
+                    "unit": "B",
+                    "window_ref": "startup"
+                  }
+                ]
+              }
+            }
+          },
+          "conditions": {
+            "case_version": 1,
+            "connector_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "definition_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "effective_load": {
+              "rows": 10000,
+              "workload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "workload_version": 1
+            },
+            "environment": {
+              "arch": "amd64",
+              "cpu_count": 4,
+              "jdk": "21.0.13+9-LTS",
+              "os": "Linux"
+            },
+            "environment_profile": "ubuntu-24.04-x64-op",
+            "mode": "snapshot",
+            "runner": {
+              "cpu": "Example CPU",
+              "mongo_images": [
+                "mongo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              ],
+              "runner_image": "ubuntu24 example.1"
+            },
+            "scale": "formal"
+          },
+          "measurement": {
+            "attempt": 1,
+            "code_sha": "1111111111111111111111111111111111111111",
+            "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "measured_on": "2026-01-01",
+            "run_id": 1
+          }
+        },
+        "first": "current",
+        "operators": [
+          "copy"
+        ],
+        "status": "completed"
+      },
+      "join.snapshot.basic.standard": {
+        "case_id": "join.snapshot.basic.standard",
+        "case_version": 1,
+        "current": {
+          "arms": {
+            "single": {
+              "metrics": {
+                "completion_ms": [
+                  {
+                    "availability": "unavailable",
+                    "reason": "Only an upper bound was observed."
+                  }
+                ],
+                "startup.rss_peak_bytes": [
+                  {
+                    "availability": "measured",
+                    "conditions": {
+                      "effective_input_rows": {
+                        "dimensions": 1000,
+                        "facts": 10000
+                      },
+                      "op_heap_limit_mib": 768,
+                      "sampling_interval_ms": 500
+                    },
+                    "samples": [
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/join.snapshot.basic.standard/1.json",
+                        "repeat": 1,
+                        "value": 336592896
+                      },
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/join.snapshot.basic.standard/2.json",
+                        "repeat": 2,
+                        "value": 337641472
+                      },
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/join.snapshot.basic.standard/3.json",
+                        "repeat": 3,
+                        "value": 338690048
+                      }
+                    ],
+                    "scope": "OP process",
+                    "source": "procfs process status",
+                    "summary": {
+                      "count": 3,
+                      "max": 338690048,
+                      "median": 337641472,
+                      "min": 336592896,
+                      "range": 2097152
+                    },
+                    "unit": "B",
+                    "window_ref": "startup"
+                  }
+                ]
+              }
+            }
+          },
+          "conditions": {
+            "case_version": 1,
+            "connector_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "definition_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "effective_load": {
+              "rows": 10000,
+              "workload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "workload_version": 1
+            },
+            "environment": {
+              "arch": "amd64",
+              "cpu_count": 4,
+              "jdk": "21.0.13+9-LTS",
+              "os": "Linux"
+            },
+            "environment_profile": "ubuntu-24.04-x64-op",
+            "mode": "snapshot",
+            "runner": {
+              "cpu": "Example CPU",
+              "mongo_images": [
+                "mongo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              ],
+              "runner_image": "ubuntu24 example.1"
+            },
+            "scale": "formal"
+          },
+          "measurement": {
+            "attempt": 1,
+            "code_sha": "1111111111111111111111111111111111111111",
+            "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "measured_on": "2026-01-01",
+            "run_id": 1
+          }
+        },
+        "first": "current",
+        "operators": [
+          "join"
+        ],
+        "status": "completed"
+      },
+      "nest.snapshot.basic.standard": {
+        "case_id": "nest.snapshot.basic.standard",
+        "case_version": 1,
+        "current": {
+          "arms": {
+            "single": {
+              "metrics": {
+                "completion_ms": [
+                  {
+                    "availability": "unavailable",
+                    "reason": "Only an upper bound was observed."
+                  }
+                ],
+                "startup.rss_peak_bytes": [
+                  {
+                    "availability": "measured",
+                    "conditions": {
+                      "effective_input_rows": {
+                        "children": 8000,
+                        "roots": 2000
+                      },
+                      "op_heap_limit_mib": 768,
+                      "sampling_interval_ms": 500
+                    },
+                    "samples": [
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/nest.snapshot.basic.standard/1.json",
+                        "repeat": 1,
+                        "value": 430964736
+                      },
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/nest.snapshot.basic.standard/2.json",
+                        "repeat": 2,
+                        "value": 432013312
+                      },
+                      {
+                        "evidence": "baselines/ubuntu-24.04-x64-op/fixture-initial/evidence/nest.snapshot.basic.standard/3.json",
+                        "repeat": 3,
+                        "value": 433061888
+                      }
+                    ],
+                    "scope": "OP process",
+                    "source": "procfs process status",
+                    "summary": {
+                      "count": 3,
+                      "max": 433061888,
+                      "median": 432013312,
+                      "min": 430964736,
+                      "range": 2097152
+                    },
+                    "unit": "B",
+                    "window_ref": "startup"
+                  }
+                ]
+              }
+            }
+          },
+          "conditions": {
+            "case_version": 1,
+            "connector_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "definition_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "effective_load": {
+              "rows": 10000,
+              "workload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "workload_version": 1
+            },
+            "environment": {
+              "arch": "amd64",
+              "cpu_count": 4,
+              "jdk": "21.0.13+9-LTS",
+              "os": "Linux"
+            },
+            "environment_profile": "ubuntu-24.04-x64-op",
+            "mode": "snapshot",
+            "runner": {
+              "cpu": "Example CPU",
+              "mongo_images": [
+                "mongo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              ],
+              "runner_image": "ubuntu24 example.1"
+            },
+            "scale": "formal"
+          },
+          "measurement": {
+            "attempt": 1,
+            "code_sha": "1111111111111111111111111111111111111111",
+            "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "measured_on": "2026-01-01",
+            "run_id": 1
+          }
+        },
+        "first": "current",
+        "operators": [
+          "nest"
+        ],
+        "status": "completed"
+      }
+    },
+    "code_sha": "1111111111111111111111111111111111111111",
+    "comparison_rules": {
+      "cases": {
+        "copy.snapshot.basic.standard": {
+          "startup.rss_peak_bytes": {
+            "baseline_noise": 1048576,
+            "minimum_absolute": 1048576,
+            "minimum_repeats": 2,
+            "observe_ratio": 0.1,
+            "suspect_ratio": 0.2,
+            "worse": "higher"
+          }
+        },
+        "join.snapshot.basic.standard": {
+          "startup.rss_peak_bytes": {
+            "baseline_noise": 1048576,
+            "minimum_absolute": 1048576,
+            "minimum_repeats": 2,
+            "observe_ratio": 0.1,
+            "suspect_ratio": 0.2,
+            "worse": "higher"
+          }
+        },
+        "nest.snapshot.basic.standard": {
+          "startup.rss_peak_bytes": {
+            "baseline_noise": 1048576,
+            "minimum_absolute": 1048576,
+            "minimum_repeats": 2,
+            "observe_ratio": 0.1,
+            "suspect_ratio": 0.2,
+            "worse": "higher"
+          }
+        }
+      },
+      "version": 1
+    },
+    "environment": "ubuntu-24.04-x64-op",
+    "id": "example-synchronization",
+    "kind": "fixture",
+    "schema_version": 2,
+    "version": "fixture-initial"
+  },
+  "update": {
+    "code_sha": "2222222222222222222222222222222222222222",
+    "measurements": {
+      "nest.snapshot.basic.standard": {
+        "arms": {
+          "single": {
+            "metrics": {
+              "completion_ms": [
+                {
+                  "availability": "unavailable",
+                  "reason": "Only an upper bound was observed."
+                }
+              ],
+              "startup.rss_peak_bytes": [
+                {
+                  "availability": "measured",
+                  "conditions": {
+                    "effective_input_rows": {
+                      "children": 8000,
+                      "roots": 2000
+                    },
+                    "op_heap_limit_mib": 768,
+                    "sampling_interval_ms": 500
+                  },
+                  "samples": [
+                    {
+                      "evidence": "baselines/ubuntu-24.04-x64-op/fixture-nest-only/evidence/nest.snapshot.basic.standard/1.json",
+                      "repeat": 1,
+                      "value": 401604608
+                    },
+                    {
+                      "evidence": "baselines/ubuntu-24.04-x64-op/fixture-nest-only/evidence/nest.snapshot.basic.standard/2.json",
+                      "repeat": 2,
+                      "value": 402653184
+                    },
+                    {
+                      "evidence": "baselines/ubuntu-24.04-x64-op/fixture-nest-only/evidence/nest.snapshot.basic.standard/3.json",
+                      "repeat": 3,
+                      "value": 403701760
+                    }
+                  ],
+                  "scope": "OP process",
+                  "source": "procfs process status",
+                  "summary": {
+                    "count": 3,
+                    "max": 403701760,
+                    "median": 402653184,
+                    "min": 401604608,
+                    "range": 2097152
+                  },
+                  "unit": "B",
+                  "window_ref": "startup"
+                }
+              ]
+            }
+          }
+        },
+        "conditions": {
+          "case_version": 1,
+          "connector_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "definition_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "effective_load": {
+            "rows": 10000,
+            "workload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "workload_version": 1
+          },
+          "environment": {
+            "arch": "amd64",
+            "cpu_count": 4,
+            "jdk": "21.0.13+9-LTS",
+            "os": "Linux"
+          },
+          "environment_profile": "ubuntu-24.04-x64-op",
+          "mode": "snapshot",
+          "runner": {
+            "cpu": "Example CPU",
+            "mongo_images": [
+              "mongo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ],
+            "runner_image": "ubuntu24 example.1"
+          },
+          "scale": "formal"
+        },
+        "measurement": {
+          "attempt": 1,
+          "code_sha": "2222222222222222222222222222222222222222",
+          "manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "measured_on": "2026-01-02",
+          "run_id": 2
+        }
+      }
+    },
+    "version": "fixture-nest-only"
+  }
+}

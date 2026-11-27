@@ -101,6 +101,7 @@ public final class MongoConfigurationBootstrap {
                             if (!mayCreate || !emptyTarget) throw refused();
                             SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.prepareCollectionOn(database, session);
                             SystemCollections.CONFIG_RETRY_SETTINGS.prepareCollectionOn(database, session);
+                            SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.prepareCollectionOn(database, session);
                             SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
                             for(var index:SystemCollections.CAPTURE_PREPARATIONS.indexes())
                                 IndexEnsure.createInTransaction(session,SystemCollections.CAPTURE_PREPARATIONS.on(database),index);
@@ -118,7 +119,8 @@ public final class MongoConfigurationBootstrap {
                                             .append("formatVersion", 1).append("keyId", SourceConfigCipher.fingerprint(key))
                                             .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
-                                    new Document("_id", "config").append("installedVersion", 2)
+                                    new Document("_id", "config").append("installedVersion", 2).append(MongoValidationSchema.AI_ONLY, true)
+                                            .append(MongoKeyMoveWindowStore.INSTALL_VERSION, 1)
                                             .append(MongoAlertStorageSchema.FIELD, MongoAlertStorageSchema.initialMarker(
                                                     clusterId, SourceConfigCipher.fingerprint(key), operationId))
                                             .append(MongoSourceIdentitySchema.FIELD, MongoSourceIdentitySchema.initial(
@@ -142,6 +144,8 @@ public final class MongoConfigurationBootstrap {
             MongoConfigurationDraftStore.prepareIndexes(database);
             MongoConfigurationImportStore.prepareIndexes(database);
             MongoRequiredDeadLetterStore.prepareIndexes(database);
+            MongoConfigurationDomain.prepareConfigComponentIdentity(connection, clusterId,
+                    new MongoReadBudget(settings.serverSelectionTimeout()));
             var prepared=new MongoConfigurationDomain(connection,clusterId);
             prepared.prepareAlertStorage(operationId);
             return prepared;

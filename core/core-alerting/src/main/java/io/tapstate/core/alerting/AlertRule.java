@@ -13,7 +13,10 @@ public record AlertRule(AlarmKey key, long revision, long generation, String pro
         producerIncarnation = AlertValidation.text(producerIncarnation, "producerIncarnation", 256);
         triggerFor = AlertValidation.duration(triggerFor, "triggerFor", true, Duration.ofDays(1));
         resolveFor = AlertValidation.duration(resolveFor, "resolveFor", true, Duration.ofDays(1));
-        maxAge = AlertValidation.duration(maxAge, "maxAge", false, Duration.ofHours(1));
+        boolean hourlyInspection = key.typeId().equals("cluster.config-structure-drift")
+                || key.typeId().equals("cluster.cache-structure-drift");
+        maxAge = AlertValidation.duration(maxAge, "maxAge", false,
+                hourlyInspection ? Duration.ofMinutes(65) : Duration.ofHours(1));
         maxGap = AlertValidation.duration(maxGap, "maxGap", false, maxAge);
     }
 }

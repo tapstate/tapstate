@@ -73,24 +73,35 @@ class MongoCacheMetadataStoresIT {
                     SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_PIPELINE_STATE)){
                 table.prepareCollectionOn(f.database);for(var index:table.indexes())IndexEnsure.createIfAbsent(table.on(f.database),index);
             }
-            var stores=f.domain.runtimeSrs(SCOPE,ACTIVE);assertThat(stores.chains().load("absent")).isEmpty();
+            var chains = f.domain.runtimeSrs(SCOPE, ACTIVE).chains();
+            assertThat(chains.load("absent")).isEmpty();
             var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);
-            try{assertThat(stores.chains().load("absent")).isEmpty();}
+            try{assertThat(chains.load("absent")).isEmpty();}
             finally{MongoCommandObservation.CURRENT.remove();}
             assertThat(commands).doesNotContain("listCollections","listIndexes");
             SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id","cluster"),new Document("$set",new Document("businessPhase","PREPARING")));
-            assertThatThrownBy(()->stores.chains().load("absent")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(()->chains.load("absent")).isInstanceOf(TapstateException.class);
             SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id","cluster"),new Document("$set",new Document("businessPhase","READY")));
-            assertThat(stores.chains().load("absent")).isEmpty();
+            assertThat(chains.load("absent")).isEmpty();
+            var schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.database);
+            var business = new Document("_id", "business");
+            var original = schema.find(business).first();
+            schema.updateOne(business, new Document("$set", new Document("phase", "PREPARING")));
+            try {
+                assertThatThrownBy(() -> chains.load("absent")).isInstanceOf(TapstateException.class);
+            } finally {
+                schema.replaceOne(business, original);
+            }
             SystemCollections.SRS_MODELS.on(f.database).createIndex(new Document("diagnostic_expiry",1),
                     new com.mongodb.client.model.IndexOptions().name("unexpected_ttl").expireAfter(1L,TimeUnit.SECONDS));
-            assertThat(stores.chains().load("absent")).isEmpty();
-            TapstateException drift=null;long deadline=System.nanoTime()+Duration.ofSeconds(11).toNanos();
-            while(System.nanoTime()-deadline<0){
-                try{stores.chains().load("absent");}catch(TapstateException detected){drift=detected;break;}
-                Thread.sleep(100);
-            }
-            assertThat(drift).isNotNull();assertThat(drift.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+            assertThat(chains.load("absent")).isEmpty();
+            assertThat(f.domain.inspectStructure(AUTH, new MongoReadBudget(Duration.ofSeconds(10))))
+                    .anySatisfy(difference -> {
+                        assertThat(difference.collection()).isEqualTo(SystemCollections.SRS_MODELS.collectionName());
+                        assertThat(difference.index()).isEqualTo("unexpected_ttl");
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.UNEXPECTED_CONSTRAINT);
+                    });
+            assertThat(chains.load("absent")).isEmpty();
         });
     }
     @Test void aWarmClaimViewCannotRecreateADroppedClaimNamespace() {
@@ -385,7 +396,7 @@ class MongoCacheMetadataStoresIT {
             assertThat(catalog.get("example")).contains(entry("example"));
             assertThat(f.domain.connectorCatalog(SCOPE, ACTIVE).list()).containsExactly(entry("example"));
             SystemCollections.CACHE_CONNECTOR_SPECS.on(f.database).drop(); var before = f.snapshot();
-            assertCode(() -> f.domain.connectorSpecs(SCOPE, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain.connectorSpecs(SCOPE, ACTIVE).get(HASH)).isEmpty();
             assertThat(f.snapshot()).isEqualTo(before);
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("connector_specs");
         });

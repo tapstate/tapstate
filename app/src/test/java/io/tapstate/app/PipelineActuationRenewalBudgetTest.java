@@ -48,6 +48,200 @@ class PipelineActuationRenewalBudgetTest {
     private static final List<String> IDS = List.of("AaAaAa", "AaAaBB", "AaBBAa", "AaBBBB",
             "BBAaAa", "BBAaBB", "BBBBAa");
 
+    @Test void aScopedPermitUsesTheConfirmedLeaseWithoutSubmittingRenewal() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner(true, Duration.ofSeconds(10));
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            io.localOffset.addAndGet(Duration.ofSeconds(11).toNanos());
+
+            var permit = owner.permit(scope(id));
+            assertThat(permit.granted()).isTrue();
+            assertThat(WorkloadClaimFence.from(permit.claim())).isEqualTo(WorkloadClaimFence.from(original));
+            assertThat(io.attempts).as("the permit must leave renewal to the background dispatcher").isEmpty();
+
+            owner.renewDue();
+            assertThat(io.attempts).containsExactly(id);
+        }
+    }
+
+    @Test void theDispatcherRenewsADifferentPipelineWhileTheOriginalCallIsStillBlocked() throws Exception {
+        try (var io = new ControlledIo(); var dispatchers = Executors.newFixedThreadPool(2)) {
+            var owner = io.owner();
+            var a = seedOne(io, owner, IDS.getFirst());
+            var b = seedOne(io, owner, IDS.get(1));
+            var aEntered = new CountDownLatch(1);
+            var blockA = new CountDownLatch(1);
+            var bFinished = new CountDownLatch(1);
+            var aAttempts = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> call.<Supplier<?>>getArgument(3).get())
+                    .when(io.store).withRenewalDeadline(any(WorkloadClaimKey.class), anyLong(), any(), any());
+            doAnswer(call -> {
+                var expected = call.<WorkloadClaim>getArgument(0);
+                if (expected.key().equals(a.key())) {
+                    aAttempts.incrementAndGet();
+                    aEntered.countDown();
+                    assertThat(blockA.await(4, TimeUnit.SECONDS)).isTrue();
+                }
+                io.raw.clockAt(io.epoch.plusMillis(500));
+                var result = io.raw.renew(expected, call.getArgument(1));
+                if (expected.key().equals(b.key())) bFinished.countDown();
+                return result;
+            }).when(io.store).renew(any(), any());
+            io.makeDue();
+            try {
+                owner.dispatchDueRenewals(dispatchers);
+                assertThat(aEntered.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThat(bFinished.await(2, TimeUnit.SECONDS)).isTrue();
+                assertThat(io.raw.read(b.key()).orElseThrow().claim().leaseUntil()).isAfter(b.leaseUntil());
+                owner.dispatchDueRenewals(dispatchers);
+                assertThat(blockA.getCount()).isOne();
+                assertThat(aAttempts).hasValue(1);
+            } finally { blockA.countDown(); }
+        }
+    }
+
+    @Test void anEarlierRecoveryGetsTheNextTurnBeforeOrdinaryRenewals() throws Exception {
+        try (var io = new ControlledIo()) {
+            var interval = Duration.ofSeconds(10);
+            var owner = io.owner(true, interval);
+            var urgentId = IDS.getFirst();
+            var ordinaryId = IDS.get(1);
+            var urgent = seedOne(io, owner, urgentId);
+            io.localOffset.addAndGet(Duration.ofSeconds(3).toNanos());
+            var ordinary = seedOne(io, owner, ordinaryId);
+            var sequence = new CopyOnWriteArrayList<String>();
+            var attempts = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> {
+                WorkloadClaim expected = call.getArgument(0);
+                if (expected.key().equals(urgent.key())) {
+                    sequence.add("renew urgent");
+                    if (attempts.incrementAndGet() == 1) {
+                        io.localOffset.addAndGet(Duration.ofSeconds(8).toNanos());
+                        throw new WorkloadClaimRenewalException(
+                                WorkloadClaimRenewalException.Reason.UNCONFIRMED, "initial result unavailable");
+                    }
+                    assertThat(io.budget.get() - System.nanoTime()).isGreaterThan(Duration.ofSeconds(2).toNanos());
+                    io.localOffset.addAndGet(Duration.ofSeconds(2).toNanos());
+                } else {
+                    assertThat(expected.key()).isEqualTo(ordinary.key());
+                    sequence.add("renew ordinary");
+                    io.localOffset.addAndGet(Duration.ofMillis(4200).toNanos());
+                }
+                io.syncClock();
+                return io.raw.renew(expected, call.getArgument(1));
+            }).when(io.store).renew(any(), any());
+            when(io.store.readPipeline(scope(urgentId))).thenAnswer(call -> {
+                sequence.add("confirm urgent");
+                io.localOffset.addAndGet(Duration.ofSeconds(4).toNanos());
+                return io.raw.read(urgent.key());
+            });
+
+            io.localOffset.addAndGet(Duration.ofSeconds(8).toNanos());
+            owner.renewDue();
+            assertThat(sequence).containsExactly("renew urgent");
+            io.localOffset.addAndGet(Duration.ofSeconds(2).toNanos());
+            owner.renewDue();
+            assertThat(sequence).as("reserve the next turn for the earlier unresolved lease")
+                    .containsExactly("renew urgent", "confirm urgent");
+
+            io.localOffset.addAndGet(Duration.ofMillis(1100).toNanos());
+            owner.renewDue();
+            assertThat(sequence).containsExactly("renew urgent", "confirm urgent", "renew urgent", "renew ordinary");
+            var stillOwned = owner.permit(scope(urgentId));
+            assertThat(stillOwned.granted()).isTrue();
+            assertThat(WorkloadClaimFence.from(stillOwned.claim())).isEqualTo(WorkloadClaimFence.from(urgent));
+            assertThat(stillOwned.claim().leaseUntil()).isAfter(urgent.leaseUntil());
+            var ordinaryPermit = owner.permit(scope(ordinaryId));
+            assertThat(ordinaryPermit.granted()).isTrue();
+            assertThat(WorkloadClaimFence.from(ordinaryPermit.claim())).isEqualTo(WorkloadClaimFence.from(ordinary));
+            assertThat(ordinaryPermit.claim().leaseUntil()).isAfter(ordinary.leaseUntil());
+        }
+    }
+
+    @Test
+    void aFreeingWorkerCannotLetALaterLeasePassAnEarlierDeferredLease() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner(true, Duration.ofSeconds(10));
+            var earlierId = IDS.getFirst();
+            var laterId = IDS.get(1);
+            var earlier = seedOne(io, owner, earlierId);
+            io.localOffset.addAndGet(Duration.ofSeconds(3).toNanos());
+            var later = seedOne(io, owner, laterId);
+            var probes = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> {
+                if (probes.incrementAndGet() == 1) throw new WorkloadClaimRenewalException(
+                        WorkloadClaimRenewalException.Reason.NOT_STARTED, "previous renewal still owns the worker");
+                return io.bounded(io.renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            }).when(io.store).withRenewalDeadline(anyLong(), any(), any());
+            io.localOffset.addAndGet(Duration.ofSeconds(11).toNanos());
+
+            owner.renewDue();
+            assertThat(io.attempts).as("a deferred earlier lease ends the batch before a later lease can use the freed worker").isEmpty();
+
+            io.localOffset.addAndGet(Duration.ofMillis(1100).toNanos());
+            owner.renewDue();
+            assertThat(io.attempts).containsExactly(earlierId, laterId);
+            for (WorkloadClaim expected : List.of(earlier, later)) {
+                var actual=owner.permit(scope(expected.key().resourceId())).claim();
+                assertThat(WorkloadClaimFence.from(actual)).isEqualTo(WorkloadClaimFence.from(expected));
+                assertThat(actual.leaseUntil()).isAfter(expected.leaseUntil());
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void deferringWithoutStartingKeepsTheOriginalProofAndConfirmationPhase(boolean alreadyUnconfirmed) throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner(true, Duration.ofSeconds(10));
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            var defer = new java.util.concurrent.atomic.AtomicBoolean();
+            var writes = new java.util.concurrent.atomic.AtomicInteger();
+            var confirmations = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> {
+                if (defer.getAndSet(false)) throw new WorkloadClaimRenewalException(
+                        WorkloadClaimRenewalException.Reason.NOT_STARTED, "renewal worker is busy");
+                return io.bounded(io.renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            }).when(io.store).withRenewalDeadline(anyLong(), any(), any());
+            doAnswer(call -> {
+                if (writes.incrementAndGet() == 1 && alreadyUnconfirmed) throw new WorkloadClaimRenewalException(
+                        WorkloadClaimRenewalException.Reason.UNCONFIRMED, "commit reply unavailable");
+                io.syncClock();
+                return io.raw.renew(call.getArgument(0), call.getArgument(1));
+            }).when(io.store).renew(any(), any());
+            when(io.store.readPipeline(scope(id))).thenAnswer(call -> {
+                confirmations.incrementAndGet();
+                return io.raw.read(original.key());
+            });
+
+            io.localOffset.addAndGet(Duration.ofSeconds(11).toNanos());
+            if (alreadyUnconfirmed) {
+                owner.renewDue();
+                io.localOffset.addAndGet(Duration.ofMillis(1100).toNanos());
+            }
+            defer.set(true);
+            owner.renewDue();
+            assertThat(writes).hasValue(alreadyUnconfirmed ? 1 : 0);
+            assertThat(confirmations).hasValue(0);
+            assertThat(owner.permit(scope(id)).granted()).isEqualTo(!alreadyUnconfirmed);
+
+            io.localOffset.addAndGet(Duration.ofMillis(1100).toNanos());
+            owner.renewDue();
+            assertThat(writes).hasValue(1);
+            assertThat(confirmations).hasValue(alreadyUnconfirmed ? 1 : 0);
+            if (alreadyUnconfirmed) {
+                io.localOffset.addAndGet(Duration.ofMillis(1100).toNanos());
+                owner.renewDue();
+                assertThat(writes).hasValue(2);
+            }
+            var renewed = owner.permit(scope(id)).claim();
+            assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(WorkloadClaimFence.from(original));
+            assertThat(renewed.leaseUntil()).isAfter(original.leaseUntil());
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void onlyLegacyPermitWaitsForAnInFlightRenewal(boolean scoped) throws Exception {
@@ -97,6 +291,64 @@ class PipelineActuationRenewalBudgetTest {
             assertThat(WorkloadClaimFence.from(current)).isEqualTo(WorkloadClaimFence.from(original));
             assertThat(current.leaseUntil()).isAfter(original.leaseUntil());
             assertThat(io.attempts).containsExactly(id);
+        }
+    }
+
+    @org.junit.jupiter.api.RepeatedTest(3)
+    void oneUncommittedTimeoutDoesNotTrapHealthyRenewalsBehindRepeatedConfirmation() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner(true, Duration.ofSeconds(10));
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            var attempts = new java.util.concurrent.atomic.AtomicInteger();
+            var confirmations = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> {
+                int attempt = attempts.incrementAndGet();
+                if (attempt == 1) throw new WorkloadClaimRenewalException(
+                        WorkloadClaimRenewalException.Reason.UNCONFIRMED, "one transient checkout timeout before commit");
+                long remaining = io.budget.get() - System.nanoTime();
+                io.allowances.add(remaining);
+                System.out.println("RENEWAL_RECOVERY attempt=" + attempt + " remainingMs="
+                        + TimeUnit.NANOSECONDS.toMillis(remaining));
+                long required = Duration.ofMillis(3500).toNanos();
+                if (remaining < required) {
+                    TimeUnit.NANOSECONDS.sleep(Math.max(0, remaining));
+                    throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "the transaction exhausted its original allowance without committing");
+                }
+                Thread.sleep(3500);
+                io.syncClock();
+                return io.raw.renew(call.getArgument(0), call.getArgument(1));
+            }).when(io.store).renew(any(), any());
+            when(io.store.readPipeline(scope(id))).thenAnswer(call -> {
+                confirmations.incrementAndGet();
+                Thread.sleep(2200);
+                io.syncClock();
+                return io.raw.read(original.key());
+            });
+            io.localOffset.addAndGet(Duration.ofSeconds(10).toNanos());
+            owner.renewDue();
+            for (int retry = 0; retry < 3; retry++) {
+                io.localOffset.addAndGet(Duration.ofSeconds(2).toNanos());
+                owner.renewDue();
+                io.awaitQuiescence(deadline(5000));
+                if (retry == 0) {
+                    assertThat(confirmations).hasValue(1);
+                    assertThat(attempts).hasValue(1);
+                    assertThat(owner.permit(scope(id)).granted()).isFalse();
+                    assertThat(owner.beginExecution(scope(id), WorkloadClaimFence.from(original)).allowed()).isFalse();
+                }
+            }
+            assertThat(confirmations).hasValue(1);
+            assertThat(attempts).hasValue(2);
+            assertThat(io.allowances).hasSize(1).allSatisfy(allowance ->
+                    assertThat(allowance).isBetween(Duration.ofMillis(3500).toNanos(), Duration.ofSeconds(5).toNanos()));
+            var current = io.raw.read(original.key()).orElseThrow().claim();
+            System.out.println("RENEWAL_RECOVERY confirmations=" + confirmations.get()
+                    + " attempts=" + attempts.get() + " extended=" + current.leaseUntil().isAfter(original.leaseUntil()));
+            assertThat(WorkloadClaimFence.from(current)).isEqualTo(WorkloadClaimFence.from(original));
+            assertThat(current.leaseUntil()).as("healthy IO after one transient failure can renew the original tenure")
+                    .isAfter(original.leaseUntil());
         }
     }
 
@@ -269,8 +521,12 @@ class PipelineActuationRenewalBudgetTest {
         private ControlledIo() {
             doAnswer(call -> bounded(worker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
                     .when(store).withDeadline(anyLong(), any(), any());
+            org.mockito.Mockito.doCallRealMethod().when(store).withClaimAcquisition(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+            org.mockito.Mockito.doCallRealMethod().when(store).withClaimAcquisitionDeadline(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
             doAnswer(call -> bounded(renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
                     .when(store).withRenewalDeadline(anyLong(), any(), any());
+            doAnswer(call -> store.withRenewalDeadline(call.<Long>getArgument(1), call.getArgument(2), call.getArgument(3)))
+                    .when(store).withRenewalDeadline(any(WorkloadClaimKey.class), anyLong(), any(), any());
             doAnswer(call -> { awaitQuiescence(call.getArgument(0));return null; })
                     .when(store).awaitQuiescence(anyLong());
             when(store.acquirePipeline(any(), any(), anyLong(), any())).thenAnswer(call -> {

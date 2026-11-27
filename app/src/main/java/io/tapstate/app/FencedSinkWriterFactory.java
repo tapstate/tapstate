@@ -59,7 +59,10 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
     @Override public Opening opening() {
         Opening batch = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed
                 ? indexed.opening() : (member, local) -> delegate.get();
-        return (member, local) -> open(batch, member, local);
+        return new Opening() {
+            public SinkWriter open(int member, int local) throws Exception { return FencedSinkWriterFactory.this.open(batch, member, local); }
+            public int maximumConcurrentRemainingOpens() { return batch.maximumConcurrentRemainingOpens(); }
+        };
     }
 
     private SinkWriter open(Opening opening, int memberIndex, int localIndex) throws Exception {
@@ -101,6 +104,21 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
         public void prepareTargets(HazelcastInstance coordinator) {
             ExecutionAuthorization.of(coordinator).require(fence);
             targets.prepareTargets(coordinator);
+        }
+
+        @Override
+        public boolean supportsParallelKeyMoves() {
+            return targets.supportsParallelKeyMoves();
+        }
+
+        @Override
+        public java.util.Map<String, io.tapstate.spi.sink.TargetKeyConstraints> prepareTargetConstraints(
+                HazelcastInstance coordinator) {
+            var authorization = ExecutionAuthorization.of(coordinator);
+            authorization.require(fence);
+            var constraints = targets.prepareTargetConstraints(coordinator);
+            authorization.require(fence);
+            return constraints;
         }
     }
 

@@ -67,6 +67,7 @@ class ScopedEngineLifecycleActuatorTest {
         when(submitted.awaitTerminal(any())).thenReturn(true); when(submitted.isCarryingAJob()).thenReturn(true);
         when(captures.forRun(any(),any(),any())).thenAnswer(call -> { events.add("bind:"+((ExecutionFence)call.getArgument(2)).executionGeneration()); return fixedCapture; });
         doAnswer(call -> { events.add("capture"); return null; }).when(fixedCapture).startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
+        when(fixedCapture.stopCaptureIfPresent(anyString(), anyBoolean())).thenCallRealMethod();
         when(fixedCapture.loadDelivered("p")).thenReturn(true);
         when(fixedCapture.captureBindings()).thenAnswer(call -> new PipelineCaptureBindings(new ExecutionFence(SCOPE,held.get()),Map.of(),false));
         when(ownership.beginExecution(eq(SCOPE),any())).thenAnswer(call -> {
@@ -83,13 +84,16 @@ class ScopedEngineLifecycleActuatorTest {
                     events.add("build"); return new DagSource.PlannedDag(new DAG(),ExecutionShape.totalOne(),List.of("node"),Map.of(),Map.of());
                 }),Map.of(),Optional.of(SourceModelSnapshot.capture("p",List.of(),mock(SchemaStore.class))),Optional.of(coordinates));
         when(dags.prepareStart(eq(pass),eq("cache"))).thenAnswer(call -> { events.add("prepare"); return preparation; });
+        when(dags.prepareStart(any(PipelineConvergencePass.class), anyString(), any())).thenCallRealMethod();
+        when(fixedCapture.prepareCaptureStart(anyString(), any(ArtifactStore.class), any(SourceModelSnapshot.class)))
+                .thenCallRealMethod();
     }
     private ScopedEngineLifecycleActuator.Ports ports() {
         return new ScopedEngineLifecycleActuator.Ports((original,capacities,members,guard) -> {
             events.add("operators"); prepared.add(original); assertThat(members).containsExactly("node");
             onPrepare.run(); guard.run();
         },original -> { onRelease.run(); released.add(original); },(original,manifest) -> rebuilds.add(original),(original,command) -> new ExecutionPlanRecorder() {
-            @Override public void record(io.tapstate.core.lifecycle.ExecutionPlan plan) {}
+            @Override public void record(io.tapstate.core.lifecycle.ExecutionPlan plan) { events.add("record"); }
             @Override public void forget(String pipeline) { assertThat(pipeline).isEqualTo(original.pipelineId()); forgottenPlans.add(original); }
             @Override public void forget(io.tapstate.core.lifecycle.ExecutionPlan expected) {
                 assertThat(expected.pipelineId()).isEqualTo(original.pipelineId()); forgottenPlans.add(original);
@@ -175,6 +179,7 @@ class ScopedEngineLifecycleActuatorTest {
         when(previous.failure()).thenReturn(Optional.empty());
         var root = mock(ScopedPipelineCaptureCoordinator.class);
         var partialCapture = mock(PipelineCaptureCoordinator.class);
+        when(partialCapture.stopCaptureIfPresent("p", false)).thenCallRealMethod();
         var attempted = new ExecutionFence(SCOPE, claim(2));
         var episodes = new java.util.concurrent.ConcurrentHashMap<ExecutionFence, CaptureReadRetry>();
         episodes.put(attempted, retry);
@@ -315,6 +320,7 @@ class ScopedEngineLifecycleActuatorTest {
         var stopPass = new PipelineConvergencePass(stopIntent, held.get(), views, () -> {});
         new ScopedEngineLifecycleActuator(stopPass, engine, dags, captures, ownership, "cache",
                 ConnectorReadiness.NONE, Clock.systemUTC(), recording, submissions).stop("p", false);
+        verify(dags).retireCoveredKeyMoves(stopPass);
         assertThat(registry.originals(SCOPE)).isEmpty();
         assertThat(releasedHot).containsAll(installed);
         assertThat(installed).hasSize(2);
@@ -479,6 +485,25 @@ class ScopedEngineLifecycleActuatorTest {
         assertThat(forgottenPlans).containsExactly(new ExecutionFence(SCOPE,claim(1)));verify(dags,never()).prepareStart(any(PipelineConvergencePass.class),anyString());
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void startOnlyReprovesPreviousCaptureWhenItWasStopped(boolean retired) {
+        when(engine.captureRun("p")).thenReturn(Optional.empty());
+        doReturn(retired).when(fixedCapture).stopCaptureIfPresent("p", false);
+        var localPorts = new ScopedEngineLifecycleActuator.Ports((m, c, n, g) -> {}, released::add,
+                (p, m) -> {}, (f, c) -> ExecutionPlanRecorder.NONE);
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), localPorts, submissions);
+        var boundary = new IllegalStateException("execution boundary");
+        when(ownership.beginExecution(eq(SCOPE), any())).thenThrow(boundary);
+        assertThatThrownBy(() -> actor.start("p")).isSameAs(boundary);
+        // One proof at Start entry and one at old-instance cleanup. A real cleanup adds a post-proof.
+        verify(ownership, times(retired ? 3 : 2)).proveStartClaim(SCOPE, claim(1));
+        verify(fixedCapture).stopCaptureIfPresent("p", false);
+        verify(previous, never()).cancel();
+        assertThat(released).isEmpty();
+    }
+
     @Test void ordinaryStopUsesTheCapturedJobAndNeverResolvesItsReplacementOrPurgesColdState() {
         var actor = actuator(); var replacement = mock(Engine.Run.class);
         when(engine.captureRun("p")).thenReturn(Optional.of(replacement));
@@ -614,6 +639,33 @@ class ScopedEngineLifecycleActuatorTest {
         verify(ownership).beginExecution(SCOPE,claim(1)); verify(ownership,never()).beginExecution(anyString());
         verify(engine).submitRun(eq("p"),any(),anyMap(),any(),eq(manifest(2)));
     }
+    @Test void aStartDoesNotRepeatRemoteProofsForLocalPreparation() {
+        var actor = actuator();
+        clearInvocations(ownership);
+
+        actor.start("p");
+
+        long proofs = mockingDetails(ownership).getInvocations().stream()
+                .filter(call -> Set.of("proveClaim", "proveStartClaim").contains(call.getMethod().getName()))
+                .count();
+        // This fixture retires an old run, installs operators, starts capture and submits Jet.
+        assertThat(proofs).isLessThanOrEqualTo(13);
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), eq(manifest(2)));
+    }
+
+    @Test void ownershipLostDuringDagBuildCannotPublishOrSubmit() {
+        preparation = new DagSource.StartPreparation(preparation.capacity(), Set.of(), preparation.artifactSnapshot(),
+                () -> new DagSource.PlannedTopology(List.of("node"), fence -> {
+                    held.set(claim(3));
+                    return new DagSource.PlannedDag(new DAG(), ExecutionShape.totalOne(), List.of("node"), Map.of(), Map.of());
+                }), Map.of(), preparation.sourceModels(), preparation.operatorPlan());
+
+        assertThatThrownBy(() -> actuator().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).doesNotContain("record", "submit");
+        verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
     @Test void aCaptureResultFromAnotherExecutionCannotBuildOrSubmitTheNewRun() {
         when(fixedCapture.captureBindings()).thenReturn(new PipelineCaptureBindings(new ExecutionFence(SCOPE,claim(1)),Map.of(),false));
         assertThatThrownBy(() -> actuator().start("p")).isInstanceOfSatisfying(TapstateException.class,
@@ -663,6 +715,70 @@ class ScopedEngineLifecycleActuatorTest {
         verify(fixedCapture,never()).startCapture(anyString(),any(ArtifactStore.class),any(SourceModelSnapshot.class));
         verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
     }
+    @Test void connectorReadinessOverlapsPlanningButOldRunWaitsForBoth() {
+        var checking = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var checked = new AtomicBoolean();
+        ConnectorReadiness readiness = (pipelineId, ids) -> {
+            assertThat(ids).containsExactly("sink");
+            checking.countDown();
+            await(release);
+            checked.set(true);
+            return Set.of();
+        };
+        doAnswer(call -> {
+            call.<java.util.function.BiConsumer<Set<String>, Map<String, String>>>getArgument(2)
+                    .accept(Set.of("sink"), Map.of());
+            try {
+                await(checking);
+                verify(previous, never()).cancel();
+                var p = preparation;
+                return new DagSource.StartPreparation(p.capacity(), p.stateLocations(), p.artifactSnapshot(), p.planner(),
+                        Map.of("target", "sink"), p.sourceModels(), p.operatorPlan());
+            } finally {
+                release.countDown();
+            }
+        }).when(dags).prepareStart(eq(pass), eq("cache"), any());
+        when(previous.awaitTerminal(any())).thenAnswer(call -> {
+            assertThat(checked.get()).isTrue();
+            return true;
+        });
+        new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                readiness, Clock.systemUTC(), ports(), submissions).start("p");
+        verify(previous).cancel();
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
+    @Test void readOnlyCaptureInputsOverlapMapsAndCaptureOpensOnlyAfterBoth() {
+        var preparingCapture = new java.util.concurrent.CountDownLatch(1);
+        var mapsReady = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> {
+            preparingCapture.countDown();
+            await(mapsReady);
+            return (Runnable) () -> fixedCapture.startCapture("p", call.getArgument(1), call.getArgument(2));
+        }).when(fixedCapture).prepareCaptureStart(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        onPrepare = () -> {
+            try {
+                await(preparingCapture);
+                verify(fixedCapture, never()).startCapture(anyString(), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+            } finally {
+                mapsReady.countDown();
+            }
+        };
+        actuator().start("p");
+        verify(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
+    private static void await(java.util.concurrent.CountDownLatch step) {
+        try {
+            assertThat(step.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
     @Test void aTopologyWithoutAnOriginalMemberSnapshotCannotStartCapture() {
         preparation = new DagSource.StartPreparation(preparation.capacity(),Set.of(),preparation.artifactSnapshot(),
                 () -> fence -> new DagSource.PlannedDag(new DAG(),ExecutionShape.totalOne(),List.of("node"),Map.of(),Map.of()),
@@ -693,4 +809,36 @@ class ScopedEngineLifecycleActuatorTest {
         };
         assertThatThrownBy(() -> legacy.forRun(SCOPE,claim(1),new ExecutionFence(SCOPE,claim(1)))).isInstanceOf(TapstateException.class);
     }
+    private ScopedEngineLifecycleActuator actuatorWithLocalCaptureLease() {
+        var original = ports();
+        var local = new ScopedEngineLifecycleActuator.Ports(original.operators(), original.releaseHot(), original.rebuild(),
+                original.plans(), ignored -> true);
+        return new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache", ConnectorReadiness.NONE,
+                Clock.systemUTC(), local, submissions);
+    }
+
+    @Test void localCapturePreparationLeaseCannotReplaceTheLaterJetSubmissionProof() {
+        var checkedAfterCapture = new AtomicBoolean();
+        when(ownership.proveStartClaim(eq(SCOPE), any())).thenAnswer(call -> {
+            if (events.contains("capture")) checkedAfterCapture.set(true);
+            return active.get() && held.get().equals(call.getArgument(1));
+        });
+        when(ownership.proveClaim(eq(SCOPE), any())).thenAnswer(call ->
+                !events.contains("record") && active.get() && held.get().equals(call.getArgument(1)));
+        assertThatThrownBy(() -> actuatorWithLocalCaptureLease().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).contains("capture", "build", "record");
+        assertThat(checkedAfterCapture).isTrue();
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class));
+    }
+
+    @Test void localCapturePreparationLeaseCannotReplaceTheCaptureBindingProof() {
+        when(ownership.proveStartClaim(eq(SCOPE), any())).thenAnswer(call ->
+                !events.contains("capture") && active.get() && held.get().equals(call.getArgument(1)));
+        assertThatThrownBy(() -> actuatorWithLocalCaptureLease().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).contains("capture").doesNotContain("build", "record", "submit");
+        verify(engine, never()).submitRun(anyString(), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class));
+    }
+
 }

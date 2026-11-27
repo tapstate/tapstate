@@ -148,5 +148,9 @@
   "TS0490028": {
     "message": "Embed {embedPath} lists orOn alternatives, and one of them matches on {fields}, which identifies its parent ({parentKey}).",
     "solution": "Use orOn only where the parent points at one shared row, such as a location looked up by code or by hub id. An embed that gathers several rows under its parent matches on one condition; give it a single on."
+  },
+  "TS0490037": {
+    "message": "Nest node {node} could not confirm both owners completed a root key change.",
+    "solution": "Inspect the root and its children at both keys and reconcile the saved position before restarting."
   }
 }

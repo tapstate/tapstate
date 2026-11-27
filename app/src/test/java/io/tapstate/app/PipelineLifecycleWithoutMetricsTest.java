@@ -50,4 +50,42 @@ class PipelineLifecycleWithoutMetricsTest {
         assertThat(catalog.find("orders").orElseThrow().status().displayState()).isEqualTo(PipelineCatalogItem.UiState.STARTING);
         assertThat(catalog.find("orders").orElseThrow().status().state()).isEqualTo(PipelineCatalogItem.DisplayState.STARTING);
     }
+
+    @Test void stopResultsUseTheBatchedIntentAndCompletionFacts() {
+        var memory = new InMemoryStorePort();
+        var facts = Map.of(
+                "clearing", stopFacts("clearing", PipelineState.STOPPED, true, false),
+                "cleared", stopFacts("cleared", PipelineState.STOPPED, false, true),
+                "retained", stopFacts("retained", PipelineState.STOPPED, false, false),
+                "pending", stopFacts("pending", PipelineState.RUNNING, false, false));
+        for (String id : facts.keySet()) {
+            memory.artifacts().save(new PipelineResource(id, null, List.of(SourceRef.bare("input")), List.of(),
+                    null, null, null, Map.of()));
+        }
+        var fallback = mock(DesiredStore.class);
+        var store = mock(StorePort.class);
+        when(store.desired()).thenReturn(fallback);
+        when(store.pipelineCatalogStates(anyList())).thenReturn(facts);
+        var artifacts = new ArtifactQueryService(memory.artifacts());
+        var observations = new PipelineObservationQueryService(artifacts, memory.observations());
+        var catalog = new PipelineCatalogService(
+                artifacts, new PipelineDraftService(mock(PipelineDraftStore.class)), observations, store);
+
+        var listed = catalog.list();
+        for (var item : listed) {
+            assertThat(catalog.find(item.id())).contains(item);
+        }
+        assertThat(listed).extracting(item -> item.status().stopState())
+                .containsExactly(PipelineCatalogItem.StopState.CLEARED, PipelineCatalogItem.StopState.CLEARING,
+                        null, PipelineCatalogItem.StopState.RETAINED);
+        verifyNoInteractions(fallback);
+    }
+
+    private static StorePort.PipelineCatalogState stopFacts(
+            String id, PipelineState checkpoint, boolean purge, boolean cleared) {
+        var observation = new Observation(id, checkpoint, Map.of(), Map.of(), Map.of(), null, null);
+        return new StorePort.PipelineCatalogState(Optional.of(observation),
+                Optional.of(new DesiredState(id, PipelineState.STOPPED, "hash", purge)),
+                Optional.empty(), false, checkpoint, null, cleared);
+    }
 }

@@ -1,0 +1,431 @@
+package io.tapstate.runtime.engine;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.hazelcast.config.Config;
+import com.hazelcast.config.SerializerConfig;
+import com.hazelcast.core.Hazelcast;
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.core.Watermark;
+import com.hazelcast.jet.core.test.TestInbox;
+import com.hazelcast.jet.core.test.TestOutbox;
+import com.hazelcast.jet.core.test.TestProcessorContext;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.spi.sink.TargetKeyConstraints;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+
+class SinkLaneRouterTest {
+    private static final ChainAxes AXES = ChainAxes.assign(List.of("orders"));
+    private static final SinkTarget TARGET = new SinkTarget("orders", List.of("id"));
+    private static HazelcastInstance first;
+    private static HazelcastInstance second;
+
+    @BeforeAll
+    static void startMembers() {
+        String cluster = "sink-lane-router-" + UUID.randomUUID();
+        first = Hazelcast.newHazelcastInstance(config(cluster));
+        second = Hazelcast.newHazelcastInstance(config(cluster));
+        assertThat(first.getCluster().getMembers()).hasSize(2);
+    }
+
+    @AfterAll
+    static void stopMembers() {
+        if (second != null) second.shutdown();
+        if (first != null) first.shutdown();
+    }
+
+    @Test
+    void unchangedKeysStayPlainAndSnapshotRowsTakeTheSpreadEdge() throws Exception {
+        try (var f = fixture(false, 32)) {
+            var snapshot = Envelope.read(1, "orders", image(1, "one"), null).withOrder(SourceOrder.snapshotRow(1));
+            var ordinary = update(2, 1, "one", 1, "one");
+            f.router.process(0, new TestInbox(List.of(snapshot, ordinary)));
+
+            assertThat(f.drain(SinkRouter.SPREAD)).containsExactly(snapshot);
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactly(ordinary);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void anUncertifiedTargetKeepsStableDataFlowingAndRejectsAnActualMove() throws Exception {
+        try (var f = fixture(TargetKeyConstraints.unknown(), 8)) {
+            var inserted = insert(1, 7, "first");
+            var stable = update(2, 7, "first", 7, "second");
+            var removed = Envelope.delete(3, "orders", image(7, "second"), null);
+            var ordinary = List.of(inserted, stable, removed);
+            f.router.process(0, new TestInbox(ordinary));
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactlyElementsOf(ordinary);
+            var move = update(4, 7, "second", 8, "second");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(move))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+        }
+    }
+
+    @Test
+    void anExplicitNullUniqueValueStaysOnTheOrdinaryWriter() throws Exception {
+        try (var f = fixture(true, 32)) {
+            var before = new HashMap<String, Object>();
+            before.put("id", 1);
+            before.put("email", null);
+            var after = new HashMap<>(before);
+            after.put("value", 21);
+            var snapshot = Envelope.read(1, "orders", before, null);
+            var update = Envelope.update(2, "orders", before, after, null);
+            f.router.process(0, new TestInbox(List.of(snapshot, update)));
+            assertThat(f.drain(SinkRouter.SPREAD)).containsExactly(snapshot);
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactly(update);
+
+            var unrelated = update(3, 2, "old", 2, "new");
+            f.router.process(0, new TestInbox(List.of(unrelated, update)));
+            assertThat(f.drain(SinkRouter.BY_KEY)).satisfiesExactly(
+                    command -> assertThat(command).isInstanceOf(SinkLaneCommand.Fence.class),
+                    plain -> assertThat(plain).isSameAs(update));
+
+            // A missing after value is not evidence of an explicit null.
+            var incomplete = Envelope.update(4, "orders", before, Map.of("id", 1), null);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(incomplete))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Op.class, names = {"UPDATE", "DELETE"})
+    void an_omitted_old_unique_value_orders_only_its_own_table(Op op) throws Exception {
+        var keys = List.of(List.of("id"), List.of("email"), List.of("_id"));
+        var constraints = new TargetKeyConstraints(keys, true, true,
+                Map.of("id", TapstateType.INT64, "email", TapstateType.STRING));
+        var targets = Map.of("orders", TARGET, "lines", new SinkTarget("lines", List.of("id")));
+        try (var f = fixture(targets, Map.of("orders", constraints, "lines", constraints), 32)) {
+            var earlier = update(10, 1, "old", 1, "released");
+            var partial = op == Op.DELETE ? Envelope.delete(11, "orders", Map.of("id", 2), null)
+                    : Envelope.update(11, "orders", Map.of("id", 2), image(2, "new"), null);
+            var later = insert(12, 3, "unknown-previous-owner");
+            var otherTable = Envelope.update(13, "lines", image(4, "other"), image(4, "other"), null);
+            f.router.process(0, new TestInbox(List.of(earlier, partial, later, otherTable)));
+
+            var initial = f.drain(SinkRouter.BY_KEY);
+            assertThat(initial).satisfiesExactly(
+                    item -> assertThat(item).isInstanceOf(SinkLaneCommand.Fence.class),
+                    item -> assertThat(item).isSameAs(otherTable));
+            f.ack((SinkLaneCommand.Fence) initial.getFirst());
+            var priorWrite = f.onlyMove();
+            assertThat(priorWrite.row()).isSameAs(earlier);
+            f.ack(priorWrite);
+
+            var partialFence = f.drain(SinkRouter.BY_KEY);
+            assertThat(partialFence).hasSize(1);
+            f.ack((SinkLaneCommand.Fence) partialFence.getFirst());
+            var partialWrite = f.onlyMove();
+            assertThat(partialWrite.row()).isSameAs(partial);
+            f.ack(partialWrite);
+
+            var laterFence = f.drain(SinkRouter.BY_KEY);
+            assertThat(laterFence).hasSize(1);
+            f.ack((SinkLaneCommand.Fence) laterFence.getFirst());
+            var laterWrite = f.onlyMove();
+            assertThat(laterWrite.row()).isSameAs(later);
+            f.ack(laterWrite);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void aDeleteWithAnIncompleteCompositePrimaryKeyCannotUseTableOrdering() throws Exception {
+        var primary = List.of("id", "region");
+        var target = new SinkTarget("orders", primary);
+        var constraints = new TargetKeyConstraints(List.of(primary, List.of("email")), true, false,
+                Map.of("id", TapstateType.INT64, "region", TapstateType.STRING, "email", TapstateType.STRING));
+        try (var f = fixture(Map.of("orders", target), Map.of("orders", constraints), 8)) {
+            var partial = Envelope.delete(11, "orders", Map.of("id", 2), null);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> f.router.process(0, new TestInbox(List.of(partial))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+        }
+    }
+
+    @Test
+    void a_changed_primary_key_still_requires_known_old_secondary_values() throws Exception {
+        try (var f = fixture(true, 8)) {
+            var move = Envelope.update(10, "orders", Map.of("id", 1), image(2, "new"), null);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    f.router.process(0, new TestInbox(List.of(move))))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+        }
+    }
+
+    @Test
+    void reusingANullUniqueValueWaitsForItsPreviousOwnerToCommit() throws Exception {
+        try (var f = fixture(true, 32)) {
+            var release = update(10, 1, null, 1, "released");
+            var acquire = insert(11, 2, null);
+            var unrelated = update(12, 3, "other", 3, "other");
+            f.router.process(0, new TestInbox(List.of(release, acquire, unrelated)));
+
+            var initial = f.drain(SinkRouter.BY_KEY);
+            assertThat(initial).hasSize(2);
+            assertThat(initial.getLast()).isSameAs(unrelated);
+            f.ack((SinkLaneCommand.Fence) initial.getFirst());
+            var releasing = f.onlyMove();
+            assertThat(releasing.row()).isSameAs(release);
+            f.ack(releasing);
+
+            var fences = f.drain(SinkRouter.BY_KEY);
+            assertThat(fences).hasSize(1);
+            f.ack((SinkLaneCommand.Fence) fences.getFirst());
+            var acquiring = f.onlyMove();
+            assertThat(acquiring.row()).isSameAs(acquire);
+            f.ack(acquiring);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void aPartialOrDifferentlyTypedKeyStopsBeforeAnyTargetCommand() throws Exception {
+        try (var f = fixture(false, 1)) {
+            for (var oldRow : List.<Map<String, Object>>of(Map.of("label", "unknown"), Map.of("id", "01"))) {
+                var change = Envelope.update(10, "orders", oldRow, image(1, "one"), null);
+                org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        f.router.process(0, new TestInbox(List.of(change))))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(EngineError.TARGET_KEY_ORDER_UNKNOWN));
+                assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void bothKeyOwnersMustConfirmBeforeAMoveAndItsFollowersCanWrite() throws Exception {
+        try (var f = fixture(false, 32)) {
+            var move = update(10, 1, "one", 2, "one");
+            var oldKey = insert(11, 1, "replacement");
+            var newKey = update(12, 2, "one", 2, "one");
+            var unrelated = update(13, 9, "nine", 9, "nine");
+            var input = new TestInbox(List.of(move, oldKey, newKey, unrelated));
+            f.router.process(0, input);
+            var initial = f.drain(SinkRouter.BY_KEY);
+            assertThat(input.size()).isZero();
+            assertThat(initial).hasSize(3);
+            var oldFence = (SinkLaneCommand.Fence) initial.get(0);
+            var newFence = (SinkLaneCommand.Fence) initial.get(1);
+            assertThat(oldFence.lane()).isNotEqualTo(newFence.lane());
+            assertThat(initial.get(2)).isSameAs(unrelated);
+
+            f.ack(oldFence);
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+            f.ack(newFence);
+            var applied = f.onlyMove();
+            assertThat(applied.row()).isSameAs(move);
+            assertThat(f.router.complete()).isFalse();
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+
+            f.ack(applied);
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactly(oldKey, newKey);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void aReleasedUniqueValueWaitsForItsWriterBeforeTheMoveAndOldKeyReuse() throws Exception {
+        try (var f = fixture(true, 32)) {
+            var release = update(10, 3, "claimed", 3, "free");
+            var move = update(11, 1, "mine", 2, "claimed");
+            var reuse = insert(12, 1, "replacement");
+            var unrelated = update(13, 9, "nine", 9, "nine");
+            f.router.process(0, new TestInbox(List.of(release, move, reuse, unrelated)));
+            var initial = f.drain(SinkRouter.BY_KEY);
+            assertThat(initial).hasSize(2);
+            assertThat(initial.get(1)).isSameAs(unrelated);
+            f.ack((SinkLaneCommand.Fence) initial.getFirst());
+            var releasing = f.onlyMove();
+            assertThat(releasing.row()).isSameAs(release);
+            f.router.tryProcess();
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+
+            f.ack(releasing);
+            var owners = f.drain(SinkRouter.BY_KEY);
+            assertThat(owners).hasSize(2).allMatch(SinkLaneCommand.Fence.class::isInstance);
+            f.ack((SinkLaneCommand.Fence) owners.getFirst());
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+            f.ack((SinkLaneCommand.Fence) owners.getLast());
+            var migrating = f.onlyMove();
+            assertThat(migrating.row()).isSameAs(move);
+            f.router.tryProcess();
+            assertThat(f.drain(SinkRouter.BY_KEY)).isEmpty();
+
+            f.ack(migrating);
+            var reusingFence = (SinkLaneCommand.Fence) f.drain(SinkRouter.BY_KEY).getFirst();
+            f.ack(reusingFence);
+            var reusing = f.onlyMove();
+            assertThat(reusing.row()).isSameAs(reuse);
+            f.ack(reusing);
+            assertThat(f.router.complete()).isTrue();
+        }
+    }
+
+    @Test
+    void aNarrowOutboxRetriesCommandsAndKeepsBoundsBelowTheUnconfirmedMove() throws Exception {
+        try (var f = fixture(false, 1)) {
+            var move = update(10, 1, "one", 2, "one");
+            var unrelated = update(11, 9, "nine", 9, "nine");
+            var input = new TestInbox(List.of(move, unrelated));
+            var emitted = new ArrayList<Object>();
+            for (int attempt = 0; attempt < 8 && (!input.isEmpty() || emitted.size() < 3); attempt++) {
+                f.router.process(0, input);
+                f.router.tryProcess();
+                emitted.addAll(f.drain(SinkRouter.BY_KEY));
+            }
+            assertThat(input.size()).isZero();
+            assertThat(emitted).hasSize(3);
+            assertThat(emitted.get(2)).isSameAs(unrelated);
+            var fences = emitted.subList(0, 2).stream().map(SinkLaneCommand.Fence.class::cast).toList();
+            long far = FrontierOrders.pack("orders", new SourceOrder(1, 90));
+            var mark = new Watermark(far, AXES.axisOf("orders"));
+            assertThat(f.out.offer("occupied")).isTrue();
+            assertThat(f.router.tryProcessWatermark(0, mark)).isFalse();
+            assertThat(f.drain(SinkRouter.SPREAD)).containsExactly("occupied");
+            assertThat(f.drain(SinkRouter.BY_KEY)).containsExactly("occupied");
+            assertThat(f.router.tryProcessWatermark(0, mark)).isTrue();
+            var before = f.drain(SinkRouter.BY_KEY);
+            assertThat(before).containsExactly(new Watermark(FrontierOrders.pack("orders", new SourceOrder(1, 10)) - 1,
+                    AXES.axisOf("orders")));
+            f.drain(SinkRouter.SPREAD);
+            fences.forEach(f::ack);
+            var applying = f.onlyMove();
+            f.ack(applying);
+            var after = f.drain(SinkRouter.BY_KEY);
+            assertThat(after).containsExactly(mark);
+        }
+    }
+
+    @Test
+    void aCommandAndItsAcknowledgmentCrossActualMemberBoundaries() throws Exception {
+        try (var f = fixture(false, 32)) {
+            var move = update(10, 1, "one", 2, "one");
+            f.router.process(0, new TestInbox(List.of(move)));
+            var wire = second.<SinkLaneCommand>getQueue("sink-lane-wire-" + UUID.randomUUID());
+            try {
+                for (Object item : f.drain(SinkRouter.BY_KEY)) {
+                    wire.put((SinkLaneCommand) item);
+                    SinkLaneAcks.acknowledge(second, wire.take().reply());
+                }
+                var applying = f.awaitMove();
+                wire.put(applying);
+                var read = (SinkLaneCommand.Move) wire.take();
+                assertThat(read.row()).isEqualTo(move);
+                assertThat(read.lane()).isEqualTo(applying.lane());
+                SinkLaneAcks.acknowledge(second, read.reply());
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (!f.router.complete() && System.nanoTime() < deadline) TimeUnit.MILLISECONDS.sleep(5);
+                assertThat(f.router.complete()).isTrue();
+            } finally {
+                wire.destroy();
+            }
+        }
+    }
+
+    private static Fixture fixture(boolean secondary, int capacity) throws Exception {
+        var keys = secondary ? List.of(List.of("id"), List.of("email"), List.of("_id"))
+                : List.of(List.of("id"), List.of("_id"));
+        return fixture(new TargetKeyConstraints(keys, true, true,
+                Map.of("id", TapstateType.INT64, "email", TapstateType.STRING)), capacity);
+    }
+
+    private static Fixture fixture(TargetKeyConstraints constraints, int capacity) throws Exception {
+        return fixture(Map.of("orders", TARGET), Map.of("orders", constraints), capacity);
+    }
+
+    private static Fixture fixture(Map<String, SinkTarget> targets, Map<String, TargetKeyConstraints> constraints,
+            int capacity) throws Exception {
+        var router = new SinkLaneRouter("copy", targets, constraints, AXES, Map.of(0, List.of("orders")));
+        var out = new TestOutbox(new int[] {capacity, capacity}, capacity);
+        router.openReplies(first);
+        router.init(out, new TestProcessorContext());
+        return new Fixture(router, out);
+    }
+
+    private record Fixture(SinkLaneRouter router, TestOutbox out) implements AutoCloseable {
+        List<Object> drain(int ordinal) {
+            var rows = new ArrayList<Object>();
+            out.drainQueueAndReset(ordinal, rows, false);
+            return rows;
+        }
+
+        void ack(SinkLaneCommand command) {
+            SinkLaneAcks.acknowledge(first, command.reply());
+            router.tryProcess();
+        }
+
+        SinkLaneCommand.Move onlyMove() {
+            var emitted = drain(SinkRouter.BY_KEY);
+            assertThat(emitted).hasSize(1);
+            return (SinkLaneCommand.Move) emitted.getFirst();
+        }
+
+        SinkLaneCommand.Move awaitMove() throws InterruptedException {
+            var emitted = new ArrayList<Object>();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (emitted.isEmpty() && System.nanoTime() < deadline) {
+                router.tryProcess();
+                emitted.addAll(drain(SinkRouter.BY_KEY));
+                if (emitted.isEmpty()) TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(emitted).hasSize(1);
+            return (SinkLaneCommand.Move) emitted.getFirst();
+        }
+
+        @Override public void close() { router.close(); }
+    }
+
+    private static Envelope update(long seq, int before, String oldEmail, int after, String newEmail) {
+        return Envelope.update(seq, "orders", image(before, oldEmail), image(after, newEmail), null)
+                .withOrder(new SourceOrder(1, seq));
+    }
+
+    private static Envelope insert(long seq, int id, String email) {
+        return Envelope.insert(seq, "orders", image(id, email), null).withOrder(new SourceOrder(1, seq));
+    }
+
+    private static Map<String, Object> image(int id, String email) {
+        var image = new HashMap<String, Object>();
+        image.put("id", id);
+        image.put("email", email);
+        return image;
+    }
+
+    private static Config config(String cluster) {
+        var config = new Config().setClusterName(cluster);
+        config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
+        config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.shutdownhook.enabled", "false");
+        config.setProperty("hazelcast.logging.type", "none");
+        config.getNetworkConfig().setPort(15891).setPortAutoIncrement(true).setPortCount(2);
+        var join = config.getNetworkConfig().getJoin();
+        join.getMulticastConfig().setEnabled(false);
+        join.getAutoDetectionConfig().setEnabled(false);
+        join.getTcpIpConfig().setEnabled(true).setMembers(List.of("127.0.0.1:15891", "127.0.0.1:15892"));
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig().setTypeClass(Envelope.class)
+                .setImplementation(new EnvelopeSerializer()));
+        return config;
+    }
+}

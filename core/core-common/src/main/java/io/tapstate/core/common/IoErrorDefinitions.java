@@ -6,6 +6,7 @@ import java.util.Set;
 /** Shared diagnostic identities retain their owners' existing behavioral contracts. */
 public final class IoErrorDefinitions {
     private static final ProductErrorDefinitionSet DEFINITIONS = new ProductErrorDefinitionSet(ProductErrorModule.IO);
+    private static final String PIPELINE = "pipeline";
 
     public static final ProductErrorDefinition STORE_UNAVAILABLE =
             DEFINITIONS.define(1, Severity.ERROR, Set.of("detail"));
@@ -26,7 +27,7 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition WORKLOAD_CLAIM_FENCED =
             DEFINITIONS.define(9, Severity.ERROR, Set.of());
     public static final ProductErrorDefinition SINK_WRITER_PROGRESS_AMBIGUOUS =
-            DEFINITIONS.define(10, Severity.ERROR, Set.of("pipeline"));
+            DEFINITIONS.define(10, Severity.ERROR, Set.of(PIPELINE));
     public static final ProductErrorDefinition NOTE_WRITE_CONFLICT =
             DEFINITIONS.define(11, Severity.ERROR, Set.of());
     public static final ProductErrorDefinition REQUIRED_DEAD_LETTER_FENCED =
@@ -38,7 +39,7 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition PIPELINE_INTENT_FENCED =
             DEFINITIONS.define(15, Severity.ERROR, Set.of());
     public static final ProductErrorDefinition PIPELINE_STATE_REBUILD_REQUIRED =
-            DEFINITIONS.define(16, Severity.ERROR, Set.of("pipeline"));
+            DEFINITIONS.define(16, Severity.ERROR, Set.of(PIPELINE));
     public static final ProductErrorDefinition CAPTURE_STATE_REBUILD_REQUIRED =
             DEFINITIONS.define(17, Severity.ERROR, Set.of("capture"));
     public static final ProductErrorDefinition CACHE_BUSINESS_FENCED =
@@ -68,13 +69,13 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition NOTE_SCOPE_UNAVAILABLE =
             DEFINITIONS.define(30, Severity.ERROR, Set.of());
     public static final ProductErrorDefinition SRS_PROGRESS_UNPROVEN =
-            DEFINITIONS.define(31, Severity.ERROR, Set.of("pipeline"));
+            DEFINITIONS.define(31, Severity.ERROR, Set.of(PIPELINE));
     public static final ProductErrorDefinition DIRECT_CHANNEL_UNAVAILABLE =
             DEFINITIONS.define(32, Severity.ERROR, Set.of("channel"));
     public static final ProductErrorDefinition PIPELINE_CAPTURE_IDENTITY_UNPROVEN =
-            DEFINITIONS.define(33, Severity.ERROR, Set.of("pipeline"));
+            DEFINITIONS.define(33, Severity.ERROR, Set.of(PIPELINE));
     public static final ProductErrorDefinition PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED =
-            DEFINITIONS.define(34, Severity.ERROR, Set.of("pipeline", "tables"));
+            DEFINITIONS.define(34, Severity.ERROR, Set.of(PIPELINE, "tables"));
     public static final ProductErrorDefinition CONFIGURATION_IMPORT_REFUSED =
             DEFINITIONS.define(35, Severity.ERROR, Set.of("reason"));
     public static final ProductErrorDefinition CONFIGURATION_IMPORT_LIMIT =
@@ -82,13 +83,21 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition DOCUMENT_TOO_LARGE =
             DEFINITIONS.define(37, Severity.ERROR, Set.of("id"));
     public static final ProductErrorDefinition SINK_MODEL_CAPACITY =
-            DEFINITIONS.define(38, Severity.ERROR, Set.of("pipeline", "target", "bytes", "limit"));
+            DEFINITIONS.define(38, Severity.ERROR, Set.of(PIPELINE, "target", "bytes", "limit"));
     public static final ProductErrorDefinition CONNECTOR_UPLOAD_UNSETTLED =
             DEFINITIONS.define(39, Severity.ERROR, Set.of("hash", "attempt"));
     public static final ProductErrorDefinition SOURCE_IDENTITY_UNAVAILABLE =
             DEFINITIONS.define(40, Severity.ERROR, Set.of("id"));
     public static final ProductErrorDefinition SOURCE_IDENTITY_EXHAUSTED =
             DEFINITIONS.define(41, Severity.ERROR, Set.of("id"));
+    public static final ProductErrorDefinition PIPELINE_COMMIT_OUTCOME_UNKNOWN =
+            DEFINITIONS.define(42, Severity.ERROR, Set.of(PIPELINE));
+
+    public static final ProductErrorDefinition KEY_MOVE_RECOVERY_UNCERTAIN =
+            DEFINITIONS.define(43, Severity.ERROR, Set.of(PIPELINE));
+
+    public static final ProductErrorDefinition KEY_MOVE_NOT_INSTALLED =
+            DEFINITIONS.define(44, Severity.ERROR, Set.of(PIPELINE));
 
     private IoErrorDefinitions() {}
 

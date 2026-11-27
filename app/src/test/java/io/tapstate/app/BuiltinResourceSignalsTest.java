@@ -12,6 +12,36 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class BuiltinResourceSignalsTest {
+    @Test void pipelineProducerSurvivesCloseUntilAnAlreadyDeclaredReportActuallySettles() throws Exception {
+        var fixture=new PipelineAlertRuntimeTest();
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        try(var runtime=fixture.runtime();var caller=java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            runtime.tick();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->runtime.health().queuedInputs()==0);
+            var pass=fixture.pass("orders");var dependency=runtime.pipelineGuard(new ExecutionFence(pass.scope(),pass.claim()),()->{});
+            var delayed=mock(PipelineAlertRuntime.class);
+            doAnswer(call->{
+                entered.countDown();assertThat(release.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                runtime.resourceInput(call.getArgument(0),call.getArgument(1),call.getArgument(2),call.getArgument(3),
+                        call.getArgument(4),call.getArgument(5),call.getArgument(6),call.getArgument(7));return null;
+            }).when(delayed).resourceInput(any(),anyString(),anyLong(),anyString(),any(),any(),any(),any());
+            var storage=mock(StorageBinding.class);when(storage.defaultSourceId()).thenReturn("other");
+            var signals=new BuiltinResourceSignals(()->delayed,()->storage,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},fixture.fixture.clock);
+            var source=new SourceBindingSnapshot(new SourceResource("erp",null,"test",Map.of(),null,null,null,null),"a".repeat(64),
+                    new SourceBindingIdentity("erp","e6e8d616-985e-49cc-a0f4-9802897abf95",2));
+            var root=signals.source(source,"target",dependency,()->{});var phase=root.fork("open");
+            var reporting=caller.submit(()->phase.completed(SourceOperationObserver.Capability.TARGET_WRITE,new java.net.ConnectException("controlled failure")));
+            assertThat(entered.await(2,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            root.close();root.close();phase.close();assertThat(root.hasPendingReports()).isTrue();assertThat(dependency.retained()).isTrue();
+            var observation=PipelineAlertRuntimeTest.observation("orders",PipelineAlertRuntimeTest.T,io.tapstate.core.lifecycle.PipelineState.STOPPED);
+            var receipt=runtime.terminalPublished(pass,TerminalPublication.from(pass,7,observation),observation,null,true);
+            assertThat(receipt.seal()).isFalse();assertThat(receipt.status()).isEqualTo(TerminalPublication.Status.PENDING);
+            release.countDown();reporting.get(2,java.util.concurrent.TimeUnit.SECONDS);
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->receipt.status()==TerminalPublication.Status.COMPLETE);
+            assertThat(root.hasPendingReports()).isFalse();assertThat(dependency.retained()).isFalse();assertThat(receipt.seal()).isTrue();
+            dependency.close();
+        }finally{release.countDown();}
+    }
+
     @Test void classifiedSourceFailuresRetainBoundedRedactedDiagnosticText() {
         var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("other");
         var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.fixed(Instant.EPOCH,ZoneOffset.UTC));
@@ -93,6 +123,28 @@ class BuiltinResourceSignalsTest {
         observer.close();assertThat(observer.hasPendingReports()).isTrue();
         queued.get().run();queued.get().run();assertThat(observer.hasPendingReports()).isFalse();
     }
+    @Test void retryablePipelineRenewalConflictIsNotACacheAvailabilitySample() {
+        var runtime = mock(PipelineAlertRuntime.class);
+        var signals = new BuiltinResourceSignals(() -> runtime, () -> null,
+                new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "cache", 1), () -> {},
+                Clock.fixed(Instant.EPOCH, ZoneOffset.UTC));
+        var delegate = mock(WorkloadClaimStore.class);
+        var claim = mock(WorkloadClaim.class);
+        var ttl = Duration.ofSeconds(30);
+        var conflict = new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.WRITE_CONFLICT,
+                "Mongo Pipeline renewal WriteConflict code=112");
+        when(delegate.renew(claim, ttl)).thenThrow(conflict).thenReturn(Optional.of(claim));
+        var observed = ObservedWorkloadClaims.observe(delegate, signals::cacheOperation);
+
+        assertThatThrownBy(() -> observed.renew(claim, ttl)).isSameAs(conflict);
+        assertThat(observed.renew(claim, ttl)).contains(claim);
+
+        var input = org.mockito.ArgumentCaptor.forClass(AlertInput.Operational.class);
+        verify(runtime).cacheInput(any(), anyString(), any(), input.capture());
+        assertThat(input.getValue().succeeded()).isTrue();
+        assertThat(input.getValue().capability()).isEqualTo(OperationalEvidence.Capability.CACHE_WRITE);
+    }
+
     @Test void cacheSuccessSamplingKeepsBoundariesClockRollbackAndEveryFailureEdge(){
         var runtime=mock(PipelineAlertRuntime.class);var now=new java.util.concurrent.atomic.AtomicReference<>(Instant.EPOCH);
         var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}public Instant instant(){return now.get();}};

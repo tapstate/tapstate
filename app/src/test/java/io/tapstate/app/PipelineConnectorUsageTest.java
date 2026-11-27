@@ -1,7 +1,5 @@
 package io.tapstate.app;
 
-import io.tapstate.core.lifecycle.DesiredState;
-import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.store.*;
 import java.time.Instant;
@@ -60,12 +58,10 @@ class PipelineConnectorUsageTest {
         var bindings = mock(ConnectorBindingStore.class);
         when(intents.connectorBindings()).thenReturn(bindings);
         var scope = new PipelineIntentScope("cluster", 1, "cache", "reader", 1);
-        when(intents.load("reader")).thenReturn(Optional.of(new PipelineIntentSnapshot(scope, 2,
-                new DesiredState("reader", PipelineState.RUNNING, "definition", false))));
         var query = new PipelineConnectorUsage(intents, mock(PipelineDraftStore.class), () -> {});
-        when(bindings.load(scope)).thenReturn(Optional.empty());
+        when(bindings.loadCurrent("reader")).thenReturn(Optional.empty());
         assertThat(query.forPipeline("reader")).isEmpty();
-        when(bindings.load(scope)).thenReturn(Optional.of(new ConnectorRunBindings(scope, 1,
+        when(bindings.loadCurrent("reader")).thenReturn(Optional.of(new ConnectorRunBindings(scope, 1,
                 List.of(binding(scope, OLD, "1.0")), new ConnectorRunBindings.Handoff(2,
                 ConnectorRunBindings.Phase.PREPARED, List.of(binding(scope, NEXT, "2.0")), List.of()))));
         assertThat(query.forPipeline("reader")).singleElement().satisfies(value -> {

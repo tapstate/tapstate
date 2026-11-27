@@ -21,9 +21,8 @@ import org.junit.jupiter.api.Test;
  * two source tables written into one target table meet on one writer for the same key. A table with no key goes by
  * the table alone.
  *
- * <p>Two changes cannot be routed by their row and end the run with a code instead: one whose key cannot be read,
- * and one that moves its row from one key to another - there is no processor that would see every change of both
- * keys in order.
+ * <p>A change whose key cannot be read ends the run with a code. A key move also ends the run on a
+ * row-partitioned edge. The coordinated ingress routes changes by table so the old and new key share a dispatcher.
  */
 class EveryChangeOfARowIsRoutedByTheRowItChangesTest {
 
@@ -67,10 +66,9 @@ class EveryChangeOfARowIsRoutedByTheRowItChangesTest {
                 "us_orders", new SinkTarget("orders", REGION_AND_ID),
                 "notes", new SinkTarget("orders", REGION_AND_ID));
 
-        Object fromOne = RoutingKeys.sinkKeyOf("sink", targets,
-                Envelope.insert(1L, "eu_orders", row("eu", 7, "new"), null));
-        Object fromTheOther = RoutingKeys.sinkKeyOf("sink", targets,
-                Envelope.delete(2L, "us_orders", row("eu", 7, "new"), null));
+        var route = RoutingKeys.forSink("sink", targets, false);
+        Object fromOne = route.apply(Envelope.insert(1L, "eu_orders", row("eu", 7, "new"), null));
+        Object fromTheOther = route.apply(Envelope.delete(2L, "us_orders", row("eu", 7, "new"), null));
 
         assertThat(fromTheOther).as("one row of the target, whichever stream brought its change").isEqualTo(fromOne);
     }
@@ -81,10 +79,11 @@ class EveryChangeOfARowIsRoutedByTheRowItChangesTest {
                 "events", new SinkTarget("events", List.of()),
                 "orders", new SinkTarget("orders", REGION_AND_ID));
 
-        Object first = RoutingKeys.sinkKeyOf("sink", targets, Envelope.insert(1L, "events", row("eu", 1, "a"), null));
-        Object second = RoutingKeys.sinkKeyOf("sink", targets, Envelope.insert(2L, "events", row("us", 2, "b"), null));
-        Object schema = RoutingKeys.sinkKeyOf("sink", targets, Envelope.ddl(3L, "events", Map.of()));
-        Object other = RoutingKeys.sinkKeyOf("sink", targets, Envelope.insert(4L, "orders", row("eu", 1, "a"), null));
+        var route = RoutingKeys.forSink("sink", targets, false);
+        Object first = route.apply(Envelope.insert(1L, "events", row("eu", 1, "a"), null));
+        Object second = route.apply(Envelope.insert(2L, "events", row("us", 2, "b"), null));
+        Object schema = route.apply(Envelope.ddl(3L, "events", Map.of()));
+        Object other = route.apply(Envelope.insert(4L, "orders", row("eu", 1, "a"), null));
 
         assertThat(second).as("every row of a keyless table goes one way").isEqualTo(first);
         assertThat(schema).as("and so does a change of its schema").isEqualTo(first);
@@ -106,12 +105,29 @@ class EveryChangeOfARowIsRoutedByTheRowItChangesTest {
 
     @Test
     void aChangeThatMovesItsRowToAnotherKeyEndsTheRunWithACode() {
+        var route = RoutingKeys.forSink("sink", Map.of("orders", new SinkTarget("orders", REGION_AND_ID)), false);
         TapstateException refused = catchThrowableOfType(TapstateException.class,
-                () -> RoutingKeys.sinkKeyOf("sink", Map.of("orders", new SinkTarget("orders", REGION_AND_ID)),
-                        Envelope.update(1L, "orders", row("eu", 7, "new"), row("us", 7, "new"), null)));
+                () -> route.apply(Envelope.update(1L, "orders", row("eu", 7, "new"), row("us", 7, "new"), null)));
 
         assertThat(refused.code()).isEqualTo(EngineError.KEY_CHANGE_ON_PARALLEL_NODE);
         assertThat(refused.args()).containsEntry("node", "sink").containsEntry("stream", "orders");
+    }
+
+    @Test
+    void aDefaultSinkKeepsBothKeysOfAMoveWithOtherChangesToTheSameTarget() {
+        SinkTarget orders = new SinkTarget("orders", REGION_AND_ID);
+        var route = RoutingKeys.forSink("sink", Map.of("eu_orders", orders, "us_orders", orders,
+                "audit", new SinkTarget("audit", REGION_AND_ID)), true);
+        var before = row("eu", 7, "new");
+        var after = row("us", 7, "new");
+
+        Object moved = route.apply(Envelope.update(2L, "eu_orders", before, after, null));
+
+        assertThat(route.apply(Envelope.insert(1L, "eu_orders", before, null))).isEqualTo(moved);
+        assertThat(route.apply(Envelope.delete(3L, "us_orders", after, null))).isEqualTo(moved);
+        assertThat(route.apply(Envelope.insert(4L, "audit", after, null))).isNotEqualTo(moved);
+        assertThat(route.apply(Envelope.read(5L, "eu_orders", before, null)))
+                .isNotEqualTo(route.apply(Envelope.read(6L, "eu_orders", after, null)));
     }
 
     @Test

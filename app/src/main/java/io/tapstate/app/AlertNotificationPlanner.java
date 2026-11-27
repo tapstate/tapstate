@@ -62,10 +62,14 @@ final class AlertNotificationPlanner {
         var discovered=seed.schedules().isEmpty()?initial:store.planning();
         var keys=discovered.schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
         int count=Math.min(32,keys.size());
+        var retained=discovered;
         for(int index=0;index<count;index++){var key=keys.get(Math.floorMod(offset+index,keys.size()));active.run();
             boolean done=false;for(int retry=0;retry<3;retry++){
-                var view=store.planning();isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
+                var view=retained==null?store.planning():retained;retained=view;isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
                 var changes=advance(view,row.get());if(changes.intents().isEmpty()&&changes.schedules().isEmpty()){done=true;break;}
+                // Any commit attempt may advance the version or observe a competing write.
+                // No proposal after it may reuse this tick's earlier snapshot.
+                retained=null;
                 if(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,changes.intents(),changes.schedules(),view.version()))!=AlertStore.Outcome.CONFLICT){done=true;break;}
             }if(!done)throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
         }
@@ -84,8 +88,8 @@ final class AlertNotificationPlanner {
         var roots=new LinkedHashMap<AlertSchedule.Key,AlertSchedule.Record>();var original=new HashMap<AlertSchedule.Key,AlertStore.Stored<AlertSchedule.Record>>();
         view.schedules().stream().filter(v->v.value().batch()==null&&v.value().retiredAt()==null).forEach(v->{roots.put(v.value().key(),v.value());original.put(v.value().key(),v);});
         var changed=new LinkedHashSet<AlertSchedule.Key>();
+        heads.values().removeIf(head -> !eligibleForRegistration(view, head));
         for(var head:heads.values()){
-            if(!firing(head)||head.binding()==null||view.unavailableRules().containsKey(head.binding().ruleIdentity().id()))continue;
             for(var destination:destinations(view,head)){
                 if(!installed(view.host(),destination))continue;
                 String group=group(destination,head.binding());
@@ -113,6 +117,11 @@ final class AlertNotificationPlanner {
             }
         }
         return new Changes(List.of(),changed.stream().map(k->new AlertStore.ScheduleChange(original.get(k),roots.get(k))).toList());
+    }
+    private static boolean eligibleForRegistration(AlertStore.Planning view, AlertStateRecord.Head head) {
+        return firing(head) && head.binding() != null
+                && !BuiltinAlarmTypes.retired(head.snapshot().rule().key().typeId())
+                && !view.unavailableRules().containsKey(head.binding().ruleIdentity().id());
     }
     private Changes advance(AlertStore.Planning view,AlertStore.Stored<AlertSchedule.Record> stored) {
         var root=stored.value();Instant now=clock.instant();var ownership=claim(root.owner(),now);
@@ -216,7 +225,8 @@ final class AlertNotificationPlanner {
         for(var member:ended){
             var previous=new ArrayList<DeliveryEvidence.Previous>();var summary=summaries.get(member.episodeMember());if(summary!=null)previous.add(summary.evidence());
             for(var key:refs)if(key.notification().kind()==DeliveryKey.Kind.FAULT||key.notification().kind()==DeliveryKey.Kind.REMINDER){var intent=changedIntent(view,edits,key);if(intent.frozen().members().stream().anyMatch(m->m.episodeMember().equals(member.episodeMember())))previous.add(evidence(intent));}
-            var ep=episode(view,member);boolean revoked=destination==null||!bindingCurrent(view,member)||ep.value().endReason()!=AlertSnapshot.EndReason.RECOVERED;
+            var ep = episode(view, member);
+            boolean revoked = recoveryRevoked(view, member, destination, ep.value());
             boolean silenced=view.definitions().stream().filter(d->d instanceof AlertConfiguration.Silence).map(d->(AlertConfiguration.Silence)d).anyMatch(s->s.matches(member.evaluation().key(),now));
             var recovery=DeliveryEvidence.recovery(previous,now,revoked,silenced);
             if(recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE&&(!canCreate||!targetReady(view,destination,now))||recovery.kind()==DeliveryEvidence.RecoveryKind.WAIT||planned&&recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE){waiting.add(member);continue;}
@@ -249,6 +259,12 @@ final class AlertNotificationPlanner {
         if(edits.size()>MAX_CHANGES||schedules.size()>MAX_CHANGES)throw invalid("planning-commit-budget");
         return new Changes(List.copyOf(edits.values()),List.copyOf(schedules));
     }
+    private static boolean recoveryRevoked(AlertStore.Planning view, AlertIntent.Member member,
+            Destination destination, AlertSnapshot.Episode episode) {
+        return destination == null || !bindingCurrent(view, member)
+                || !cloudSeverityEligible(destination, episode.severity())
+                || episode.endReason() != AlertSnapshot.EndReason.RECOVERED;
+    }
     private static boolean held(AlertStore.Planning view,AlertSchedule.Record root){
         if(root.members().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id()))
                 ||root.pending().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id()))
@@ -258,11 +274,10 @@ final class AlertNotificationPlanner {
     }
     private static TapstateException unavailableRule(){return new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-planning","field","rule-capability"),null);}
     private List<Destination> destinations(AlertStore.Planning view,AlertStateRecord.Head head) {
+        if(head!=null && AlertEvaluationHost.structureInspection(head.snapshot().rule().key().typeId()))return List.of();
         var host=view.host();var result=new ArrayList<Destination>();
         if(host.deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED){
-            if(host.managedRoute()==null||host.managedTarget()==null||cloudOrigin==null)throw invalid("managed-planning-binding");
-            result.add(new Destination(host.managedRoute(),host.managedTarget(),"cloud-sdk",host.managedTarget().incarnation(),host.managedTarget().logicalTargetId(),
-                    MessageSettings.empty(),1,new AlertGroupingClock.Policy(Duration.ZERO,Duration.ofSeconds(1),Duration.ofHours(1)),Set.of(),null));return result;
+            return managedDestinations(host, head);
         }
         for(var definition:view.definitions())if(definition instanceof AlertConfiguration.Subscription route&&route.header().active()&&route.enabled()&&route.bindingRevision()>0){
             if(head!=null&&!route.matches(head.snapshot().rule().key(),head.episode().value().severity()))continue;
@@ -279,13 +294,35 @@ final class AlertNotificationPlanner {
         }
         return result;
     }
+    private List<Destination> managedDestinations(AlertStore.Host host, AlertStateRecord.Head head) {
+        if (host.managedRoute() == null || host.managedTarget() == null || cloudOrigin == null) {
+            throw invalid("managed-planning-binding");
+        }
+        if (head != null && head.episode().value().severity() == AlarmSeverity.WARNING) return List.of();
+        return List.of(cloudDestination(host, AlertChannelPolicy.CLOUD_EVENTS, Duration.ZERO),
+                cloudDestination(host, AlertChannelPolicy.CLOUD_EMAIL, Duration.ofSeconds(60)));
+    }
+    private static Destination cloudDestination(AlertStore.Host host, AlertChannelPolicy.Capability channel, Duration initialWait) {
+        var target = host.managedTarget();
+        return new Destination(host.managedRoute(), target, channel.typeId(), target.incarnation(), target.logicalTargetId(),
+                MessageSettings.empty(), 1, new AlertGroupingClock.Policy(initialWait, Duration.ofSeconds(1),
+                        Duration.ofHours(1)), Set.of(), null);
+    }
     private static boolean covered(AlertStore.Planning view,AlertSchedule.Record root,AlertIntent.Member member){
         if(root.summaries().stream().anyMatch(v->v.alarm().equals(member.evaluation().key())&&v.episode()==member.episode()&&v.outcome()==DeliveryEvidence.Outcome.ACCEPTED))return true;
         return root.protectedIntents().stream().filter(k->k.notification().kind()==DeliveryKey.Kind.FAULT||k.notification().kind()==DeliveryKey.Kind.REMINDER).map(view.intents()::get)
                 .filter(Objects::nonNull).anyMatch(v->v.value().state().summary()==DeliveryEvidence.Outcome.ACCEPTED&&v.value().frozen().members().stream().anyMatch(m->m.episodeMember().equals(member.episodeMember())));
     }
-    private static boolean bindingCurrent(AlertStore.Planning view,AlertIntent.Member member){return view.definitions().stream().filter(d->d instanceof AlertConfiguration.Rule).map(d->(AlertConfiguration.Rule)d).anyMatch(r->r.header().identity().equals(member.ruleIdentity())&&r.evaluationRevision()==member.evaluation().revision()&&r.matches(member.evaluation().key()));}
-    private boolean matches(Destination d,AlertStateRecord.Head head){return d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity());}
+    private static boolean bindingCurrent(AlertStore.Planning view,AlertIntent.Member member){
+        return !BuiltinAlarmTypes.retired(member.evaluation().key().typeId())
+                &&view.definitions().stream().filter(d->d instanceof AlertConfiguration.Rule).map(d->(AlertConfiguration.Rule)d).anyMatch(r->r.header().identity().equals(member.ruleIdentity())&&r.evaluationRevision()==member.evaluation().revision()&&r.matches(member.evaluation().key()));
+    }
+    private static boolean cloudSeverityEligible(Destination destination, AlarmSeverity severity) {
+        return !(destination.target() instanceof AlertIntent.SdkTarget) || severity != AlarmSeverity.WARNING;
+    }
+    private boolean matches(Destination d,AlertStateRecord.Head head){return !AlertEvaluationHost.structureInspection(head.snapshot().rule().key().typeId())
+            && cloudSeverityEligible(d, head.episode().value().severity())
+            && (d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity()));}
     private boolean muted(AlertStore.Planning view,Destination d,AlertStateRecord.Head head,Instant now){
         for(var def:view.definitions())if(def instanceof AlertConfiguration.Silence silence&&silence.matches(head.snapshot().rule().key(),now))return true;
         if(d.subscription()!=null){var policy=new AlertInhibitionPolicy(view.host().scope(),d.subscription().inhibition());
@@ -294,6 +331,9 @@ final class AlertNotificationPlanner {
     }
     private static boolean firing(AlertStateRecord.Head head){return head.retiredAt()==null&&head.snapshot().enabled()&&head.snapshot().status()==AlertSnapshot.Status.FIRING&&head.episode()!=null&&head.episode().value().endedAt()==null;}
     private static boolean installed(AlertStore.Host host,Destination destination){
+        if (AlertChannelPolicy.CLOUD_EMAIL.typeId().equals(destination.channel())) {
+            return host.availableChannels().contains(AlertChannelPolicy.CLOUD_EMAIL);
+        }
         return !(destination.target() instanceof AlertIntent.ReceiverTarget receiver&&receiver.transport() instanceof AlertReceiver.HttpsJson generic)
                 ||host.availableChannels().contains(new AlertChannelPolicy.Capability(generic.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL));
     }
@@ -321,8 +361,12 @@ final class AlertNotificationPlanner {
     private AlertIntent.Record create(AlertStore.Planning view,Destination d,DeliveryKey key,List<AlertIntent.Member> members,
             DeliveryEvidence.RecoveryKind recovery,Instant now,Instant originalDeadline,ChannelRetryPolicy originalPolicy,AlertIntent.Policy policy){
         if(policy.deployment()!=view.host().deployment())throw invalid("foreign-retention-profile");
-        var identity=new AlertIntent.Business(key);var capability=new AlertChannelPolicy.Capability(d.channel(),d.channel().equals("cloud-sdk")?2:1,
-                d.channel().equals("cloud-sdk")?AlertChannelPolicy.Family.CLOUD_SDK:AlertChannelPolicy.Family.OP_EXTERNAL);
+        var identity=new AlertIntent.Business(key);
+        var capability = switch (d.channel()) {
+            case "cloud-sdk" -> AlertChannelPolicy.CLOUD_EVENTS;
+            case "cloud-sdk-email" -> AlertChannelPolicy.CLOUD_EMAIL;
+            default -> new AlertChannelPolicy.Capability(d.channel(), 1, AlertChannelPolicy.Family.OP_EXTERNAL);
+        };
         var retry=originalPolicy!=null?originalPolicy:d.channel().equals("email")?ChannelRetryPolicy.emailDefaults():d.target() instanceof AlertIntent.SdkTarget?new ChannelRetryPolicy(1,0,List.of(),Duration.ofDays(1),Duration.ofSeconds(30)):ChannelRetryPolicy.webhookDefaults();
         Instant deadline=originalDeadline==null?now.plus(retry.maximumAge()):originalDeadline;
         var template=new AlertIntent.Template("fixed-alert",1,d.settingsRevision(),"en",d.messages());byte[] bytes=null;
@@ -345,8 +389,7 @@ final class AlertNotificationPlanner {
             }
             var rendered=renderer.render(new NotificationRenderer.Facts(kind,identity.deliveryId(),key.notification().round(),now,items,items.size(),links.details(members,recoveryMessage),prior,null,null),d.messages());
             if(rendered.successful()){
-                if(d.target() instanceof AlertIntent.ReceiverTarget receiver&&receiver.transport() instanceof AlertReceiver.Email email){var mime=EmailMime.freeze(identity.deliveryId(),now,email.from(),d.targetId(),rendered.snapshot());if(mime.successful())bytes=mime.bytes();}
-                else bytes=rendered.snapshot().webhook();
+                bytes = encodeRenderedContent(d, capability, identity.deliveryId(), now, rendered.snapshot());
             }
         }
         var payload=bytes==null?null:new AlertIntent.Payload(bytes);
@@ -355,6 +398,18 @@ final class AlertNotificationPlanner {
         if(payload==null)retained=retained.stop(now,now);
         return new AlertIntent.Record(frozen,new AlertIntent.State(AlertOwnership.unclaimed(),0,payload==null,payload==null?AlertIntent.StopReason.RENDER_FAILED:null,
                 payload==null?null:now,0,List.of(),DeliveryEvidence.Outcome.NOT_ATTEMPTED,AlertIntent.Retained.capture(retained),payload,null,null,null,null));
+    }
+    private static byte[] encodeRenderedContent(Destination destination, AlertChannelPolicy.Capability capability,
+            String deliveryId, Instant now, NotificationRenderer.Snapshot snapshot) {
+        if (capability.equals(AlertChannelPolicy.CLOUD_EMAIL)) {
+            return CloudAlertNotificationWire.encode(snapshot, deliveryId);
+        }
+        if (destination.target() instanceof AlertIntent.ReceiverTarget receiver
+                && receiver.transport() instanceof AlertReceiver.Email email) {
+            var mime = EmailMime.freeze(deliveryId, now, email.from(), destination.targetId(), snapshot);
+            return mime.successful() ? mime.bytes() : null;
+        }
+        return snapshot.webhook();
     }
     private static Instant observed(AlertStore.Planning view,AlertIntent.Member member,AlertStateRecord.Episode episode) {
         if(episode.diagnostics().latest()!=null)return episode.diagnostics().latest().observedAt();

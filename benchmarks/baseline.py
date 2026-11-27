@@ -1,10 +1,12 @@
 """Read a benchmark baseline without suppressing measurement and coverage reports."""
 
+from datetime import date
 import hashlib
 import json
 import math
 from pathlib import PurePosixPath
 import re
+from statistics import median
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -15,6 +17,10 @@ RELEASE_RECORD = "baselines/releases.json"
 PUBLISHED_FIELDS = ("release_record_commit", "baseline_commit", "id", "version", "environment", "code_sha", "sha256")
 CASE_CONDITIONS = ("case_version", "definition_sha256", "mode", "scale", "effective_load",
                    "connector_sha256", "environment")
+SOURCE_SCHEMA = 2
+SOURCE_METRIC_BINDING = ("conditions", "scope", "source", "unit", "window_ref")
+INCOMPLETE_STATUSES = ("failed", "measurement-incomplete", "invalid", "timed-out",
+                       "not-run", "out-of-memory", "skipped")
 
 
 def get_bytes(url):
@@ -106,12 +112,18 @@ def load(path, *, identity=None):
                 or not isinstance(baseline.get("environment"), str) or not baseline["environment"]
                 or not isinstance(baseline.get("cases"), dict)):
             raise ValueError("invalid-baseline-schema")
+        version = baseline.get("schema_version", 1)
+        if type(version) is not int or version not in (1, SOURCE_SCHEMA):
+            raise ValueError("unsupported-baseline-schema")
         if not valid_cases(baseline, published="id" in details):
             raise ValueError("invalid-baseline-case")
         if "comparison_rules" in baseline and not valid_rules(baseline["comparison_rules"]):
             raise ValueError("invalid-baseline-comparison-rules")
-        if "memory_limits" in baseline and not valid_memory_limits(baseline["memory_limits"]):
-            raise ValueError("invalid-baseline-memory-limits")
+        if "memory_limits" in baseline:
+            valid_limits = (valid_source_memory_limits(baseline) if version == SOURCE_SCHEMA
+                            else valid_memory_limits(baseline["memory_limits"]))
+            if not valid_limits:
+                raise ValueError("invalid-baseline-memory-limits")
         if "id" in details and (baseline["kind"] != "accepted" or baseline["id"] != details["id"]
                                 or baseline.get("version") != details.get("version")
                                 or baseline["environment"] != details.get("environment")
@@ -129,11 +141,156 @@ def load(path, *, identity=None):
 
 
 def valid_cases(baseline, *, published):
+    if baseline.get("schema_version") == SOURCE_SCHEMA:
+        environment = baseline["environment"]
+        return all(valid_source_case(key, row, environment) for key, row in baseline["cases"].items())
     environment = baseline["environment"] if published else None
     return all(valid_case(row, environment=environment)
                and (not published or (row.get("case_id", key) == key
                                      and row.get("code_sha", baseline.get("code_sha")) == baseline.get("code_sha")))
                for key, row in baseline["cases"].items())
+
+
+def valid_source_case(case_id, row, environment):
+    if (not nonblank(case_id) or not isinstance(row, dict) or row.get("case_id") != case_id
+            or not positive_int(row.get("case_version"))):
+        return False
+    if row.get("status") == "completed":
+        current = row.get("current")
+        first = row.get("first")
+        return (valid_reference(current, environment) and current["conditions"]["case_version"] == row["case_version"]
+                and (first == "current" or valid_reference(first, environment)))
+    return (row.get("status") in INCOMPLETE_STATUSES and nonblank(row.get("reason"))
+            and valid_measurement(row.get("measurement"))
+            and isinstance(row.get("evidence"), list) and bool(row["evidence"])
+            and all(valid_evidence_path(path) for path in row["evidence"])
+            and not {"current", "first", "arms", "metrics"}.intersection(row))
+
+
+def valid_reference(reference, environment):
+    if not isinstance(reference, dict) or not valid_measurement(reference.get("measurement")):
+        return False
+    conditions = reference.get("conditions")
+    if (not isinstance(conditions, dict) or not valid_completed_case(conditions, environment)
+            or not digest_matches(conditions.get("definition_sha256"), 64)
+            or not digest_matches(conditions.get("connector_sha256"), 64)):
+        return False
+    runner = conditions.get("runner")
+    if (not isinstance(runner, dict) or not nonblank(runner.get("cpu"))
+            or not nonblank(runner.get("runner_image")) or not isinstance(runner.get("mongo_images"), list)
+            or any(not nonblank(image) for image in runner["mongo_images"])):
+        return False
+    arms = reference.get("arms")
+    return (isinstance(arms, dict) and bool(arms)
+            and all(nonblank(name) and valid_metric_groups(arm) for name, arm in arms.items()))
+
+
+def valid_metric_groups(arm):
+    if not isinstance(arm, dict) or not isinstance(arm.get("metrics"), dict) or not arm["metrics"]:
+        return False
+    for metric, groups in arm["metrics"].items():
+        if not nonblank(metric) or not isinstance(groups, list) or not groups:
+            return False
+        if not all(valid_metric_group(metric, group) for group in groups):
+            return False
+        measured = [group for group in groups if group["availability"] == "measured"]
+        signatures = [{k: group[k] for k in SOURCE_METRIC_BINDING} for group in measured]
+        if any(group == prior for index, group in enumerate(signatures) for prior in signatures[:index]):
+            return False
+    return True
+
+
+def valid_metric_group(metric, group):
+    if not isinstance(group, dict):
+        return False
+    if group.get("availability") in ("unavailable", "not_applicable"):
+        return nonblank(group.get("reason")) and not {"samples", "summary", "value"}.intersection(group)
+    if (group.get("availability") != "measured"
+            or not all(nonblank(group.get(field)) for field in ("unit", "scope", "source", "window_ref"))
+            or not isinstance(group.get("conditions"), dict) or not isinstance(group.get("samples"), list)
+            or not group["samples"]):
+        return False
+    expected_unit = metric_unit(metric)
+    if expected_unit and group["unit"] != expected_unit:
+        return False
+    repeats = set()
+    values = []
+    for sample in group["samples"]:
+        if (not isinstance(sample, dict) or not positive_int(sample.get("repeat")) or sample["repeat"] in repeats
+                or not valid_evidence_path(sample.get("evidence")) or not finite_number(sample.get("value"))
+                or (expected_unit and not metric.endswith("_bytes_per_hour") and sample["value"] < 0)):
+            return False
+        repeats.add(sample["repeat"])
+        values.append(sample["value"])
+    minimum, maximum = min(values), max(values)
+    summary = {"count": len(values), "median": median(values), "min": minimum,
+               "max": maximum, "range": maximum - minimum}
+    return all(finite_number(value) for value in summary.values()) and group.get("summary") == summary
+
+
+def metric_unit(metric):
+    units = (("_bytes_per_hour", "B/h"), ("_bytes", "B"), ("_ms", "ms"))
+    return next((unit for ending, unit in units if metric.endswith(ending)), None)
+
+
+def valid_source_memory_limits(baseline):
+    limits = baseline["memory_limits"]
+    if not isinstance(limits, dict):
+        return False
+    for case_id, arms in limits.items():
+        case = baseline["cases"].get(case_id)
+        if not case or case["status"] != "completed" or not isinstance(arms, dict):
+            return False
+        reference = case["current"]["arms"]
+        for arm, metrics in arms.items():
+            if arm not in reference or not isinstance(metrics, dict):
+                return False
+            for metric, budgets in metrics.items():
+                if metric_unit(metric) not in ("B", "B/h") or not isinstance(budgets, list) or not budgets:
+                    return False
+                source_groups = reference[arm]["metrics"].get(metric, ())
+                bindings = []
+                for budget in budgets:
+                    if (not isinstance(budget, dict) or not positive_int(budget.get("budget_version"))
+                            or not finite_number(budget.get("limit")) or budget["limit"] <= 0
+                            or not all(key in budget for key in SOURCE_METRIC_BINDING)):
+                        return False
+                    binding = {key: budget[key] for key in SOURCE_METRIC_BINDING}
+                    if binding in bindings or not any(
+                            group["availability"] == "measured" and all(group[key] == value for key, value in binding.items())
+                            for group in source_groups):
+                        return False
+                    bindings.append(binding)
+    return True
+
+
+def valid_measurement(measurement):
+    if (not isinstance(measurement, dict) or not positive_int(measurement.get("run_id"))
+            or not positive_int(measurement.get("attempt")) or not digest_matches(measurement.get("code_sha"), 40)
+            or not digest_matches(measurement.get("manifest_sha256"), 64)
+            or not nonblank(measurement.get("measured_on"))):
+        return False
+    try:
+        stamp = measurement["measured_on"]
+        return date.fromisoformat(stamp).isoformat() == stamp
+    except ValueError:
+        return False
+
+
+def valid_evidence_path(value):
+    if not nonblank(value) or any(character in value for character in ("\\", "?", "#", ":")):
+        return False
+    parts = value.split("/")
+    return (len(parts) > 4 and parts[0] == "baselines" and parts[3] == "evidence"
+            and all(part not in ("", ".", "..") for part in parts))
+
+
+def digest_matches(value, length):
+    return isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None
+
+
+def positive_int(value):
+    return type(value) is int and value > 0
 
 
 def valid_case(row, *, environment=None):
@@ -225,6 +382,12 @@ def valid_rules(policy):
                     return False
             if rule["observe_ratio"] >= rule["suspect_ratio"]:
                 return False
+            if "zero_reference" in rule:
+                absolute = rule["zero_reference"]
+                if (not isinstance(absolute, dict)
+                        or not all(finite_number(absolute.get(key)) for key in ("observe_absolute", "suspect_absolute"))
+                        or not 0 < absolute["observe_absolute"] < absolute["suspect_absolute"]):
+                    return False
     return True
 
 

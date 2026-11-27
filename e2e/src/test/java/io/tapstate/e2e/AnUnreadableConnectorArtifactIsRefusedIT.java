@@ -29,7 +29,7 @@ class AnUnreadableConnectorArtifactIsRefusedIT {
             assertThat(refusal.code()).isEqualTo("TS0060013");
             assertThat(refusal.params()).containsKey("artifact");
             assertThat(refusal.params().get("artifact")).asString()
-                    .contains("tapstate-connector-").endsWith(".jar");
+                    .startsWith(".connector-").endsWith(".jar");
         }
     }
 }

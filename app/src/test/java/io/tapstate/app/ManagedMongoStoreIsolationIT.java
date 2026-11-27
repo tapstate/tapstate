@@ -69,6 +69,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.assertj.core.api.Assertions.tuple;
 
 /** Enforced Mongo authorization, not an unauthenticated simulation of database routing. */
 @RequiresDocker
@@ -286,12 +287,17 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
                 var initialRules = admin.getDatabase(configDb).getCollection("alert_rules").find().into(new ArrayList<>());
-                assertThat(initialRules).hasSize(5);
+                assertThat(initialRules).extracting(rule -> rule.get("_id", Document.class).getString("id"))
+                        .containsExactlyInAnyOrder("builtin-cluster.storage-unavailable",
+                                "builtin-pipeline.failed", "builtin-pipeline.observation-stale", "builtin-source.connection-failed",
+                                "builtin-cluster.config-structure-drift", "builtin-cluster.cache-structure-drift");
                 for (var rule : initialRules) {
                     assertThat(rule.get("_id", Document.class)).containsEntry("authorityId", setup.scope().installationId())
                             .containsEntry("clusterId", setup.scope().clusterId());
                     assertThat(rule.getString("deployment")).isEqualTo("ON_PREM");
-                    assertThat(rule.get("body", Document.class)).containsEntry("enabled", true);
+                    var body = rule.get("body", Document.class);
+                    assertThat(body).containsEntry("enabled", true);
+                    assertThat(rule.get("_id", Document.class).getString("id")).isEqualTo("builtin-" + body.getString("typeId"));
                 }
                 String key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId");
                 var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
@@ -300,7 +306,8 @@ class ManagedMongoStoreIsolationIT {
                         .body(Map.of("username", "admin", "password", "op-installation-password")).retrieve().body(Map.class);
                 assertThat(created.get("phase")).isEqualTo("COMPLETE");
                 assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
-                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "LOGIN", "management", false));
+                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "LOGIN", "management", false,
+                                "businessReady", true));
                 assertThat(files.capability()).isEmpty();
                 var publicClient = process.publicClient();
                 var login = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "op-installation-password", "createSession", true))
@@ -308,9 +315,15 @@ class ManagedMongoStoreIsolationIT {
                 var client = publicClient.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
                     var rules = client.post().uri("/api/alerts/configuration/list").body(Map.of("kind", "RULE")).retrieve().body(Map.class);
-                    assertThat((List<?>) rules.get("rows")).hasSize(5);
-                    assertThat(admin.getDatabase(configDb).getCollection("alert_node_lifecycles")
-                            .countDocuments(new Document("phase", "EXPECTED"))).isGreaterThanOrEqualTo(1);
+                    assertThat(rules.get("nextCursor")).isNull();
+                    var storedDefaults = initialRules.stream().map(rule -> {
+                        var body = rule.get("body", Document.class);
+                        return tuple(rule.get("_id", Document.class).getString("id"), body.getString("typeId"), body.getBoolean("enabled"));
+                    }).toList();
+                    assertThat((List<?>) rules.get("rows")).extracting(row -> {
+                        var rule = (Map<?, ?>) row;
+                        return tuple(rule.get("id"), rule.get("typeId"), rule.get("enabled"));
+                    }).containsExactlyInAnyOrderElementsOf(storedDefaults);
                 });
                 var admitted = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
                 assertThat(((List<?>)admitted.get("allowedActions")).containsAll(List.of("configuration.export", "configuration.import.preflight",
@@ -1443,6 +1456,9 @@ class ManagedMongoStoreIsolationIT {
             var settings=new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser,configDb),null,Duration.ofSeconds(5));
             try (var ignored=io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings,cluster,"installation","setup",1)) { }
             try (var application=cloudRecoveryRoot(settings.uri(),sdk,CloudConnectorTestInputs.seedDirectory(),seeds,context -> {
+                // Tomcat also uses this timeout for blocking socket writes.
+                context.getEnvironment().getPropertySources().addFirst(new org.springframework.core.env.MapPropertySource(
+                        "disconnect-fixture", Map.of("server.tomcat.connection-timeout", "2s")));
                 var factory=new org.springframework.beans.factory.support.RootBeanDefinition(StorageBusinessFactory.class,
                         () -> (StorageBusinessFactory)bound -> {
                             assemblies.incrementAndGet(); var owner=new NativeBusinessContext(context.getBean(StorageRoot.class),bound,context);
@@ -1488,8 +1504,10 @@ class ManagedMongoStoreIsolationIT {
                     var child=childRef.get(); var member=child.getBean(com.hazelcast.core.HazelcastInstance.class);
                     assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
                     publish.countDown();
-                    assertThat(response.finished.await(60,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                    assertThat(response.failure.get()).as("the original HTTP reply meets an actually reset client socket").isNotNull();
+                    assertThat(response.finished.await(60, TimeUnit.SECONDS))
+                            .as("the original HTTP reply finishes: %s", response.diagnostics()).isTrue();
+                    assertThat(response.failure.get())
+                            .as("the original HTTP reply meets an actually reset client socket: %s", response.diagnostics()).isNotNull();
                     try {
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).until(() -> {
                             var progress = root.initializationProgress().snapshot(original).orElseThrow();
@@ -1524,39 +1542,113 @@ class ManagedMongoStoreIsolationIT {
     }
 
     private static final class DisconnectedResponse implements jakarta.servlet.Filter {
-        final java.util.concurrent.CountDownLatch finished=new java.util.concurrent.CountDownLatch(1);
-        final java.util.concurrent.CountDownLatch clientDisconnected=new java.util.concurrent.CountDownLatch(1);
-        final AtomicReference<java.io.IOException> failure=new AtomicReference<>();
-        private final java.util.concurrent.atomic.AtomicBoolean first=new java.util.concurrent.atomic.AtomicBoolean(true);
+        private static final Duration OBSERVATION_WINDOW = Duration.ofSeconds(5);
+        private static final int MAX_WRITES = 200;
+        final java.util.concurrent.CountDownLatch finished = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch clientDisconnected = new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<java.io.IOException> failure = new AtomicReference<>();
+        private final java.util.concurrent.atomic.AtomicBoolean first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        private volatile String stage = "waiting for commit request";
+        private volatile long started;
+        private volatile int attempts;
+        private volatile int bytesWritten;
+
         @Override public void doFilter(jakarta.servlet.ServletRequest request,jakarta.servlet.ServletResponse response,jakarta.servlet.FilterChain chain)
                 throws java.io.IOException,jakarta.servlet.ServletException {
             if (!(request instanceof jakarta.servlet.http.HttpServletRequest http) || !http.getRequestURI().equals("/api/storage/setup/commit")
-                    || !first.compareAndSet(true,false)) { chain.doFilter(request,response); return; }
-            var wrapped=new jakarta.servlet.http.HttpServletResponseWrapper((jakarta.servlet.http.HttpServletResponse)response) {
+                    || !first.compareAndSet(true, false)) {
+                chain.doFilter(request, response);
+                return;
+            }
+            stage = "waiting for first response body write";
+            var original = (jakarta.servlet.http.HttpServletResponse) response;
+            var wrapped = new jakarta.servlet.http.HttpServletResponseWrapper(original) {
                 private jakarta.servlet.ServletOutputStream observed;
+
                 @Override public jakarta.servlet.ServletOutputStream getOutputStream() throws java.io.IOException {
-                    if (observed!=null) return observed; var output=super.getOutputStream();
-                    observed=new jakarta.servlet.ServletOutputStream() {
+                    if (observed != null) return observed;
+                    var output = super.getOutputStream();
+                    observed = new jakarta.servlet.ServletOutputStream() {
                         @Override public boolean isReady() { return output.isReady(); }
                         @Override public void setWriteListener(jakarta.servlet.WriteListener listener) { output.setWriteListener(listener); }
-                        @Override public void write(int value) throws java.io.IOException { try { awaitClientDisconnect(); output.write(value); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void write(byte[] value,int offset,int length) throws java.io.IOException { try { awaitClientDisconnect(); output.write(value,offset,length); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void flush() throws java.io.IOException { try { awaitClientDisconnect(); output.flush(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void close() throws java.io.IOException { try { output.close(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                    }; return observed;
+                        @Override public void write(int value) throws java.io.IOException { observeDisconnect(original, output); }
+                        @Override public void write(byte[] value, int offset, int length) throws java.io.IOException {
+                            if (length != 0) observeDisconnect(original, output);
+                        }
+                        @Override public void flush() throws java.io.IOException { output.flush(); }
+                        @Override public void close() throws java.io.IOException { output.close(); }
+                    };
+                    return observed;
                 }
             };
-            try { chain.doFilter(request,wrapped); awaitClientDisconnect(); wrapped.flushBuffer(); }
-            catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; }
-            finally { finished.countDown(); }
-        }
-        private void awaitClientDisconnect() throws java.io.IOException {
             try {
-                if (!clientDisconnected.await(60, java.util.concurrent.TimeUnit.SECONDS))
-                    throw new AssertionError("the test did not disconnect its HTTP client");
-            } catch (InterruptedException failure) {
-                Thread.currentThread().interrupt(); throw new java.io.IOException(failure);
+                chain.doFilter(request, wrapped);
+            } finally {
+                finished.countDown();
             }
+        }
+
+        private void observeDisconnect(jakarta.servlet.http.HttpServletResponse response, jakarta.servlet.ServletOutputStream output)
+                throws java.io.IOException {
+            // Error or fallback dispatches must not turn a failed setup into a successful observation.
+            if (started != 0 || !"waiting for first response body write".equals(stage)) {
+                throw new AssertionError("Unexpected additional commit response write: " + diagnostics());
+            }
+            stage = "waiting for client socket close";
+            try {
+                if (!clientDisconnected.await(60, TimeUnit.SECONDS))
+                    throw new AssertionError("Client socket did not close: " + diagnostics());
+                if (response.isCommitted() || response.getStatus() / 100 != 2) {
+                    stage = "cannot observe commit response (status=" + response.getStatus()
+                            + ", committed=" + response.isCommitted() + ")";
+                    throw new AssertionError(diagnostics());
+                }
+                // Keep the original HTTP response open with streaming framing. Leading whitespace is valid JSON.
+                response.setContentLengthLong(-1);
+                started = System.nanoTime();
+                long deadline = started + OBSERVATION_WINDOW.toNanos();
+                while (attempts < MAX_WRITES && System.nanoTime() - deadline < 0) {
+                    writePadding(output);
+                    TimeUnit.MILLISECONDS.sleep(25);
+                }
+                stage = "disconnect observation timed out";
+                throw new AssertionError(diagnostics());
+            } catch (InterruptedException interrupted) {
+                stage = "disconnect observation interrupted";
+                Thread.currentThread().interrupt();
+                throw new AssertionError(diagnostics(), interrupted);
+            }
+        }
+
+        private void writePadding(jakarta.servlet.ServletOutputStream output) throws java.io.IOException {
+            attempts++;
+            try {
+                stage = "writing response padding";
+                output.write(' ');
+                bytesWritten++;
+                stage = "flushing response padding";
+                output.flush();
+            } catch (java.io.IOException error) {
+                Throwable cause = error;
+                while (cause.getCause() != null) cause = cause.getCause();
+                if (cause instanceof java.io.InterruptedIOException || Thread.currentThread().isInterrupted()) {
+                    stage += " timed out or was interrupted";
+                } else if (error instanceof org.apache.catalina.connector.ClientAbortException
+                        || cause instanceof java.net.SocketException) {
+                    stage += " observed peer disconnect";
+                    failure.set(error);
+                } else {
+                    stage += " failed with " + error.getClass().getSimpleName();
+                }
+                throw error;
+            }
+        }
+
+        String diagnostics() {
+            long start = started;
+            long elapsedMillis = start == 0 ? 0 : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            return "stage=" + stage + ", elapsedMillis=" + elapsedMillis + ", attempts=" + attempts
+                    + ", paddingBytesWritten=" + bytesWritten;
         }
     }
 

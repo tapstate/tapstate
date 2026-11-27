@@ -146,6 +146,249 @@ class MongoConfigurationArtifactStoreIT {
     }
 
     @Test
+    void runtimeStartReadsOnlyItsDependenciesAndBindingInOneSnapshot() {
+        withBound((domain, database) -> {
+            var input = source("src", "input-secret");
+            var target = source("target", "target-secret");
+            var flow = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: src
+                    serve: {from: src.orders, sync: [{id: output, source: target}]}
+                    """);
+            var unrelated = definition("view", "unrelated");
+            domain.artifacts().saveAll(List.of(input, target, flow, unrelated));
+            var key = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var commands = new java.util.ArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event.getCommandName());
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                var store = new MongoConfigurationArtifactStore(client, client.getDatabase(database.getName()),
+                        new SourceConfigCipher(Base64.getUrlDecoder().decode(key)));
+                assertThat(store.list()).contains(flow, input, target, unrelated);
+                assertThat(store.managedDefaultSourceId()).contains("views");
+                int previous = commands.size();
+                commands.clear();
+                var captured = store.runtimeStartInventory("flow").orElseThrow();
+                assertThat(captured.managedDefaultSourceId()).contains("views");
+                assertThat(captured.resources()).containsExactlyInAnyOrder(flow, input, target);
+                assertThat(commands.stream().filter("commitTransaction"::equals)).hasSize(1);
+                assertThat(commands).hasSize(5).doesNotContain("listCollections", "listIndexes");
+                System.out.printf("Runtime CONFIG snapshot Mongo commands %d -> %d%n", previous, commands.size());
+
+                var serve = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: output, source: target}]\n");
+                var referenced = servedPipeline("referenced");
+                domain.artifacts().saveAll(List.of(serve, referenced));
+                assertThat(store.runtimeStartInventory("referenced").orElseThrow().resources())
+                        .containsExactlyInAnyOrder(referenced, input, target, serve);
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"admitted", "captured-start"})
+    void positiveConfigurationHelpersRejectAnExtraRecoveryRecord(String entry) {
+        withBound((domain, database) -> {
+            var input=source("src","input");
+            var flow=(io.tapstate.core.model.PipelineResource)PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\n");
+            domain.artifacts().saveAll(List.of(input,flow));
+            var original=SystemCollections.STORAGE_RECOVERY.on(database).find().first();
+            SystemCollections.STORAGE_RECOVERY.on(database).insertOne(new Document("_id","unexpected"));
+            String material=SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers=SourceConfigCipherProvider.fixed(new SourceConfigCipher(Base64.getUrlDecoder().decode(material)));
+            try(var client=MongoClients.create(MONGO.getReplicaSetUrl());var session=client.startSession()) {
+                var selected=client.getDatabase(database.getName());var bindings=new MongoStorageBindingStore(client,selected,ciphers);
+                assertThatThrownBy(()->session.withTransaction(()->bindings.cachePreparationForTransaction(session)))
+                        .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                var captured=new MongoConfigurationArtifactStore(client,selected,ciphers);
+                if(entry.equals("admitted")) assertThatThrownBy(()->session.withTransaction(()->bindings.admittedCachePreparation(session)))
+                        .isInstanceOfSatisfying(TapstateException.class,error->{
+                            assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                            assertThat(error.args()).containsEntry("id","storage-recovery").containsEntry("field","cache-identity");
+                        });
+                else assertThat(captured.capturedStartInventory(flow,new io.tapstate.spi.store.CacheBusinessScope(
+                        "cluster-a",1,original.getString("cacheIncarnation")))).isEmpty();
+            }
+        });
+    }
+
+    @Test void runtimeStartInventoryRejectsAnExtraRecoveryRecord() {
+        withBound((domain,database)->{
+            var input=source("src","input");
+            var flow=PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\n");
+            domain.artifacts().saveAll(List.of(input,flow));
+            SystemCollections.STORAGE_RECOVERY.on(database).insertOne(new Document("_id","unexpected"));
+            assertThatThrownBy(()->domain.artifacts().runtimeStartInventory("flow"))
+                    .isInstanceOfSatisfying(TapstateException.class,error->{
+                        assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                        assertThat(error.args()).containsEntry("id","storage-recovery").containsEntry("field","cache-identity");
+                    });
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"large-identity","large-pipeline","large-binding","large-setup","large-recovery","large-source","large-global",
+            "missing-pipeline","missing-pipeline-bad-binding","missing-binding","bad-pipeline-hash","bad-binding-hash","bad-recovery","wrong-scope","bad-pipeline-and-recovery",
+            "foreign-kind-collision","foreign-pipeline-id","foreign-pipeline-id-bad-hash","reordered-global-id","huge-extra-recovery-id"})
+    void runtimeInventoryRetainsTheLegacyAuditAndFallbackForDamagedOrUnboundedFacts(String change) {
+        withBound((domain,database)->{
+            var input=source("src","input");var flow=PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\n");
+            domain.artifacts().saveAll(List.of(input,flow));
+            var root=new Document("_id","cluster");
+            var globalId=new Document("bindingVersion",1L).append("namespace","pdk.global-state");
+            var pipelines=SystemCollections.PIPELINES.on(database);var binding=SystemCollections.STORAGE_BINDING.on(database);
+            var recovery=SystemCollections.STORAGE_RECOVERY.on(database);
+            if(change.startsWith("large-")) {
+                var table=switch(change){
+                    case "large-identity"->SystemCollections.CONFIG_CLUSTER_IDENTITY;case "large-pipeline"->SystemCollections.PIPELINES;
+                    case "large-binding"->SystemCollections.STORAGE_BINDING;case "large-setup"->SystemCollections.STORAGE_SETUP;
+                    case "large-recovery"->SystemCollections.STORAGE_RECOVERY;case "large-source"->SystemCollections.SOURCES;
+                    case "large-global"->SystemCollections.PDK_NOTE_SCOPES;default->throw new AssertionError(change);
+                };
+                Object id=change.equals("large-pipeline")?"flow":change.equals("large-source")?"views":change.equals("large-global")?globalId:"cluster";
+                table.on(database).updateOne(new Document("_id",id),new Document("$set",new Document("padding","x".repeat(80*1024))));
+            } else switch(change) {
+                case "missing-pipeline" -> pipelines.deleteOne(new Document("_id","flow"));
+                case "missing-pipeline-bad-binding" -> {pipelines.deleteOne(new Document("_id","flow"));binding.updateOne(root,new Document("$set",new Document("candidateHash","broken")));}
+                case "missing-binding" -> binding.deleteOne(root);
+                case "bad-pipeline-hash" -> pipelines.updateOne(new Document("_id","flow"),new Document("$set",new Document("contentHash","broken")));
+                case "bad-binding-hash" -> binding.updateOne(root,new Document("$set",new Document("candidateHash","broken")));
+                case "bad-recovery" -> recovery.updateOne(root,new Document("$set",new Document("formatVersion",2)));
+                case "wrong-scope" -> recovery.updateOne(root,new Document("$set",new Document("clusterId","other")));
+                case "bad-pipeline-and-recovery" -> {pipelines.updateOne(new Document("_id","flow"),new Document("$set",new Document("contentHash","broken")));recovery.updateOne(root,new Document("$set",new Document("formatVersion",2)));}
+                case "foreign-kind-collision" -> {
+                    var table=SystemCollections.TRANSFORM_DEFINITIONS.on(database);String name=table.getNamespace().getCollectionName();table.drop();
+                    database.createCollection(name,new com.mongodb.client.model.CreateCollectionOptions().collation(com.mongodb.client.model.Collation.builder().locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                    table.insertOne(new Document("_id","VIEWS"));
+                }
+                case "foreign-pipeline-id","foreign-pipeline-id-bad-hash" -> {
+                    var row=pipelines.find().first();pipelines.drop();database.createCollection(SystemCollections.PIPELINES.collectionName(),new com.mongodb.client.model.CreateCollectionOptions().collation(
+                            com.mongodb.client.model.Collation.builder().locale("en").collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                    row.put("_id","FLOW");if(change.endsWith("bad-hash"))row.put("contentHash","broken");pipelines.insertOne(row);
+                }
+                case "reordered-global-id" -> {
+                    var notes=SystemCollections.PDK_NOTE_SCOPES.on(database);var row=notes.find(new Document("_id",globalId)).first();notes.deleteOne(new Document("_id",globalId));
+                    row.put("_id",new Document("namespace","pdk.global-state").append("bindingVersion",1L));notes.insertOne(row);
+                }
+                case "huge-extra-recovery-id" -> recovery.insertOne(new Document("_id",new Document("large","x".repeat(80*1024))));
+                default -> throw new AssertionError(change);
+            }
+            try(var client=MongoClients.create(MONGO.getReplicaSetUrl())) {
+                client.getDatabase("admin").runCommand(new Document("ping",1));
+                var cipher=new SourceConfigCipher(Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material")));
+                var old=new MongoConfigurationArtifactStore(inventoryTopology(client,"unknown"),client.getDatabase(database.getName()),cipher);
+                var current=new MongoConfigurationArtifactStore(client,client.getDatabase(database.getName()),cipher);
+                var expected=inventoryOutcome(old,"flow");var actual=inventoryOutcome(current,"flow");
+                assertThat(actual).as(change).isEqualTo(expected);
+                if(change.startsWith("large-"))assertThat(actual.result()).as(change).isInstanceOfSatisfying(java.util.Optional.class,value->assertThat(value).isPresent());
+                if(change.equals("bad-pipeline-and-recovery"))assertThat(actual.parameters()).containsEntry("id","flow").containsEntry("field","body");
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"unknown","unknown-secondary","mixed"})
+    void runtimeInventoryUsesTheOriginalPointPathForUnprovedOrMixedPeerCapabilities(String topology) {
+        withBound((domain,database)->{
+            var input=source("src","input");var flow=PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\n");
+            domain.artifacts().saveAll(List.of(input,flow));var commands=new java.util.ArrayList<String>();
+            var settings=com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener(){@Override public void commandStarted(com.mongodb.event.CommandStartedEvent event){commands.add(event.getCommandName());}}).build();
+            try(var client=MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping",1));
+                var cipher=new SourceConfigCipher(Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material")));
+                var store=new MongoConfigurationArtifactStore(inventoryTopology(client,topology),client.getDatabase(database.getName()),cipher);
+                commands.clear();assertThat(store.runtimeStartInventory("flow").orElseThrow().resources()).containsExactlyInAnyOrder(flow,input);
+                assertThat(commands).doesNotContain("aggregate").contains("find","commitTransaction");
+            }
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={0,100})
+    void runtimeInventoryKeepsItsFiveRoundTripSavingWithPopulatedSiblingKinds(int siblings) {
+        withBound((domain,database)->{
+            var input=source("src","input");var target=source("target","target");
+            var flow=PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\nserve: {from: src.orders, sync: [{id: output, source: target}]}\n");
+            domain.artifacts().saveAll(List.of(input,target,flow,definition("view","unrelated")));
+            for(String kind:List.of("pipeline","transform","view","serve")) {
+                var peers=new java.util.ArrayList<Resource>();
+                for(int n=0;n<siblings;n++) peers.add(kind.equals("pipeline")?new io.tapstate.core.model.PipelineResource("peer_pipeline_"+n,null,List.of(),null,null,null,null,null):definition(kind,"peer_"+kind+"_"+n));
+                if(!peers.isEmpty())domain.artifacts().saveAll(peers);
+            }
+            var commands=new java.util.ArrayList<String>();
+            var settings=com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener(){@Override public void commandStarted(com.mongodb.event.CommandStartedEvent event){commands.add(event.getCommandName());}}).build();
+            try(var client=MongoClients.create(settings)) {
+                client.getDatabase("admin").runCommand(new Document("ping",1));var selected=client.getDatabase(database.getName());
+                var cipher=new SourceConfigCipher(Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material")));
+                var first=new java.util.concurrent.atomic.AtomicBoolean(true);var unsupported=inventoryTopology(client,"unknown").getClusterDescription();
+                var legacy=(MongoClient)java.lang.reflect.Proxy.newProxyInstance(MongoClient.class.getClassLoader(),new Class<?>[]{MongoClient.class},(proxy,method,args)->{
+                    if(method.getName().equals("getClusterDescription")&&first.compareAndSet(true,false))return unsupported;
+                    try{return method.invoke(client,args);}catch(java.lang.reflect.InvocationTargetException failed){throw failed.getCause();}
+                });
+                var old=new MongoConfigurationArtifactStore(legacy,selected,cipher);var current=new MongoConfigurationArtifactStore(client,selected,cipher);
+                commands.clear();var before=old.runtimeStartInventory("flow").orElseThrow();int oldCount=commands.size();
+                assertThat(commands.stream().filter("aggregate"::equals).count()).isEqualTo(1);
+                commands.clear();var after=current.runtimeStartInventory("flow").orElseThrow();int newCount=commands.size();
+                assertThat(after).isEqualTo(before);assertThat(after.resources()).containsExactlyInAnyOrder(flow,input,target);
+                assertThat(oldCount-newCount).isEqualTo(5);assertThat(newCount).isEqualTo(siblings==0?5:7);
+                System.out.println("DAG_ROOT_BUDGET siblings_per_kind="+siblings+" original="+oldCount+" optimized="+newCount);
+            }
+        });
+    }
+
+    @Test void runtimeInventoryRetriesItsWholeSnapshotAndReadsTheNewPipelineRevision() {
+        withBound((domain,database)->{
+            var input=source("src","input");var alternate=source("alternate","other");var target=source("target","target");
+            var flow=PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: src\nserve: {from: src.orders, sync: [{id: output, source: target}]}\n");
+            var changed=PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: alternate\nserve: {from: alternate.orders, sync: [{id: output, source: target}]}\n");
+            domain.artifacts().saveAll(List.of(input,alternate,target,flow));String app="inventory-retry-"+UUID.randomUUID();
+            var first=new java.util.concurrent.atomic.AtomicBoolean(true);var commits=new java.util.concurrent.atomic.AtomicInteger();
+            var failedWriter=new java.util.concurrent.atomic.AtomicReference<Throwable>();
+            var settings=com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).applicationName(app)
+                    .addCommandListener(new com.mongodb.event.CommandListener(){@Override public void commandStarted(com.mongodb.event.CommandStartedEvent event){
+                        if(!event.getCommandName().equals("commitTransaction"))return;commits.incrementAndGet();
+                        if(first.compareAndSet(true,false))try{assertThat(domain.artifacts().replace("flow",CanonicalHash.of(flow),changed)).isEqualTo(ArtifactMutation.REPLACED);}catch(Throwable failure){failedWriter.set(failure);}
+                    }}).build();
+            try(var client=MongoClients.create(settings);var admin=MongoClients.create(MONGO.getReplicaSetUrl())) {
+                client.getDatabase("admin").runCommand(new Document("ping",1));var cipher=new SourceConfigCipher(Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material")));
+                var store=new MongoConfigurationArtifactStore(client,client.getDatabase(database.getName()),cipher);
+                admin.getDatabase("admin").runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1)).append("data",
+                        new Document("failCommands",List.of("commitTransaction")).append("appName",app).append("errorCode",251).append("errorLabels",List.of("TransientTransactionError"))));
+                try {
+                    var result=store.runtimeStartInventory("flow").orElseThrow();
+                    assertThat(failedWriter.get()).isNull();assertThat(commits.get()).isGreaterThanOrEqualTo(2);
+                    assertThat(result.resources()).containsExactlyInAnyOrder(changed,alternate,target).doesNotContain(input);
+                }finally{admin.getDatabase("admin").runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+            }
+        });
+    }
+
+    private record InventoryOutcome(Object result,String error,Map<String,Object> parameters) {}
+    private static InventoryOutcome inventoryOutcome(MongoConfigurationArtifactStore store,String pipeline) {
+        try{return new InventoryOutcome(store.runtimeStartInventory(pipeline),null,Map.of());}
+        catch(TapstateException error){return new InventoryOutcome(null,error.code().code(),new java.util.LinkedHashMap<>(error.args()));}
+    }
+    private static MongoClient inventoryTopology(MongoClient original,String condition) {
+        var topology=org.mockito.Mockito.mock(com.mongodb.connection.ClusterDescription.class);
+        org.mockito.Mockito.when(topology.getType()).thenReturn(condition.equals("unknown")?com.mongodb.connection.ClusterType.UNKNOWN:com.mongodb.connection.ClusterType.REPLICA_SET);
+        var primary=org.mockito.Mockito.mock(com.mongodb.connection.ServerDescription.class);org.mockito.Mockito.when(primary.getMaxWireVersion()).thenReturn(21);
+        var secondary=org.mockito.Mockito.mock(com.mongodb.connection.ServerDescription.class);org.mockito.Mockito.when(secondary.getMaxWireVersion()).thenReturn(condition.equals("mixed")?8:0);
+        org.mockito.Mockito.when(topology.getServerDescriptions()).thenReturn(condition.equals("unknown")?List.of():List.of(primary,secondary));
+        return (MongoClient)java.lang.reflect.Proxy.newProxyInstance(MongoClient.class.getClassLoader(),new Class<?>[]{MongoClient.class},(proxy,method,args)->{
+            if(method.getName().equals("getClusterDescription"))return topology;
+            try{return method.invoke(original,args);}catch(java.lang.reflect.InvocationTargetException failed){throw failed.getCause();}
+        });
+    }
+
+    @Test
     void staleDefinitionDependenciesRejectTheWholeMixedConfigurationBatch() {
         withStore((store, database) -> {
             Resource original = definition("view", "reusable");
@@ -670,7 +913,8 @@ class MongoConfigurationArtifactStoreIT {
                             "alert_rules", "alert_receivers", "alert_subscriptions", "alert_silences", "alert_instances",
                             "alert_episodes", "alert_transitions", "alert_notification_schedules", "alert_delivery_intents",
                             "alert_target_limits", "alert_test_quotas", "alert_node_lifecycles", "ai_provider_settings",
-                            "retry_settings");
+                            "retry_settings", "pipeline_key_move_windows");
+            assertThat(SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();

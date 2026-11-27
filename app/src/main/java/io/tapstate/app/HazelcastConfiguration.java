@@ -76,6 +76,9 @@ import java.util.regex.Pattern;
 @Import(ClusterMembershipConfiguration.class)
 class HazelcastConfiguration {
     private ObjectProvider<MemberStorage> nativeStorage;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void singleMemberProcessExit(SingleMemberGuard.ProcessExit exit) { this.singleMemberExit = exit; }
+    private SingleMemberGuard.ProcessExit singleMemberExit;
 
     @org.springframework.beans.factory.annotation.Autowired
     void memberStorage(ObjectProvider<MemberStorage> providers) { nativeStorage = providers; }
@@ -154,12 +157,13 @@ class HazelcastConfiguration {
                 && (identityStore != null || claimStore != null)) {
             identity = ClusterMemberPreflight.singleIdentity(clusterProperties, identityStore, membershipStores.getIfAvailable());
         }
+        MemberStorage storage = nativeStorage == null ? null : nativeStorage.getIfAvailable();
         long sessionAskedAt = System.nanoTime();
         NodeSessionStartup startup = null;
         if (identity != null) {
             try {
                 identity = clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
-                        ? ClusterMemberPreflight.reserveExisting(identity, clusterProperties, identityStore, claimStore, bootId.value())
+                        ? ClusterMemberPreflight.reserveExisting(identity, clusterProperties, identityStore, claimStore, bootId.value(), storage != null && storage.processOwnsNode())
                         : ClusterMemberPreflight.reserve(identity, clusterProperties, identityStore, claimStore, bootId.value());
                 if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) membershipGate.bindSingle(identity.nodeSession());
                 startup = new NodeSessionStartup(claimStore, identity.nodeSession(), sessionAskedAt,
@@ -179,22 +183,29 @@ class HazelcastConfiguration {
         var candidate = new java.util.concurrent.atomic.AtomicReference<HazelcastInstance>();
         try {
             Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
+            var single = clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
+                    ? new SingleMemberGuard(identity == null ? config.getClusterName() : identity.clusterId(), singleMemberExit) : null;
+            if (single != null) config.addListenerConfig(new com.hazelcast.config.ListenerConfig(single));
             if (identity != null) {
                 identify(config, identity);
-                membershipGate.observeNodeSession(startup::isCurrent);
+                var reserved = startup;
+                membershipGate.observeNodeSession(() -> reserved.isCurrent() && (single == null || single.intact()));
                 configureClusterProtection(config, membershipGate, clusterProperties.getProfile() != ClusterProperties.Profile.SINGLE);
                 config.addListenerConfig(new com.hazelcast.config.ListenerConfig(startup));
                 startup.requireCurrent();
             } else {
                 identifyConfiguredSingleMember(config, clusterProperties, controlProperties, bootId);
             }
-            MemberStorage storage = nativeStorage == null ? null : nativeStorage.getIfAvailable();
             if (storage != null) {
                 if (identity == null) throw ThreeLayerStorePort.refused();
                 storage.prepare(config, identity.nodeSession(), sessionAskedAt, startup.lease());
             }
             member = startMember(() -> memberFactory.apply(config));
             candidate.set(member);
+            if (single != null) {
+                single.observe(member.getCluster().getMembers());
+                single.requireSingle();
+            }
             if (startup != null) {
                 startup.handOff(member);
                 member.getUserContext().put(NODE_SESSION_LEASE_CONTEXT_KEY, startup.lease());
@@ -302,6 +313,7 @@ class HazelcastConfiguration {
             } else if (nestDeadLetterStore != null) {
                 DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
             }
+            if (single != null) single.started(member);
             return member;
         } catch (RuntimeException | Error failure) {
             if (startup != null) {
@@ -330,7 +342,7 @@ class HazelcastConfiguration {
         member.getCluster().addMembershipListener(new DepartedMemberTransactions(store));
     }
 
-    /** Destroys the same lease that kept the reserved identity live during member creation. */
+    /** Stops the member before releasing the same lease that kept its identity live during startup. */
     @Bean(destroyMethod = "close")
     NodeSessionLease nodeSessionLease(HazelcastInstance member) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);

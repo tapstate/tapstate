@@ -36,6 +36,12 @@ final class ReadOnlyArtifactSnapshot implements ArtifactStore {
         return new ReadOnlyArtifactSnapshot(Objects.requireNonNull(source, "source").list(), source.managedDefaultSourceId());
     }
 
+    static ReadOnlyArtifactSnapshot captureForStart(ArtifactStore source, String pipelineId) {
+        return source.runtimeStartInventory(pipelineId)
+                .map(inventory -> new ReadOnlyArtifactSnapshot(inventory.resources(), inventory.managedDefaultSourceId()))
+                .orElseGet(() -> capture(source));
+    }
+
     /** An already bounded native validation reading; it never broadens to an ambient store list. */
     static ReadOnlyArtifactSnapshot validation(io.tapstate.spi.store.ValidationTaskStore.Inputs inputs, String managedDefault) {
         Objects.requireNonNull(inputs);

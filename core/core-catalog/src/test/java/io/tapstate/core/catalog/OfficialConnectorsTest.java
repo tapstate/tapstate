@@ -19,10 +19,8 @@ class OfficialConnectorsTest {
         // Written out in full rather than counted or matched by prefix. The release verifies the
         // database kinds themselves; each managed variant is accepted by an explicit support decision.
         assertThat(OfficialConnectors.IDS).containsExactly(
-                "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
-                "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
-                "tencent-db-postgres",
-                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
+                "mysql", "aws-rds-mysql", "mysql-pxc",
+                "postgres", "mongodb", "mongodb-atlas", "oracle", "sqlserver",
                 "db2", "db2i", "dummy");
     }
 

@@ -68,7 +68,7 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
         return view(session).status();
     }
     private View view(ClientSession session) {
-        var facts = bindings.readForTransaction(session);
+        var facts = bindings.readForStorageLifecycle(session);
         var binding = facts.loaded().map(MongoStorageBindingStore.Loaded::binding);
         Document row = facts.setup();
         try {

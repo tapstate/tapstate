@@ -79,7 +79,7 @@ class SessionResumePtyIT {
             sent = False
             status = None
             answered_queries = set()
-            deadline = time.time() + 30
+            deadline = time.monotonic() + 30
 
             def no_echo():
                 try:
@@ -87,7 +87,7 @@ class SessionResumePtyIT {
                 except (OSError, termios.error):
                     return False
 
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 readable, _, _ = select.select([fd], [], [], 0.25)
                 if readable:
                     try:
@@ -105,11 +105,12 @@ class SessionResumePtyIT {
                     (b"\\x1b[?2048$p", b"\\x1b[?2048;0$y"),
                     (b"\\x1b[?u", b"\\x1b[?0u"),
                     (b"\\x1b[c", b"\\x1b[?1;0c"),
+                    (b"\\x1b[6n", b"\\x1b[1;1R"),
                 ):
                     if query in output and query not in answered_queries:
                         os.write(fd, response)
                         answered_queries.add(query)
-                ready = no_echo() if wait_no_echo else b"\\x1b[?2004h>" in output
+                ready = (no_echo() and b">" in output) if wait_no_echo else b"\\x1b[?2004h>" in output
                 if not sent and ready:
                     os.write(fd, data)
                     sent = True
@@ -120,7 +121,7 @@ class SessionResumePtyIT {
             else:
                 os.kill(pid, signal.SIGKILL)
                 _, status = os.waitpid(pid, 0)
-                reason = b" waiting for terminal no-echo mode" if wait_no_echo and not sent else b""
+                reason = b" waiting for the masked prompt and terminal no-echo mode" if wait_no_echo and not sent else b""
                 output.extend(b"\\nPTY timeout" + reason + b"\\n")
 
             try:

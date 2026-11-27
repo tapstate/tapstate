@@ -148,6 +148,11 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
         return transaction(session -> MongoCacheRecoveryFacts.read(SystemCollections.OPERATOR_GENERATIONS.on(database)
                 .find(session, new Document("_id", pipelineId)).first()));
     }
+    @Override public Optional<PipelineCacheRecovery> readForCaptureStartup(String pipelineId) {
+        if (!MongoCaptureStartupRows.supportsReadSnapshot(client, database)) return read(pipelineId);
+        return MongoCaptureStartupRows.readSnapshot(client, active, session -> MongoCacheRecoveryFacts.read(
+                SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", pipelineId)).first()));
+    }
     @Override public List<RequiredNoteContext> inspectPrivateContexts(String pipelineId) {
         return transaction(session -> inspectNotes(session,pipelineId));
     }

@@ -6,6 +6,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
@@ -214,6 +215,8 @@ public final class ObservationPublisher {
     private static final String NEST_DEAD_LETTERED_METRIC = "tapstate.pipeline.nest.dead_lettered";
     private static final String JOIN_RECOMPUTE_ROWS_METRIC = "tapstate.pipeline.join.recompute.rows";
     private static final String JOIN_RECOMPUTE_ROWS_TOTAL_METRIC = "tapstate.pipeline.join.recompute.rows.total";
+
+    private static final String RECORD_UNIT = "{record}";
 
     /**
      * The three measurements of a pipeline's movement that carry their dimensions as attributes rather
@@ -457,6 +460,7 @@ public final class ObservationPublisher {
     private final Function<String, SnapshotReading> snapshots;
     private final Function<String, SnapshotReading> runSnapshots;
     private final Function<String, InitialLoad> initialLoads;
+    private final java.util.function.BiFunction<String, Instant, CaptureMeasurements> captureMeasurements;
     private final AtomicReference<Function<String, Map<String, Long>>> aggregateReadings =
             new AtomicReference<>(id -> Map.of());
     private final Function<String, Map<String, Long>> frontierGaps;
@@ -484,6 +488,14 @@ public final class ObservationPublisher {
      * tell a restart from a total that went backwards. Carrying totals across restarts and keeping
      * restarts visible cannot both be had, and every counter on this face has already chosen the second.
      */
+    /** Separates a new measurement from a refreshed lifecycle projection. */
+    public record Publication(Observation observation, boolean measured) { }
+
+    private record TerminalMeasurement(PipelineIntentScope scope, long epoch,
+            Observation projection, Instant measuredAt) { }
+    private final Map<String, TerminalMeasurement> terminalMeasurements = new ConcurrentHashMap<>();
+    private static final long TERMINAL_MEASUREMENT_SECONDS = 30;
+
     private final Map<String, Map<String, Long>> failuresByPipelineAndCode = new ConcurrentHashMap<>();
 
     /** When this publisher opened the failure account above; every failure point accumulates from it. */
@@ -789,6 +801,30 @@ public final class ObservationPublisher {
             Function<String, SnapshotReading> runSnapshots,
             Function<String, InitialLoad> initialLoads,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, runSnapshots, initialLoads, null, clock);
+    }
+
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SnapshotReading> runSnapshots,
+            Function<String, InitialLoad> initialLoads,
+            java.util.function.BiFunction<String, Instant, CaptureMeasurements> captureMeasurements,
+            Clock clock) {
+        this.captureMeasurements = captureMeasurements;
         this.initialLoads = Objects.requireNonNull(initialLoads, "initialLoads");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
@@ -858,15 +894,22 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
-        return publish(pipelineId, failure, state, observations, false, null);
+        return publish(pipelineId, failure, state, observations, null, false).map(Publication::observation);
     }
 
     /** Projects through the fixed state and original-claim observation views captured by this pass. */
     public Optional<Observation> publishScoped(PipelineIntentScope scope, StateStore scopedState,
             ObservationStore scopedObservations, ObservationFailure failure) {
+        return publishScopedReading(scope, scopedState, scopedObservations, failure, false)
+                .map(Publication::observation);
+    }
+
+    /** Reuse is allowed only when no consumer requires a fresh terminal metric sample. */
+    public Optional<Publication> publishScopedReading(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, ObservationFailure failure, boolean allowTerminalReuse) {
         Objects.requireNonNull(scope, "scope");
         return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
-                Objects.requireNonNull(scopedObservations, "scopedObservations"), true, scope);
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), scope, allowTerminalReuse);
     }
 
     /**
@@ -879,7 +922,7 @@ public final class ObservationPublisher {
                 || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING) {
             throw new IllegalArgumentException("periodic observations require the original running checkpoint");
         }
-        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null);
+        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null).map(Publication::observation);
     }
 
     /** Capture facts obtained together for the current execution and checked against its checkpoint. */
@@ -895,18 +938,34 @@ public final class ObservationPublisher {
         if (!scope.pipelineId().equals(checkpoint.pipelineId()) || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING)
             throw new IllegalArgumentException("a combined observation requires its running checkpoint");
         return publishCheckpoint(Optional.of(checkpoint), null, store, true, stillCurrent, scope,
-                Objects.requireNonNull(capture));
+                Objects.requireNonNull(capture)).map(Publication::observation);
     }
 
-    private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
-            ObservationStore observations, boolean requirePreparedState, PipelineIntentScope scope) {
+    private Optional<Publication> publish(String pipelineId, ObservationFailure failure, StateStore state,
+            ObservationStore observations, PipelineIntentScope scope, boolean allowTerminalReuse) {
+        boolean requirePreparedState = scope != null;
         Objects.requireNonNull(pipelineId, "pipelineId");
+        var terminalReading = terminalMeasurements.get(pipelineId);
+        Instant refreshAt = observedNow();
+        if (allowTerminalReuse && failure == null && terminalReading != null && terminalReading.scope().equals(scope)
+                && !refreshAt.isBefore(terminalReading.measuredAt())
+                && refreshAt.isBefore(terminalReading.measuredAt().plusSeconds(TERMINAL_MEASUREMENT_SECONDS))) {
+            Optional<Observation> refreshed;
+            try { refreshed = observations.refreshTerminal(terminalReading.projection(), terminalReading.epoch(), refreshAt); }
+            catch (TapstateException unavailable) { refreshed = Optional.empty(); }
+            if (refreshed.isPresent()) {
+                var projection = refreshed.orElseThrow();
+                terminalMeasurements.put(pipelineId,
+                        new TerminalMeasurement(scope, terminalReading.epoch(), projection, terminalReading.measuredAt()));
+                return Optional.of(new Publication(projection, false));
+            }
+        }
         var current = state.read(pipelineId);
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
         return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true, scope, null);
     }
 
-    private Optional<Observation> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
+    private Optional<Publication> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
             ObservationStore observations, boolean requirePreparedState, BooleanSupplier stillCurrent,
             PipelineIntentScope scope, CaptureSample capture) {
         return expected.flatMap(checkpoint -> {
@@ -915,6 +974,8 @@ public final class ObservationPublisher {
             }
             String pipelineId = checkpoint.pipelineId();
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
+            // A partial fallback or failed save must never become a reusable successful sample.
+            terminalMeasurements.remove(pipelineId);
             if (actual == PipelineState.COMPLETED) {
                 Optional<Observation> previous = observations.read(pipelineId)
                         .filter(last -> last.state() == PipelineState.COMPLETED && last.observedAt() != null);
@@ -929,7 +990,7 @@ public final class ObservationPublisher {
                             retainedMetrics, last.snapshot(),
                             last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
                     save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null, scope);
-                    return Optional.of(terminal);
+                    return Optional.of(new Publication(terminal, true));
                 }
             }
             ObservationFailure carried = failure;
@@ -955,17 +1016,23 @@ public final class ObservationPublisher {
                 readings = nestStateReadings.apply(pipelineId);
                 gaps = frontierGaps.apply(pipelineId);
                 pinned = frontierStalls.apply(pipelineId);
-                SnapshotReading loaded = capture == null ? snapshots.apply(pipelineId) : capture.loaded();
-                SnapshotReading readThisRun = capture == null ? runSnapshots.apply(pipelineId) : capture.run();
+                CaptureMeasurements measuredCapture = capture == null && captureMeasurements != null
+                        ? Objects.requireNonNull(captureMeasurements.apply(pipelineId, at), "capture measurements") : null;
+                SnapshotReading loaded = capture != null ? capture.loaded()
+                        : measuredCapture == null ? snapshots.apply(pipelineId) : measuredCapture.snapshot();
+                SnapshotReading readThisRun = capture != null ? capture.run()
+                        : measuredCapture == null ? runSnapshots.apply(pipelineId) : measuredCapture.runSnapshot();
                 List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun));
                 measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                        loaded.byTable(), capture == null ? positions.apply(pipelineId) : capture.positions(), carried, at, measured,
-                        capture == null ? initialLoadAt(pipelineId, at)
-                                : capture.initialLoad() == null ? null : capture.initialLoad().at(at));
+                        loaded.byTable(), capture != null ? capture.positions()
+                                : measuredCapture == null ? positions.apply(pipelineId)
+                                : measuredCapture.positions().orElseGet(() -> positions.apply(pipelineId)), carried, at, measured,
+                        capture != null ? capture.initialLoad() == null ? null : capture.initialLoad().at(at)
+                                : measuredCapture == null ? initialLoadAt(pipelineId, at) : measuredCapture.initialLoad());
                 measuredSuccessfully = true;
             } catch (TapstateException unavailable) {
                 if (actual != PipelineState.FAILED) throw unavailable;
@@ -993,14 +1060,18 @@ public final class ObservationPublisher {
                 var committedReadings = readings;
                 var committedPinned = pinned;
                 var committedGaps = gaps;
+                var committedObservation = published;
                 observations.afterSave(() -> {
                     coldLayer.saw(pipelineId, committedReadings);
                     frontierStall.saw(pipelineId, committedPinned, committedGaps);
+                    if (requirePreparedState && (actual == PipelineState.FAILED || actual == PipelineState.STOPPED))
+                        terminalMeasurements.put(pipelineId,
+                                new TerminalMeasurement(scope, checkpoint.epoch(), committedObservation, at));
                 });
             }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
-            return Optional.of(published);
+            return Optional.of(new Publication(published, true));
         });
     }
 
@@ -1167,7 +1238,7 @@ public final class ObservationPublisher {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
-                .ifPresent(count -> facts.add(readAt(pipelineId, RECORDS_DRIVEN_METRIC, "{record}", at, count)));
+                .ifPresent(count -> facts.add(readAt(pipelineId, RECORDS_DRIVEN_METRIC, RECORD_UNIT, at, count)));
         // One point per chain that reported a reading, so a chain keeping up and a chain that has stalled
         // stay distinguishable; a chain that reported none is absent rather than zero, which would read as
         // the healthy end of the same scale. The distance is dimensionless: what it counts is a position's
@@ -1220,7 +1291,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         readingsAt(pipelineId, NEST_BACKFILL_TIME_METRIC, "ms", at, NEST_NAMESPACE_ATTRIBUTE, backfillMillis)
                 .ifPresent(facts::add);
-        readingsAt(pipelineId, NEST_PENDING_HIGH_WATER_METRIC, "{record}", at, NEST_NAMESPACE_ATTRIBUTE,
+        readingsAt(pipelineId, NEST_PENDING_HIGH_WATER_METRIC, RECORD_UNIT, at, NEST_NAMESPACE_ATTRIBUTE,
                 pendingHighWater).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
@@ -1427,6 +1498,7 @@ public final class ObservationPublisher {
     public void forgetPipelinesOutside(Collection<String> live) {
         Objects.requireNonNull(live, "live");
         failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
+        terminalMeasurements.keySet().retainAll(Set.copyOf(live));
         storedFacts.retain(live);
     }
 
@@ -1506,7 +1578,7 @@ public final class ObservationPublisher {
             });
         }
         if (!rows.isEmpty()) {
-            facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, "{record}", rows));
+            facts.add(new MetricFact(RECORDS_METRIC, MetricType.COUNTER, RECORD_UNIT, rows));
         }
         if (!payload.isEmpty()) {
             facts.add(new MetricFact(BYTES_METRIC, MetricType.COUNTER, "By", payload));
@@ -1520,6 +1592,14 @@ public final class ObservationPublisher {
                 at, ageInSeconds(at, eventTime))));
         if (!ages.isEmpty()) {
             facts.add(new MetricFact(LAG_METRIC, MetricType.GAUGE, "s", ages));
+        }
+        if (delivered.cdcDelivery() != null) {
+            var cdc = delivered.cdcDelivery();
+            var scope = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId);
+            facts.add(MetricFact.single(CdcDeliveryTotals.COUNT_METRIC, MetricType.COUNTER, RECORD_UNIT,
+                    MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.count())));
+            facts.add(MetricFact.single(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, MetricType.COUNTER, "ms",
+                    MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.totalMillis())));
         }
         // The distribution accumulates from the same start as the counts: it is over the same rows.
         delivered.start().ifPresent(start -> {

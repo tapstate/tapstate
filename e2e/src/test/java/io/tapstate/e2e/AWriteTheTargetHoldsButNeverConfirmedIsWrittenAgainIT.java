@@ -95,7 +95,7 @@ class AWriteTheTargetHoldsButNeverConfirmedIsWrittenAgainIT {
                         """.formatted(SOURCE, CONNECTOR, sourceUri, TABLE));
                 resources.put(TARGET + ".tap.yml", Workspaces.targetYaml(TARGET, target, Map.of(
                         "hold", holds.directory().toString(), "write_witness", written.directory().toString())));
-                resources.put(PIPELINE + ".tap.yml", Workspaces.pipelineYaml(PIPELINE, SOURCE, TARGET, TABLE));
+                resources.put(PIPELINE + ".tap.yml", Workspaces.pipelineYaml(PIPELINE, SOURCE, TARGET, TABLE, 4));
                 control.apply(resources);
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 Await.until(PIPELINE + " to reach " + PipelineState.RUNNING, Duration.ofMinutes(1),

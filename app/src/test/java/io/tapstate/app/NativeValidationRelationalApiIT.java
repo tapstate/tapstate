@@ -2,14 +2,18 @@ package io.tapstate.app;
 
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
+import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
 import io.tapstate.control.core.*;
 import io.tapstate.core.model.*;
 import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
+import java.math.BigDecimal;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.*;
 import java.util.*;
 import org.bson.Document;
+import org.bson.types.Decimal128;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -17,6 +21,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 import org.testcontainers.containers.*;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
@@ -33,9 +38,171 @@ class NativeValidationRelationalApiIT {
     @Test @Timeout(180) void mysqlMappingsAndAllMethodsUseTheRealHttpAndScheduledRun()throws Exception{verify(true);}
     @Test @Timeout(180) void postgresMappingsAndAllMethodsUseTheRealHttpAndScheduledRun()throws Exception{verify(false);}
 
+    @Test
+    @Timeout(180)
+    void mysqlCustomerBalanceCanBeValidatedAfterCopyToAtlas() throws Exception {
+        String table = "bmsql_customer";
+        String ddl = "CREATE TABLE bmsql_customer (c_w_id INT NOT NULL, c_d_id INT NOT NULL, "
+                + "c_id INT NOT NULL, c_balance DECIMAL(12,2) NOT NULL, PRIMARY KEY (c_w_id,c_d_id,c_id))";
+        var seeds = Files.createDirectory(work.resolve("seeds"));
+        for (var connector : List.of("mysql", "mongodb-atlas")) {
+            Files.copy(artifact(connector), seeds.resolve(connector + "-connector.jar"));
+        }
+        try (var mysql = new GenericContainer<>("mysql:8.0").withExposedPorts(3306)
+                .withEnv("MYSQL_ROOT_PASSWORD", PASSWORD).withEnv("MYSQL_DATABASE", DB)
+                .withCommand("--innodb-buffer-pool-size=64M", "--max-connections=20")
+                .waitingFor(Wait.forLogMessage(".*mysqld: ready for connections\\..*port: 3306.*\\n", 1))
+                .withStartupTimeout(Duration.ofSeconds(75))) {
+            mysql.start();
+            var seed = mysql.execInContainer("mysql", "--protocol=TCP", "--host=127.0.0.1", "--user=root",
+                    "--password=" + PASSWORD, DB, "-e", ddl + "; INSERT INTO bmsql_customer VALUES (1,1,1,-10.00)");
+            assertThat(seed.getExitCode()).as(seed.getStderr()).isZero();
+            var inputSettings = Map.<String, Object>of("host", mysql.getHost(), "port", mysql.getMappedPort(3306),
+                    "database", DB, "username", "root", "password", PASSWORD, "timezone", "+00:00",
+                    "oldVersionTimezone", false, "addtionalString", "useSSL=false&allowPublicKeyRetrieval=true");
+            var storage = NativeAppStorage.createOnPremWithAdmin(MONGO, "customer_balance", "admin", PASSWORD);
+            try (var raw = MongoClients.create(storage.configurationUri())) {
+                try (var schema = io.tapstate.adapters.mongostore.MongoConfigurationDomain.prepareValidationSchema(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)),
+                        storage.clusterId(), UUID.randomUUID());
+                        var cache = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(
+                                new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                                        storage.cacheUri(), storage.cacheDatabase(), null),
+                                Duration.ofSeconds(5), "customer-balance-fixture")) {
+                    schema.prepareCache(cache);
+                    while (!schema.advance(20).ready()) {}
+                }
+                var collection = raw.getDatabase(storage.masterDatabase()).getCollection(table);
+                try (var app = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                        "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
+                        "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
+                        "--tapstate.store.mongo.uri=" + storage.configurationUri(),
+                        "--tapstate.connectors.seed-dir=" + seeds,
+                        "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
+                        "--tapstate.control.auth.jwt-secret=customer-balance-http-signing-key")) {
+                    NativeAppStorage.awaitBusiness(app);
+                    var child = NativeAppStorage.business(app);
+                    var artifacts = child.getBean(ArtifactStore.class);
+                    assertThat(artifacts.create(new SourceResource("input", null, "mysql", inputSettings,
+                            SourceMode.SNAPSHOT, List.of(TableRef.literal(table)), null, null))).isEqualTo(ArtifactMutation.CREATED);
+                    assertThat(artifacts.create(new SourceResource("target", null, "mongodb-atlas",
+                            Map.of("uri", storage.masterUri(), "database", storage.masterDatabase(), "isUri", true),
+                            null, null, null, null))).isEqualTo(ArtifactMutation.CREATED);
+                    assertThat(artifacts.create(new PipelineResource("balance_flow", null, List.of(SourceRef.spec("input", false)),
+                            null, null, new ServeBlock.Inline("serve", FromClause.list(FromRef.literal("input." + table)),
+                            List.of(new SyncElement("out", "target", WriteMode.UPSERT, null, null)), null, null),
+                            null, null))).isEqualTo(ArtifactMutation.CREATED);
+                    var tokens = child.getBean(TokenService.class);
+                    String write = tokens.create(Scope.WRITE), read = tokens.create(Scope.READ);
+                    var http = RestClient.create("http://127.0.0.1:" + ((WebServerApplicationContext) app).getWebServer().getPort());
+                    http.post().uri("/api/connections:discover-schema").header("Authorization", "Bearer " + write)
+                            .contentType(MediaType.APPLICATION_JSON).body(Map.of(
+                                    "id", "input", "connectorId", "mysql", "settings", inputSettings))
+                            .retrieve().toBodilessEntity();
+                    http.post().uri("/api/pipelines/balance_flow:start").header("Authorization", "Bearer " + write)
+                            .retrieve().toBodilessEntity();
+                    try {
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                                assertThat(collection.find().first()).isNotNull().containsKey("c_balance"));
+                    } catch (org.awaitility.core.ConditionTimeoutException timedOut) {
+                        throw new AssertionError("Copy did not write the customer row. Pipeline status: "
+                                + get(http, read, "/api/pipelines/balance_flow/status"), timedOut);
+                    }
+
+                    var selection = Map.of("pipelineId", "balance_flow", "taskId", "balance", "expectedRevision", "0",
+                            "mappings", List.of(Map.of("mappingId", "customer", "outputId", "out", "sourceId", "input", "table", table)));
+                    var input = new LinkedHashMap<String, Object>(selection);
+                    input.put("method", "UNIQUE_KEY");
+                    input.put("confirmations", Map.of());
+                    var models = post(http, write, "evaluate", input);
+                    input.put("method", "FULL_COLUMN");
+                    var fields = List.of("c_w_id", "c_d_id", "c_id").stream()
+                            .map(field -> Map.of("source", field, "target", field)).toList();
+                    input.put("confirmations", Map.of("customer", Map.of("id", UUID.randomUUID().toString(), "fields", fields)));
+                    String taskPath = "/api/pipelines/balance_flow/validation-tasks/balance";
+                    Map<String, Object> evaluated;
+                    try {
+                        evaluated = post(http, write, "evaluate", input);
+                    } catch (RestClientResponseException refused) {
+                        int taskStatus = http.get().uri(taskPath).header("Authorization", "Bearer " + read)
+                                .exchange((request, response) -> response.getStatusCode().value());
+                        var connectors = child.getBean(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
+                        throw new AssertionError("Expected FULL_COLUMN evaluation of the copied customer balance. Runtime: "
+                                + get(http, read, "/version") + "; MySQL SHA-256 " + connectors.resolve("mysql").contentHash()
+                                + "; Atlas SHA-256 " + connectors.resolve("mongodb-atlas").contentHash() + "; DDL: " + ddl
+                                + "; BSON: " + collection.find().first().toJson() + "; live models: " + models
+                                + "; evaluate HTTP " + refused.getStatusCode().value() + ": " + refused.getResponseBodyAsString()
+                                + "; save was not reached; task reload HTTP " + taskStatus, refused);
+                    }
+                    assertThat(evaluated.get("fingerprint")).isInstanceOf(String.class);
+                    var saved = post(http, write, "save", Map.of("input", input, "fingerprint", evaluated.get("fingerprint"),
+                            "commandId", UUID.randomUUID().toString(), "historyLimit", 10, "scheduleEnabled", false));
+                    assertThat(saved).containsEntry("outcome", "APPLIED");
+                    var task = get(http, read, taskPath);
+                    assertThat(task).containsEntry("revision", "1").containsEntry("taskGeneration", saved.get("taskGeneration"));
+                    assertThat(collection.find().first()).containsKey("_id");
+                    var cleanRun = Map.of("context", task.get("context"), "pipeline", "balance_flow",
+                            "task", "balance", "taskGeneration", task.get("taskGeneration"), "revision", task.get("revision"),
+                            "sequence", "1", "command", UUID.randomUUID().toString());
+                    assertThat(run(http, write, read, cleanRun))
+                            .containsEntry("result", "COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount", "0");
+                    assertThat(collection.updateOne(new Document("c_id", 1), new Document("$set",
+                            new Document("c_balance", new Decimal128(new BigDecimal("-11.00"))))).getModifiedCount()).isEqualTo(1);
+                    var driftRun = new LinkedHashMap<>(cleanRun);
+                    driftRun.put("sequence", "2");
+                    driftRun.put("command", UUID.randomUUID().toString());
+                    var report = run(http, write, read, driftRun);
+                    assertThat(report).containsEntry("result", "COMPLETE_WITH_OBSERVATIONS").containsEntry("rootCount", "1");
+                    var reference = (Map<?, ?>) report.get("reference");
+                    String rootsPath = taskPath + "/reports/" + reference.get("run") + "/roots";
+                    String query = "?generation=" + reference.get("generation") + "&sequence=" + reference.get("sequence");
+                    var roots = get(http, read, rootsPath + query);
+                    assertThat((List<Map>) roots.get("items")).singleElement().satisfies(root -> {
+                        var detail = get(http, read, rootsPath + "/" + root.get("id") + query);
+                        var observation = (Map<?, ?>) detail.get("observation");
+                        assertThat((List<Map>) reportField(observation, "samples").get("value")).singleElement().satisfies(sample -> {
+                            var finding = reportField(sample, "finding");
+                            assertThat(reportField(finding, "kind").get("value")).isEqualTo("TARGET_VALUE");
+                            var path = reportField(reportField(finding, "location"), "fieldPath");
+                            assertThat((List<Map>) path.get("value")).extracting(part -> part.get("value"))
+                                    .containsExactly("c_balance");
+                            assertBalanceSample(reportField(sample, "source"), new BigDecimal("-10.00"));
+                            assertBalanceSample(reportField(sample, "target"), new BigDecimal("-11.00"));
+                        });
+                    });
+                } finally {
+                    for (String database : List.of(storage.configurationDatabase(), storage.cacheDatabase(), storage.masterDatabase())) {
+                        raw.getDatabase(database).drop();
+                    }
+                }
+            }
+        }
+    }
+
+    private static Map<?, ?> reportField(Map<?, ?> object, String name) {
+        var fields = (List<Map<?, ?>>) object.get("value");
+        return fields.stream().filter(field -> name.equals(field.get("name")))
+                .map(field -> (Map<?, ?>) field.get("value"))
+                .findFirst().orElseThrow(() -> new AssertionError("Missing report field " + name));
+    }
+
+    private static void assertBalanceSample(Map<?, ?> side, BigDecimal expected) {
+        var row = reportField(side, "row");
+        var entries = (List<Map<?, ?>>) reportField(row, "entries").get("value");
+        assertThat(entries).anySatisfy(entry -> {
+            assertThat(reportField(entry, "name").get("value")).isEqualTo("c_balance");
+            var balance = reportField(reportField(entry, "value"), "value");
+            assertThat(reportField(balance, "kind").get("value")).isEqualTo("DECIMAL");
+            assertThat(reportField(balance, "scale").get("value")).isEqualTo(Integer.toString(expected.scale()));
+            assertThat(reportField(balance, "unscaled").get("value")).isEqualTo(expected.unscaledValue().toString());
+        });
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings={"UNIQUE_KEY","FULL_COLUMN"})
     @Timeout(180) void smallPostgresPairsFitTheOriginalProcessCapacityAndReadBothSides(String method)throws Exception{
+        var seeds = Files.createDirectory(work.resolve("seeds"));
+        Files.copy(artifact("postgres"), seeds.resolve("postgres-connector.jar"));
         try(var sql=new GenericContainer<>("postgres:16").withExposedPorts(5432).withEnv("POSTGRES_PASSWORD",PASSWORD)
                 .withEnv("POSTGRES_USER","validation").withEnv("POSTGRES_DB",DB).withStartupTimeout(Duration.ofSeconds(75))
                 .withCommand("postgres","-c","log_statement=all")
@@ -53,10 +220,10 @@ class NativeValidationRelationalApiIT {
             }
             try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                     "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--logging.level.io.tapstate.app.NativeValidationOwnerReservations=WARN","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
-                    "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
+                    "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+seeds,
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=postgres-pair-http-signing-key")){
                 NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
-                var connector=child.getBean(ConnectorArtifactRegistrar.class).register(artifact("postgres"),RegistrationSource.REGISTER).registration().connectorId();
+                var connector="postgres";
                 var artifacts=child.getBean(ArtifactStore.class);
                 assertThat(artifacts.create(new SourceResource("input",null,connector,connection,SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null))).isEqualTo(ArtifactMutation.CREATED);
                 assertThat(artifacts.create(new SourceResource("target",null,connector,connection,null,null,null,null))).isEqualTo(ArtifactMutation.CREATED);
@@ -68,8 +235,39 @@ class NativeValidationRelationalApiIT {
                         "mappings",List.of(Map.of("mappingId","orders","outputId","out","sourceId","input","table","orders")),
                         "confirmations",Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id")))));
                 var evaluated=post(http,write,"evaluate",input);
+                var mapping = (Map) ((List) evaluated.get("mappings")).getFirst();
+                for (String side : List.of("source", "target")) {
+                    var model = (Map) mapping.get(side);
+                    assertThat(model.get("modelVersion")).isInstanceOf(String.class);
+                    assertThat((List<Map>) model.get("fields")).anySatisfy(field ->
+                            assertThat(field).containsEntry("name", "id").containsEntry("keyDomain", "EXACT_NUMBER"));
+                }
+                String taskPath = "/api/pipelines/flow/validation-tasks/pair";
+                if (method.equals("UNIQUE_KEY")) {
+                    var incompatible = new LinkedHashMap<String, Object>(input);
+                    incompatible.put("confirmations", Map.of("orders", Map.of("id", UUID.randomUUID().toString(),
+                            "fields", List.of(Map.of("source", "id", "target", "payload")))));
+                    assertThatThrownBy(() -> post(http, write, "evaluate", incompatible))
+                            .isInstanceOfSatisfying(RestClientResponseException.class, refused -> {
+                                assertThat(refused.getStatusCode().value()).isEqualTo(400);
+                                assertThat(refused.getResponseBodyAsString()).contains("TS0300007", "key-domain-mismatch");
+                            });
+                    assertThatThrownBy(() -> post(http, write, "save", Map.of("input", incompatible,
+                            "fingerprint", evaluated.get("fingerprint"), "commandId", UUID.randomUUID().toString(),
+                            "historyLimit", 10, "scheduleEnabled", false)))
+                            .isInstanceOfSatisfying(RestClientResponseException.class, refused -> {
+                                assertThat(refused.getStatusCode().value()).isEqualTo(409);
+                                assertThat(refused.getResponseBodyAsString()).contains("CONFLICT");
+                            });
+                    assertThatThrownBy(() -> get(http, read, taskPath))
+                            .isInstanceOf(org.springframework.web.client.HttpClientErrorException.NotFound.class);
+                }
                 var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
                 assertThat(saved).containsEntry("outcome","APPLIED");
+                var reloaded = get(http, read, taskPath);
+                assertThat(reloaded).containsEntry("revision", "1").containsEntry("taskGeneration", saved.get("taskGeneration"));
+                var savedKeys = (Map) ((Map) ((List) reloaded.get("mappings")).getFirst()).get("keys");
+                assertThat(savedKeys.get("fields")).isEqualTo(List.of(Map.of("source", List.of("id"), "target", List.of("id"))));
                 assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().data().capacity().bytes()).isEqualTo(256L*1024*1024);
                 if(method.equals("FULL_COLUMN"))try(var query=java.util.concurrent.Executors.newSingleThreadExecutor();var decode=java.util.concurrent.Executors.newSingleThreadExecutor()){
                     var resource=StoredArtifacts.requireSource(artifacts,"input");
@@ -187,9 +385,12 @@ class NativeValidationRelationalApiIT {
                     "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--logging.level.io.tapstate.app.NativeValidationOwnerReservations=WARN","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                     "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=relational-validation-http-signing-key")){
-                NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);var registrar=child.getBean(ConnectorArtifactRegistrar.class);
-                var sourceConnector=registrar.register(artifact(kind),RegistrationSource.REGISTER).registration().connectorId();
-                var targetConnector=registrar.register(artifact("mongodb"),RegistrationSource.REGISTER).registration().connectorId();
+                NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
+                var local=child.getBean(LocalConnectorArtifacts.class);
+                var sourceConnector=local.register(Files.readAllBytes(artifact(kind)),RegistrationSource.REGISTER)
+                        .registration().connectorId();
+                var targetConnector=local.register(Files.readAllBytes(artifact("mongodb")),RegistrationSource.REGISTER)
+                        .registration().connectorId();
                 var artifacts=child.getBean(ArtifactStore.class);
                 artifacts.create(new SourceResource("input",null,sourceConnector,source,SourceMode.SNAPSHOT,textOnly?List.of(TableRef.literal("orders"),TableRef.literal("items"),TableRef.literal("text_orders")):List.of(TableRef.literal("orders"),TableRef.literal("items")),null,null));
                 artifacts.create(new SourceResource("target",null,targetConnector,Map.of("uri",MONGO.getReplicaSetUrl(targetName),"database",targetName,"isUri",true),null,null,null,null));

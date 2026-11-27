@@ -3,17 +3,22 @@ package io.tapstate.e2e;
 import io.tapstate.app.Bootstrap;
 import io.tapstate.app.IsolatedConnectionDiagnostics;
 import io.tapstate.app.ObservationWorkerFixture;
+import io.tapstate.testsupport.MongoRenewedTopology;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.boot.web.server.context.WebServerInitializedEvent;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
+import org.springframework.web.util.UriComponentsBuilder;
 
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The product booted inside the test JVM, from its real assembly root.
@@ -29,7 +34,7 @@ final class InProcessServer implements ServerHandle {
      * The scheduled pass that republishes every pipeline's observation, as the scheduler renders it:
      * a scheduled method's string form is its declaring class and method name.
      */
-    private static final String PUBLISHING_PASS = "io.tapstate.app.ConvergenceDriver.reconcile";
+    private static final String PUBLISHING_PASS = "io.tapstate.app.ConvergenceDriver.schedule";
 
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
@@ -42,6 +47,23 @@ final class InProcessServer implements ServerHandle {
         this.refreshedContexts = refreshedContexts;
         this.baseUrl = baseUrl;
         this.stagingDirectory = stagingDirectory;
+    }
+
+    void inspectStorageNow() throws ReflectiveOperationException {
+        Class<?> rootType = Class.forName("io.tapstate.app.StorageRoot");
+        var root = context.getBean(rootType);
+        var runtimeMethod = rootType.getDeclaredMethod("runtime");
+        runtimeMethod.setAccessible(true);
+        var runtime = runtimeMethod.invoke(root);
+        var businessMethod = runtime.getClass().getDeclaredMethod("business");
+        businessMethod.setAccessible(true);
+        var business = ((java.util.Optional<?>) businessMethod.invoke(runtime)).orElseThrow();
+        var field = business.getClass().getDeclaredField("storageInspection");
+        field.setAccessible(true);
+        var inspection = field.get(business);
+        var run = inspection.getClass().getDeclaredMethod("runOnce");
+        run.setAccessible(true);
+        run.invoke(inspection);
     }
 
     /** Boots the assembly against the given store and returns once its surface is listening. */
@@ -110,18 +132,22 @@ final class InProcessServer implements ServerHandle {
             throw e;
         }
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
-        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
-        // one of those is the address bound below.
-        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory, refreshed);
+        String address = context.getEnvironment().getProperty("server.address", "127.0.0.1");
+        URI endpoint = UriComponentsBuilder.newInstance().scheme("http").host(address).port(port).build().toUri();
+        return new InProcessServer(context, endpoint, stagingDirectory, refreshed);
     }
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
             Path stagingDirectory, List<String> additionalArguments,
             java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
             io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
-        java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
-                "--server.address=127.0.0.1", "--server.port=0"));
-        arguments.addAll(additionalArguments);
+        var arguments = new java.util.ArrayList<>(additionalArguments);
+        if (arguments.stream().noneMatch(value -> value.startsWith("--server.address="))) {
+            arguments.add("--server.address=127.0.0.1");
+        }
+        if (arguments.stream().noneMatch(value -> value.startsWith("--server.port="))) {
+            arguments.add("--server.port=0");
+        }
         var defaults = new java.util.ArrayList<>(List.of(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
@@ -133,6 +159,16 @@ final class InProcessServer implements ServerHandle {
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
         var builder = new SpringApplicationBuilder(Bootstrap.class);
+        String advertiseSetting = "--" + MongoRenewedTopology.CONTROL_ADVERTISE_URL + "=";
+        if (arguments.stream().anyMatch(argument -> argument.startsWith(advertiseSetting) && argument.endsWith(":0"))) {
+            builder.listeners((ApplicationListener<WebServerInitializedEvent>) event -> {
+                var environment = ((ConfigurableApplicationContext) event.getApplicationContext()).getEnvironment();
+                var url = MongoRenewedTopology.controlUrl(environment.getRequiredProperty("server.address"),
+                        event.getWebServer().getPort());
+                environment.getPropertySources().addFirst(new MapPropertySource("fixtureControlEndpoint",
+                        Map.of(MongoRenewedTopology.CONTROL_ADVERTISE_URL, url.toString())));
+            });
+        }
         if (diagnostics != null) {
             builder.initializers(context -> context.getBeanFactory().registerSingleton("isolatedConnectionDiagnostics", diagnostics));
         }
@@ -206,7 +242,11 @@ final class InProcessServer implements ServerHandle {
                 for (ScheduledTask task : holder.getScheduledTasks()) {
                     // The runnable is wrapped by the scheduler; its rendering names the scheduled method.
                     if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
-                        stoppedPublishers.add(task.getTask().getRunnable());task.cancel();
+                        Runnable scheduled = task.getTask().getRunnable();
+                        Object driver = owner.getBean("convergenceDriver");
+                        stoppedPublishers.add(synchronousPublishingPass(driver));
+                        task.cancel();
+                        awaitPublishingIdle(driver);
                         cancelled++;
                     }
                 }
@@ -225,18 +265,68 @@ final class InProcessServer implements ServerHandle {
 
     /** The real scheduled pass, for a case that controls its storage interleaving. */
     Runnable publishingObservations() {
-        var passes = new java.util.ArrayList<Runnable>();
+        var passes = new java.util.ArrayList<Object>();
         for (var owner : refreshedContexts) {
             if (!owner.isActive() || !belongsToThisServer(owner)) continue;
             for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values()) {
                 for (ScheduledTask task : holder.getScheduledTasks()) {
                     if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
-                        passes.add(task.getTask().getRunnable());
+                        passes.add(owner.getBean("convergenceDriver"));
                 }
             }
         }
         if (passes.size() != 1) throw new AssertionError("expected one native convergence pass: " + passes.size());
-        return passes.getFirst();
+        return synchronousPublishingPass(passes.getFirst());
+    }
+
+    /** The real publisher in this server's scheduled business context, for a scoped read barrier. */
+    Object observationPublisher() {
+        var publishers = new java.util.ArrayList<Object>();
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values())
+                for (ScheduledTask task : holder.getScheduledTasks())
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
+                        publishers.add(owner.getBean("observationPublisher"));
+        }
+        if (publishers.size() != 1) throw new AssertionError("expected one native publisher: " + publishers.size());
+        return publishers.getFirst();
+    }
+
+    /** Test-only mutation access; no production setting admits a serial worker pool. */
+    java.util.concurrent.ThreadPoolExecutor convergenceWorkers() {
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values())
+                for (ScheduledTask task : holder.getScheduledTasks())
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
+                        return (java.util.concurrent.ThreadPoolExecutor) field(field(owner.getBean("convergenceDriver"),"passes"),"workers");
+        }
+        throw new AssertionError("no convergence worker pool belongs to this server");
+    }
+
+    private static Runnable synchronousPublishingPass(Object driver) {
+        var method = org.springframework.util.ReflectionUtils.findMethod(driver.getClass(),"reconcile");
+        if (method == null) throw new AssertionError("the native synchronous pass is missing");
+        org.springframework.util.ReflectionUtils.makeAccessible(method);
+        return () -> {
+            awaitPublishingIdle(driver);
+            org.springframework.util.ReflectionUtils.invokeMethod(method,driver);
+        };
+    }
+
+    private static void awaitPublishingIdle(Object driver) {
+        var scanning = (java.util.concurrent.atomic.AtomicBoolean) field(driver,"scanning");
+        var active = (java.util.Set<?>) field(field(driver,"passes"),"active");
+        Await.until("all cancelled publishing work to finish",java.time.Duration.ofSeconds(30),
+                () -> !scanning.get() && active.isEmpty(),() -> "active Pipeline passes=" + active);
+    }
+
+    private static Object field(Object owner,String name) {
+        var field = org.springframework.util.ReflectionUtils.findField(owner.getClass(),name);
+        if (field == null) throw new AssertionError("missing native field " + name);
+        org.springframework.util.ReflectionUtils.makeAccessible(field);
+        return org.springframework.util.ReflectionUtils.getField(field,owner);
     }
 
     private boolean belongsToThisServer(ConfigurableApplicationContext candidate) {

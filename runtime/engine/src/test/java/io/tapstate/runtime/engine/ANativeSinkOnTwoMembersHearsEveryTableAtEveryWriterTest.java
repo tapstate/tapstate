@@ -44,6 +44,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * A sink running writers on two members, fed by a step running on both of them and by a source running on one,
@@ -108,10 +110,11 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
         }
     }
 
-    @Test
-    void everyWriterOnBothMembersReportsBothTablesAndEachKeyStaysOnOneWriter() throws InterruptedException {
+    @ParameterizedTest
+    @EnumSource(NodeParallelism.Origin.class)
+    void everyWriterOnBothMembersReportsBothTablesAndEachKeyStaysOnOneWriter(NodeParallelism.Origin origin) throws InterruptedException {
         Job job = first.getJet().newJob(
-                PipelineDagBuilder.build(pipeline(), bindings(), new RecordingAcks(), FRONTIER, shape()));
+                PipelineDagBuilder.build(pipeline(), bindings(), new RecordingAcks(), FRONTIER, shape(origin)));
         try {
             long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
             while (!(everyWriterReportedBothTables() && everyUpdateWritten()) && System.nanoTime() < deadline) {
@@ -139,6 +142,9 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
                     .as("and the order they were applied in there")
                     .containsExactly(1, 2, 3, 4, 5);
         }
+        assertThat(WRITTEN.values().stream().filter(rows -> rows.stream().anyMatch(
+                row -> row.op() == Op.UPDATE && row.src().equals("orders"))).count())
+                .as("several writers land ordinary updates of the same table").isGreaterThan(1);
         assertThat(WRITTEN.keySet()).as("the writers handed anything, on both members").hasSizeGreaterThan(1);
     }
 
@@ -245,11 +251,11 @@ class ANativeSinkOnTwoMembersHearsEveryTableAtEveryWriterTest {
                         "logs", new SinkTarget("logs", List.of()))));
     }
 
-    private static ExecutionShape shape() {
+    private static ExecutionShape shape(NodeParallelism.Origin origin) {
         return new ExecutionShape(2,
                 Map.of("stamp", new NodeParallelism("stamp", WRITERS, NodeParallelism.Origin.EXPLICIT,
                                 NodeParallelism.Scope.NATIVE, 2, PER_MEMBER, WRITERS, List.of()),
-                        "serve.s", new NodeParallelism("serve.s", WRITERS, NodeParallelism.Origin.EXPLICIT,
+                        "serve.s", new NodeParallelism("serve.s", WRITERS, origin,
                                 NodeParallelism.Scope.NATIVE, 2, PER_MEMBER, WRITERS, List.of())),
                 Map.of("stamp", Map.of("orders", List.of("id"))),
                 Map.of("serve.s", Map.of(

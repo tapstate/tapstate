@@ -18,13 +18,13 @@ import static org.mockito.Mockito.*;
 
 /** Counts the actual validation calls without substituting the scoped operator implementation. */
 class MongoOperatorValidationCostTest {
-    @Test void hotReadsReuseTheSameStructureProof() {
+    @Test void hotReadsLeaveStructureChecksToInspection() {
         var f = new Fixture();
         f.store.load(f.at.mapName(), "one");
         int descriptions = f.descriptionReads;
         var indexes = Map.copyOf(f.indexReads);
-        assertThat(descriptions).isPositive();
-        assertThat(indexes).containsKeys("pipeline_state", "nest_state", "nest_shapes", "operator_cleanup");
+        assertThat(descriptions).isZero();
+        assertThat(indexes).isEmpty();
 
         f.store.load(f.at.mapName(), "two");
 
@@ -32,34 +32,36 @@ class MongoOperatorValidationCostTest {
         assertThat(f.indexReads).isEqualTo(indexes);
     }
 
-    @Test void retryRechecksEveryIndexAndReadsFreshDescriptions() {
+    @Test void aTransactionRetryKeepsCatalogReadsOffTheHotPath() {
         var oneAttempt = new Fixture();
         oneAttempt.store.load(oneAttempt.at.mapName(), "one");
         var retried = new Fixture();
         retried.attempts = 2;
         retried.store.load(retried.at.mapName(), "one");
 
-        assertThat(retried.descriptionReads).isGreaterThan(oneAttempt.descriptionReads);
-        oneAttempt.indexReads.forEach((name, count) ->
-                assertThat(retried.indexReads).containsEntry(name, count * 2));
+        assertThat(oneAttempt.descriptionReads).isZero();
+        assertThat(retried.descriptionReads).isZero();
+        assertThat(retried.indexReads).isEmpty();
     }
 
-    @Test void aWriteAfterAReadMustProveTheCollectionStillExists() {
+    @Test void catalogDriftDoesNotPreemptAnOtherwiseSuccessfulWrite() {
         var f = new Fixture();
         f.store.load(f.at.mapName(), "one");
         f.missingCollection = "nest_state";
-        assertThatThrownBy(() -> f.store.save(f.at.mapName(), "two", new byte[]{1}))
-                .isInstanceOfSatisfying(TapstateException.class,
-                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        f.store.save(f.at.mapName(), "two", new byte[]{1});
+        assertThat(f.updates).containsKey("workload_claims");
+        assertThat(f.descriptionReads).isZero();
+        assertThat(f.indexReads).isEmpty();
     }
 
-    @Test void aRetryCannotReuseACollectionDescriptionFromTheFailedAttempt() {
+    @Test void catalogDriftBetweenCallbacksDoesNotPreemptTheRetriedRead() {
         var f = new Fixture();
         f.attempts = 2;
         f.afterAttempt = () -> f.missingCollection = "nest_shapes";
-        assertThatThrownBy(() -> f.store.load(f.at.mapName(), "one"))
-                .isInstanceOfSatisfying(TapstateException.class,
-                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        f.store.load(f.at.mapName(), "one");
+        assertThat(f.finds.get("workload_claims")).isGreaterThanOrEqualTo(2);
+        assertThat(f.descriptionReads).isZero();
+        assertThat(f.indexReads).isEmpty();
     }
 
     @Test void aHotBatchDoesNotReopenTheClaimAndInventoryProof() {
@@ -97,13 +99,14 @@ class MongoOperatorValidationCostTest {
                         assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
-    @Test void aWriteAfterAReadMustProveTheIndexStillExists() {
+    @Test void aMissingIndexDoesNotPreemptAnOtherwiseSuccessfulWrite() {
         var f = new Fixture();
         f.store.load(f.at.mapName(), "one");
         f.missingIndex = "operator_placement";
-        assertThatThrownBy(() -> f.store.save(f.at.mapName(), "two", new byte[]{1}))
-                .isInstanceOfSatisfying(TapstateException.class,
-                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        f.store.save(f.at.mapName(), "two", new byte[]{1});
+        assertThat(f.updates).containsKey("workload_claims");
+        assertThat(f.descriptionReads).isZero();
+        assertThat(f.indexReads).isEmpty();
     }
 
     @Test void hotWritesKeepTheLiveClaimAndInventoryFence() {
@@ -160,6 +163,7 @@ class MongoOperatorValidationCostTest {
             rows.put("nest_shapes", new Document("_id", new Document("scope", MongoPipelinePreparationFacts.scope(SCOPE))
                     .append("stepId", OperatorStateText.encode("nest"))).append("formatVersion", 1)
                     .append("paths", List.of(OperatorStateText.encode("root"))));
+            when(client.getClusterDescription()).thenReturn(mock(com.mongodb.connection.ClusterDescription.class));
             when(db.getName()).thenReturn("cache-db");
             when(db.getCollection(anyString())).thenAnswer(call -> collections.computeIfAbsent(call.getArgument(0), this::collection));
             when(db.listCollections()).thenAnswer(call -> {
@@ -189,6 +193,12 @@ class MongoOperatorValidationCostTest {
         @SuppressWarnings("unchecked")
         private MongoCollection<Document> collection(String name) {
             MongoCollection<Document> result = mock(MongoCollection.class);
+            if (name.equals("cache_identity")) {
+                AggregateIterable<Document> read = mock(AggregateIterable.class);
+                when(result.aggregate(any(ClientSession.class), anyList())).thenReturn(read);
+                when(read.first()).thenAnswer(call -> new Document("identity", rows.get("cache_identity"))
+                        .append("schema", List.of(rows.get("schema_migrations"))));
+            }
             when(result.withReadPreference(any())).thenReturn(result);
             when(result.withReadConcern(any())).thenReturn(result);
             when(result.withWriteConcern(any())).thenReturn(result);
