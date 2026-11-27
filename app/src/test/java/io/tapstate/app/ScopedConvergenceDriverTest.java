@@ -42,6 +42,7 @@ import java.util.function.BooleanSupplier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -74,6 +75,7 @@ class ScopedConvergenceDriverTest {
     private boolean readyToComplete, releasedSnapshot, completionObserved, pendingCleanup, rejectCleanup;
     private final List<String> completionTrace = new ArrayList<>();
     private Runnable onFinalObservation = () -> {};
+    private Runnable beforePositionSample = () -> {};
     private PipelineAlertFeed alertFeed = PipelineAlertFeed.none();
     private MetricsExport metricsExport = MetricsExport.none();
     private final java.util.concurrent.atomic.AtomicLong nanoTime = new java.util.concurrent.atomic.AtomicLong();
@@ -131,7 +133,10 @@ class ScopedConvergenceDriverTest {
         var converger = new PipelineConverger(poisonDesired, poisonState, poisonActuator,
                 Clock.fixed(T0, ZoneOffset.UTC), poisonRebuilds);
         return ConvergenceDriver.scoped(converger, new ObservationPublisher(poisonState, poisonObservations,
-                id -> sampleMetrics ? java.util.OptionalLong.of(5) : java.util.OptionalLong.empty(), id -> Map.of(), id -> {
+                id -> sampleMetrics ? java.util.OptionalLong.of(5) : java.util.OptionalLong.empty(), id -> {
+                    beforePositionSample.run();
+                    return Map.of();
+                }, id -> {
                     if(releasedSnapshot)throw new AssertionError("completed observations must not sample released capture");
                     return readyToComplete ? new io.tapstate.core.lifecycle.SnapshotReading(
                             Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
@@ -507,6 +512,34 @@ class ScopedConvergenceDriverTest {
             assertThat(intents.loads).isEqualTo(reads);
             frequent.set(true); scheduledPass(driver); scheduledPass(driver);
             assertThat(intents.loads).isEqualTo(reads + 2);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aRetiredCaptureCanReportItsStoppedMeasurementOnlyWhileItsIntentIsCurrent(boolean intentChanges) {
+        alertFeed = mock(PipelineAlertFeed.class);
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        assertThat(views.state(FIRST).compareAndSwap("orders", 0, StateJson.of(PipelineState.STOPPED), T0))
+                .isInstanceOf(CasOutcome.Applied.class);
+        var checkpoint = views.state(FIRST).read("orders").orElseThrow();
+        var retained = new Observation("orders", PipelineState.STOPPED, Map.of(), Map.of(),
+                Map.of("source.orders", "retained-position"), null, T0, List.of());
+        beforePositionSample = () -> { throw fenced(); };
+        var recovered = new AtomicBoolean();
+        views.restoreStopped = original -> {
+            assertThat(original).isEqualTo(checkpoint);
+            recovered.set(true);
+            if (intentChanges) intents.snapshot = new PipelineIntentSnapshot(FIRST, 5,
+                    new DesiredState("orders", PipelineState.RUNNING, "original"));
+            return Optional.of(retained);
+        };
+        try (var driver = driver()) {
+            driver.reconcile();
+            assertThat(recovered).isTrue();
+            assertThat(views.state(FIRST).read("orders")).contains(checkpoint);
+            verify(alertFeed, times(intentChanges ? 0 : 1)).published(any(), eq(retained), eq(null), eq(false));
         }
     }
 
@@ -1276,6 +1309,7 @@ class ScopedConvergenceDriverTest {
         private final Map<PipelineIntentScope, InMemoryStateStore> states = new HashMap<>();
         private final Map<PipelineIntentScope, InMemoryObservationStore> projections = new HashMap<>();
         private Runnable beforeObservationWrite = () -> {};
+        private Function<CheckpointDoc, Optional<Observation>> restoreStopped = ignored -> Optional.empty();
         private final InMemoryRateHistoryStore rates = new InMemoryRateHistoryStore();
         private final List<PipelineIntentScope> requested = new ArrayList<>();
         private final List<Write> writes = new ArrayList<>();
@@ -1326,6 +1360,10 @@ class ScopedConvergenceDriverTest {
         @Override public ObservationStore pipelineObservations(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             return new ObservationStore() {
                 @Override public Optional<Observation> read(String id) { check(scope); return observations(scope).read(id); }
+                @Override public Optional<Observation> republishStopped(CheckpointDoc checkpoint) {
+                    check(scope, original, active);
+                    return restoreStopped.apply(checkpoint);
+                }
                 @Override public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
                     check(scope, original, active);
                     var checkpoint = state(scope).read(scope.pipelineId()).orElseThrow();

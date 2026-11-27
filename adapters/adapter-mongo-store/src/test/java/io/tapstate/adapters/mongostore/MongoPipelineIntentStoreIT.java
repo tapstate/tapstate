@@ -662,11 +662,19 @@ class MongoPipelineIntentStoreIT {
                 var bindings = new MongoStorageBindingStore(client, db, ciphers);
                 var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), bindings);
                 var artifacts = new MongoConfigurationArtifactStore(client, db, ciphers);
-                assertThat(store.commitRetainedStart(scope, 1, next, inputs, artifacts))
+                long before = revision(database);
+                var refused = new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
+                        Map.of("pipeline", scope.pipelineId(), "tables", "input.customers"), null);
+                assertThatThrownBy(() -> store.commitRetainedStart(scope, 1, next, inputs, artifacts,
+                        () -> { throw refused; })).isSameAs(refused);
+                assertThat(commands).containsExactly("aggregate", "abortTransaction");
+                assertThat(revision(database)).isEqualTo(before);
+                commands.clear();
+                assertThat(store.commitRetainedStart(scope, 1, next, inputs, artifacts, () -> {}))
                         .isEqualTo(MongoConfigurationDomain.RetainedStart.SAVED);
                 assertThat(commands).containsExactly("aggregate", "update", "update", "update", "commitTransaction");
                 long written = revision(database);
-                assertThatThrownBy(() -> store.commitRetainedStart(scope, 1, next, inputs, artifacts))
+                assertThatThrownBy(() -> store.commitRetainedStart(scope, 1, next, inputs, artifacts, () -> {}))
                         .satisfies(MongoPipelineIntentStoreIT::fenced);
                 assertThat(revision(database)).isEqualTo(written);
                 assertThat(domain.intents().load(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, next));

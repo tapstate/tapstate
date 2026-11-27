@@ -49,6 +49,23 @@ final class InProcessServer implements ServerHandle {
         this.stagingDirectory = stagingDirectory;
     }
 
+    void inspectStorageNow() throws ReflectiveOperationException {
+        Class<?> rootType = Class.forName("io.tapstate.app.StorageRoot");
+        var root = context.getBean(rootType);
+        var runtimeMethod = rootType.getDeclaredMethod("runtime");
+        runtimeMethod.setAccessible(true);
+        var runtime = runtimeMethod.invoke(root);
+        var businessMethod = runtime.getClass().getDeclaredMethod("business");
+        businessMethod.setAccessible(true);
+        var business = ((java.util.Optional<?>) businessMethod.invoke(runtime)).orElseThrow();
+        var field = business.getClass().getDeclaredField("storageInspection");
+        field.setAccessible(true);
+        var inspection = field.get(business);
+        var run = inspection.getClass().getDeclaredMethod("runOnce");
+        run.setAccessible(true);
+        run.invoke(inspection);
+    }
+
     /** Boots the assembly against the given store and returns once its surface is listening. */
     static InProcessServer start(String storeUri) {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
