@@ -7,6 +7,11 @@ import com.hazelcast.jet.Job;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.metrics.JobMetrics;
+import com.hazelcast.jet.core.metrics.Measurement;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import java.util.HashMap;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
@@ -127,6 +132,32 @@ class EngineRunHandleTest {
         assertThat(second.futures.get()).isZero();
     }
 
+    @Test void cumulativeReadingsComeFromOneSampleOfTheCapturedJob() {
+        var original = new FakeJob(1, "run-a", JobStatus.RUNNING);
+        var manifest = new OperatorRunManifest("p", "run-a", List.of());
+        original.job.getConfig().setArgument(Engine.OPERATOR_MANIFEST_ARGUMENT, manifest);
+        var fixture = new Fixture(original);
+        var run = fixture.engine.captureRun("p").orElseThrow();
+        fixture.named.set(new FakeJob(2, "run-b", JobStatus.RUNNING));
+        var values = new HashMap<String, List<Measurement>>();
+        java.util.function.BiConsumer<String, Long> add = (name, value) ->
+                values.put(name, List.of(Measurement.of(name, value, 0L, Map.of())));
+        add.accept("outCountingSince", 1000L);
+        add.accept("recordsOut.insert.orders", 7L);
+        add.accept("outDeliveryCount.orders", 1L);
+        add.accept("outDeliverySumMillis.orders", 0L);
+        for (int i = 0; i < HistogramBounds.RECORD_DELIVERY_DURATION.buckets(); i++)
+            add.accept("outDeliveryBucket." + i + ".orders", i == 0 ? 1L : 0L);
+        original.metrics = () -> JobMetrics.of(values);
+        var sample = run.metrics().orElseThrow();
+        assertThat(original.metricReads.get()).isOne();
+        assertThat(sample.jobId()).isEqualTo(1L);
+        assertThat(sample.manifest()).isEqualTo(manifest);
+        assertThat(sample.delivered().countingSince()).isEqualTo(java.time.Instant.ofEpochMilli(1000));
+        assertThat(sample.delivered().rowsByTableAndOp()).containsEntry("orders", Map.of("insert", 7L));
+        assertThat(sample.delivered().deliveryDurationByTable().get("orders").bucketCounts().getFirst()).isOne();
+    }
+
     @Test void capturedPlacementsCannotBeReplacedThroughTheSameMutableJobConfiguration() {
         var job = new FakeJob(1, "run-a", JobStatus.RUNNING); var fixture = new Fixture(job);
         var original = new OperatorRunManifest("p", "run-a", java.util.List.of());
@@ -229,12 +260,15 @@ class EngineRunHandleTest {
         final AtomicReference<JobStatus> status; final CompletableFuture<Void> future = new CompletableFuture<>();
         final AtomicInteger suspends = new AtomicInteger(), resumes = new AtomicInteger(), cancels = new AtomicInteger(), futures = new AtomicInteger();
         final Job job; Runnable onStatus = () -> {}; Runnable onConfig = () -> {};
+        java.util.function.Supplier<JobMetrics> metrics;
+        final AtomicInteger metricReads = new AtomicInteger();
         final AtomicInteger configReads = new AtomicInteger();
         FakeJob(long id, String identity, JobStatus initial) {
             status = new AtomicReference<>(initial); JobConfig config = new JobConfig().setName("p");
             if (identity != null) config.setArgument(Engine.RUN_IDENTITY_ARGUMENT, identity);
             job = proxy(Job.class, (method, args) -> switch (method) {
                 case "getId" -> id;
+                case "getMetrics" -> { metricReads.incrementAndGet(); yield metrics.get(); }
                 case "getConfig" -> { configReads.incrementAndGet(); onConfig.run(); yield config; }
                 case "getDistributedObjects" -> java.util.List.of();
                 case "getName" -> "p";

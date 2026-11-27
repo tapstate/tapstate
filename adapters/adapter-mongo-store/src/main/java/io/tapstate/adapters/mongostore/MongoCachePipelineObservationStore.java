@@ -346,6 +346,21 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         return document;
     }
 
+    static List<io.tapstate.core.lifecycle.MetricFact> pauseFacts(MongoCachePipelineAccess access,
+            ClientSession session, long epoch) {
+        var key = keyOfFence(access, epoch, access.originalClaim());
+        var row = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).find(session, new Document("_id", key))
+                .projection(new Document("pipelineId", 1).append("state", 1).append("facts", 1)).first();
+        if (row == null) return List.of();
+        if (!key.equals(row.get("_id")) || !access.scope.pipelineId().equals(row.get("pipelineId")))
+            throw access.unreadable("observation");
+        if (!PipelineState.RUNNING.name().equals(row.get("state"))) return List.of();
+        var facts = MongoObservationStore.readFacts(row, access.scope.pipelineId());
+        if (row.containsKey("facts") && !facts.stream().map(MongoObservationStore::toDocument).toList().equals(row.get("facts")))
+            throw access.unreadable("facts");
+        return facts;
+    }
+
     private static Document keyOfFence(MongoCachePipelineAccess access, long epoch, WorkloadClaimFence fence) {
         return key(access, epoch, fence.claimGeneration(), fence.executionGeneration(), fence.topologyRevision(),
                 fence.owner().nodeId(), fence.owner().bootId());

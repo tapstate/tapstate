@@ -8,6 +8,9 @@ import io.tapstate.runtime.engine.OperatorMapCapacity;
 import io.tapstate.runtime.engine.OperatorRunManifest;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ResumeMetrics;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
+import java.util.List;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Clock;
 import java.time.Duration;
@@ -82,6 +85,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private PipelineCaptureCoordinator capture;
     private boolean checkingStart;
     private boolean recoveringSource;
+    private Boolean coldResume;
+
 
     ScopedEngineLifecycleActuator(PipelineConvergencePass pass,Engine engine,DagSource dags,
             PipelineCaptureCoordinator captures,PipelineActuationOwnership ownership,String defaultDatabase,
@@ -223,7 +228,13 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         }
         PipelineActuationOwnership.Execution execution;
         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_EXECUTION_CLAIM)) {
-            execution = ownership.beginExecution(pass.scope(),command);
+            var binding = pass.metricState() == null ? null : pass.metricState().latestBinding();
+            boolean retryingResume = binding != null && binding.revision() == pass.intent().intentRevision()
+                    && binding.fence().equals(command) && (run == null || !isCurrentRun()
+                            || run.jobId() == binding.baseline().jobId());
+            execution = Boolean.TRUE.equals(coldResume) || retryingResume || (pass.metricState() != null && pass.metricState().unavailable())
+                    ? ownership.beginExecution(pass.scope(), command, pass.intent().intentRevision())
+                    : ownership.beginExecution(pass.scope(),command);
             if (!execution.allowed()) throw fenced();
             pass.advancedSubmission(execution); command = execution.claimFence(); requireLocal();
             original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
@@ -427,12 +438,35 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         // A changed physical generation must be loaded by a new pass, never adopted by this command.
         throw new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
     }
+    @Override public synchronized ResumeMetrics.Transition resumeMetricTransition(
+            PipelineState from, PipelineState to) {
+        if (run == null || !isCurrentRun()) return null;
+        if (to == PipelineState.PAUSED) {
+            var sample = run.metrics();
+            if (sample.isEmpty()) return null;
+            var reading = sample.orElseThrow();
+            requireLocal();
+            var raw = ObservationPublisher.nativeFacts(id(), clock.instant(),
+                    reading.captured(), reading.delivered(), reading.stages());
+            return new ResumeMetrics.Transition(ResumeMetrics.Action.PAUSE,
+                    pass.intent().intentRevision(), reading.jobId(), raw);
+        }
+        var desired = pass.intent().desired();
+        if (desired.reassemble() || desired.rebuiltAtStateEpoch() != null) return null;
+        requireLocal();
+        coldResume = capture == null || !capture.loadDelivered(id());
+        return new ResumeMetrics.Transition(coldResume
+                ? ResumeMetrics.Action.REBUILD : ResumeMetrics.Action.IN_PLACE,
+                pass.intent().intentRevision(), run.jobId(), List.of());
+    }
+
     @Override public synchronized void pause(String pipeline) {
         requireId(pipeline); if (run == null || !isCurrentRun()) throw fenced(); run.suspend(); require();
     }
     @Override public synchronized void resume(String pipeline) {
         requireId(pipeline);
-        if (!isCurrentRun() || run == null || capture == null || !capture.loadDelivered(id())) {
+        if (!isCurrentRun() || run == null || capture == null ||
+                (coldResume != null ? coldResume : !capture.loadDelivered(id()))) {
             require(); start(id()); return;
         }
         require(); run.resume(); require();
@@ -524,6 +558,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     @Override public synchronized boolean isCarryingAJob(String pipeline) {
         requireRead(pipeline);
+        var state = pass.metricState();
+        var binding = state == null ? null : state.latestBinding();
+        if (binding != null && binding.revision() == pass.intent().intentRevision() && binding.fence().equals(command)
+                && binding.baseline().origin().equals(command) && run != null && run.jobId() == binding.baseline().jobId())
+            return false;
         // A successful bounded job still owns completion while its target receipts arrive.
         boolean carrying = (run != null && isCurrentRun() && run.isCarryingAJob()) || successfulBoundedJob(pipeline);
         requireRead(pipeline);

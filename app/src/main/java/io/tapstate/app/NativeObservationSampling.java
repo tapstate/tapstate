@@ -165,7 +165,7 @@ final class NativeObservationSampling {
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };
         return new Attempt(true, publisher.publishRunning(pass.scope(), checkpoint,
-                deferred == null ? sink : deferred.apply(sink), sample.orElseThrow(), stillCurrent));
+                deferred == null ? sink : deferred.apply(sink), sample.orElseThrow(), stillCurrent, pass.metricState()));
     }
 
     void requireExecution(PipelineConvergencePass pass, ExecutionFence original) {

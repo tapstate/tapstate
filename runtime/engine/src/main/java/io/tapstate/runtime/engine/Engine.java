@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
@@ -241,6 +242,9 @@ public final class Engine {
         }
     }
 
+    public record RunMetrics(long jobId, OperatorRunManifest manifest, CaptureReading captured,
+            DeliveryReading delivered, StageReading stages) {}
+
     /** A local, non-serializable handle for the one concrete job whose configuration was verified. */
     public final class Run {
         private final String pipelineId;
@@ -259,6 +263,15 @@ public final class Engine {
                     || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
             return originalManifest;
         }
+        /** Read all producer windows from one collection on the captured Job. */
+        public Optional<RunMetrics> metrics() {
+            if (!isCarryingAJob()) return Optional.empty();
+            var manifest = operatorManifest();
+            var collected = job.getMetrics();
+            return Optional.of(new RunMetrics(jobId(), manifest, SourceArrivals.reading(collected),
+                    deliveryIn(collected), stageDurationsIn(collected)));
+        }
+
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
         public boolean completed() {
             return !isLost() && job.getStatus() == JobStatus.COMPLETED
@@ -912,7 +925,23 @@ public final class Engine {
         if (job == null) {
             return OptionalLong.empty();
         }
-        JobMetrics collected = job.getMetrics();
+        return countingSinceIn(job.getMetrics());
+    }
+
+    public DeliveryReading deliveryReading(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? DeliveryReading.NONE : deliveryIn(job.getMetrics());
+    }
+
+    private static DeliveryReading deliveryIn(JobMetrics collected) {
+        var start = countingSinceIn(collected);
+        if (start.isEmpty()) return DeliveryReading.NONE;
+        return new DeliveryReading(deliveredRowsIn(collected), settledBytesIn(collected),
+                highestIn(collected, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(start.getAsLong()),
+                settledDurationsIn(collected));
+    }
+
+    private static OptionalLong countingSinceIn(JobMetrics collected) {
         OptionalLong latest = OptionalLong.empty();
         for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
             latest = latest.isPresent()

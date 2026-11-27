@@ -1,8 +1,6 @@
 package io.tapstate.app;
 
-import java.util.OptionalLong;
 import java.time.Instant;
-import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import org.springframework.beans.factory.ObjectProvider;
 import java.util.List;
@@ -117,7 +115,7 @@ class RuntimeConvergenceConfiguration {
                 // rows counted where a source handed them over. On its own it says a pipeline is reading;
                 // beside the far end it says whether what it reads is arriving, which neither answers.
                 captureCoordinator::capturedRows,
-                id -> deliveredBy(engine, id),
+                engine::deliveryReading,
                 // Where the run spends its time, per stage of the graph, as the processors time their own
                 // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
                 engine::stageDurations,
@@ -126,23 +124,17 @@ class RuntimeConvergenceConfiguration {
                         executionPlans.current(List.of(id)).get(id),
                         Instant.now()),
                 (id, at) -> captureCoordinator.measurements(id, executionPlans.current(List.of(id)).get(id), at),
-                Clock.systemUTC()).withAggregateReadings(engine::aggregateReadings);
-    }
-
-    /**
-     * What {@code engine}'s live job for {@code pipelineId} reports about rows that reached a target.
-     * A run with no start reported has counted nothing, so it reports nothing rather than totals nobody
-     * could place against a starting point.
-     */
-    private static DeliveryReading deliveredBy(Engine engine, String pipelineId) {
-        OptionalLong since = engine.countingSince(pipelineId);
-        if (since.isEmpty()) {
-            return DeliveryReading.NONE;
-        }
-        return new DeliveryReading(engine.recordsDelivered(pipelineId),
-                engine.bytesDelivered(pipelineId),
-                engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()),
-                engine.deliveryDurations(pipelineId));
+                Clock.systemUTC()).withAggregateReadings(engine::aggregateReadings)
+                .withResumeSample((scope, binding, at) -> {
+                    var expected = new ExecutionFence(scope, binding.fence());
+                    return engine.captureRun(scope.pipelineId())
+                            .filter(run -> run.jobId() != binding.baseline().jobId()
+                                    && expected.equals(run.operatorManifest().executionIdentity()))
+                            .flatMap(Engine.Run::metrics)
+                            .map(sample -> ObservationPublisher.nativeFacts(scope.pipelineId(), at,
+                                    sample.captured(), sample.delivered(), sample.stages()))
+                            .orElseGet(List::of);
+                });
     }
 
     /**

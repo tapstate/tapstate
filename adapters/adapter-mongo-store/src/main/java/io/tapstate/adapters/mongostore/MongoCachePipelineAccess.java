@@ -94,6 +94,10 @@ final class MongoCachePipelineAccess {
     }
 
     CheckpointDoc readCheckpoint(MongoStructureProof structures) {
+        return readCheckpoint(structures, MongoStateStore::toCheckpoint);
+    }
+
+    <T> T readCheckpoint(MongoStructureProof structures, Function<Document, T> decode) {
         try {
             if (!unpreparedModels && authoringModels == null && StoreIo.call(() -> MongoReadBudget.supportsSnapshotReads(client))) {
                 var facts = MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
@@ -105,9 +109,9 @@ final class MongoCachePipelineAccess {
                     requireActive.run();
                     return captured;
                 }));
-                if (facts != null) return MongoStateStore.toCheckpoint(facts.checkpoint());
+                if (facts != null) return decode.apply(facts.checkpoint());
             }
-            return transaction(session -> MongoStateStore.toCheckpoint(state(session, true)));
+            return transaction(session -> decode.apply(state(session, true)));
         }
         catch (RuntimeException failure) {
             if (structures != null) structures.clear();

@@ -66,12 +66,19 @@ class ScopedResumeMetricsTest {
     private static final Clock CLOCK = Clock.systemUTC();
     private static final Instant FIRST_START = Instant.parse("2026-11-25T00:00:00Z");
     private static final Instant NEXT_START = FIRST_START.plusSeconds(60);
+    private static final Instant RESTARTED_START = NEXT_START.plusSeconds(60);
+    private static final String RESTARTED = ScopedResumeMetricsTest.class.getName() + ".restarted";
 
     enum Scenario { WAIT_AND_RECONSTRUCT, IMMEDIATE_RESUME, STAMPED_START, IN_PLACE_RESUME, PREFLIGHT_REFUSAL }
+    enum Recovery { NORMAL, LOST_SUBMISSION_REPLY, NEW_NATIVE_WINDOW }
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(Scenario.class)
     void preservesResumeMetricsAndStartSemantics(Scenario scenario) {
+        exercise(scenario, Recovery.NORMAL);
+    }
+
+    static void exercise(Scenario scenario, Recovery recovery) {
         Config config = new Config().setClusterName("resume-probe-" + java.util.UUID.randomUUID());
         config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
@@ -87,7 +94,7 @@ class ScopedResumeMetricsTest {
         try {
             var fixture = new Fixture(member);
             fixture.accept(fixture.lifecycle.start("operator", ID));
-            var first = fixture.process();
+            var first = fixture.process(recovery == Recovery.LOST_SUBMISSION_REPLY);
             first.driver().reconcile();
             Job old = member.getJet().getJob(ID);
             assertThat(old).isNotNull();
@@ -124,7 +131,10 @@ class ScopedResumeMetricsTest {
             fixture.loaded = scenario == Scenario.IN_PLACE_RESUME;
             fixture.waitForRing = scenario == Scenario.WAIT_AND_RECONSTRUCT;
             fixture.refusePreparation = scenario == Scenario.PREFLIGHT_REFUSAL;
-            first.driver().reconcile();
+            if (recovery == Recovery.LOST_SUBMISSION_REPLY) {
+                org.assertj.core.api.Assertions.assertThatThrownBy(first.driver()::reconcile)
+                        .isInstanceOf(SubmissionReplyLost.class);
+            } else first.driver().reconcile();
             var intermediate = fixture.observation();
             System.out.printf("Scoped resume metrics %s original=%s oldJob=%s oldStatus=%s checkpoint=%s generation=%s live=%s out=%s%n",
                     scenario, oldKey, old.getId(), old.getStatus(), fixture.checkpoint(), fixture.claim().executionGeneration(),
@@ -148,6 +158,12 @@ class ScopedResumeMetricsTest {
 
             assertThat(old.getStatus().isTerminal()).isTrue();
             var process = first;
+            if (recovery == Recovery.LOST_SUBMISSION_REPLY) {
+                long admittedJob = member.getJet().getJob(ID).getId();
+                process = fixture.process();
+                process.driver().reconcile();
+                assertThat(member.getJet().getJob(ID).getId()).isEqualTo(admittedJob);
+            }
             long expectedGeneration = oldKey.claim().executionGeneration() + 1;
             if (scenario == Scenario.WAIT_AND_RECONSTRUCT) {
                 assertThat(fixture.actual()).isEqualTo(PipelineState.RUNNING);
@@ -196,9 +212,36 @@ class ScopedResumeMetricsTest {
                             .isEqualTo(Math.max(0L, (lag.observedAt().toEpochMilli() - eventTime) / 1000));
                 }
             });
+            if (recovery == Recovery.NEW_NATIVE_WINDOW)
+                verifyRestartedWindow(member, fixture, replacement);
         } finally {
             member.shutdown();
         }
+    }
+
+    private static void verifyRestartedWindow(HazelcastInstance member, Fixture fixture, Engine.Run original) {
+        var key = fixture.currentKey();
+        var manifest = original.operatorManifest();
+        member.getUserContext().put(RESTARTED, true);
+        member.getJet().getJob(original.jobId()).restart();
+        var restored = fixture.process();
+        awaitNativeReadings(restored.engine(), 1L, 0L, RESTARTED_START);
+        var nativeSample = restored.engine().captureRun(ID).orElseThrow().metrics().orElseThrow();
+        assertThat(nativeSample.jobId()).isEqualTo(original.jobId());
+        assertThat(nativeSample.manifest()).isEqualTo(manifest);
+        assertThat(nativeSample.delivered().countingSince()).isEqualTo(RESTARTED_START);
+        assertSoftly(soft -> {
+            for (int publication = 0; publication < 2; publication++) {
+                restored.driver().reconcile();
+                assertThat(fixture.currentKey()).isEqualTo(key);
+                var observed = fixture.observation().orElseThrow();
+                soft.assertThat(observed.metrics().get("records.out")).as("output in the new native window").isEqualTo(1L);
+                soft.assertThat(point(observed).startTime()).as("counter start").isEqualTo(RESTARTED_START);
+                var duration = tablePoint(observed, "tapstate.pipeline.record.delivery.duration");
+                soft.assertThat(duration.histogram().count()).as("delivery samples").isZero();
+                soft.assertThat(duration.startTime()).as("histogram start").isEqualTo(RESTARTED_START);
+            }
+        });
     }
 
     private static MetricPoint point(Observation observation) {
@@ -227,6 +270,8 @@ class ScopedResumeMetricsTest {
     }
 
     private record ObservationKey(long epoch, WorkloadClaimFence claim) {}
+    private static final class SubmissionReplyLost extends Error {}
+
     private record Process(Engine engine, ConvergenceDriver driver) {}
 
     private static final class Fixture {
@@ -237,6 +282,7 @@ class ScopedResumeMetricsTest {
         final InMemoryDesiredStore desired = new InMemoryDesiredStore();
         final PipelineLifecycleService lifecycle = new PipelineLifecycleService(new ArtifactQueryService(artifacts),
                 desired, new AuditGate(record -> {}, CLOCK), state::read);
+        ResumeMetrics.Handoff handoff = ResumeMetrics.Handoff.EMPTY;
         final Map<ObservationKey, Observation> observations = new HashMap<>();
         final List<ObservationKey> observationReads = new java.util.ArrayList<>();
         PipelineIntentSnapshot intent;
@@ -271,7 +317,9 @@ class ScopedResumeMetricsTest {
         ObservationKey currentKey() { return new ObservationKey(checkpoint().epoch(), claim()); }
         Optional<Observation> observation() { return Optional.ofNullable(observations.get(currentKey())); }
 
-        Process process() {
+        Process process() { return process(false); }
+
+        Process process(boolean loseSubmissionReply) {
             var membership = mock(ClusterMembershipGate.class);
             when(membership.businessEligible()).thenReturn(true);
             when(membership.committed()).thenReturn(new ClusterMembership("cluster", 7, Set.of("node")));
@@ -279,14 +327,29 @@ class ScopedResumeMetricsTest {
             when(scopedClaims.acquirePipeline(eq(SCOPE), any(), anyLong(), any()))
                     .thenAnswer(call -> claims.acquire(KEY, call.getArgument(1), call.getArgument(2), call.getArgument(3)));
             when(scopedClaims.readPipeline(eq(SCOPE))).thenAnswer(call -> claims.read(KEY));
-            when(scopedClaims.advanceExecution(any(), anyLong(), any()))
-                    .thenAnswer(call -> claims.advanceExecution(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
+            when(scopedClaims.advanceExecution(any(), anyLong(), any())).thenAnswer(call -> {
+                var advanced = claims.advanceExecution(call.getArgument(0), call.getArgument(1), call.getArgument(2));
+                if (advanced.isPresent()) handoff = ResumeMetrics.Handoff.EMPTY;
+                return advanced;
+            });
+            when(scopedClaims.advanceResumeExecution(any(), anyLong(), any(), anyLong())).thenAnswer(call -> {
+                var before = claim();
+                var advanced = claims.advanceExecution(call.getArgument(0), call.getArgument(1), call.getArgument(2));
+                advanced.ifPresent(value -> handoff = handoff.advance(before, WorkloadClaimFence.from(value), call.getArgument(3)));
+                return advanced;
+            });
             var ownership = PipelineActuationOwnership.scoped(new CacheBusinessScope("cluster", 3, "cache-a"), OWNER,
                     membership, new ClusterWorkloadClaims(scopedClaims, membership), Duration.ofMinutes(1),
                     Duration.ofSeconds(10), System::nanoTime);
             var root = mock(ScopedPipelineCaptureCoordinator.class);
             when(root.forRun(eq(SCOPE), any(), any())).thenAnswer(call -> capture(call.getArgument(2)));
-            var engine = new Engine(member);
+            var engine = loseSubmissionReply ? spy(new Engine(member)) : new Engine(member);
+            if (loseSubmissionReply) doAnswer(call -> {
+                var run = (Engine.Run) call.callRealMethod();
+                if (claim().executionGeneration() > 1) throw new SubmissionReplyLost();
+                return run;
+            }).when(engine).submitRun(eq(ID), any(), anyMap(), any(),
+                    any(io.tapstate.runtime.engine.OperatorRunManifest.class));
             var dags = mock(DagSource.class);
             when(dags.prepareStart(any(PipelineConvergencePass.class), eq("cache"), any())).thenCallRealMethod();
             var coordinates = OperatorCoordinatePlan.compile(SCOPE, (PipelineResource) artifacts.get(ID).orElseThrow(),
@@ -308,7 +371,7 @@ class ScopedResumeMetricsTest {
                     (fence, claim) -> ExecutionPlanRecorder.NONE);
             var submissions = new ScopedEngineLifecycleActuator.Submissions();
             var views = mock(PipelineStoreViews.class);
-            when(views.pipelineStates(eq(SCOPE))).thenReturn(state);
+            when(views.pipelineStates(eq(SCOPE))).thenAnswer(call -> stateView(claim(), () -> {}));
             when(views.pipelineStates(eq(SCOPE), any(), any())).thenAnswer(call -> stateView(call.getArgument(1), call.getArgument(2)));
             when(views.pipelineObservations(eq(SCOPE), any(), any())).thenAnswer(call -> observationView(call.getArgument(1), call.getArgument(2)));
             var intents = mock(PipelineIntentStore.class);
@@ -349,15 +412,26 @@ class ScopedResumeMetricsTest {
         }
 
         private StateStore stateView(WorkloadClaimFence original, Runnable active) {
-            return new StateStore() {
+            class View implements StateStore, StateStore.MetricReader {
+                public Optional<ResumeMetrics.Checkpoint> readForMetrics(String id) {
+                    return state.read(id).map(doc -> new ResumeMetrics.Checkpoint(doc, handoff.applied()));
+                }
+                public CasOutcome transitionMetrics(String id, long epoch, String next, Instant at, ResumeMetrics.Transition transition) {
+                    active.run(); assertThat(original).isEqualTo(claim());
+                    var observed = observations.get(new ObservationKey(epoch, original));
+                    var outcome = state.compareAndSwap(id, epoch, next, at);
+                    if (outcome instanceof CasOutcome.Applied)
+                        handoff = handoff.transition(transition, original, epoch, observed == null ? List.of() : observed.facts());
+                    return outcome;
+                }
                 public Optional<CheckpointDoc> read(String id) { return state.read(id); }
                 public CasOutcome compareAndSwap(String id, long epoch, String json, Instant at) {
-                    active.run(); assertThat(original).isEqualTo(claim());
-                    return state.compareAndSwap(id, epoch, json, at);
+                    return transitionMetrics(id, epoch, json, at, null);
                 }
                 public void create(String id, String json, Instant at) { throw new AssertionError("unexpected create"); }
                 public void delete(String id) { throw new AssertionError("unexpected delete"); }
-            };
+            }
+            return new View();
         }
 
         private ObservationStore observationView(WorkloadClaimFence original, Runnable active) {
@@ -382,8 +456,12 @@ class ScopedResumeMetricsTest {
         var source = dag.newVertex("source", ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(
                 () -> new AbstractProcessor() {
                     private int emitted;
+                    private int limit;
+                    @Override protected void init(Context context) {
+                        limit = context.hazelcastInstance().getUserContext().containsKey(RESTARTED) ? 1 : records;
+                    }
                     public boolean tryProcess() {
-                        while (emitted < records && tryEmit(emitted)) emitted++;
+                        while (emitted < limit && tryEmit(emitted)) emitted++;
                         return false;
                     }
                     public boolean complete() { return tryProcess(); }
@@ -391,10 +469,15 @@ class ScopedResumeMetricsTest {
         var sink = dag.newVertex("sink", ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(
                 () -> new AbstractProcessor() {
                     private long count;
+                    private long startMillis;
+                    @Override protected void init(Context context) {
+                        startMillis = (context.hazelcastInstance().getUserContext().containsKey(RESTARTED)
+                                ? RESTARTED_START : counterStart).toEpochMilli();
+                    }
                     protected boolean tryProcess(int ordinal, Object item) {
-                        Metrics.metric("outCountingSince").set(counterStart.toEpochMilli());
+                        Metrics.metric("outCountingSince").set(startMillis);
                         Metrics.metric("recordsOut.insert.orders").set(++count);
-                        Metrics.metric("outEventTime.orders").set(counterStart.toEpochMilli());
+                        Metrics.metric("outEventTime.orders").set(startMillis);
                         // Take one zero-duration sample per pair of delivered records.
                         long samples = count / 2;
                         Metrics.metric("outDeliveryCount.orders").set(samples);
