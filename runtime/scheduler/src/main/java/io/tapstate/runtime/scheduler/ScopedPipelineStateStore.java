@@ -8,20 +8,64 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /** The converge loop's fixed physical state view; the original claim is captured before each write's callbacks. */
 public final class ScopedPipelineStateStore implements StateStore {
     private final PipelineIntentScope scope;
+    private final long intentRevision;
     private final Supplier<WorkloadClaimFence> originalClaim;
     private final PipelineStoreViews views;
     private final Runnable requireActive;
+    private final AtomicReference<ResumeMetrics.Checkpoint> measured = new AtomicReference<>();
     public ScopedPipelineStateStore(PipelineIntentScope scope,Supplier<WorkloadClaimFence> originalClaim,PipelineStoreViews views,Runnable requireActive) {
+        this(scope, 0L, originalClaim, views, requireActive);
+    }
+
+    public ScopedPipelineStateStore(PipelineIntentSnapshot intent, Supplier<WorkloadClaimFence> claim,
+            PipelineStoreViews views, Runnable requireActive) {
+        this(intent.scope(), intent.intentRevision(), claim, views, requireActive);
+    }
+
+    private ScopedPipelineStateStore(PipelineIntentScope scope, long revision, Supplier<WorkloadClaimFence> originalClaim,
+            PipelineStoreViews views, Runnable requireActive) {
+        this.intentRevision = revision;
         this.scope = Objects.requireNonNull(scope,"scope"); this.originalClaim = Objects.requireNonNull(originalClaim,"originalClaim");
         this.views = Objects.requireNonNull(views,"views"); this.requireActive = Objects.requireNonNull(requireActive,"requireActive");
     }
+    public boolean unavailable() {
+        var current = measured.get();
+        return intentRevision > 0 && current != null && current.unavailableRevision() == intentRevision;
+    }
+
+    public ResumeMetrics.Binding latestBinding() {
+        var current = measured.get();
+        return current == null ? null : current.applied();
+    }
+
+    public ResumeMetrics.Checkpoint resumeCheckpoint(CheckpointDoc expected) {
+        var current = measured.get();
+        if (current == null || !current.state().equals(expected)) return null;
+        var applied = current.applied();
+        return applied != null && applied.revision() == intentRevision && applied.fence().equals(originalClaim.get())
+                && !applied.fence().equals(applied.baseline().origin()) ? current : null;
+    }
+
+    @Override public CasOutcome transitionMetrics(String id, long epoch, String next, Instant at,
+            ResumeMetrics.Transition transition) {
+        var original = originalClaim.get();
+        requirePipeline(id);
+        return views.pipelineStates(scope, original, requireActive).transitionMetrics(id, epoch, next, at, transition);
+    }
+
     @Override public Optional<CheckpointDoc> read(String pipelineId) {
-        requirePipeline(pipelineId); return views.pipelineStates(scope).read(pipelineId);
+        requirePipeline(pipelineId);
+        var store = views.pipelineStates(scope);
+        if (!(store instanceof StateStore.MetricReader reader)) return store.read(pipelineId);
+        var reading = reader.readForMetrics(pipelineId);
+        measured.set(reading.orElse(null));
+        return reading.map(ResumeMetrics.Checkpoint::state);
     }
     @Override public CasOutcome compareAndSwap(String pipelineId,long epoch,String next,Instant at) {
         WorkloadClaimFence original = Objects.requireNonNull(originalClaim.get(),"originalClaim");

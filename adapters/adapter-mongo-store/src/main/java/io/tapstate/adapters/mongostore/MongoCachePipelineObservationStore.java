@@ -8,11 +8,13 @@ import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.ResumeMetrics;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -271,7 +273,10 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
                         decoded.positions(), new io.tapstate.core.lifecycle.ObservationFailure(original.code(), original.params(), diagnostic),
                         decoded.observedAt(), decoded.facts(), decoded.initialLoad());
             }
-            if (!document(decoded, expected).equals(row)) throw access.unreadable("observation");
+            var canonical = document(decoded, expected);
+            var window = MongoResumeWindow.decode(row, access.scope.pipelineId());
+            if (window != null) canonical.append(MongoResumeWindow.FIELD, MongoResumeWindow.encode(window));
+            if (!canonical.equals(row)) throw access.unreadable("observation");
             return Optional.of(decoded);
         } catch (TapstateException | NullPointerException | ClassCastException | IllegalArgumentException invalid) {
             throw access.unreadable("observation");
@@ -283,25 +288,37 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     }
 
     @Override public void save(Observation observation, long checkpointEpoch) {
-        write(observation, checkpointEpoch, true);
+        write(observation, checkpointEpoch, true, null);
+    }
+
+    @Override public boolean saveResumed(Observation observation, long checkpointEpoch, ResumeMetrics.Publication publication) {
+        java.util.Objects.requireNonNull(publication);
+        if (superseded(observation, publication)) return false;
+        return write(observation, checkpointEpoch, !publication.expected().exists(), publication);
     }
 
     boolean updateExisting(Observation observation, long checkpointEpoch) {
-        return write(observation, checkpointEpoch, false);
+        return write(observation, checkpointEpoch, false, null);
     }
 
-    private boolean write(Observation observation, long checkpointEpoch, boolean create) {
-        var update = prepare(observation, checkpointEpoch, create);
+    private boolean write(Observation observation, long checkpointEpoch, boolean create, ResumeMetrics.Publication publication) {
+        var update = prepare(observation, checkpointEpoch, create, publication);
         var result = access.inspectObservationFailure( () -> StoreIo.call(() -> {
             requireWriteActive(create);
-            return collection().updateOne(update.getFilter(), update.getUpdatePipeline(), update.getOptions());
+            try {
+                return collection().updateOne(update.getFilter(), update.getUpdatePipeline(), update.getOptions());
+            } catch (MongoWriteException conflict) {
+                if (publication != null && conflict.getCode() == 11000) return null;
+                throw conflict;
+            }
         }));
-        if (!create && result.getMatchedCount() != 1) return false;
+        if (result == null || !create && result.getMatchedCount() != 1) return false;
         written(checkpointEpoch);
         return true;
     }
 
-    record BatchWrite(MongoCachePipelineObservationStore store, Observation observation, long checkpointEpoch) {}
+    record BatchWrite(MongoCachePipelineObservationStore store, Observation observation, long checkpointEpoch,
+            ResumeMetrics.Publication publication) {}
     private record PreparedWrite(int index, BatchWrite write, UpdateOneModel<Document> update) {}
 
     static List<RuntimeException> writeBatch(List<BatchWrite> batch) {
@@ -312,7 +329,8 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             var write = batch.get(i);
             var store = write.store();
             try {
-                var update = store.prepare(write.observation(), write.checkpointEpoch(), true);
+                if (superseded(write.observation(), write.publication())) throw observationChanged();
+                var update = store.prepare(write.observation(), write.checkpointEpoch(), true, write.publication());
                 boolean verifyStructure = !verified;
                 StoreIo.run(() -> store.requireWriteActive(verifyStructure));
                 verified = true;
@@ -333,7 +351,9 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
                     if (failure.getWriteConcernError() != null) throw failure;
                     for (var error : failure.getWriteErrors()) {
                         int index = prepared.get(error.getIndex()).index();
-                        failures.set(index, StoreIo.coded(new MongoWriteException(error, failure.getServerAddress())));
+                        failures.set(index, (error.getCode() == 11000 || error.getCode() == 40066)
+                                && batch.get(index).publication() != null ? observationChanged()
+                                : StoreIo.coded(new MongoWriteException(error, failure.getServerAddress())));
                     }
                 }
                 return null;
@@ -354,17 +374,48 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     }
 
-    private UpdateOneModel<Document> prepare(Observation observation, long checkpointEpoch, boolean create) {
+    private UpdateOneModel<Document> prepare(Observation observation, long checkpointEpoch, boolean create, ResumeMetrics.Publication publication) {
         access.requirePipeline(observation.pipelineId());
         if (access.originalClaim() == null) throw MongoCachePipelineAccess.fenced();
         if (checkpointEpoch < 0 || observation.observedAt() == null) throw new IllegalArgumentException("invalid observation checkpoint");
         var id = keyOfFence(access, checkpointEpoch, access.originalClaim());
         var captured = document(observation, id);
+        var filter = new Document("_id", id);
+        if (publication != null) {
+            if (!publication.key().equals(new ResumeMetrics.ObservationKey(access.scope, checkpointEpoch, access.originalClaim())))
+                throw MongoCachePipelineAccess.claimFenced();
+            var prior = publication.expected();
+            filter.append("pipelineId", new Document("$exists", prior.exists()));
+            filter.append("observedAt", prior.observedAt() == null ? new Document("$exists", false)
+                    : java.util.Date.from(prior.observedAt()));
+            filter.append(MongoResumeWindow.FIELD, prior.window() == null ? new Document("$exists", false)
+                    : MongoResumeWindow.encode(prior.window()));
+            if (publication.window() != null)
+                captured.append(MongoResumeWindow.FIELD, MongoResumeWindow.bounded(publication.window(), observation.pipelineId()));
+        }
         // A delayed sample may populate only its original key and cannot replace a later measurement.
         var keepExisting = new Document("$gte", List.of("$observedAt", captured.get("observedAt")));
+        var replacement = new Document("$literal", captured);
+        if (publication != null && create && publication.expected().exists()) {
+            // A batch uses upsert to receive a per-entry duplicate-key error on a competing write.
+            // A reaped predecessor must also fail its entry. An insert seed has no pipelineId.
+            var exists = new Document("$eq", List.of("$pipelineId", new Document("$literal", observation.pipelineId())));
+            replacement = new Document("$switch", new Document("branches",
+                    List.of(new Document("case", exists).append("then", replacement))));
+        }
         var changes = List.of(new Document("$replaceWith", new Document("$cond",
-                List.of(keepExisting, "$$ROOT", new Document("$literal", captured)))));
-        return new UpdateOneModel<>(new Document("_id", id), changes, new UpdateOptions().upsert(create));
+                List.of(keepExisting, "$$ROOT", replacement))));
+        return new UpdateOneModel<>(filter, changes, new UpdateOptions().upsert(create));
+    }
+
+    private static boolean superseded(Observation value, ResumeMetrics.Publication publication) {
+        return publication != null && publication.expected().observedAt() != null
+                && !value.observedAt().isAfter(publication.expected().observedAt());
+    }
+
+    private static TapstateException observationChanged() {
+        return new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "the original observation changed before publication"), null);
     }
 
     private void written(long checkpointEpoch) {
@@ -391,7 +442,27 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         return document;
     }
 
-    private static Document keyOfFence(MongoCachePipelineAccess access, long epoch, WorkloadClaimFence fence) {
+    record PauseObservation(List<MetricFact> facts, ResumeMetrics.Window window) {
+        static final PauseObservation EMPTY = new PauseObservation(List.of(), null);
+    }
+
+    static PauseObservation pauseObservation(MongoCachePipelineAccess access,
+            ClientSession session, long epoch) {
+        var key = keyOfFence(access, epoch, access.originalClaim());
+        var row = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).find(session, new Document("_id", key))
+                .projection(new Document("pipelineId", 1).append("state", 1).append("facts", 1)
+                        .append(MongoResumeWindow.FIELD, 1)).first();
+        if (row == null) return PauseObservation.EMPTY;
+        if (!key.equals(row.get("_id")) || !access.scope.pipelineId().equals(row.get("pipelineId")))
+            throw access.unreadable("observation");
+        if (!PipelineState.RUNNING.name().equals(row.get("state"))) return PauseObservation.EMPTY;
+        var facts = MongoObservationStore.readFacts(row, access.scope.pipelineId());
+        if (row.containsKey("facts") && !facts.stream().map(MongoObservationStore::toDocument).toList().equals(row.get("facts")))
+            throw access.unreadable("facts");
+        return new PauseObservation(facts, MongoResumeWindow.decode(row, access.scope.pipelineId()));
+    }
+
+    static Document keyOfFence(MongoCachePipelineAccess access, long epoch, WorkloadClaimFence fence) {
         return key(access, epoch, fence.claimGeneration(), fence.executionGeneration(), fence.topologyRevision(),
                 fence.owner().nodeId(), fence.owner().bootId());
     }
