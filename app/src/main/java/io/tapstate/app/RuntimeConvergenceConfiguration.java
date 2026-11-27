@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.spi.store.ResumeMetrics.Producer;
 import java.time.Instant;
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import org.springframework.beans.factory.ObjectProvider;
@@ -131,9 +132,14 @@ class RuntimeConvergenceConfiguration {
                             .filter(run -> run.jobId() != binding.baseline().jobId()
                                     && expected.equals(run.operatorManifest().executionIdentity()))
                             .flatMap(Engine.Run::metrics)
-                            .map(sample -> ObservationPublisher.nativeFacts(scope.pipelineId(), at,
-                                    sample.captured(), sample.delivered(), sample.stages()))
-                            .orElseGet(List::of);
+                            .map(sample -> {
+                                var starts = new java.util.EnumMap<Producer, Long>(Producer.class);
+                                sample.captured().start().ifPresent(start -> starts.put(Producer.IN, start.toEpochMilli()));
+                                sample.delivered().start().ifPresent(start -> starts.put(Producer.OUT, start.toEpochMilli()));
+                                sample.stages().start().ifPresent(start -> starts.put(Producer.STAGE, start.toEpochMilli()));
+                                return new ObservationPublisher.NativeSample(sample.jobId(), ObservationPublisher.nativeFacts(
+                                        scope.pipelineId(), at, sample.captured(), sample.delivered(), sample.stages()), starts);
+                            });
                 });
     }
 

@@ -284,6 +284,7 @@ class ScopedResumeMetricsTest {
                 desired, new AuditGate(record -> {}, CLOCK), state::read);
         ResumeMetrics.Handoff handoff = ResumeMetrics.Handoff.EMPTY;
         final Map<ObservationKey, Observation> observations = new HashMap<>();
+        final Map<ObservationKey, ResumeMetrics.Window> windows = new HashMap<>();
         final List<ObservationKey> observationReads = new java.util.ArrayList<>();
         PipelineIntentSnapshot intent;
         long revision;
@@ -414,7 +415,7 @@ class ScopedResumeMetricsTest {
         private StateStore stateView(WorkloadClaimFence original, Runnable active) {
             class View implements StateStore, StateStore.MetricReader {
                 public Optional<ResumeMetrics.Checkpoint> readForMetrics(String id) {
-                    return state.read(id).map(doc -> new ResumeMetrics.Checkpoint(doc, handoff.applied()));
+                    return state.read(id).map(doc -> new ResumeMetrics.Checkpoint(doc, handoff.applied(), 0, prior()));
                 }
                 public CasOutcome transitionMetrics(String id, long epoch, String next, Instant at, ResumeMetrics.Transition transition) {
                     active.run(); assertThat(original).isEqualTo(claim());
@@ -434,6 +435,12 @@ class ScopedResumeMetricsTest {
             return new View();
         }
 
+        private ResumeMetrics.Prior prior() {
+            return observation().map(value -> new ResumeMetrics.Prior(true, value.observedAt(),
+                    windows.get(currentKey()), value.metrics().containsKey("records.out")
+                            ? Set.of(ResumeMetrics.Producer.OUT) : Set.of())).orElse(ResumeMetrics.Prior.ABSENT);
+        }
+
         private ObservationStore observationView(WorkloadClaimFence original, Runnable active) {
             return new ObservationStore() {
                 public Optional<Observation> read(String id) {
@@ -444,7 +451,14 @@ class ScopedResumeMetricsTest {
                 public void save(Observation value, long epoch) {
                     active.run(); assertThat(original).isEqualTo(claim());
                     assertThat(epoch).isEqualTo(checkpoint().epoch());
+                    windows.remove(new ObservationKey(epoch, original));
                     observations.put(new ObservationKey(epoch, original), value);
+                }
+                public boolean saveResumed(Observation value, long epoch, ResumeMetrics.Publication publication) {
+                    assertThat(prior()).isEqualTo(publication.expected());
+                    save(value, epoch);
+                    windows.put(currentKey(), publication.window());
+                    return true;
                 }
                 public void delete(String id) { throw new AssertionError("unexpected delete"); }
             };

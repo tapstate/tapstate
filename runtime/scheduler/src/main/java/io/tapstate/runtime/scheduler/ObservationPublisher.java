@@ -857,7 +857,14 @@ public final class ObservationPublisher {
      * with no aggregate step yields none.
      */
     @FunctionalInterface public interface ResumeSample {
-        List<MetricFact> read(PipelineIntentScope scope, ResumeMetrics.Binding binding, Instant at);
+        Optional<NativeSample> read(PipelineIntentScope scope, ResumeMetrics.Binding binding, Instant at);
+    }
+
+    public record NativeSample(long jobId, List<MetricFact> facts, Map<ResumeMetrics.Producer, Long> starts) {
+        public NativeSample {
+            facts = List.copyOf(facts);
+            starts = Map.copyOf(starts);
+        }
     }
 
     private ResumeSample resumeSample;
@@ -1032,6 +1039,7 @@ public final class ObservationPublisher {
             Map<String, Long> gaps = Map.of();
             Map<String, Long> pinned = Map.of();
             boolean measuredSuccessfully = false;
+            ResumeMetrics.Publication continuation = null;
             Observation published;
             try {
                 // Share each measurement between the observation and its alert watches. A second read
@@ -1045,9 +1053,15 @@ public final class ObservationPublisher {
                         : measuredCapture == null ? snapshots.apply(pipelineId) : measuredCapture.snapshot();
                 SnapshotReading readThisRun = capture != null ? capture.run()
                         : measuredCapture == null ? runSnapshots.apply(pipelineId) : measuredCapture.runSnapshot();
-                var binding = state == null || actual != PipelineState.RUNNING ? null : state.applied(checkpoint);
-                List<MetricFact> resumed = binding == null ? null : ResumeMetricProjection.apply(
-                        binding.baseline(), Objects.requireNonNull(resumeSample).read(scope, binding, at));
+                var resume = state == null || actual != PipelineState.RUNNING ? null : state.resumeCheckpoint(checkpoint);
+                List<MetricFact> resumed = null;
+                if (resume != null) {
+                    var sample = Objects.requireNonNull(resumeSample).read(scope, resume.applied(), at);
+                    var projection = ResumeMetricProjection.project(scope, resume, sample.orElse(null));
+                    if (projection == null) return Optional.empty();
+                    continuation = projection.publication();
+                    resumed = projection.facts();
+                }
                 List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun, resumed));
@@ -1083,7 +1097,9 @@ public final class ObservationPublisher {
             if (!stillCurrent.getAsBoolean()) {
                 return Optional.empty();
             }
-            save(observations, published, requirePreparedState ? checkpoint.epoch() : null, scope);
+            if (continuation == null) save(observations, published, requirePreparedState ? checkpoint.epoch() : null, scope);
+            else if (!observations.saveResumed(storedFacts.project(published, scope), checkpoint.epoch(), continuation))
+                return Optional.empty();
             if (!stillCurrent.getAsBoolean()) {
                 return Optional.empty();
             }

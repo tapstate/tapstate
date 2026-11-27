@@ -96,6 +96,25 @@ class MongoResumeMetricsTest {
                 .isInstanceOfSatisfying(TapstateException.class, ex -> assertThat(ex.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
+    @Test void theCompleteWindowFitsItsBoundAndMalformedOrUnknownVersionsAreUnreadable() {
+        var slots = new java.util.EnumMap<ResumeMetrics.Producer, ResumeMetrics.Slot>(ResumeMetrics.Producer.class);
+        for (var producer : ResumeMetrics.Producer.values()) slots.put(producer, new ResumeMetrics.Slot(Long.MIN_VALUE, true));
+        var window = new ResumeMetrics.Window(Long.MAX_VALUE, Long.MIN_VALUE, slots);
+        var encoded = MongoResumeWindow.bounded(window, ID);
+        var row = new Document(MongoResumeWindow.FIELD, encoded);
+        assertThat(new org.bson.RawBsonDocument(row, new org.bson.codecs.DocumentCodec()).getByteBuffer().remaining())
+                .isLessThanOrEqualTo(256);
+        assertThat(MongoResumeWindow.decode(row, ID)).isEqualTo(window);
+        assertThat(MongoResumeWindow.decode(new Document(), ID)).isNull();
+        encoded.put("formatVersion", 2);
+        assertThatThrownBy(() -> MongoResumeWindow.decode(row, ID)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        encoded.put("formatVersion", 1);
+        encoded.get("in", Document.class).remove("carry");
+        assertThatThrownBy(() -> MongoResumeWindow.decode(row, ID)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+    }
+
     private Document pause(MetricFact saved, MetricFact sampled) {
         var key = new Document("scope", MongoPipelinePreparationFacts.scope(SCOPE)).append("epoch", 1L)
                 .append("claimGeneration", 4L).append("executionGeneration", 5L).append("topologyRevision", 6L)

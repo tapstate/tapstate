@@ -44,12 +44,12 @@ public final class ScopedPipelineStateStore implements StateStore {
         return current == null ? null : current.applied();
     }
 
-    public ResumeMetrics.Binding applied(CheckpointDoc expected) {
+    public ResumeMetrics.Checkpoint resumeCheckpoint(CheckpointDoc expected) {
         var current = measured.get();
         if (current == null || !current.state().equals(expected)) return null;
         var applied = current.applied();
         return applied != null && applied.revision() == intentRevision && applied.fence().equals(originalClaim.get())
-                && !applied.fence().equals(applied.baseline().origin()) ? applied : null;
+                && !applied.fence().equals(applied.baseline().origin()) ? current : null;
     }
 
     @Override public CasOutcome transitionMetrics(String id, long epoch, String next, Instant at,

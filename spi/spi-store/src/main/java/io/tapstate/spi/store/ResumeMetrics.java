@@ -3,11 +3,13 @@ package io.tapstate.spi.store;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Map;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** Private checkpoint evidence. A bound baseline belongs to one intent and allocator fence. */
 public final class ResumeMetrics {
@@ -68,7 +70,40 @@ public final class ResumeMetrics {
         }
     }
 
-    public record Checkpoint(CheckpointDoc state, Binding applied, long unavailableRevision) {
+    public enum Producer { IN, OUT, STAGE }
+
+    public record Slot(long startMillis, boolean carry) {}
+
+    public record Window(long intentRevision, long jobId, Map<Producer, Slot> slots) {
+        public Window {
+            if (intentRevision < 1) throw new IllegalArgumentException("missing resume intent");
+            slots = Map.copyOf(slots);
+        }
+    }
+
+    /** A checked read of the observation at the checkpoint's complete original key. */
+    public record Prior(boolean exists, Instant observedAt, Window window, Set<Producer> cumulative) {
+        public static final Prior ABSENT = new Prior(false, null, null, Set.of());
+        public Prior { cumulative = Set.copyOf(cumulative); }
+    }
+
+    public record ObservationKey(PipelineIntentScope scope, long epoch, WorkloadClaimFence fence) {
+        public ObservationKey { Objects.requireNonNull(scope); Objects.requireNonNull(fence); }
+    }
+
+    public record Publication(ObservationKey key, Prior expected, Window window) {
+        public Publication {
+            Objects.requireNonNull(key);
+            Objects.requireNonNull(expected);
+            if (window == null && expected.exists())
+                throw new IllegalArgumentException("a provisional observation requires a proved empty key");
+        }
+    }
+
+    public record Checkpoint(CheckpointDoc state, Binding applied, long unavailableRevision, Prior prior) {
+        public Checkpoint(CheckpointDoc state, Binding applied, long unavailableRevision) {
+            this(state, applied, unavailableRevision, null);
+        }
         public Checkpoint(CheckpointDoc state, Binding applied) { this(state, applied, 0); }
     }
 

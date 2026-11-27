@@ -165,9 +165,7 @@ final class MongoCachePipelineStateStore implements StateStore, StateStore.Metri
 
     @Override public Optional<ResumeMetrics.Checkpoint> readForMetrics(String pipelineId) {
         access.requirePipeline(pipelineId);
-        return Optional.of(access.readCheckpoint(structures, row ->
-                new ResumeMetrics.Checkpoint(MongoStateStore.toCheckpoint(row), MongoResumeMetrics.read(row).applied(),
-                        MongoResumeMetrics.unavailableRevision(row))));
+        return Optional.of(access.readCheckpoint(structures, true, row -> MongoResumeWindow.checkpoint(access, row)));
     }
 
     @Override public void create(String pipelineId, String stateJson, Instant touchTime) {

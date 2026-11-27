@@ -12,6 +12,7 @@ import io.tapstate.core.model.canonical.SourceCaptureIdentity;
 import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.ResumeMetrics;
 import io.tapstate.spi.store.PipelineIntentStore;
 import java.time.Clock;
 import java.util.Collection;
@@ -162,6 +163,10 @@ final class NativeObservationSampling {
                 if (!reading.updateExisting(value, epoch))
                     cache.pipelineObservations(pass.scope(), pass.claim(), current).save(value, epoch);
             }
+            @Override public boolean saveResumed(Observation value, long epoch, ResumeMetrics.Publication publication) {
+                current.run();
+                return cache.pipelineObservations(pass.scope(), pass.claim(), current).saveResumed(value, epoch, publication);
+            }
             @Override public void delete(String pipeline) { pass.observationSample().delete(pipeline); }
         };
         return new Attempt(true, publisher.publishRunning(pass.scope(), checkpoint,
@@ -184,6 +189,10 @@ final class NativeObservationSampling {
             @Override public Runnable writeGuard() { return writeGuard; }
             @Override public void save(Observation value) { current.run(); store.save(value); }
             @Override public void save(Observation value, long epoch) { current.run(); store.save(value, epoch); }
+            @Override public boolean saveResumed(Observation value, long epoch, ResumeMetrics.Publication publication) {
+                current.run();
+                return store.saveResumed(value, epoch, publication);
+            }
             @Override public void afterSave(Runnable action) { store.afterSave(action); }
             @Override public Optional<Observation> read(String pipeline) { return store.read(pipeline); }
             @Override public Optional<Observation> beforeCompletion(String pipeline, long epoch) { return store.beforeCompletion(pipeline, epoch); }

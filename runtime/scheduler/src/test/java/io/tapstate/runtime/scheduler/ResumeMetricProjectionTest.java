@@ -23,14 +23,35 @@ class ResumeMetricProjectionTest {
     @Test void oldOperationsRemainInTheTotalWhenOnlyAnotherOperationHasNewRows() {
         var baseline = new ResumeMetrics.Baseline(2, 1, FENCE, 8, List.of(records("insert", OLD, 7)), false);
         var live = records("update", NEW, 2);
-        var points = ResumeMetricProjection.apply(baseline, List.of(live)).getFirst().points();
+        var window = ResumeMetricProjection.window(3, 12, ResumeMetrics.Prior.ABSENT,
+                Map.of(ResumeMetrics.Producer.OUT, NEW.toEpochMilli()));
+        var points = ResumeMetricProjection.apply(baseline, List.of(live), window).getFirst().points();
         assertThat(points).extracting(MetricPoint::value).containsExactlyInAnyOrder(2L, 7L);
         assertThat(points).filteredOn(point -> point.value() == 7).singleElement()
                 .satisfies(point -> {
                     assertThat(point.startTime()).isEqualTo(OLD);
                     assertThat(point.observedAt()).isEqualTo(NEW);
                 });
-        assertThat(ResumeMetricProjection.apply(baseline, List.of())).isEmpty();
+        assertThat(ResumeMetricProjection.apply(baseline, List.of(), window)).isEmpty();
+    }
+
+    @Test void onlyTheRestartedProducerLosesItsBaselineAcrossPublications() {
+        var input = ResumeMetrics.Producer.IN;
+        var output = ResumeMetrics.Producer.OUT;
+        var stage = ResumeMetrics.Producer.STAGE;
+        var starts = Map.of(input, 10L, output, 20L, stage, 30L);
+        var first = ResumeMetricProjection.window(3, 12, ResumeMetrics.Prior.ABSENT, starts);
+        var prior = new ResumeMetrics.Prior(true, OLD, first, starts.keySet());
+        var restarted = ResumeMetricProjection.window(3, 12, prior, Map.of(input, 10L, output, 40L));
+        assertThat(restarted.slots()).containsEntry(input, new ResumeMetrics.Slot(10, true))
+                .containsEntry(output, new ResumeMetrics.Slot(40, false)).containsEntry(stage, new ResumeMetrics.Slot(30, true));
+        var recovered = new ResumeMetrics.Prior(true, NEW, restarted, starts.keySet());
+        assertThat(ResumeMetricProjection.window(3, 12, recovered, Map.of(output, 40L))).isEqualTo(restarted);
+        assertThat(ResumeMetricProjection.window(3, 13, recovered, starts).slots().values())
+                .noneMatch(ResumeMetrics.Slot::carry);
+        var legacy = new ResumeMetrics.Prior(true, OLD, null, java.util.Set.of(output));
+        assertThat(ResumeMetricProjection.window(3, 12, legacy, starts).slots())
+                .containsEntry(input, new ResumeMetrics.Slot(10, true)).containsEntry(output, new ResumeMetrics.Slot(20, false));
     }
 
     private static MetricFact records(String operation, Instant since, long count) {
