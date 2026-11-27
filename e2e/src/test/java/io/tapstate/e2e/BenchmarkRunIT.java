@@ -596,9 +596,11 @@ class BenchmarkRunIT {
                 evidence.result.put("latency_probe_error", "Probe window or drain did not complete");
                 latencyProbe.start();
             }
-            var result = prepared.inject(new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
-                    Duration.ofSeconds(measure)), mix, null, () -> {
-                        settleExpected(entry, control, baseline + (long) rate * warmup);
+            var result = prepared.injectWithWarmupReport(
+                    new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup), Duration.ofSeconds(measure)),
+                    mix, null, report -> {
+                        long warmWrites = report.streams().get(RECORDS).observed().total();
+                        settleExpected(entry, control, baseline + warmWrites);
                         observedWarm[0] = settled(control);
                         if (latencyProbe != null) latencyProbe.awaitScoringBoundary();
                         if (targetWindow != null) {
