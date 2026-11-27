@@ -44,14 +44,20 @@ final class ConfigurationVersion {
     static void advanceForPublication(ClientSession session, MongoCollection<Document> versions,
             com.mongodb.client.MongoClient originalClient) {
         if (!session.hasActiveTransaction()) throw new IllegalStateException("publication requires an active transaction");
-        var legalRevision = new Document("$gte", 0L).append("$lt", Long.MAX_VALUE - 1);
+        if (reserveRevision(session, versions, Long.MAX_VALUE - 1) == null) throw unreadable("revision");
+        requireWritable(session, versions, originalClient);
+    }
+
+    /** The update and all later validation share one transaction and roll back together. */
+    static Document reserveRevision(ClientSession session, MongoCollection<Document> versions, long exclusiveLimit) {
+        var legalRevision = new Document("$gte", 0L).append("$lt", exclusiveLimit);
         var filter = new Document("_id", ID).append("revision", legalRevision)
                 .append("$expr", new Document("$eq", java.util.List.of(new Document("$type", "$revision"), "long")));
-        var previous = versions.findOneAndUpdate(session, filter,
-                new Document("$inc", new Document("revision", 1L)));
-        if (previous == null) throw unreadable("revision");
-        // The provisional increment rolls back with every refusal. Maintenance is still checked
-        // against this same snapshot before any artifact, draft marker or note reservation commits.
+        return versions.findOneAndUpdate(session, filter, new Document("$inc", new Document("revision", 1L)));
+    }
+
+    static void requireWritable(ClientSession session, MongoCollection<Document> versions,
+            com.mongodb.client.MongoClient originalClient) {
         requireNoValidationMaintenance(session, versions, null,
                 originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
     }

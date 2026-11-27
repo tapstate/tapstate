@@ -54,10 +54,26 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     @Override public PipelineRebuildPreparation begin(PipelineRebuildRequest original) {
         Objects.requireNonNull(original, "original");
         String hash = confirmationHash(original), id = UUID.randomUUID().toString();
+        String pipelineId = original.originalScope().pipelineId();
+        var replay = transaction(session -> {
+            var rebuilding = SystemCollections.OPERATOR_GENERATIONS.on(database)
+                    .find(session, new Document("_id", pipelineId).append("phase", "REBUILDING"))
+                    .projection(new Document("_id", 1)).first();
+            return rebuilding == null ? null : retained(original, hash, requireOriginal(session, original));
+        });
+        if (replay != null) return replay;
         return transaction(session -> {
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(database);
+            // Claim the shared document before dependency reads can age the snapshot behind alert writes.
+            var reserved = ConfigurationVersion.reserveRevision(session, versions, Long.MAX_VALUE - 2);
             Document mapping = requireOriginal(session, original);
-            var state = MongoPipelineStateMappings.decode(original.originalScope().pipelineId(), mapping);
-            if (state.phase() == PipelineStateMapping.Phase.REBUILDING) return retained(original, hash, mapping);
+            var state = MongoPipelineStateMappings.decode(pipelineId, mapping);
+            if (state.phase() == PipelineStateMapping.Phase.REBUILDING) {
+                // Another begin won after the replay check. Discard our provisional increment.
+                var winner = retained(original, hash, mapping);
+                session.abortTransaction();
+                return winner;
+            }
             if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw fenced();
             var previous = MongoPipelinePreparationFacts.decode(state.pipelineId(), mapping, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.COMPLETE || !original.originalScope().equals(previous.scope())) throw fenced();
@@ -66,8 +82,12 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             var pending = new Pending(this, original, id, previous.preparationId(), hash, version,
                     version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
             long fence = mapping.getLong("noteWriteFence");
-            if (fence >= Long.MAX_VALUE - 2 || ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database)) >= Long.MAX_VALUE - 2) throw fenced();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
+            if (fence >= Long.MAX_VALUE - 2) throw fenced();
+            if (reserved == null) {
+                ConfigurationVersion.read(session, versions); // Preserve the diagnostic for a malformed revision.
+                throw fenced();
+            }
+            ConfigurationVersion.requireWritable(session, versions, client);
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", state.pipelineId()).append("stateGeneration", state.stateGeneration()).append("phase", "ACTIVE")
                             .append("noteWriteFence", fence).append("cachePreparation", mapping.get("cachePreparation")),

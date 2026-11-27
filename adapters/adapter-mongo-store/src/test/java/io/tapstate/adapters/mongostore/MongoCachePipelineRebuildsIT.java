@@ -1715,6 +1715,67 @@ class MongoCachePipelineRebuildsIT {
         });
     }
 
+    @Test void rebuildClaimsTheRevisionBeforeAlertWritesCanInvalidateInputValidation() {
+        withFixture(f -> {
+            var request = f.request(0);
+            var writes = new AtomicInteger();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var name = event.getCommandName();
+                    if (!name.equals("findAndModify") && !name.equals("update")) return;
+                    if (!event.getCommand().getString(name).getValue().equals("configuration_version")) return;
+                    if (writes.incrementAndGet() == 1) {
+                        // An independent writer commits just before the rebuild sends its first version write.
+                        f.config.getCollection("configuration_version").updateOne(new Document("_id", "configuration"),
+                                new Document("$inc", new Document("alertWriteFence", 1L)));
+                    }
+                }
+            };
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(CONFIG.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var store = observedRebuilds(f, client);
+                long before = f.version();
+                var first = store.begin(request);
+                assertThat(store.begin(request).preparationId()).isEqualTo(first.preparationId());
+                assertThat(writes).hasValue(1);
+                assertThat(f.version()).isEqualTo(before + 1);
+            }
+        });
+    }
+
+    @Test void aRacingBeginRollsBackItsProvisionalRevisionAndReturnsTheWinner() {
+        withFixture(f -> {
+            var request = f.request(0);
+            var winner = new java.util.concurrent.atomic.AtomicReference<PipelineRebuildPreparation>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (event.getCommandName().equals("findAndModify") && winner.get() == null) {
+                        // Commit through a separate client between replay detection and the reservation.
+                        winner.set(f.configuration.rebuilds().begin(request));
+                    }
+                }
+            };
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(CONFIG.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var before = f.version();
+                var replay = observedRebuilds(f, client).begin(request);
+                assertThat(winner.get()).isNotNull();
+                assertThat(replay.preparationId()).isEqualTo(winner.get().preparationId());
+                assertThat(f.version()).isEqualTo(before + 1);
+            }
+        });
+    }
+
+    private static MongoPipelineStateRebuilds observedRebuilds(Fixture f, MongoClient client) {
+        var db = client.getDatabase(f.config.getName());
+        var material = SystemCollections.CLUSTER_KEYS.on(f.config).find().first().getString("material");
+        var cipher = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+        return new MongoPipelineStateRebuilds(client, db, "cluster-a", new MongoStorageBindingStore(client, db, cipher),
+                new MongoConfigurationArtifactStore(client, db, cipher), ACTIVE);
+    }
+
     @Test void saturationAtBeginReservesBothOriginalMappingWrites() {
         withFixture(f -> {
             SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id","flow"),new Document("$set",new Document("noteWriteFence",Long.MAX_VALUE-2)));

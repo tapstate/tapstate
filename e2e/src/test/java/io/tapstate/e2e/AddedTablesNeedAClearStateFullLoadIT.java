@@ -120,9 +120,11 @@ class AddedTablesNeedAClearStateFullLoadIT {
             try (var interleaving = controlledClear
                     ? new ClearStateCompletionInterleaving((InProcessServer) server, storage, PIPELINE) : null) {
                 PipelineIntentScope originalScope = intent(storage).scope();
+                if (interleaving != null) interleaving.observeRevisionReservation();
                 control.stop(PIPELINE, true);
                 if (interleaving != null) interleaving.holdBeforeReplacement();
                 awaitClearCompletion(control, storage, originalScope, interleaving);
+                if (interleaving != null) interleaving.requireRevisionReservation();
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 awaitState(control, PipelineState.RUNNING);
                 awaitPriority(control, target, ORDERS, "1", "while-stopped");
