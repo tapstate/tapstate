@@ -6,9 +6,11 @@ import io.tapstate.control.restapi.StorageEntryStatus;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.*;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.*;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
@@ -581,6 +583,50 @@ class OnPremInstallationCompletionTest {
             assertThat(f.completions).hasValue(0);
 
             cacheReachable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @Test void retainedInstallationRetriesAfterAnotherProcessReleasesItsMutationLock() throws Exception {
+        try (var f = new Fixture(directory.resolve("retained-owner-mutation-lock"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var lockWaitRefused = new AtomicBoolean();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            doAnswer(invocation -> {
+                try {
+                    return invocation.callRealMethod();
+                } catch (TapstateException refused) {
+                    if (refused.code() == ControlError.BOOTSTRAP_FORBIDDEN) lockWaitRefused.set(true);
+                    throw refused;
+                }
+            }).when(f.files).locked(any());
+            f.root.loadExisting(ignored -> f.business);
+
+            Path output = directory.resolve("retained-owner-mutation-lock.log");
+            var blocker = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx64m", "-cp", System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                    InstallationRuntimeProbe.class.getName(), f.files.directory().toString(), "mutation")
+                    .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+            try {
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(10)).untilAsserted(() -> {
+                    assertThat(blocker.isAlive()).as("mutation probe diagnostics: %s", Files.readString(output)).isTrue();
+                    assertThat(Files.readAllLines(output)).contains("MUTATION_HELD");
+                });
+                available.set(true);
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(25))
+                        .untilAsserted(() -> assertThat(lockWaitRefused).isTrue());
+                assertThat(f.completions).hasValue(0);
+            } finally {
+                blocker.getOutputStream().close();
+                if (!blocker.waitFor(5, TimeUnit.SECONDS)) {
+                    blocker.destroyForcibly().waitFor(5, TimeUnit.SECONDS);
+                }
+            }
+            assertThat(blocker.exitValue()).isZero();
             org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
                     .untilAsserted(() -> assertThat(f.completions).hasValue(1));
             assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
