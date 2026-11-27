@@ -331,6 +331,7 @@ final class StorageRoot implements AutoCloseable {
             } catch (TapstateException unavailable) {
                 // Retry only the original owner's temporary admission, store or mutation-lock failures.
                 if (unavailable.code() != IoError.STORE_UNAVAILABLE
+                        && !(unavailable instanceof StorageAuthentication.AuthenticationStoreUnavailable)
                         && !(unavailable instanceof OnPremInstallation.BusinessAdmissionUnavailable)
                         && !(unavailable instanceof InstallationFiles.MutationLockTimeout)) throw unavailable;
             }

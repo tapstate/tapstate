@@ -590,6 +590,45 @@ class OnPremInstallationCompletionTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void retainedInstallationRetriesAfterTransientAuthenticationStoreFailure(boolean configurationPublication) {
+        try (var f = new Fixture(directory.resolve("retained-owner-auth-outage-" + configurationPublication))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var reachable = new AtomicBoolean(true);
+            var refusedReads = new AtomicInteger();
+            Runnable requireStore = () -> {
+                if (!reachable.get()) {
+                    refusedReads.incrementAndGet();
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "test authentication outage"), null);
+                }
+            };
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            if (configurationPublication) {
+                doAnswer(ignored -> { requireStore.run(); return null; })
+                        .when(f.configuration).requireAuthenticationPublished(eq(f.preparation), any(MongoReadBudget.class));
+            } else {
+                var scope = f.preparation.authScope();
+                when(f.cache.loadAuthScope(eq(scope), any(MongoReadBudget.class)))
+                        .thenAnswer(ignored -> { requireStore.run(); return scope; });
+            }
+
+            f.root.loadExisting(ignored -> f.business);
+            reachable.set(false);
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(refusedReads.get()).isPositive());
+            assertThat(f.completions).hasValue(0);
+
+            reachable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedInstallationRetriesAfterAnotherProcessReleasesItsMutationLock() throws Exception {
         try (var f = new Fixture(directory.resolve("retained-owner-mutation-lock"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
