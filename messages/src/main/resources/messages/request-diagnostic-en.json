@@ -80,8 +80,8 @@
     "solution": "Configure absolute HTTPS origins without paths, queries, fragments, or credentials."
   },
   "TS0210021": {
-    "message": "Managed Cloud authentication is not available.",
-    "solution": "Install the SDK exchange/online-validation and trusted deployment bindings, then enter from Cloud again."
+    "message": "Managed Cloud authentication is unavailable.",
+    "solution": "Try entering the cluster again from the Cloud Console later. If the problem persists, contact your administrator."
   },
   "TS0210022": {
     "message": "Cloud mode does not allow an explicit Nest state.database.",
@@ -134,5 +134,9 @@
   "TS0210034": {
     "message": "Retry settings changed after they were read.",
     "solution": "Reload the retry settings and reapply the desired changes."
+  },
+  "TS0210035": {
+    "message": "This sign-in link is no longer valid.",
+    "solution": "Return to the Cloud Console and select Enter for the cluster again."
   }
 }
