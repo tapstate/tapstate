@@ -1450,12 +1450,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public RetainedStart commitRetainedStart(io.tapstate.spi.store.PipelineIntentScope scope, long expected,
             io.tapstate.core.lifecycle.DesiredState desired, io.tapstate.spi.store.PipelinePreparationInputs inputs,
-            Runnable active) {
+            Runnable active, Runnable verifyRetainedSources) {
         requireOpen();
         if (MongoValidationClaimObservation.lacksSnapshotRead(connection.client())) return RetainedStart.FALLBACK;
         var store = new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings);
         return ((MongoPipelineIntentStore) store.guardedBy(() -> { requireOpen(); active.run(); }))
-                .commitRetainedStart(scope, expected, desired, inputs, artifacts);
+                .commitRetainedStart(scope, expected, desired, inputs, artifacts, verifyRetainedSources);
     }
 
     public record ObservationCapture(String sourceId, String captureId) {
@@ -1494,6 +1494,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 return ObservationCheck.fallback();
             throw failure;
         }
+    }
+
+    public io.tapstate.spi.store.PipelineKeyMoveWindows keyMoveWindows() {
+        requireOpen();
+        return new MongoKeyMoveWindowStore(connection.database(), this::requireOpen);
     }
 
     public io.tapstate.spi.store.PipelineIntentStore intents() {

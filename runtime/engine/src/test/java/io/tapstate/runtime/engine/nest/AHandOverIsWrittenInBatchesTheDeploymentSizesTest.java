@@ -122,19 +122,21 @@ class AHandOverIsWrittenInBatchesTheDeploymentSizesTest {
      * the earlier carried.
      */
     @Test
-    void asecondHandOverOntoTheSameAddressKeepsWhatTheFirstLeft() throws Exception {
+    void aSecondHandOverOntoTheSameAddressKeepsWhatTheFirstLeft() throws Exception {
         AssemblerProcessor losing = assembler(twoPerBatch());
         AssemblerProcessor gaining = assembler(twoPerBatch());
         customer(losing, "C1");
         policies(losing, "C1", 0, 3);
         feed(losing, DEPARTURES, renamed("C1", "C2"));
 
-        // The same key vacated a second time, with rows of its own - different rows, so that a lot dropped
-        // shows as rows missing rather than being hidden by the other lot carrying the same element keys.
-        policies(losing, "C1", 3, 2);
-        feed(losing, DEPARTURES, renamed("C1", "C2"));
+        // A distinct root occupies the old key before its own departure.
+        customer(losing, "C1", 91);
+        policy(losing, "C1", 3, 92);
+        policy(losing, "C1", 4, 93);
+        Envelope secondMove = renamed("C1", "C2", 94);
+        feed(losing, DEPARTURES, secondMove);
 
-        feed(gaining, OWN_ROWS, renamed("C1", "C2"));
+        feed(gaining, OWN_ROWS, secondMove);
         assertThat(policiesOf("C2"))
                 .describedAs("both lots travelled; the second hand-over did not overwrite the first")
                 .hasSize(5);
@@ -162,8 +164,12 @@ class AHandOverIsWrittenInBatchesTheDeploymentSizesTest {
     }
 
     private void customer(AssemblerProcessor processor, String customerId) {
-        feed(processor, OWN_ROWS, Envelope.insert(1, "customer",
-                row("customer_id", customerId, "name", "n"), null).withOrder(at(1)));
+        customer(processor, customerId, 1);
+    }
+
+    private void customer(AssemblerProcessor processor, String customerId, long sequence) {
+        feed(processor, OWN_ROWS, Envelope.insert(sequence, "customer",
+                row("customer_id", customerId, "name", "n"), null).withOrder(at(sequence)));
     }
 
     private void policies(AssemblerProcessor processor, String customerId, int count) {
@@ -173,16 +179,24 @@ class AHandOverIsWrittenInBatchesTheDeploymentSizesTest {
     /** {@code count} policies numbered from {@code from}, so two lots never share an element key. */
     private void policies(AssemblerProcessor processor, String customerId, int from, int count) {
         for (int i = from; i < from + count; i++) {
-            feed(processor, POLICIES, Envelope.insert(2, "policy",
-                    row("policy_id", "P" + i, "customer_id", customerId, "policy_no", "PN-" + i), null)
-                    .withOrder(at(2 + i)));
+            policy(processor, customerId, i, 2 + i);
         }
     }
 
+    private void policy(AssemblerProcessor processor, String customerId, int index, long sequence) {
+        feed(processor, POLICIES, Envelope.insert(sequence, "policy",
+                row("policy_id", "P" + index, "customer_id", customerId, "policy_no", "PN-" + index), null)
+                .withOrder(at(sequence)));
+    }
+
     private static Envelope renamed(String was, String is) {
-        return Envelope.update(9, "customer",
+        return renamed(was, is, 90);
+    }
+
+    private static Envelope renamed(String was, String is, long sequence) {
+        return Envelope.update(sequence, "customer",
                 row("customer_id", was, "name", "n"),
-                row("customer_id", is, "name", "n"), null).withOrder(at(90));
+                row("customer_id", is, "name", "n"), null).withOrder(at(sequence));
     }
 
     @SuppressWarnings("unchecked")

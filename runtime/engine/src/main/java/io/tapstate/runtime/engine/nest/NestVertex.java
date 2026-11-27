@@ -42,6 +42,24 @@ public record NestVertex(
         }
     }
 
+    /** Source fields whose previous values this vertex needs to move a tracked row. */
+    public List<String> trackedColumns(NestInbound edge) {
+        var fields = new java.util.LinkedHashSet<String>();
+        if (isAssembler()) {
+            fields.addAll(edge.keyFields());
+            fields.addAll(edge.elementKey());
+        } else {
+            fields.addAll(edge.elementKey());
+            if (edge.pathId().equals(pathId)) {
+                fields.addAll(partitionKey);
+                fields.addAll(parentKeyFields);
+            } else {
+                fields.addAll(edge.keyFields());
+            }
+        }
+        return List.copyOf(fields);
+    }
+
     /** Whether this vertex assembles whole documents rather than resolving one embed's parent keys. */
     public boolean isAssembler() {
         return pathId.isEmpty();

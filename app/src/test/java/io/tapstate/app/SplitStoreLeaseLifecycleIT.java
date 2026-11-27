@@ -10,11 +10,13 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupScope;
+import io.tapstate.testsupport.MongoRenewedTopology;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.testcontainers.containers.MongoDBContainer;
@@ -27,7 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -43,7 +45,7 @@ class SplitStoreLeaseLifecycleIT {
     @TempDir Path work;
 
     @Test
-    void configurationOutageDoesNotStopCacheRenewalsButAnUnansweredCacheRenewalLosesTheOriginalProof() {
+    void configurationOutageDoesNotStopCacheRenewalsButAnUnansweredCacheRenewalLosesTheOriginalProof() throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String configDb = "split_config_" + suffix, cacheDb = "split_cache_" + suffix;
         String configUri = options(CONFIG.getReplicaSetUrl(configDb), "socketTimeoutMS=1500&connectTimeoutMS=1500");
@@ -65,13 +67,16 @@ class SplitStoreLeaseLifecycleIT {
                     new io.tapstate.spi.store.User("admin", new BCryptPasswordHasher().hash("split-test-password"), "admin"));
         }
 
-        try (var app = start(configUri, "original");
+        var topology = new MongoRenewedTopology(scope.clusterId());
+        try (var app = start(configUri, topology, MongoRenewedTopology.ORIGINAL, 0);
+             var peer = start(configUri, topology, MongoRenewedTopology.PEER, memberPort(app));
              MongoClient observer = MongoClients.create(CACHE.getReplicaSetUrl(cacheDb))) {
             var root = app.getBean(StorageRoot.class);
             await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
             var child = (ConfigurableApplicationContext) ReflectionTestUtils.getField(root.runtime().business().orElseThrow(), "context");
             var lease = child.getBean(NodeSessionLease.class);
             var member = child.getBean(HazelcastInstance.class);
+            await().atMost(Duration.ofSeconds(20)).until(() -> member.getCluster().getMembers().size() == 2);
             var originalFence = lease.currentFence().orElseThrow();
             var bound = root.runtime().current().orElseThrow();
             var claims = bound.cache().workloadClaims(bound.preparation().businessScope());
@@ -88,10 +93,13 @@ class SplitStoreLeaseLifecycleIT {
             try {
                 assertThatThrownBy(() -> root.runtime().requireConfiguration().artifacts().get("views"))
                         .isInstanceOf(TapstateException.class);
-                try (var unavailable = start(configUri, "unavailable")) {
+                try (var unavailable = start(configUri, topology, MongoRenewedTopology.UNAVAILABLE, memberPort(app))) {
                     var blocked = unavailable.getBean(StorageRoot.class);
                     assertThat(blocked.phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
                     assertThat(blocked.runtime().business()).isEmpty();
+                    assertThat(((WebServerApplicationContext) unavailable).getWebServer().getPort())
+                            .isEqualTo(NativeAppStorage.advertisedControl(unavailable).getPort())
+                            .isNotEqualTo(NativeAppStorage.advertisedControl(app).getPort());
                 }
                 await().atMost(TTL.plusSeconds(5)).untilAsserted(() -> {
                     var renewed = claims.read(initial.key()).orElseThrow();
@@ -107,24 +115,30 @@ class SplitStoreLeaseLifecycleIT {
             var admin = observer.getDatabase("admin");
             String appName = "tapstate/" + app.getBean(BootId.class).value();
             long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
-                    .append("mode", new Document("times", 1))
+                    .append("mode", "alwaysOn")
                     .append("data", new Document("failCommands", List.of("findAndModify"))
                             .append("blockConnection", true).append("blockTimeMS", 25000).append("appName", appName)))
                     .get("count")).longValue();
             try {
                 admin.runCommand(new Document("waitForFailPoint", "failCommand").append("timesEntered", entered + 1).append("maxTimeMS", 5000));
-                long originalDeadline = (long) ReflectionTestUtils.getField(lease, "provenUntil");
+                var proof = (AtomicReference<?>) ReflectionTestUtils.getField(lease, "current");
+                var original = proof.get();
+                long originalDeadline = (long) ReflectionTestUtils.invokeMethod(original, "until");
                 assertThat(originalDeadline - System.nanoTime()).isPositive();
-                // Observe closure without invoking a lease accessor that can trigger expiry itself.
-                AtomicBoolean closed = (AtomicBoolean) ReflectionTestUtils.getField(lease, "closed");
-                await().atMost(TTL.plusSeconds(2)).untilTrue(closed);
-                assertThat(lease.currentFence()).isEmpty();
+                // Reading the atomic proof directly does not cause the test itself to expire it.
+                await().atMost(TTL.plusSeconds(2)).until(() -> {
+                    var current = proof.get();
+                    if (current == null) return true;
+                    assertThat(current).isSameAs(original);
+                    return false;
+                });
                 assertThat(System.nanoTime()).isGreaterThanOrEqualTo(originalDeadline);
-                assertThat(ReflectionTestUtils.getField(lease, "provenUntil")).isEqualTo(originalDeadline);
+                assertThat(lease.currentFence()).isEmpty();
                 await().atMost(Duration.ofSeconds(10)).until(() -> !member.getLifecycleService().isRunning());
                 assertThat(root.runtime().requireConfiguration().artifacts().get("views")).isPresent();
                 assertThat(observer.getDatabase(cacheDb).getCollection("workload_claims")
-                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isEqualTo(1);
+                        .countDocuments(new Document("resourceType", "NODE_SESSION")
+                                .append("ownerBootId", originalFence.owner().bootId()))).isEqualTo(1);
             } finally {
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
@@ -132,15 +146,23 @@ class SplitStoreLeaseLifecycleIT {
         }
     }
 
-    private ConfigurableApplicationContext start(String configUri, String name) {
-        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
-                "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
-                "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=ERROR", "--SDK_STATUS_SENDER_ENABLED=false",
+    private static int memberPort(ConfigurableApplicationContext context) {
+        return NativeAppStorage.business(context).getBean(HazelcastInstance.class)
+                .getCluster().getLocalMember().getAddress().getPort();
+    }
+
+    private ConfigurableApplicationContext start(String configUri, MongoRenewedTopology topology, String name, int seedPort) {
+        var arguments = new ArrayList<>(topology.arguments(name, seedPort));
+        arguments.addAll(List.of(
+                "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=WARN", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + configUri, "--tapstate.store.mongo.server-selection-timeout=2s",
                 "--tapstate.cluster.node-session-ttl=" + TTL.toSeconds() + "s", "--tapstate.cluster.node-session-renew-interval=1s",
                 "--tapstate.control.auth.jwt-secret=split-store-stable-test-key",
                 "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds"),
-                "--tapstate.connectors.plugins-dir=" + work.resolve(name));
+                "--tapstate.connectors.plugins-dir=" + work.resolve(name)));
+        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .listeners(NativeAppStorage.boundControlAdvertisement())
+                .run(arguments.toArray(String[]::new));
     }
 
     private static String options(String uri, String options) { return uri + (uri.contains("?") ? "&" : "?") + options; }

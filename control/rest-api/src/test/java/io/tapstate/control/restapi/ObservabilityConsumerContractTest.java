@@ -5,6 +5,7 @@ import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.EffectiveHistoryResolution;
 import io.tapstate.control.core.PipelineExplanation;
 import io.tapstate.control.core.PipelineMetricsHistory;
+import io.tapstate.control.core.PipelineMetricsHistory.CdcDelivery;
 import io.tapstate.control.core.PipelineMetricsHistory.Consistency;
 import io.tapstate.control.core.PipelineMetricsHistory.Gap;
 import io.tapstate.control.core.PipelineMetricsHistory.GapReason;
@@ -80,6 +81,7 @@ class ObservabilityConsumerContractTest {
                 "history-aggregate-boundaries.golden.json",
                 "history-single-metric-missing.golden.json",
                 "history-empty.golden.json",
+                "history-cdc-delivery.golden.json",
                 "explain-stale.golden.json",
                 "explain-coded-failure.golden.json",
                 "explain-reconcile-failures.golden.json",
@@ -157,6 +159,21 @@ class ObservabilityConsumerContractTest {
 
         assertGolden(PipelineHistoryResponse.of(auto), "history-auto-page-1.golden.json");
         assertGolden(PipelineHistoryResponse.of(missing), "history-single-metric-missing.golden.json");
+    }
+
+    @Test
+    void cdcHistoryMatchesTheConsumerFixtureWithFractionalZeroAndAbsentReadings() throws Exception {
+        Instant firstEnd = FROM.plusSeconds(60);
+        Instant secondEnd = firstEnd.plusSeconds(60);
+        Instant thirdEnd = secondEnd.plusSeconds(60);
+        Segment segment = new Segment(FROM, thirdEnd, StartReason.WINDOW_START, List.of(
+                new Point(FROM, firstEnd, null, null, List.of(), new CdcDelivery(8, new BigDecimal("91.125"))),
+                new Point(firstEnd, secondEnd, null, null, List.of(), new CdcDelivery(1, BigDecimal.ZERO)),
+                new Point(secondEnd, thirdEnd, null, null, List.of())));
+        PipelineMetricsHistory page = history(EffectiveHistoryResolution.PT1M, List.of(segment),
+                List.of(), List.of(), null);
+
+        assertGolden(PipelineHistoryResponse.of(page), "history-cdc-delivery.golden.json");
     }
 
     @Test

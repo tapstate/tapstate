@@ -5,9 +5,14 @@ import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.*;
+import io.tapstate.testsupport.MongoRenewedTopology;
+import java.net.URI;
 import java.time.Duration;
 import java.util.Map;
+import org.springframework.boot.web.server.context.WebServerInitializedEvent;
+import org.springframework.context.ApplicationListener;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.testcontainers.containers.MongoDBContainer;
 
@@ -63,6 +68,20 @@ public record NativeAppStorage(String configurationUri,String configurationDatab
 
     public static org.springframework.core.env.StandardEnvironment isolatedEnvironment() {
         return CloudFixtureEnvironment.isolated();
+    }
+
+    static ApplicationListener<WebServerInitializedEvent> boundControlAdvertisement() {
+        return event -> {
+            var environment = ((ConfigurableApplicationContext) event.getApplicationContext()).getEnvironment();
+            var url = MongoRenewedTopology.controlUrl(environment.getRequiredProperty("server.address"),
+                    event.getWebServer().getPort());
+            environment.getPropertySources().addFirst(new MapPropertySource("fixtureControlEndpoint",
+                    Map.of(MongoRenewedTopology.CONTROL_ADVERTISE_URL, url.toString())));
+        };
+    }
+
+    static URI advertisedControl(ConfigurableApplicationContext root) {
+        return URI.create(root.getEnvironment().getRequiredProperty(MongoRenewedTopology.CONTROL_ADVERTISE_URL));
     }
 
     public static void awaitBusiness(ConfigurableApplicationContext root) {

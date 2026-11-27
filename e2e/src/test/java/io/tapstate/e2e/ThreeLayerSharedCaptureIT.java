@@ -2,11 +2,13 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.testsupport.RequiresDocker;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -352,7 +354,9 @@ class ThreeLayerSharedCaptureIT {
             mongo.seed(source,"orders",SeedRows.generated(8));mongo.seed(second,"items",SeedRows.generated(5));
             var cache=cacheClient.getDatabase(cacheDb);var config=configClient.getDatabase(configDb);
             var generations=config.getCollection("operator_generations");String canonical,replacement,operation;long firstPid;
-            try(var server=lossServer(configUri,cluster)) {
+            // Both boots represent a process replacement on the same node, including its local artifact directory.
+            Path staging = Files.createDirectory(work.resolve("shared-loss-staging"));
+            try(var server=lossServer(configUri,cluster,staging)) {
                 firstPid=server.pid();
                 var control=new ControlPlane(server.baseUrl());control.login(NativeMongoStorageFixture.USER,NativeMongoStorageFixture.PASSWORD);
                 control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
@@ -389,9 +393,7 @@ class ThreeLayerSharedCaptureIT {
                     captureDiagnostic(config,cache,canonical);
                     FailureScene.writeMemberLogs(cluster,Map.of("runtime",server.output()));FailureScene.writeThreads(cluster,server);throw failed;
                 }
-                assertThat(preview.get("affectedPipelineIds")).isEqualTo(List.of("reader_a","reader_b"));
-                assertThat(preview.get("preflightCurrent")).isEqualTo(true);
-                for(String id:List.of("reader_a","reader_b","reader_c"))assertThat(generations.find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
+                verifyAffectedReaders(preview, generations);
                 mongo.update(second,"items",Map.of("id",2L),Map.of("seq",222L));awaitRows(mongo,second,c,"items",BOUND);
                 Await.answered("C's original target confirmation to advance during the shared preflight",BOUND,
                         () -> control.durablePosition("reader_c","items").filter(value -> !value.equals(cAck)));
@@ -403,24 +405,11 @@ class ThreeLayerSharedCaptureIT {
                     return "COMPLETE".equals(status.get("phase"));
                 },() -> String.valueOf(storage(control,"status",Map.of("operationId",preview.get("operationId")))));
                 operation=(String)preview.get("operationId");
-                var bindings=config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId",operation)).into(new ArrayList<>());
-                assertThat(bindings).hasSize(1);var current=bindings.getFirst().get("currentRecovery",Document.class);
-                assertThat(current).containsEntry("phase","READY").containsEntry("operationId",operation);
-                replacement=current.getString("physicalChain");assertThat(replacement).isNotBlank().isNotEqualTo(canonical);
-                assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
-                        .containsEntry("phase","RETIRED").containsEntry("operationId",operation).containsEntry("replacementChain",replacement);
-                for(String id:List.of("reader_a","reader_b")) {
-                    var observed = Await.answered(id + " to publish its state after shared recovery", BOUND,
-                            () -> control.state(id));
-                    assertThat(observed).isEqualTo(PipelineState.STOPPED);
-                    assertThat(generations.find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
-                    var refusal=control.startExpectingRefusal(id);assertThat(refusal.status()).isEqualTo(409);
-                    assertThat(refusal.code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
-                }
-                assertThat(execution(cache,"reader_b")).isEqualTo(bExecution);
-                assertThat(control.state("reader_c")).contains(PipelineState.RUNNING);assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
+                replacement = verifiedReplacement(config, cache, canonical, operation);
+                verifyReadersBeforeClear(control, generations, cache, bExecution, cExecution);
                 for(String field:List.of("captureId","captureFence","epoch"))assertThat(cache.getCollection("srs_chains").find(new Document("_id",kept)).first().get(field)).isEqualTo(keptRoot.get(field));
                 assertThat(cache.getCollection("srs_models").find(new Document("_id.chain",kept)).sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(keptModels);
+                var bCheckpoint = stoppedReaderCheckpoint(cache);
                 for(String id:List.of("reader_a","reader_b")) {
                     control.stop(id,true);
                     Await.until(id+" to finish its separately confirmed clear",BOUND,() -> {
@@ -429,7 +418,8 @@ class ThreeLayerSharedCaptureIT {
                     },() -> String.valueOf(generations.find(new Document("_id",id)).first()));
                     control.lifecycle(id,LifecycleVerb.START);awaitRows(mongo,source,id.equals("reader_a")?a:b,BOUND);
                     if(id.equals("reader_a")) {
-                        awaitRows(mongo,second,a,"items",BOUND);assertThat(control.state("reader_b")).contains(PipelineState.STOPPED);
+                        awaitRows(mongo,second,a,"items",BOUND);
+                        awaitRetainedStoppedReader(control, cache, bCheckpoint, bExecution);
                         mongo.update(source,"orders",Map.of("id",2L),Map.of("seq",202L));awaitRows(mongo,source,a,BOUND);
                         mongo.update(second,"items",Map.of("id",3L),Map.of("seq",333L));awaitRows(mongo,second,c,"items",BOUND);
                         assertThat(rows(mongo,b)).isEqualTo(bRows);assertThat(execution(cache,"reader_b")).isEqualTo(bExecution);
@@ -440,31 +430,111 @@ class ThreeLayerSharedCaptureIT {
                 }
                 mongo.update(source,"orders",Map.of("id",4L),Map.of("seq",444L));awaitRows(mongo,source,a,BOUND);awaitRows(mongo,source,b,BOUND);
                 awaitRows(mongo,second,a,"items",BOUND);awaitRows(mongo,second,c,"items",BOUND);
-                assertThat(generations.find(new Document("_id","reader_c")).first()).containsEntry("stateGeneration",1L);
-                assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
-                assertThat(membership(cache,"reader_a","input").get("_id",Document.class)).containsEntry("chain",replacement);
-                assertThat(membership(cache,"reader_b","input").get("_id",Document.class)).containsEntry("chain",replacement);
-                assertThat(membership(cache,"reader_a","second").get("_id",Document.class).getString("chain")).isEqualTo(kept);
+                verifyClearedReadersAndUnaffectedCapture(control, generations, cache, replacement, kept, cExecution);
             }
-            try(var reopened=lossServer(configUri,cluster)) {
+            try(var reopened=lossServer(configUri,cluster,staging)) {
                 assertThat(reopened.pid()).isNotEqualTo(firstPid);
                 var control=new ControlPlane(reopened.baseUrl());control.login(NativeMongoStorageFixture.USER,NativeMongoStorageFixture.PASSWORD);
                 for(String id:List.of("reader_a","reader_b","reader_c"))Await.until(id+" to resume its original new scope after process replacement",BOUND,
                         () -> control.state(id).filter(PipelineState.RUNNING::equals).isPresent(),() -> control.failureCode(id).toString());
                 mongo.update(source,"orders",Map.of("id",5L),Map.of("seq",555L));mongo.update(second,"items",Map.of("id",4L),Map.of("seq",444L));
                 awaitRows(mongo,source,a,BOUND);awaitRows(mongo,source,b,BOUND);awaitRows(mongo,second,a,"items",BOUND);awaitRows(mongo,second,c,"items",BOUND);
-                assertThat(generations.find(new Document("_id","reader_a")).first()).containsEntry("stateGeneration",2L);
-                assertThat(generations.find(new Document("_id","reader_b")).first()).containsEntry("stateGeneration",2L);
-                assertThat(generations.find(new Document("_id","reader_c")).first()).containsEntry("stateGeneration",1L);
-                for(String id:List.of("reader_a","reader_b"))assertThat(membership(cache,id,"input").get("_id",Document.class)).containsEntry("chain",replacement);
-                assertThat(config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId",operation)).first()
-                        .get("currentRecovery",Document.class)).containsEntry("physicalChain",replacement).containsEntry("operationId",operation);
+                verifyDurableRecovery(generations, cache, config, replacement, operation);
             }
         }
     }
 
+    private static void verifyAffectedReaders(Map<?, ?> preview, MongoCollection<Document> generations) {
+        assertThat(preview.get("affectedPipelineIds")).isEqualTo(List.of("reader_a", "reader_b"));
+        assertThat(preview.get("preflightCurrent")).isEqualTo(true);
+        for (String id : List.of("reader_a", "reader_b", "reader_c")) {
+            assertThat(generations.find(new Document("_id", id)).first()).containsEntry("stateGeneration", 1L);
+        }
+    }
+
+    private static String verifiedReplacement(MongoDatabase config, MongoDatabase cache, String canonical, String operation) {
+        var bindings = config.getCollection("capture_preparations")
+                .find(new Document("currentRecovery.operationId", operation)).into(new ArrayList<>());
+        assertThat(bindings).hasSize(1);
+        var current = bindings.getFirst().get("currentRecovery", Document.class);
+        assertThat(current).containsEntry("phase", "READY").containsEntry("operationId", operation);
+        String replacement = current.getString("physicalChain");
+        assertThat(replacement).isNotBlank().isNotEqualTo(canonical);
+        var retired = cache.getCollection("srs_chains").find(new Document("_id", canonical)).first();
+        assertThat(retired.get("recoveryControl", Document.class))
+                .containsEntry("phase", "RETIRED").containsEntry("operationId", operation).containsEntry("replacementChain", replacement);
+        return replacement;
+    }
+
+    private static void verifyReadersBeforeClear(ControlPlane control, MongoCollection<Document> generations,
+            MongoDatabase cache, long bExecution, long cExecution) {
+        for (String id : List.of("reader_a", "reader_b")) {
+            var observed = Await.answered(id + " to publish its state after shared recovery", BOUND,
+                    () -> control.state(id));
+            assertThat(observed).isEqualTo(PipelineState.STOPPED);
+            assertThat(generations.find(new Document("_id", id)).first()).containsEntry("stateGeneration", 1L);
+            var refusal = control.startExpectingRefusal(id);
+            assertThat(refusal.status()).isEqualTo(409);
+            assertThat(refusal.code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
+        }
+        assertThat(execution(cache, "reader_b")).isEqualTo(bExecution);
+        assertThat(control.state("reader_c")).contains(PipelineState.RUNNING);
+        assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
+    }
+
+    private static Document stoppedReaderCheckpoint(MongoDatabase cache) {
+        var checkpoint = cache.getCollection("pipeline_state").find(new Document("_id", "reader_b")).first();
+        assertThat(checkpoint).isNotNull();
+        assertThat(checkpoint.getString("stateJson")).isEqualTo("STOPPED");
+        return checkpoint;
+    }
+
+    private static void awaitRetainedStoppedReader(ControlPlane control, MongoDatabase cache, Document bCheckpoint, long bExecution) {
+        var bClaim = new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", "reader_b");
+        var claims = cache.getCollection("workload_claims");
+        var observations = cache.getCollection("pipeline_observation");
+        Await.until("reader_b to remain STOPPED under its current claim", Duration.ofSeconds(10), () -> {
+            var claim = claims.find(bClaim).first();
+            return claim != null && control.state("reader_b").filter(PipelineState.STOPPED::equals).isPresent()
+                    && observations.find(new Document("pipelineId", "reader_b").append("state", "STOPPED")
+                            .append("_id.scope", bCheckpoint.get("scope"))
+                            .append("_id.epoch", bCheckpoint.getLong("epoch"))
+                            .append("_id.claimGeneration", claim.getLong("claimGeneration"))
+                            .append("_id.executionGeneration", bExecution)
+                            .append("_id.topologyRevision", claim.getLong("topologyRevision"))
+                            .append("_id.node", claim.getString("ownerNodeId"))
+                            .append("_id.boot", claim.getString("ownerBootId"))).first() != null;
+        }, () -> "state=" + control.state("reader_b") + ", claim=" + claims.find(bClaim).first());
+        assertThat(cache.getCollection("pipeline_state").find(new Document("_id", "reader_b")).first())
+                .containsEntry("scope", bCheckpoint.get("scope")).containsEntry("epoch", bCheckpoint.getLong("epoch"));
+    }
+
+    private static void verifyClearedReadersAndUnaffectedCapture(ControlPlane control, MongoCollection<Document> generations,
+            MongoDatabase cache, String replacement, String kept, long cExecution) {
+        assertThat(generations.find(new Document("_id", "reader_c")).first()).containsEntry("stateGeneration", 1L);
+        assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
+        assertThat(membership(cache, "reader_a", "input").get("_id", Document.class)).containsEntry("chain", replacement);
+        assertThat(membership(cache, "reader_b", "input").get("_id", Document.class)).containsEntry("chain", replacement);
+        assertThat(membership(cache, "reader_a", "second").get("_id", Document.class).getString("chain")).isEqualTo(kept);
+    }
+
+    private static void verifyDurableRecovery(MongoCollection<Document> generations, MongoDatabase cache,
+            MongoDatabase config, String replacement, String operation) {
+        assertThat(generations.find(new Document("_id", "reader_a")).first()).containsEntry("stateGeneration", 2L);
+        assertThat(generations.find(new Document("_id", "reader_b")).first()).containsEntry("stateGeneration", 2L);
+        assertThat(generations.find(new Document("_id", "reader_c")).first()).containsEntry("stateGeneration", 1L);
+        for (String id : List.of("reader_a", "reader_b")) {
+            assertThat(membership(cache, id, "input").get("_id", Document.class)).containsEntry("chain", replacement);
+        }
+        assertThat(config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId", operation)).first()
+                .get("currentRecovery", Document.class)).containsEntry("physicalChain", replacement).containsEntry("operationId", operation);
+    }
+
     private RealProcessServer lossServer(String configurationUri,String cluster) {
-        return RealProcessServer.startPrepared(configurationUri,"127.0.0.1",port -> List.of("--tapstate.cluster.id="+cluster,
+        return lossServer(configurationUri, cluster, null);
+    }
+    private RealProcessServer lossServer(String configurationUri,String cluster,Path staging) {
+        return RealProcessServer.startPrepared(configurationUri,"127.0.0.1",staging,port -> List.of("--tapstate.cluster.id="+cluster,
                 "--tapstate.cluster.node-id=shared-loss-node","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false","--logging.level.io.tapstate.app.HazelcastOperatorReadiness=DEBUG",
                 "--tapstate.connectors.seed-dir="+work.resolve("no-loss-seeds")));

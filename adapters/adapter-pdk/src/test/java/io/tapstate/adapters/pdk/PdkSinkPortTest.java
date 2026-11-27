@@ -2,6 +2,8 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
+import io.tapdata.entity.event.dml.TapRecordEvent;
+import io.tapdata.pdk.apis.entity.WriteListResult;
 import io.tapdata.entity.schema.value.TapStringValue;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
@@ -294,13 +296,53 @@ class PdkSinkPortTest {
     }
 
     @Test
+    void aRejectedRowPreventsTheBatchFromAcknowledgingItsSourcePosition(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.partiallyRejectedSink(dir);
+        var port = new PdkSinkPort(provisioner(jar, "synthetic.PartiallyRejected"));
+        try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.IGNORE))) {
+            assertThatThrownBy(() -> await(writer, List.of(insert(1), insert(2))))
+                    .isInstanceOf(ExecutionException.class)
+                    .cause().isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ConnectorError.WRITE_FAILED);
+                        assertThat(failure).hasRootCauseMessage("target rejected the row");
+                    });
+        }
+    }
+
+    @Test
     void writeAccumulatesCountsAcrossMultipleConnectorFlushes(@TempDir Path dir) throws Exception {
         // A connector may report a batch in several flushes, one consumer callback each; the writer must
         // sum the accepted counts, not report only the last flush's.
         Path jar = Synthetic.multiFlushSink(dir);
         PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.MultiFlush"));
         try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.APPLY))) {
-            assertThat(await(writer, List.of(insert(1), insert(2))).written()).isEqualTo(2);
+            assertThat(await(writer, List.of(insert(1), insert(2)))).isEqualTo(new WriteResult(2, 2));
+        }
+    }
+
+    @Test
+    void pdkReceiptsDistinguishAcknowledgedEventsFromChangeCounts(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.countingSink(dir);
+        PdkConnector connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink")
+                .resolve("demo"), Map.of());
+        AtomicInteger calls = new AtomicInteger();
+        try (SinkWriter writer = new PdkSinkWriter(connector, (context, events, table, result) -> {
+            assertThat(events).hasSize(2);
+            switch (calls.getAndIncrement()) {
+                case 0 -> result.accept(new WriteListResult<>(0L, 0L, 0L));
+                case 1 -> result.accept(new WriteListResult<TapRecordEvent>(0L, 2L, 0L)
+                        .addError(events.getLast(), new IllegalStateException("row rejected")));
+                default -> { }
+            }
+        }, WriteMode.UPSERT, DdlPolicy.IGNORE, Map.of())) {
+            var batch = List.of(
+                    Envelope.update(1L, "t1", Map.of("id", 1), Map.of("id", 1), null),
+                    Envelope.delete(2L, "t1", Map.of("id", 2), null),
+                    Envelope.ddl(3L, "t1", Map.of()));
+            assertThat(await(writer, batch)).isEqualTo(new WriteResult(0, 2));
+            assertThatThrownBy(() -> await(writer, batch)).isInstanceOf(ExecutionException.class)
+                    .hasRootCauseMessage("row rejected");
+            assertThat(await(writer, batch)).isEqualTo(new WriteResult(0, 0));
         }
     }
 
@@ -455,7 +497,9 @@ class PdkSinkPortTest {
         Path jar = Synthetic.fieldCountingSink(dir);
         PdkSinkPort port = new PdkSinkPort(provisioner(jar, "synthetic.FieldCounting"));
         try (SinkWriter writer = port.open(config(WriteMode.UPSERT, DdlPolicy.FAIL))) {
-            assertThat(await(writer, List.of(insert(1))).written()).isEqualTo(0);
+            var receipt = await(writer, List.of(insert(1)));
+            assertThat(receipt.written()).isZero();
+            assertThat(receipt.acknowledgedRows()).isEqualTo(1);
         }
     }
 }

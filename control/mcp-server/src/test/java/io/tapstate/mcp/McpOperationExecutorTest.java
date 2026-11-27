@@ -256,7 +256,8 @@ class McpOperationExecutorTest {
                 "history-auto-page-1.golden.json",
                 "history-aggregate-boundaries.golden.json",
                 "history-single-metric-missing.golden.json",
-                "history-empty.golden.json");
+                "history-empty.golden.json",
+                "history-cdc-delivery.golden.json");
         AtomicReference<String> response = new AtomicReference<>();
         HttpServer server = server(exchange -> answer(exchange, 200, response.get()));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {

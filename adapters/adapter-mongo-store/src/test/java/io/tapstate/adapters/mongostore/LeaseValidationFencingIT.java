@@ -136,6 +136,8 @@ class LeaseValidationFencingIT {
             f.addTtlIndex();
             store.saveAll(f.at.mapName(), keys("b", 10));
             assertThat(f.stored()).as("within the lease the structure is not looked at").isEqualTo(20);
+            f.assertTtlDrift();
+            f.removeShape();
             outlive(Duration.ofMillis(1_700));
             code(() -> store.saveAll(f.at.mapName(), keys("c", GROUP)), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.stored()).isEqualTo(20);
@@ -147,6 +149,8 @@ class LeaseValidationFencingIT {
             System.setProperty(MongoCacheOperatorStateStore.LEASE_PROPERTY, "600000");
             var store = f.writer(); store.saveAll(f.at.mapName(), keys("a", 10));
             f.addTtlIndex();
+            f.assertTtlDrift();
+            f.removeShape();
             // What the member's claim reading does when a refresh fails or the claim moves.
             ((LeasedStateStore) store).dropLease();
             code(() -> store.saveAll(f.at.mapName(), keys("b", GROUP)), IoError.DOCUMENT_UNREADABLE);
@@ -161,6 +165,8 @@ class LeaseValidationFencingIT {
             var store = f.writer();
             assertThat(store.loadAll(f.at.mapName(), List.of("a1"))).containsKey("a1");
             f.addTtlIndex();
+            f.assertTtlDrift();
+            f.removeShape();
             code(() -> store.save(f.at.mapName(), "b", new byte[]{1}), IoError.DOCUMENT_UNREADABLE);
             code(() -> store.loadAll(f.at.mapName(), List.of("a1")), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.stored()).isEqualTo(10);
@@ -172,6 +178,8 @@ class LeaseValidationFencingIT {
             System.setProperty(MongoCacheOperatorStateStore.VALIDATION_PROPERTY, "transaction");
             var store = f.writer(); store.saveAll(f.at.mapName(), keys("a", 10));
             f.addTtlIndex();
+            f.assertTtlDrift();
+            f.removeShape();
             code(() -> store.saveAll(f.at.mapName(), keys("b", 10)), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.stored()).isEqualTo(10);
         });
@@ -260,6 +268,20 @@ class LeaseValidationFencingIT {
         MongoCollection<Document> claims() { return SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database); }
         void onClaim(Document update) {
             assertThat(claims().updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)), update).getMatchedCount()).isEqualTo(1);
+        }
+        void removeShape() {
+            assertThat(SystemCollections.CACHE_NEST_SHAPES.on(database).deleteOne(new Document()).getDeletedCount()).isOne();
+        }
+        void assertTtlDrift() {
+            var tables = List.of(SystemCollections.CACHE_NEST_STATE);
+            assertThat(MongoStructureInspection.inspect(database,
+                    MongoStructureInspection.namespaces(tables, tables, Duration.ofSeconds(5)),
+                    new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(difference -> {
+                        assertThat(difference.collection()).isEqualTo(SystemCollections.CACHE_NEST_STATE.collectionName());
+                        assertThat(difference.index()).isEqualTo("ttl_1");
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.UNEXPECTED_CONSTRAINT);
+                    });
         }
         void addTtlIndex() {
             SystemCollections.CACHE_NEST_STATE.on(database).createIndex(new Document("ttl", 1), new IndexOptions().expireAfter(3600L, TimeUnit.SECONDS));

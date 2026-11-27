@@ -90,7 +90,11 @@ class MongoCacheOperatorStateStoreIT {
             var paused = new CountDownLatch(2); var resume = new CountDownLatch(1);
             Set<Thread> observedWorkers = ConcurrentHashMap.newKeySet();
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
-                if (readingPipelineState(event) && observedWorkers.add(Thread.currentThread())) {
+                if (f.database.getName().equals(event.getDatabaseName())
+                        && "aggregate".equals(event.getCommandName())
+                        && event.getCommand().getString("aggregate").getValue()
+                                .equals(SystemCollections.CACHE_IDENTITY.collectionName())
+                        && observedWorkers.add(Thread.currentThread())) {
                     paused.countDown(); await(resume);
                 }
             }};
