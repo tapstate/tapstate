@@ -455,10 +455,10 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             if (sample.isEmpty()) return null;
             var reading = sample.orElseThrow();
             requireLocal();
-            var raw = ObservationPublisher.nativeFacts(id(), clock.instant(),
+            var nativeSample = ObservationPublisher.NativeSample.from(reading.jobId(), id(), clock.instant(),
                     reading.captured(), reading.delivered(), reading.stages());
             return new ResumeMetrics.Transition(ResumeMetrics.Action.PAUSE,
-                    pass.intent().intentRevision(), reading.jobId(), raw);
+                    pass.intent().intentRevision(), nativeSample.jobId(), nativeSample.facts(), nativeSample.starts());
         }
         var desired = pass.intent().desired();
         if (desired.reassemble() || desired.rebuiltAtStateEpoch() != null) return null;

@@ -80,6 +80,33 @@ class MongoResumeMetricsTest {
                 .isEqualTo(new ResumeMetrics.Binding(expected, 3, ORIGINAL));
     }
 
+    @Test void aSecondPauseRequiresProofForACarriedSeries() {
+        var resumed = rebuild(pause(SAVED, SAVED), JOB);
+        long replacementJob = JOB + 1;
+        var start = Instant.EPOCH.plusSeconds(1);
+        var saved = count("table", 9);
+        var row = runningObservation(3, saved);
+        var raw = count("different-table", 2, start);
+        var producer = ResumeMetrics.Producer.OUT;
+        long nativeStart = start.toEpochMilli();
+        var command = new ResumeMetrics.Transition(ResumeMetrics.Action.PAUSE, 4, replacementJob,
+                List.of(raw), Map.of(producer, nativeStart));
+        var slots = Map.of(producer, new ResumeMetrics.Slot(nativeStart, true));
+        row.put(MongoResumeWindow.FIELD, MongoResumeWindow.encode(new ResumeMetrics.Window(3, replacementJob, slots)));
+        assertThat(MongoResumeMetrics.read(transition(resumed, command)).candidate().facts()).containsExactly(saved);
+
+        for (var unqualified : List.of(
+                new ResumeMetrics.Window(2, replacementJob, slots),
+                new ResumeMetrics.Window(3, JOB, slots),
+                new ResumeMetrics.Window(3, replacementJob, Map.of(producer, new ResumeMetrics.Slot(nativeStart - 1, true))),
+                new ResumeMetrics.Window(3, replacementJob, Map.of(producer, new ResumeMetrics.Slot(nativeStart, false))))) {
+            row.put(MongoResumeWindow.FIELD, MongoResumeWindow.encode(unqualified));
+            assertThat(MongoResumeMetrics.read(transition(resumed, command)).candidate()).as("window %s", unqualified).isNull();
+        }
+        row.remove(MongoResumeWindow.FIELD);
+        assertThat(MongoResumeMetrics.read(transition(resumed, command)).candidate()).as("legacy observation").isNull();
+    }
+
     @Test void oversizedFenceCarriesOnlyTheUnavailableRevisionThroughTheMatchingResume() {
         var resumed = rebuild(pause(SAVED, SAVED), JOB);
         var hugeFence = new WorkloadClaimFence(KEY, new WorkloadOwner("node", "b".repeat(LIMIT)), 4, 6, 6);
@@ -181,7 +208,12 @@ class MongoResumeMetricsTest {
     }
 
     private Document pause(MetricFact saved, MetricFact sampled) {
-        var key = new Document("scope", MongoPipelinePreparationFacts.scope(SCOPE)).append("epoch", 1L)
+        runningObservation(1, saved);
+        return transition(state(new Document(), 1), ResumeMetrics.Action.PAUSE, 2, JOB, List.of(sampled));
+    }
+
+    private Document runningObservation(long epoch, MetricFact saved) {
+        var key = new Document("scope", MongoPipelinePreparationFacts.scope(SCOPE)).append("epoch", epoch)
                 .append("claimGeneration", 4L).append("executionGeneration", 5L).append("topologyRevision", 6L)
                 .append("node", "node").append("boot", "boot");
         var row = new Document("_id", key).append("pipelineId", ID).append("state", "RUNNING")
@@ -190,9 +222,10 @@ class MongoResumeMetricsTest {
         FindIterable<Document> query = mock();
         when(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database)).thenReturn(collection);
         when(collection.find(session, new Document("_id", key))).thenReturn(query);
-        when(query.projection(new Document("pipelineId", 1).append("state", 1).append("facts", 1))).thenReturn(query);
+        when(query.projection(new Document("pipelineId", 1).append("state", 1).append("facts", 1)
+                .append(MongoResumeWindow.FIELD, 1))).thenReturn(query);
         when(query.first()).thenReturn(row);
-        return transition(state(new Document(), 1), ResumeMetrics.Action.PAUSE, 2, JOB, List.of(sampled));
+        return row;
     }
 
     private Document rebuild(Document paused, long job) {
@@ -200,9 +233,14 @@ class MongoResumeMetricsTest {
     }
 
     private Document transition(Document row, ResumeMetrics.Action action, long revision, long job, List<MetricFact> raw) {
+        return transition(row, new ResumeMetrics.Transition(action, revision, job, raw));
+    }
+
+    private Document transition(Document row, ResumeMetrics.Transition command) {
         var values = new Document();
-        MongoResumeMetrics.transition(access, session, row, values, new ResumeMetrics.Transition(action, revision, job, raw));
-        return state(values, row.getLong("epoch") + 1).append("stateJson", action == ResumeMetrics.Action.PAUSE ? "PAUSED" : "RUNNING");
+        MongoResumeMetrics.transition(access, session, row, values, command);
+        return state(values, row.getLong("epoch") + 1)
+                .append("stateJson", command.action() == ResumeMetrics.Action.PAUSE ? "PAUSED" : "RUNNING");
     }
 
     private static Document state(Document values, long epoch) {
@@ -210,7 +248,11 @@ class MongoResumeMetricsTest {
     }
 
     private static MetricFact count(String table, long rows) {
+        return count(table, rows, Instant.EPOCH);
+    }
+
+    private static MetricFact count(String table, long rows, Instant start) {
         return MetricFact.single("tapstate.pipeline.records", MetricType.COUNTER, "{record}", MetricPoint.accumulated(
-                Map.of(MetricAttributes.TABLE_ID, table, "direction", "out"), Instant.EPOCH, Instant.EPOCH, rows));
+                Map.of(MetricAttributes.TABLE_ID, table, "direction", "out"), start, start, rows));
     }
 }

@@ -9,6 +9,7 @@ import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.spi.store.ResumeMetrics;
+import io.tapstate.spi.store.ResumeMetrics.Producer;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -39,6 +40,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.List;
@@ -860,10 +862,19 @@ public final class ObservationPublisher {
         Optional<NativeSample> read(PipelineIntentScope scope, ResumeMetrics.Binding binding, Instant at);
     }
 
-    public record NativeSample(long jobId, List<MetricFact> facts, Map<ResumeMetrics.Producer, Long> starts) {
+    public record NativeSample(long jobId, List<MetricFact> facts, Map<Producer, Long> starts) {
         public NativeSample {
             facts = List.copyOf(facts);
             starts = Map.copyOf(starts);
+        }
+
+        public static NativeSample from(long jobId, String pipelineId, Instant at,
+                CaptureReading captured, DeliveryReading delivered, StageReading stages) {
+            var starts = new EnumMap<Producer, Long>(Producer.class);
+            captured.start().ifPresent(start -> starts.put(Producer.IN, start.toEpochMilli()));
+            delivered.start().ifPresent(start -> starts.put(Producer.OUT, start.toEpochMilli()));
+            stages.start().ifPresent(start -> starts.put(Producer.STAGE, start.toEpochMilli()));
+            return new NativeSample(jobId, nativeFacts(pipelineId, at, captured, delivered, stages), starts);
         }
     }
 

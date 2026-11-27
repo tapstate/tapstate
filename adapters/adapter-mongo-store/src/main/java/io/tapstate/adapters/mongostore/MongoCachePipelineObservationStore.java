@@ -8,6 +8,7 @@ import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -441,19 +442,24 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         return document;
     }
 
-    static List<io.tapstate.core.lifecycle.MetricFact> pauseFacts(MongoCachePipelineAccess access,
+    record PauseObservation(List<MetricFact> facts, ResumeMetrics.Window window) {
+        static final PauseObservation EMPTY = new PauseObservation(List.of(), null);
+    }
+
+    static PauseObservation pauseObservation(MongoCachePipelineAccess access,
             ClientSession session, long epoch) {
         var key = keyOfFence(access, epoch, access.originalClaim());
         var row = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).find(session, new Document("_id", key))
-                .projection(new Document("pipelineId", 1).append("state", 1).append("facts", 1)).first();
-        if (row == null) return List.of();
+                .projection(new Document("pipelineId", 1).append("state", 1).append("facts", 1)
+                        .append(MongoResumeWindow.FIELD, 1)).first();
+        if (row == null) return PauseObservation.EMPTY;
         if (!key.equals(row.get("_id")) || !access.scope.pipelineId().equals(row.get("pipelineId")))
             throw access.unreadable("observation");
-        if (!PipelineState.RUNNING.name().equals(row.get("state"))) return List.of();
+        if (!PipelineState.RUNNING.name().equals(row.get("state"))) return PauseObservation.EMPTY;
         var facts = MongoObservationStore.readFacts(row, access.scope.pipelineId());
         if (row.containsKey("facts") && !facts.stream().map(MongoObservationStore::toDocument).toList().equals(row.get("facts")))
             throw access.unreadable("facts");
-        return facts;
+        return new PauseObservation(facts, MongoResumeWindow.decode(row, access.scope.pipelineId()));
     }
 
     static Document keyOfFence(MongoCachePipelineAccess access, long epoch, WorkloadClaimFence fence) {

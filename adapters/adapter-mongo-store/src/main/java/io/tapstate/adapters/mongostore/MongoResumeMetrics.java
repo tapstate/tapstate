@@ -2,7 +2,6 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.ClientSession;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ResumeMetrics;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -73,12 +72,12 @@ final class MongoResumeMetrics {
         }
         var handoff = read(current);
         long epoch = current.getLong("epoch");
-        List<MetricFact> facts = List.of();
+        var observed = MongoCachePipelineObservationStore.PauseObservation.EMPTY;
         if (command != null && command.action() == ResumeMetrics.Action.PAUSE && !command.raw().isEmpty()
                 && "RUNNING".equals(current.getString("stateJson"))) {
-            facts = MongoCachePipelineObservationStore.pauseFacts(access, session, epoch);
+            observed = MongoCachePipelineObservationStore.pauseObservation(access, session, epoch);
         }
-        write(current, values, handoff.transition(command, access.originalClaim(), epoch, facts));
+        write(current, values, handoff.transition(command, access.originalClaim(), epoch, observed.facts(), observed.window()));
     }
 
     static Document advance(Document current, WorkloadClaimFence before, WorkloadClaimFence after, long revision) {

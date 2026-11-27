@@ -70,7 +70,7 @@ class ScopedResumeMetricsTest {
     private static final String RESTARTED = ScopedResumeMetricsTest.class.getName() + ".restarted";
 
     enum Scenario { WAIT_AND_RECONSTRUCT, IMMEDIATE_RESUME, STAMPED_START, IN_PLACE_RESUME, PREFLIGHT_REFUSAL }
-    enum Recovery { NORMAL, LOST_SUBMISSION_REPLY, NEW_NATIVE_WINDOW }
+    enum Recovery { NORMAL, LOST_SUBMISSION_REPLY, NEW_NATIVE_WINDOW, PAUSE_BEFORE_REPUBLICATION }
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(Scenario.class)
@@ -212,15 +212,17 @@ class ScopedResumeMetricsTest {
                             .isEqualTo(Math.max(0L, (lag.observedAt().toEpochMilli() - eventTime) / 1000));
                 }
             });
-            if (recovery == Recovery.NEW_NATIVE_WINDOW)
-                verifyRestartedWindow(member, fixture, replacement);
+            if (recovery == Recovery.NEW_NATIVE_WINDOW || recovery == Recovery.PAUSE_BEFORE_REPUBLICATION) {
+                var restored = restartProducer(member, fixture, replacement);
+                if (recovery == Recovery.NEW_NATIVE_WINDOW) verifyRestartedWindow(fixture, restored);
+                else verifyPauseBeforeRepublication(fixture, restored, replacement.jobId());
+            }
         } finally {
             member.shutdown();
         }
     }
 
-    private static void verifyRestartedWindow(HazelcastInstance member, Fixture fixture, Engine.Run original) {
-        var key = fixture.currentKey();
+    private static Process restartProducer(HazelcastInstance member, Fixture fixture, Engine.Run original) {
         var manifest = original.operatorManifest();
         member.getUserContext().put(RESTARTED, true);
         member.getJet().getJob(original.jobId()).restart();
@@ -230,6 +232,11 @@ class ScopedResumeMetricsTest {
         assertThat(nativeSample.jobId()).isEqualTo(original.jobId());
         assertThat(nativeSample.manifest()).isEqualTo(manifest);
         assertThat(nativeSample.delivered().countingSince()).isEqualTo(RESTARTED_START);
+        return restored;
+    }
+
+    private static void verifyRestartedWindow(Fixture fixture, Process restored) {
+        var key = fixture.currentKey();
         assertSoftly(soft -> {
             for (int publication = 0; publication < 2; publication++) {
                 restored.driver().reconcile();
@@ -241,6 +248,35 @@ class ScopedResumeMetricsTest {
                 soft.assertThat(duration.histogram().count()).as("delivery samples").isZero();
                 soft.assertThat(duration.startTime()).as("histogram start").isEqualTo(RESTARTED_START);
             }
+        });
+    }
+
+    private static void verifyPauseBeforeRepublication(Fixture fixture, Process restored, long restartedJob) {
+        var oldObservation = fixture.observation().orElseThrow();
+        assertThat(oldObservation.metrics()).containsEntry("records.out", 9L);
+        assertThat(point(oldObservation).startTime()).isEqualTo(FIRST_START);
+        var oldKey = fixture.currentKey();
+
+        fixture.accept(fixture.lifecycle.pause("operator", ID));
+        restored.driver().reconcile();
+        assertThat(fixture.actual()).isEqualTo(PipelineState.PAUSED);
+        await().atMost(Duration.ofSeconds(10))
+                .until(() -> fixture.member.getJet().getJob(restartedJob).getStatus() == JobStatus.SUSPENDED);
+        assertThat(fixture.observations.get(oldKey)).isEqualTo(oldObservation);
+
+        fixture.member.getUserContext().remove(RESTARTED);
+        fixture.accept(fixture.lifecycle.resume("operator", ID));
+        restored.driver().reconcile();
+        awaitNativeReadings(restored.engine(), 2L, 1L, NEXT_START);
+        assertThat(restored.engine().captureRun(ID).orElseThrow().jobId()).isNotEqualTo(restartedJob);
+        restored.driver().reconcile();
+        var observed = fixture.observation().orElseThrow();
+        assertSoftly(soft -> {
+            soft.assertThat(observed.metrics().get("records.out")).as("output after the second rebuild").isEqualTo(2L);
+            soft.assertThat(point(observed).startTime()).as("counter start").isEqualTo(NEXT_START);
+            var duration = tablePoint(observed, "tapstate.pipeline.record.delivery.duration");
+            soft.assertThat(duration.histogram().count()).as("delivery samples after the second rebuild").isEqualTo(1);
+            soft.assertThat(duration.startTime()).as("histogram start").isEqualTo(NEXT_START);
         });
     }
 
@@ -419,10 +455,12 @@ class ScopedResumeMetricsTest {
                 }
                 public CasOutcome transitionMetrics(String id, long epoch, String next, Instant at, ResumeMetrics.Transition transition) {
                     active.run(); assertThat(original).isEqualTo(claim());
-                    var observed = observations.get(new ObservationKey(epoch, original));
+                    var key = new ObservationKey(epoch, original);
+                    var observed = observations.get(key);
                     var outcome = state.compareAndSwap(id, epoch, next, at);
                     if (outcome instanceof CasOutcome.Applied)
-                        handoff = handoff.transition(transition, original, epoch, observed == null ? List.of() : observed.facts());
+                        handoff = handoff.transition(transition, original, epoch,
+                                observed == null ? List.of() : observed.facts(), windows.get(key));
                     return outcome;
                 }
                 public Optional<CheckpointDoc> read(String id) { return state.read(id); }

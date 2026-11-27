@@ -12,4 +12,9 @@ class ResumeSubmissionRecoveryIT {
         ScopedResumeMetricsTest.exercise(ScopedResumeMetricsTest.Scenario.IMMEDIATE_RESUME,
                 ScopedResumeMetricsTest.Recovery.NEW_NATIVE_WINDOW);
     }
+
+    @Test void pausingBeforeAProducerPublishesItsNewWindowDiscardsTheOldTotals() {
+        ScopedResumeMetricsTest.exercise(ScopedResumeMetricsTest.Scenario.IMMEDIATE_RESUME,
+                ScopedResumeMetricsTest.Recovery.PAUSE_BEFORE_REPUBLICATION);
+    }
 }

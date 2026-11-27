@@ -1,6 +1,8 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import java.time.Instant;
@@ -17,11 +19,16 @@ public final class ResumeMetrics {
 
     public enum Action { PAUSE, REBUILD, IN_PLACE }
 
-    public record Transition(Action action, long revision, long jobId, List<MetricFact> raw) {
+    public record Transition(Action action, long revision, long jobId, List<MetricFact> raw, Map<Producer, Long> starts) {
         public Transition {
             Objects.requireNonNull(action);
             raw = List.copyOf(raw);
+            starts = Map.copyOf(starts);
             if (revision < 1) throw new IllegalArgumentException("missing intent revision");
+        }
+
+        public Transition(Action action, long revision, long jobId, List<MetricFact> raw) {
+            this(action, revision, jobId, raw, Map.of());
         }
     }
 
@@ -45,12 +52,13 @@ public final class ResumeMetrics {
     public record Handoff(Binding applied, Baseline candidate) {
         public static final Handoff EMPTY = new Handoff(null, null);
 
-        public Handoff transition(Transition command, WorkloadClaimFence claim, long epoch, List<MetricFact> observed) {
+        public Handoff transition(Transition command, WorkloadClaimFence claim, long epoch,
+                List<MetricFact> observed, Window window) {
             if (command == null) return EMPTY;
             var prior = applied != null && applied.fence().equals(claim) ? applied : null;
             return switch (command.action()) {
                 case PAUSE -> {
-                    var facts = qualified(observed, command.raw(), prior);
+                    var facts = qualified(observed, window, command, prior);
                     boolean unavailable = prior != null && prior.baseline().unavailable();
                     yield new Handoff(prior, facts.isEmpty() && !unavailable ? null :
                             new Baseline(command.revision(), epoch, claim, command.jobId(), facts, unavailable));
@@ -70,7 +78,19 @@ public final class ResumeMetrics {
         }
     }
 
-    public enum Producer { IN, OUT, STAGE }
+    public enum Producer {
+        IN, OUT, STAGE;
+
+        public static Producer of(MetricFact fact, MetricPoint point) {
+            var direction = point.attributes().get(MetricAttributes.DIRECTION);
+            if (direction != null) return "in".equals(direction) ? IN : OUT;
+            return switch (fact.name()) {
+                case "tapstate.pipeline.record.delivery.duration", CdcDeliveryTotals.COUNT_METRIC,
+                        CdcDeliveryTotals.TOTAL_MILLIS_METRIC -> OUT;
+                default -> STAGE;
+            };
+        }
+    }
 
     public record Slot(long startMillis, boolean carry) {}
 
@@ -108,18 +128,25 @@ public final class ResumeMetrics {
     }
 
     /** Select only the saved stable series identified by the captured native producer. */
-    public static List<MetricFact> qualified(List<MetricFact> saved, List<MetricFact> raw, Binding prior) {
-        var measured = index(raw);
-        var applied = prior == null ? Map.<Series,MetricPoint>of() : index(prior.baseline().facts());
+    private static List<MetricFact> qualified(List<MetricFact> saved, Window window, Transition command, Binding prior) {
+        var measured = index(command.raw());
+        var applied = prior == null ? Map.<Series, MetricPoint>of() : index(prior.baseline().facts());
+        var slots = prior != null && window != null && window.jobId() == command.jobId()
+                && window.intentRevision() == prior.revision() ? window.slots() : Map.<Producer, Slot>of();
         var selected = new ArrayList<MetricFact>();
         for (var fact : saved) {
             var points = fact.points().stream().filter(point -> {
-                var key = new Series(fact.name(), point.attributes());
-                var producer = measured.get(key);
                 if (point.startTime() == null) return false;
+                var key = new Series(fact.name(), point.attributes());
+                var nativePoint = measured.get(key);
+                if (nativePoint != null && point.startTime().equals(nativePoint.startTime())) return true;
+                // A carried fact needs native provenance in addition to its logical start.
                 var baseline = applied.get(key);
-                return producer != null && point.startTime().equals(producer.startTime())
-                        || baseline != null && point.startTime().equals(baseline.startTime());
+                if (baseline == null || !point.startTime().equals(baseline.startTime())) return false;
+                var producer = Producer.of(fact, point);
+                var slot = slots.get(producer);
+                var currentStart = command.starts().get(producer);
+                return slot != null && slot.carry() && currentStart != null && slot.startMillis() == currentStart;
             }).toList();
             if (!points.isEmpty()) selected.add(new MetricFact(fact.name(), fact.type(), fact.unit(), points));
         }

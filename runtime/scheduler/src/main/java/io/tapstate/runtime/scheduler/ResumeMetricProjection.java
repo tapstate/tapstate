@@ -1,6 +1,5 @@
 package io.tapstate.runtime.scheduler;
 
-import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -64,7 +63,7 @@ final class ResumeMetricProjection {
                     continue;
                 }
                 if (baseline.unavailable()) continue;
-                var producer = producer(fact, point);
+                var producer = Producer.of(fact, point);
                 var slot = window.slots().get(producer);
                 if (slot == null || !slot.carry() || slot.startMillis() != point.startTime().toEpochMilli()) {
                     points.add(point);
@@ -83,7 +82,7 @@ final class ResumeMetricProjection {
         }
         for (var fact : baseline.facts()) {
             for (var old : fact.points()) {
-                var latest = windows.get(producer(fact, old));
+                var latest = windows.get(Producer.of(fact, old));
                 if (latest == null || !previous.containsKey(new ResumeMetrics.Series(fact.name(), old.attributes()))) continue;
                 instruments.putIfAbsent(fact.name(), fact);
                 pointsByName.computeIfAbsent(fact.name(), ignored -> new ArrayList<>()).add(new MetricPoint(
@@ -96,16 +95,6 @@ final class ResumeMetricProjection {
             if (!points.isEmpty()) result.add(new MetricFact(name, fact.type(), fact.unit(), points));
         });
         return List.copyOf(result);
-    }
-
-    private static Producer producer(MetricFact fact, MetricPoint point) {
-        var direction = point.attributes().get(io.tapstate.core.lifecycle.MetricAttributes.DIRECTION);
-        if (direction != null) return "in".equals(direction) ? Producer.IN : Producer.OUT;
-        return switch (fact.name()) {
-            case "tapstate.pipeline.record.delivery.duration", CdcDeliveryTotals.COUNT_METRIC,
-                    CdcDeliveryTotals.TOTAL_MILLIS_METRIC -> Producer.OUT;
-            default -> Producer.STAGE;
-        };
     }
 
     private static HistogramValue add(HistogramValue left, HistogramValue right) {
