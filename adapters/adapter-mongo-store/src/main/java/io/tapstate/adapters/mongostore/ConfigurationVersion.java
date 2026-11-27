@@ -12,6 +12,7 @@ import java.util.Set;
 /** One actual document orders authoring changes and alert transactions without invalidating import preflight. */
 final class ConfigurationVersion {
     static final String ID = "configuration";
+    private static final String FIELD = "field";
     private static final String REVISION = "revision";
     static final String ALERT_FENCE = "alertWriteFence";
     private static final Set<String> LEGACY_FIELDS = Set.of("_id", REVISION);
@@ -27,7 +28,7 @@ final class ConfigurationVersion {
         if (current == null || !(current.get(REVISION) instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", ID, "field", REVISION), null);
+                    Map.of("id", ID, FIELD, REVISION), null);
         }
         return revision;
     }
@@ -137,7 +138,7 @@ final class ConfigurationVersion {
 
     private static void advanceRaw(ClientSession session, MongoCollection<Document> versions, long revision) {
         if (revision >= Long.MAX_VALUE - 1) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", ID, "field", REVISION), null);
+                Map.of("id", ID, FIELD, REVISION), null);
         long modified = versions.updateOne(session, new Document("_id", ID).append(REVISION, revision),
                 new Document("$inc", new Document(REVISION, 1L))).getModifiedCount();
         if (modified != 1) throw new IllegalStateException("revision changed within one transaction snapshot");
@@ -200,6 +201,6 @@ final class ConfigurationVersion {
     }
 
     private static TapstateException unreadable(String field) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", ID, "field", field), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", ID, FIELD, field), null);
     }
 }
