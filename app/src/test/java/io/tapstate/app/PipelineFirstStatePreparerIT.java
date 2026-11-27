@@ -7,16 +7,26 @@ import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.control.core.ArtifactQueryService;
+import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.PipelineCatalogItem;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.FirstPipelineCreationResult;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelinePreparationInputs;
@@ -45,6 +55,8 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Concrete app orchestration over isolated CONFIG/CACHE replica sets. */
 @RequiresDocker
@@ -377,6 +389,82 @@ class PipelineFirstStatePreparerIT {
                 var historical = port.observations().read("flow").orElseThrow().failure();
                 assertThat(historical.code()).isEqualTo(failure.code());
                 assertThat(historical.params()).isEmpty();
+            }
+        });
+    }
+
+    @Test void clearingStopSettlesAfterFailedUnassignedFirstStart() {
+        withFixture(false, f -> {
+            var id = f.scope.pipelineId();
+            var intents = f.configuration.intents();
+            var bound = mock(StorageRuntime.Bound.class);
+            when(bound.cache()).thenReturn(f.cache);
+            when(bound.preparation()).thenReturn(f.configuration.bindings().cachePreparation().orElseThrow());
+            var port = new ThreeLayerStorePort(f.configuration, bound,
+                    ignored -> { throw new AssertionError("Unexpected synchronous preparation"); },
+                    (scope, inputs) -> { throw new AssertionError("Unexpected synchronous preparation"); }, true);
+            var artifacts = new ArtifactQueryService(port.artifacts());
+            var observations = new PipelineObservationQueryService(artifacts, port.observations());
+            var catalog = new PipelineCatalogService(artifacts, new PipelineDraftService(mock(PipelineDraftStore.class)),
+                    observations, port);
+            var lifecycle = new PipelineLifecycleService(artifacts, port.desired(),
+                    new AuditGate(f.configuration.audit(), CLOCK), port.state()::read);
+
+            var rebuildStore = f.configuration.rebuilds();
+            var noteRetirement = new PipelinePrivateNoteRetirement(f.configuration.requiredNotes(), rebuildStore,
+                    (notes, config, purpose, cluster, guard) -> { throw new AssertionError("Unexpected connector release"); });
+            var rebuilds = new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(
+                    f.configuration.artifacts(), f.cache.schemas(f.business(), ACTIVE), f.cache,
+                    f.cache.srs(f.business(), ACTIVE).consumers(), rebuildStore, f.cache.pipelineRebuilds(f.business(), ACTIVE)),
+                    noteRetirement, () -> f.node, ACTIVE, (request, manifest) -> {}, TTL, CLOCK);
+            var resumeResults = new ArrayList<Boolean>();
+            var membership = mock(ClusterMembershipGate.class);
+            when(membership.businessEligible()).thenReturn(true);
+            var ownership = PipelineActuationOwnership.nodeBacked(f.business(), f.node, membership,
+                    new ClusterWorkloadClaims(f.cache.workloadClaims(f.business()), membership),
+                    TTL, Duration.ofSeconds(10), System::nanoTime);
+            var ports = new ConvergenceDriver.ScopedPorts(intents, f.cache, ACTIVE,
+                    pass -> { throw new AssertionError("Unexpected runtime actuation"); }, pass -> null,
+                    ignored -> {}, PipelineAlertFeed.none(), pending -> {
+                        throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", "revision"), null);
+                    }, pipelineId -> intents.load(pipelineId)
+                            .filter(intent -> !intent.deleted() && PipelineRebuildCoordinator.clearsPrivateCapture(intent.desired()))
+                            .ifPresent(intent -> {
+                                try (var ignored = ownership.enterPass(intent.scope())) {
+                                    resumeResults.add(rebuilds.resume(intent.scope(), Optional.empty()).isPresent());
+                                }
+                            }));
+            try (var driver = ConvergenceDriver.scoped(null, mock(ObservationPublisher.class), null, null,
+                    () -> true, ownership, ports)) {
+                var entry = port.desired().startEntry(id).orElseThrow();
+                String hash = CanonicalHash.of(entry.pipeline());
+                var captured = new DesiredStore.StartPreparation(f.scope,
+                        new PipelinePreparationInputs(hash, Map.of(), Map.of(), List.of()));
+                port.desired().saveStart(new DesiredState(id, PipelineState.RUNNING, hash), entry.intent(), Optional.of(captured));
+                driver.reconcile();
+                assertThat(port.observations().read(id).orElseThrow().failure().code())
+                        .isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+                assertThat(f.configuration.preparations().read(id).orElseThrow().phase())
+                        .isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                assertThat(f.state()).isNull();
+
+                assertThat(lifecycle.stop("operator", id, true).targetState()).isEqualTo(PipelineState.STOPPED);
+                driver.reconcile();
+                driver.reconcile();
+
+                var detail = catalog.find(id).orElseThrow();
+                assertThat(catalog.list()).containsExactly(detail);
+                var intent = intents.load(id).orElseThrow();
+                var preparation = f.configuration.preparations().read(id).orElseThrow();
+                var mapping = f.configuration.pipelineStates().read(id).orElseThrow();
+                assertThat(detail.status())
+                        .as("Clearing Stop after two reconciliation passes: purgeState=%s, preparation=%s, mapping=%s, "
+                                        + "checkpointExists=%s, actuationAdmitted=%s, pendingStart=%s, resumedRebuilds=%s",
+                                intent.desired().purgeState(), preparation.phase(), mapping.phase(), f.state() != null,
+                                intents.loadForActuation(id).isPresent(), intents.pendingStart(id).isPresent(), resumeResults)
+                        .matches(status -> status.displayState() != PipelineCatalogItem.UiState.STOPPING
+                                        && status.stopState() != PipelineCatalogItem.StopState.CLEARING,
+                                "the clearing Stop has settled");
             }
         });
     }

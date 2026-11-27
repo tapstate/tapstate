@@ -63,6 +63,8 @@ final class StartFlow {
         StartAttempt start(String pipelineId, List<StartDecision> decisions, String ifMatch);
 
         StartChecksOutcome checks(String pipelineId, String intent);
+
+        StatusOutcome status(String pipelineId);
     }
 
     /** What the session reports for this flow the way it reports everything else. */
@@ -346,20 +348,31 @@ final class StartFlow {
         return new RerunPlan.Ready(decided, checks);
     }
 
-    /**
-     * The start half of a rerun, after the clearing stop went through. A start refused now leaves the
-     * pipeline stopped with its state cleared, and that is said plainly, with the command that starts it.
-     */
+    /** The start half of a rerun, after the server accepts the clearing Stop. */
     Result startAfterRerunStop(String id, RerunPlan.Ready plan, Answering answering) {
         Result result = send(id, new ArrayList<>(plan.decisions()), plan.checks().contentHash(), plan.checks(),
                 answering);
         if (result.exitCode() != Cli.EXIT_OK) {
-            err.println(verb + ": " + id + " was stopped and its state cleared, but it has not been started; "
-                    + "it reads its whole source when it is. Start it with: " + startCommand(id)
-                    + answersFor(result.checks()));
-            err.flush();
+            reportRerunStartFailure(id, result.checks());
         }
         return result;
+    }
+
+    void reportRerunStartFailure(String id, StartChecks checks) {
+        var clear = server.status(id).stopDetails();
+        if (clear.failureCode() != null) {
+            reporting.rejection(clear.failureCode(), clear.failureMessage(), clear.failureParams());
+            return;
+        }
+        String retry = startCommand(id) + answersFor(checks);
+        if ("CLEARED".equals(clear.state())) {
+            err.println(verb + ": " + id + " state is cleared. Start it with: " + retry);
+        } else if ("CLEARING".equals(clear.state())) {
+            err.println(verb + ": " + id + " is still clearing. After clearing completes, run: " + retry);
+        } else {
+            err.println(verb + ": " + id + " clear result is unconfirmed. Check its status before retrying Start.");
+        }
+        err.flush();
     }
 
     // ---- answering -----------------------------------------------------------------------------------
