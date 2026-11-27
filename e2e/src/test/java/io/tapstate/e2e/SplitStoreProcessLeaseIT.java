@@ -51,14 +51,17 @@ class SplitStoreProcessLeaseIT {
              MongoClient cacheObserver = MongoClients.create(CACHE.getReplicaSetUrl(cacheDb));
              var cluster = start(prepared)) {
             for (String node : NODES) assertThat(cluster.awaitMembers(node, 3)).containsExactlyInAnyOrderElementsOf(NODES);
-            Await.until("all original node boots to be durably observed",()->configObserver.getDatabase(configDb).getCollection("alert_node_lifecycles")
-                    .countDocuments(new Document("phase","EXPECTED"))==3,()->"the original lifecycle facts are incomplete");
             for(String node:NODES)cluster.member(node).awaitInitialAlertMaintenance();
             var keys = configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>());
             assertThat(keys).hasSize(1);
             assertThat(cluster.member(NODES.getFirst()).artifactIds()).contains("views");
             var original = claims(cacheObserver, cacheDb);
             assertThat(original.keySet()).containsExactlyInAnyOrderElementsOf(NODES);
+            var members = cluster.member(NODES.getFirst()).clusterMembers();
+            assertThat(members).extracting(ClusterMemberFacts::nodeId).containsExactlyInAnyOrderElementsOf(NODES);
+            for (var member : members) {
+                assertThat(member.bootId()).isNotBlank().isEqualTo(original.get(member.nodeId()).getString("ownerBootId"));
+            }
             CONFIG.getDockerClient().pauseContainerCmd(CONFIG.getContainerId()).exec();
             try {
                 long pausedAt = System.nanoTime();
@@ -90,12 +93,12 @@ class SplitStoreProcessLeaseIT {
             var replacement = claims(cacheObserver, cacheDb).get(NODES.getFirst());
             assertThat(replacement.getString("ownerBootId")).isNotEqualTo(oldBoot);
             assertThat(((Number) replacement.get("claimGeneration")).longValue()).isGreaterThan(generation);
-            String replacementBoot=replacement.getString("ownerBootId");
-            Await.until("the orderly retirement and replacement boot facts",()->{
-                var facts=configObserver.getDatabase(configDb).getCollection("alert_node_lifecycles");
-                return facts.countDocuments(new Document("nodeId",NODES.getFirst()).append("bootId",oldBoot).append("phase","RETIRING"))==1
-                        &&facts.countDocuments(new Document("nodeId",NODES.getFirst()).append("bootId",replacementBoot).append("phase","EXPECTED"))==1;
-            },()->"the original retirement or replacement lifecycle fact is absent");
+            String replacementBoot = replacement.getString("ownerBootId");
+            Await.until("a surviving member to observe only the replacement boot",
+                    () -> cluster.member(NODES.get(1)).clusterMembers().stream()
+                            .filter(member -> member.nodeId().equals(NODES.getFirst()))
+                            .map(ClusterMemberFacts::bootId).toList().equals(List.of(replacementBoot)),
+                    () -> "the surviving member has not observed the replacement session");
             var after=configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>());assertThat(after).hasSize(1);
             var originalIdentity=new Document(keys.getFirst());originalIdentity.remove("sourceWriteFence");
             var replacementIdentity=new Document(after.getFirst());replacementIdentity.remove("sourceWriteFence");
