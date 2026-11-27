@@ -854,9 +854,9 @@ final class ConvergenceDriver implements AutoCloseable {
             var projection = PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_SAMPLE, () -> {
                 if (stage != null) stage.diagnosticSampleId = PipelineDiagnostics.currentPassId();
                 return scoped.observations() == null
-                        ? publisher.publishRunningScoped(scope, checkpoint, destination, current)
+                        ? publisher.publishRunningScoped(scope, checkpoint, destination, current, pass.metricState())
                         : scoped.observations().publishRunning(publisher, pass, checkpoint, config, current,
-                                requireCurrentTicket, () -> publisher.publishRunningScoped(scope, checkpoint, destination, current), deferred);
+                                requireCurrentTicket, () -> publisher.publishRunningScoped(scope, checkpoint, destination, current, pass.metricState()), deferred);
             });
             projection.ifPresent(published -> {
                 if (stage == null) {
