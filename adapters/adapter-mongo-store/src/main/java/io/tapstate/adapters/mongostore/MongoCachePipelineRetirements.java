@@ -118,6 +118,11 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                 Map.entry(SystemCollections.CACHE_SNAPSHOT_ORDERS,"_id.pipelineId"),Map.entry(SystemCollections.CACHE_SNAPSHOT_COUNTS,"_id.scope.pipelineId"),
                 Map.entry(SystemCollections.CACHE_PIPELINE_RATE_HISTORY,"scope.pipelineId")))
             if(entry.getKey().on(database).find(session,new Document(entry.getValue(),scope.pipelineId())).first()!=null)throw rebuild(scope);
+
+        var observations = SystemCollections.CACHE_PIPELINE_OBSERVATION;
+        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(observations);
+        if (observations.on(database).find(session, MongoCachePipelineObservationStore.scopeFilter(scope))
+                .projection(new Document("_id", 1)).first() != null) throw rebuild(scope);
     }
 
     void requireUnpreparedAbsent(PipelineIntentScope scope, Duration rateRetention) {
