@@ -24,6 +24,7 @@ import java.util.UUID;
 
 /** Application service for durable draft CAS, preview compilation, and atomic publication. */
 public final class PipelineDraftService {
+    private static final String REASON = "reason";
 
     private final PipelineDraftStore store;
     private final PipelineDraftCompiler compiler;
@@ -82,10 +83,10 @@ public final class PipelineDraftService {
     /** Observes a new Pipeline ID without reserving it or inspecting an occupied definition. */
     public boolean idAvailable(String pipelineId) {
         if (pipelineId == null || pipelineId.isBlank()) {
-            throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "id must be non-blank"), null);
+            throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(REASON, "id must be non-blank"), null);
         }
         DslParser.idCharacterRequirement(pipelineId).ifPresent(required -> {
-            throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "id must be " + required), null);
+            throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(REASON, "id must be " + required), null);
         });
         return !store.idOccupied(pipelineId).orElseGet(() -> {
             // Portable stores can supply their own exact reads instead of the native combined observation.

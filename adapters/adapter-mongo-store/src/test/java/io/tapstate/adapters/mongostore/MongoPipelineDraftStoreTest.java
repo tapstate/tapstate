@@ -84,6 +84,36 @@ class MongoPipelineDraftStoreTest {
         verify(attempt.session()).abortTransaction();
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void legacyOccupancyChecksOnlyPrimaryIdHeadersAndRejectsUnreadableTombstones() {
+        var client = mock(MongoClient.class);
+        MongoCollection<Document> drafts = mock(MongoCollection.class, RETURNS_SELF);
+        MongoCollection<Document> artifacts = mock(MongoCollection.class, RETURNS_SELF);
+        FindIterable<Document> draftQuery = mock(FindIterable.class, RETURNS_SELF);
+        FindIterable<Document> artifactQuery = mock(FindIterable.class, RETURNS_SELF);
+        var id = new Document("_id", "orders");
+        when(artifacts.find(id)).thenReturn(artifactQuery);
+        when(drafts.find(id)).thenReturn(draftQuery);
+        var store = new MongoPipelineDraftStore(client, drafts, artifacts);
+        when(artifactQuery.first()).thenReturn(id, null);
+        when(draftQuery.first()).thenReturn(null, id, new Document("deleted", true).append("revision", 1L),
+                new Document("deleted", true));
+
+        assertThat(store.idOccupied("orders")).contains(true);
+        verify(drafts, never()).find(id);
+        assertThat(store.idOccupied("orders")).contains(false);
+        assertThat(store.idOccupied("orders")).contains(true);
+        assertThat(store.idOccupied("orders")).contains(false);
+        assertThatThrownBy(() -> store.idOccupied("orders"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        verify(artifacts, times(5)).withReadPreference(com.mongodb.ReadPreference.primary());
+        verify(drafts, times(4)).withReadPreference(com.mongodb.ReadPreference.primary());
+        verify(artifactQuery, times(5)).projection(new Document("_id", 1));
+        verify(draftQuery, times(4)).projection(new Document("_id", 1).append("deleted", 1).append("revision", 1));
+    }
+
     private record CommitAttempt(ClientSession session, Supplier<PipelineDraftMutation> write,
                                  PipelineDraftMutation success) {}
 

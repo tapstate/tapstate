@@ -33,6 +33,9 @@ import java.util.logging.Logger;
 /** Mongo persistence for Pipeline drafts and the cross-collection publish transaction. */
 public final class MongoPipelineDraftStore implements PipelineDraftStore {
 
+    private static final String DELETED = "deleted";
+    private static final String PIPELINE_ID = "pipelineId";
+    private static final String FIELD = "field";
     private static final String REVISION = "revision";
     private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final Logger LOG = Logger.getLogger(MongoPipelineDraftStore.class.getName());
@@ -58,19 +61,18 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
 
     @Override
     public Optional<Boolean> idOccupied(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         return Optional.of(StoreIo.call(() -> {
             var key = new Document("_id", pipelineId);
-            var idOnly = new Document("_id", 1);
             if (artifacts.withReadPreference(com.mongodb.ReadPreference.primary()).find(key)
-                    .projection(idOnly).first() != null) return true;
+                    .projection(new Document("_id", 1)).first() != null) return true;
             var row = drafts.withReadPreference(com.mongodb.ReadPreference.primary()).find(key)
-                    .projection(idOnly.append("deleted", 1).append(REVISION, 1)).first();
+                    .projection(new Document("_id", 1).append(DELETED, 1).append(REVISION, 1)).first();
             if (row == null) return false;
-            if (!Boolean.TRUE.equals(row.getBoolean("deleted"))) return true;
+            if (!Boolean.TRUE.equals(row.getBoolean(DELETED))) return true;
             if (!(row.get(REVISION) instanceof Number)) {
                 throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                        Map.of("id", pipelineId, "field", REVISION), null);
+                        Map.of("id", pipelineId, FIELD, REVISION), null);
             }
             return false;
         }));

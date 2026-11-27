@@ -35,6 +35,8 @@ import java.util.logging.Logger;
 
 /** Private draft saves keep their own CAS; publication joins the existing configuration artifact transaction. */
 final class MongoConfigurationDraftStore implements PipelineDraftStore {
+    private static final String DELETED = "deleted";
+    private static final String DRAFT_SLOT = "draft";
     private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
@@ -84,33 +86,45 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
     @Override public Optional<Boolean> idOccupied(String id) {
         Objects.requireNonNull(id, "id");
         return Optional.of(StoreIo.call(() -> {
-            var stages = MongoStartConfigRead.root();
-            stages.add(new Document("$project", new Document("_id", 1)));
-            var kindCollections = artifacts.artifactIdCollections();
-            // All authoring kinds share the create-only ID namespace, including those that are not Pipelines.
-            for (int i = 0; i < kindCollections.size(); i++) {
-                stages.add(occupancyLookup(kindCollections.get(i), "artifact" + i, id, new Document("_id", 1)));
-            }
-            var deleted = new Document("$eq", List.of("$deleted", true));
-            var draftHeader = new Document("_id", 1).append("deleted", deleted)
-                    .append("tombstone", new Document("$cond",
-                            List.of(deleted, MongoStartConfigRead.boundedValue(), false)));
-            stages.add(occupancyLookup(SystemCollections.CONFIG_PIPELINE_DRAFTS.collectionName(), "draft", id, draftHeader));
+            var kinds = artifacts.artifactIdCollections();
+            var stages = occupancyStages(id, kinds);
             Document result = MongoValidationClaimObservation.lacksSnapshotRead(client)
                     ? transaction(session -> MongoStartConfigRead.snapshot(database, session, stages))
                     : MongoStartConfigRead.snapshot(database, stages);
-            if (result == null) throw unreadableIdObservation(id);
-            for (int i = 0; i < kindCollections.size(); i++) {
-                if (!result.getList("artifact" + i, Document.class).isEmpty()) return true;
-            }
-            List<Document> found = result.getList("draft", Document.class);
-            if (found.isEmpty()) return false;
-            var draft = found.getFirst();
-            if (!Boolean.TRUE.equals(draft.get("deleted"))) return true;
-            if (!(draft.get("tombstone") instanceof Document tombstone)) throw unreadableIdObservation(id);
-            codec.tombstoneRevision(tombstone);
-            return false;
+            return occupied(result, id, kinds.size());
         }));
+    }
+
+    private static List<Document> occupancyStages(String id, List<String> kinds) {
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$project", new Document("_id", 1)));
+        // Every authoring kind shares the create-only ID namespace.
+        for (int i = 0; i < kinds.size(); i++) {
+            stages.add(occupancyLookup(kinds.get(i), artifactSlot(i), id, new Document("_id", 1)));
+        }
+        var deleted = new Document("$eq", List.of("$" + DELETED, true));
+        var draftHeader = new Document("_id", 1).append(DELETED, deleted)
+                .append("tombstone", new Document("$cond", List.of(deleted, MongoStartConfigRead.boundedValue(), false)));
+        stages.add(occupancyLookup(SystemCollections.CONFIG_PIPELINE_DRAFTS.collectionName(), DRAFT_SLOT, id, draftHeader));
+        return stages;
+    }
+
+    private boolean occupied(Document result, String id, int kinds) {
+        if (result == null) throw unreadableIdObservation(id);
+        for (int i = 0; i < kinds; i++) {
+            if (!result.getList(artifactSlot(i), Document.class).isEmpty()) return true;
+        }
+        var found = result.getList(DRAFT_SLOT, Document.class);
+        if (found.isEmpty()) return false;
+        var draft = found.getFirst();
+        if (!Boolean.TRUE.equals(draft.get(DELETED))) return true;
+        if (!(draft.get("tombstone") instanceof Document tombstone)) throw unreadableIdObservation(id);
+        codec.tombstoneRevision(tombstone);
+        return false;
+    }
+
+    private static String artifactSlot(int index) {
+        return "artifact" + index;
     }
 
     private static Document occupancyLookup(String collection, String field, String id, Document projection) {
