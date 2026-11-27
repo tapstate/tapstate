@@ -72,8 +72,11 @@ public enum ControlError implements TapstateErrorCode {
     /** The configured browser authentication public-origin allow-list is invalid. */
     BROWSER_AUTH_CONFIG_INVALID(RequestErrorDefinitions.BROWSER_AUTH_CONFIG_INVALID),
 
-    /** Managed authentication was reached before its real SDK/validated deployment binding was installed. */
+    /** Managed authentication could not reach or use its configured provider. */
     CLOUD_AUTH_UNAVAILABLE(RequestErrorDefinitions.CLOUD_AUTH_UNAVAILABLE),
+
+    /** The Cloud provider rejected an expired or unusable one-time sign-in link. */
+    CLOUD_SIGN_IN_LINK_INVALID(RequestErrorDefinitions.CLOUD_SIGN_IN_LINK_INVALID),
 
     /** A Cloud author attempted to select the deployment-owned Nest state database. */
     STATE_DATABASE_UNAVAILABLE(RequestErrorDefinitions.STATE_DATABASE_UNAVAILABLE),

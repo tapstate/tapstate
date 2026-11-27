@@ -133,6 +133,8 @@ jobs:
         id: onprem-seed
         env:
           GH_TOKEN: ${{ github.token }}
+          TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
+          TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS: "1"
         shell: bash
         run: |
           set -euo pipefail
@@ -349,6 +351,8 @@ jobs:
       - name: stage the exact published connector and license bytes
         env:
           GH_TOKEN: ${{ github.token }}
+          TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
+          TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS: "1"
         shell: bash
         run: |
           set -euo pipefail

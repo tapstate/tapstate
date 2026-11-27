@@ -21,6 +21,7 @@ import io.tapstate.control.core.CloudLoginIdentity;
 import io.tapstate.control.core.CloudRuntimeStatus;
 import io.tapstate.control.core.CloudSessionCallbackVerifier;
 import io.tapstate.control.core.CloudStatusSender;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.Scope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionContext;
@@ -71,9 +72,9 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EXCHANGE)) {
             ExchangeResult result = sdk.exchange(exchangeCode);
             return new CloudCodeExchangeResult(result.jwt(), result.context());
-        } catch (ProviderFailure unavailable) {
+        } catch (ProviderFailure failure) {
             MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EXCHANGE);
-            throw CloudAuthenticationService.unavailable();
+            throw new TapstateException(failure.error, Map.of(), null);
         }
     }
 
@@ -335,8 +336,15 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     }
 
     static final class ProviderFailure extends RuntimeException {
+        private final ControlError error;
+
         ProviderFailure() {
+            this(ControlError.CLOUD_AUTH_UNAVAILABLE);
+        }
+
+        private ProviderFailure(ControlError error) {
             super(null, null, false, false);
+            this.error = error;
         }
     }
 
@@ -405,6 +413,12 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 return exchangeResult(sdk.exchangeForJwt(code));
             } catch (CloudControlPlaneException failure) {
                 logExchangeFailure(failure);
+                String upstreamCode = failure.getErrorCode();
+                if (failure.getHttpStatus() == 401
+                        && ("exchange.code-expired".equals(upstreamCode)
+                                || "exchange.code-consumed".equals(upstreamCode))) {
+                    throw new ProviderFailure(ControlError.CLOUD_SIGN_IN_LINK_INVALID);
+                }
                 throw new ProviderFailure();
             }
         }
