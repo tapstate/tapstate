@@ -21,12 +21,18 @@ import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ContentHash;
+import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -104,15 +110,123 @@ class MongoCacheMetadataStoresIT {
             assertThat(chains.load("absent")).isEmpty();
         });
     }
+    @Test void legacyClaimsDoNotUseCatalogOrWritePreparationRecords() {
+        withFixture(f -> {
+            var claims = f.domain.workloadClaims(SCOPE);
+            var owner = new WorkloadOwner("node", "boot");
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, owner.nodeId());
+            var processOwner = new WorkloadOwner(SCOPE.clusterId(), "process-boot");
+            var processKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, processOwner.nodeId());
+            var ttl = Duration.ofSeconds(30);
+            assertNoClaimCatalogReads(() -> {
+                assertThat(claims.acquire(key, owner, 1, ttl).acquired()).isTrue();
+                assertThat(claims.acquireProcessNode(processKey, processOwner, ttl).acquired()).isTrue();
+            });
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database);
+            assertThat(table.countDocuments()).isEqualTo(2);
+            assertThat(table.find(new Document("_id", "business-preparation")).first()).isNull();
+            assertThat(SystemCollections.CACHE_IDENTITY.on(f.database).find().first())
+                    .doesNotContainKey("claimNamespaceProofVersion");
+        });
+    }
+
+    @Test void aLegacyClaimStorageFailureDoesNotInspectTheCatalog() {
+        withFixture(f -> {
+            var claims = f.domain.workloadClaims(SCOPE);
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node");
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
+            table.on(f.database).drop();
+            f.database.createView(table.collectionName(), "unavailable_claims", List.of());
+            var owner = new WorkloadOwner("node", "boot");
+            var ttl = Duration.ofSeconds(30);
+            assertNoClaimCatalogReads(() -> assertThatThrownBy(() -> claims.acquire(key, owner, 1, ttl))
+                    .isInstanceOf(TapstateException.class));
+            assertThat(f.admissions()).isZero();
+        });
+    }
+
     @Test void aWarmClaimViewCannotRecreateADroppedClaimNamespace() {
-        withFixture(f->{
-            var claims=f.domain.workloadClaims(SCOPE);
-            var owner=new io.tapstate.spi.store.WorkloadOwner("node","boot");
-            var original=new io.tapstate.spi.store.WorkloadClaimKey(SCOPE.clusterId(),io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION,"node");
-            claims.acquire(original,owner,1,Duration.ofSeconds(30));
-            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).drop();
-            assertThatThrownBy(()->claims.acquire(original,owner,1,Duration.ofSeconds(30))).isInstanceOf(TapstateException.class);
-            assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName());
+        withFixture(f -> {
+            f.protectClaimNamespace();
+            var claims = f.domain.workloadClaims(SCOPE);
+            var owner = new WorkloadOwner("node", "boot");
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node");
+            var ttl = Duration.ofSeconds(30);
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            io.tapstate.spi.store.WorkloadClaimAttempt original;
+            try {
+                original = ((DeadlineWorkloadClaimStore) claims).withClaimAcquisitionDeadline(key, deadline, ACTIVE,
+                        () -> claims.acquire(key, owner, 1, ttl));
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).doesNotContain("listCollections");
+            assertThat(original.acquired()).isTrue();
+            var renewed = claims.acquire(key, owner, 1, ttl);
+            assertThat(renewed.acquired()).isTrue();
+            assertThat(renewed.claim().claimGeneration()).isEqualTo(original.claim().claimGeneration());
+            assertThat(renewed.claim().owner()).isEqualTo(owner);
+            var competing = claims.acquire(key, new WorkloadOwner("other-node", "other-boot"), 1, ttl);
+            assertThat(competing.acquired()).isFalse();
+            assertThat(competing.claim()).isEqualTo(renewed.claim());
+
+            var processOwner = new WorkloadOwner(SCOPE.clusterId(), "process-boot");
+            var processKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, processOwner.nodeId());
+            assertNoClaimCatalogReads(() ->
+                    assertThat(claims.acquireProcessNode(processKey, processOwner, ttl).acquired()).isTrue());
+
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
+            table.on(f.database).drop();
+            long admissions = f.admissions();
+            assertNoClaimCatalogReads(() -> {
+                assertCode(() -> claims.acquire(key, owner, 1, ttl), IoError.DOCUMENT_UNREADABLE);
+                assertCode(() -> claims.acquireProcessNode(processKey, processOwner, ttl), IoError.DOCUMENT_UNREADABLE);
+            });
+            assertThat(f.database.listCollectionNames()).doesNotContain(table.collectionName());
+            assertThat(f.admissions()).isEqualTo(admissions);
+
+            table.prepareCollectionOn(f.database);
+            var anotherView = f.domain.workloadClaims(SCOPE);
+            assertNoClaimCatalogReads(() -> {
+                assertCode(() -> claims.acquire(key, owner, 1, ttl), IoError.DOCUMENT_UNREADABLE);
+                assertCode(() -> anotherView.acquireProcessNode(processKey, processOwner, ttl), IoError.DOCUMENT_UNREADABLE);
+            });
+            assertThat(table.on(f.database).countDocuments()).isZero();
+            assertThat(f.admissions()).isEqualTo(admissions);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aDropBeforeThePreparedClaimReadCannotCommitAnImplicitNamespace(boolean processOwned) {
+        withFixture(f -> {
+            f.protectClaimNamespace();
+            var claims = f.domain.workloadClaims(SCOPE);
+            var owner = new WorkloadOwner(processOwned ? SCOPE.clusterId() : "node", "boot");
+            var key = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, owner.nodeId());
+            var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
+            long admissions = f.admissions();
+            var dropped = new AtomicBoolean();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (collection.equals(table.collectionName()) && !dropped.get()) {
+                    f.database.runCommand(new Document("drop", collection).append("maxTimeMS", 2_000));
+                    dropped.set(true);
+                }
+            });
+            var ttl = Duration.ofSeconds(30);
+            org.assertj.core.api.ThrowableAssert.ThrowingCallable acquire = processOwned
+                    ? () -> claims.acquireProcessNode(key, owner, ttl)
+                    : () -> claims.acquire(key, owner, 1, ttl);
+            try {
+                assertThatThrownBy(acquire).isInstanceOf(TapstateException.class);
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+            assertThat(dropped).isTrue();
+            assertThat(f.database.listCollectionNames()).doesNotContain(table.collectionName());
+            assertThat(f.admissions()).isEqualTo(admissions);
         });
     }
     @Test void smallResourcesRemainSeparateAndPreserveCanonicalBodiesAndByteExactSpecs() {
@@ -542,6 +656,14 @@ class MongoCacheMetadataStoresIT {
         });
     }
 
+    private static void assertNoClaimCatalogReads(Runnable action) {
+        var commands = new ArrayList<String>();
+        MongoCommandObservation.CURRENT.set(commands::add);
+        try { action.run(); }
+        finally { MongoCommandObservation.CURRENT.remove(); }
+        assertThat(commands).isNotEmpty().doesNotContain("listCollections");
+    }
+
     private static MongoClient client(CommandListener listener) { return MongoClients.create(MongoClientSettings.builder()
             .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build()); }
     private static boolean updates(CommandStartedEvent event, String table) { return event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals(table); }
@@ -575,6 +697,14 @@ class MongoCacheMetadataStoresIT {
         catch (Exception failure) { throw new AssertionError(failure); }
     }
     private record Fixture(MongoClient client, MongoDatabase database, MongoCacheDomain domain, StorageBinding.Connection binding) {
+        void protectClaimNamespace() {
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).insertOne(new Document("_id", "business-preparation")
+                    .append("clusterId", SCOPE.clusterId()).append("bindingVersion", SCOPE.bindingVersion())
+                    .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("businessPreparationId", "business-a"));
+            SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimNamespaceProofVersion", 1)));
+        }
+
         long admissions() { return SystemCollections.CACHE_IDENTITY.on(database).find().first().getLong("claimAdmissionFence"); }
         Map<String, List<Document>> snapshot() {
             var out = new java.util.TreeMap<String, List<Document>>(); var names = database.listCollectionNames().into(new ArrayList<>());

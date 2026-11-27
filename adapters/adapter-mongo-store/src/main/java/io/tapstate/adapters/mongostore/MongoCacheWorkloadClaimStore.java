@@ -22,6 +22,8 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
+import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.Document;
 
 import java.time.Duration;
@@ -33,6 +35,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
@@ -220,15 +223,23 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 return raw.inStrictSession(session).acquireRetainedCapture(key, owner, topologyRevision, ttl, row);
             }, null);
         }
-        return transaction(true, (store, session) -> {
-            if (key.type() == WorkloadClaimType.VALIDATION) {
+        if (key.type() == WorkloadClaimType.VALIDATION) {
+            return transaction(true, (store, session) -> {
                 var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
                 requireValidationClaim(session, row, key);
                 return store.acquireExisting(key, owner, topologyRevision, ttl);
-            }
-            return store.acquire(key,owner,topologyRevision,ttl);
-        });
+            });
+        }
+        return acquireInPreparedNamespace(store -> store.acquire(key, owner, topologyRevision, ttl));
     }
+
+    private WorkloadClaimAttempt acquireInPreparedNamespace(Function<MongoWorkloadClaimStore, WorkloadClaimAttempt> acquire) {
+        return transaction((session, budget) -> {
+            new MongoCacheBusinessIdentity(database, scope).admitUpsertingClaim(session);
+            return acquire.apply(raw.inStrictSession(session));
+        }, null, false);
+    }
+
     @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
         return acquireValidationExecution(key, owner, topologyRevision, ttl, null);
@@ -265,7 +276,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(key);
         if (key.type() != WorkloadClaimType.NODE_SESSION || !scope.clusterId().equals(key.resourceId())
                 || !key.resourceId().equals(owner.nodeId())) throw claimFenced();
-        return transaction(true, (store, session) -> store.acquireProcessNode(key, owner, proofWindow));
+        return acquireInPreparedNamespace(store -> store.acquireProcessNode(key, owner, proofWindow));
     }
 
     @Override public WorkloadClaimAttempt acquireNodeBackedCapture(WorkloadClaimKey key, WorkloadClaimFence node, long revision) {
@@ -651,33 +662,14 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private <T> T transaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
             java.util.function.Consumer<T> verifyCommitted) {
-        return MongoStructureFailureScope.inspectOnFailure(client, operations.budget(), () -> StoreIo.call(() -> {
+        return transaction(callback, verifyCommitted, true);
+    }
+
+    private <T> T transaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
+            java.util.function.Consumer<T> verifyCommitted, boolean inspectOnFailure) {
+        return MongoStructureFailureScope.observe(client, operations.budget(), inspectOnFailure, () -> StoreIo.call(() -> {
             try {
-                if(operations.budget()==null)operations.requireAdmission();
-                requireActive.run();
-                requireValidationAuthority();
-                var budget = operations.budget();
-                if (budget != null) {
-                    var result = boundedTransaction(callback, budget);
-                    if (verifyCommitted != null) verifyCommitted.accept(result);
-                    return result;
-                }
-                for (int attempt = 0; ; attempt++) {
-                    T committed;
-                    try {
-                        committed = MongoCacheAdmissionQueue.driverTransaction(client, operations, TRANSACTION,
-                                session -> checkedAttempt(session, null, callback));
-                    } catch (MongoException conflict) {
-                        // A duplicate-key error aborts its transaction; retry the original callback,
-                        // never keep using that session or adopt another scope.
-                        if (attempt >= 2 || ErrorCategory.fromErrorCode(conflict.getCode()) != ErrorCategory.DUPLICATE_KEY) throw conflict;
-                        continue;
-                    }
-                    // CONFIG registration verifies the exact committed owner without replaying a CACHE write on failure.
-                    if (verifyCommitted == null) requireValidationAuthority();
-                    else verifyCommitted.accept(committed);
-                    return committed;
-                }
+                return runTransaction(callback, verifyCommitted);
             } catch (RuntimeException failed) {
                 operations.structures.clear();
                 // A known closed/revoked owner is diagnosed before a driver's closed-client failure.
@@ -685,6 +677,36 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 throw failed;
             }
         }));
+    }
+
+    private <T> T runTransaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
+            java.util.function.Consumer<T> verifyCommitted) {
+        if (operations.budget() == null) operations.requireAdmission();
+        requireActive.run();
+        requireValidationAuthority();
+        var budget = operations.budget();
+        if (budget != null) {
+            var result = boundedTransaction(callback, budget);
+            if (verifyCommitted != null) verifyCommitted.accept(result);
+            return result;
+        }
+        T committed = unboundedTransaction(callback);
+        // CONFIG registration verifies the exact committed owner without replaying a CACHE write on failure.
+        if (verifyCommitted == null) requireValidationAuthority();
+        else verifyCommitted.accept(committed);
+        return committed;
+    }
+
+    private <T> T unboundedTransaction(BiFunction<ClientSession, MongoReadBudget, T> callback) {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return MongoCacheAdmissionQueue.driverTransaction(client, operations, TRANSACTION,
+                        session -> checkedAttempt(session, null, callback));
+            } catch (MongoException conflict) {
+                // A duplicate-key error aborts its transaction; retry the original callback in a new session.
+                if (attempt >= 2 || ErrorCategory.fromErrorCode(conflict.getCode()) != ErrorCategory.DUPLICATE_KEY) throw conflict;
+            }
+        }
     }
 
     private <T> T attempt(ClientSession session, boolean admission, PipelineIntentScope pipeline,
@@ -828,8 +850,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     static void requireCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
-        Document found = database.listCollections().filter(new Document("name", table.collectionName())).first();
-        if (found == null || !"collection".equals(found.get("type"))) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", "cache-business", "field", "workload-claims"), null);
+        var found = database.listCollections(BsonDocument.class).filter(new Document("name", table.collectionName())).first();
+        if (found == null || !new BsonString("collection").equals(found.get("type")))
+            throw MongoCacheBusinessIdentity.unreadableClaimNamespace();
     }
 }
