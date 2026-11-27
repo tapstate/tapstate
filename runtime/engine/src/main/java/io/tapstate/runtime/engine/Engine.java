@@ -244,6 +244,9 @@ public final class Engine {
         }
     }
 
+    public record RunMetrics(long jobId, OperatorRunManifest manifest, CaptureReading captured,
+            DeliveryReading delivered, StageReading stages) {}
+
     /** A local, non-serializable handle for the one concrete job whose configuration was verified. */
     public final class Run {
         private final String pipelineId;
@@ -262,6 +265,15 @@ public final class Engine {
                     || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
             return originalManifest;
         }
+        /** Read all producer windows from one collection on the captured Job. */
+        public Optional<RunMetrics> metrics() {
+            if (!isCarryingAJob()) return Optional.empty();
+            var manifest = operatorManifest();
+            var collected = job.getMetrics();
+            return Optional.of(new RunMetrics(jobId(), manifest, SourceArrivals.reading(collected),
+                    deliveryIn(collected), stageDurationsIn(collected)));
+        }
+
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
         public boolean completed() {
             return !isLost() && job.getStatus() == JobStatus.COMPLETED
@@ -964,16 +976,25 @@ public final class Engine {
         long jobId = job.getId();
         OptionalLong execution = JetLiveExecution.forHistory(member, jobId);
         JobMetrics metrics = job.getMetrics();
-        OptionalLong since = deliveryStart(metrics);
         var evidence = execution.isPresent() && execution.equals(JetLiveExecution.forHistory(member, jobId))
                 ? new RateSample.StartupEvidence(jobId, execution.getAsLong(),
                         outboundZeroAt(metrics, com.hazelcast.jet.Util.idToString(execution.getAsLong())))
                 : null;
+        return deliveryIn(metrics, evidence);
+    }
+
+    private static DeliveryReading deliveryIn(JobMetrics metrics) {
+        return deliveryIn(metrics, null);
+    }
+
+    private static DeliveryReading deliveryIn(JobMetrics metrics, RateSample.StartupEvidence evidence) {
+        OptionalLong since = deliveryStart(metrics);
         if (since.isEmpty()) {
             return evidence == null ? DeliveryReading.NONE
                     : new DeliveryReading(Map.of(), Map.of(), Map.of(), null, Map.of(), null, evidence);
         }
-        return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics), highestIn(metrics, JetDeliveryGauge::reachedTableOf),
+        return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics),
+                highestIn(metrics, JetDeliveryGauge::reachedTableOf),
                 Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics), evidence);
     }
 

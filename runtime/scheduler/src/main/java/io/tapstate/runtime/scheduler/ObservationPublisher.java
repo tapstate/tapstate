@@ -9,6 +9,8 @@ import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.spi.store.ResumeMetrics;
+import io.tapstate.spi.store.ResumeMetrics.Producer;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FlatReduction;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -39,6 +41,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.List;
@@ -860,6 +863,33 @@ public final class ObservationPublisher {
      * themselves. {@code readings} yields them keyed by a kind's prefix and then the step; a pipeline
      * with no aggregate step yields none.
      */
+    @FunctionalInterface public interface ResumeSample {
+        Optional<NativeSample> read(PipelineIntentScope scope, ResumeMetrics.Binding binding, Instant at);
+    }
+
+    public record NativeSample(long jobId, List<MetricFact> facts, Map<Producer, Long> starts) {
+        public NativeSample {
+            facts = List.copyOf(facts);
+            starts = Map.copyOf(starts);
+        }
+
+        public static NativeSample from(long jobId, String pipelineId, Instant at,
+                CaptureReading captured, DeliveryReading delivered, StageReading stages) {
+            var starts = new EnumMap<Producer, Long>(Producer.class);
+            captured.start().ifPresent(start -> starts.put(Producer.IN, start.toEpochMilli()));
+            delivered.start().ifPresent(start -> starts.put(Producer.OUT, start.toEpochMilli()));
+            stages.start().ifPresent(start -> starts.put(Producer.STAGE, start.toEpochMilli()));
+            return new NativeSample(jobId, nativeFacts(pipelineId, at, captured, delivered, stages), starts);
+        }
+    }
+
+    private ResumeSample resumeSample;
+
+    public ObservationPublisher withResumeSample(ResumeSample source) {
+        resumeSample = Objects.requireNonNull(source);
+        return this;
+    }
+
     public ObservationPublisher withAggregateReadings(Function<String, Map<String, Long>> readings) {
         this.aggregateReadings.set(Objects.requireNonNull(readings, "readings"));
         return this;
@@ -923,11 +953,16 @@ public final class ObservationPublisher {
      */
     public Optional<Publication> publishRunningScoped(PipelineIntentScope scope, CheckpointDoc checkpoint,
             ObservationStore observations, BooleanSupplier stillCurrent) {
+        return publishRunningScoped(scope, checkpoint, observations, stillCurrent, null);
+    }
+
+    public Optional<Publication> publishRunningScoped(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore observations, BooleanSupplier stillCurrent, ScopedPipelineStateStore state) {
         if (!scope.pipelineId().equals(checkpoint.pipelineId())
                 || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING) {
             throw new IllegalArgumentException("periodic observations require the original running checkpoint");
         }
-        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null);
+        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null, state);
     }
 
     /** Capture facts obtained together for the current execution and checked against its checkpoint. */
@@ -940,10 +975,15 @@ public final class ObservationPublisher {
 
     public Optional<Publication> publishRunning(PipelineIntentScope scope, CheckpointDoc checkpoint,
             ObservationStore store, CaptureSample capture, BooleanSupplier stillCurrent) {
+        return publishRunning(scope, checkpoint, store, capture, stillCurrent, null);
+    }
+
+    public Optional<Publication> publishRunning(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore store, CaptureSample capture, BooleanSupplier stillCurrent, ScopedPipelineStateStore state) {
         if (!scope.pipelineId().equals(checkpoint.pipelineId()) || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING)
             throw new IllegalArgumentException("a combined observation requires its running checkpoint");
         return publishCheckpoint(Optional.of(checkpoint), null, store, true, stillCurrent, scope,
-                Objects.requireNonNull(capture));
+                Objects.requireNonNull(capture), state);
     }
 
     private Optional<Publication> publish(String pipelineId, ObservationFailure failure, StateStore state,
@@ -967,12 +1007,13 @@ public final class ObservationPublisher {
         }
         var current = state.read(pipelineId);
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
-        return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true, scope, null);
+        return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true, scope, null,
+                state instanceof ScopedPipelineStateStore scoped ? scoped : null);
     }
 
     private Optional<Publication> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
             ObservationStore observations, boolean requirePreparedState, BooleanSupplier stillCurrent,
-            PipelineIntentScope scope, CaptureSample capture) {
+            PipelineIntentScope scope, CaptureSample capture, ScopedPipelineStateStore state) {
         return expected.flatMap(checkpoint -> {
             if (!stillCurrent.getAsBoolean()) {
                 return Optional.empty();
@@ -1015,6 +1056,7 @@ public final class ObservationPublisher {
             Map<String, Long> pinned = Map.of();
             boolean measuredSuccessfully = false;
             RateSample.StartupEvidence startupEvidence = null;
+            ResumeMetrics.Publication continuation = null;
             Observation published;
             try {
                 // Share each measurement between the observation and its alert watches. A second read
@@ -1028,10 +1070,30 @@ public final class ObservationPublisher {
                         : measuredCapture == null ? snapshots.apply(pipelineId) : measuredCapture.snapshot();
                 SnapshotReading readThisRun = capture != null ? capture.run()
                         : measuredCapture == null ? runSnapshots.apply(pipelineId) : measuredCapture.runSnapshot();
-                DeliveryReading delivered = deliveries.apply(pipelineId);
+                var resume = state == null || actual != PipelineState.RUNNING ? null : state.resumeCheckpoint(checkpoint);
+                List<MetricFact> movementFacts;
+                DeliveryReading nativeDelivery = null;
+                if (resume != null) {
+                    var sample = Objects.requireNonNull(resumeSample).read(scope, resume.applied(), at);
+                    var projection = ResumeMetricProjection.project(scope, resume, sample.orElse(null));
+                    if (projection == null) return Optional.empty();
+                    continuation = projection.publication();
+                    movementFacts = projection.facts();
+                } else {
+                    nativeDelivery = deliveries.apply(pipelineId);
+                    movementFacts = nativeFacts(pipelineId, at, captures.apply(pipelineId), nativeDelivery,
+                            stages.apply(pipelineId));
+                }
                 List<MetricFact> measured = new ArrayList<>(facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun, delivered));
+                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun, movementFacts));
+                boolean unavailable = state != null && state.unavailable();
+                if (unavailable)
+                    measured.removeIf(fact -> switch (fact.name()) {
+                        case RECORDS_METRIC, BYTES_METRIC, RECORD_DELIVERY_DURATION_METRIC, PROCESS_DURATION_METRIC,
+                                CdcDeliveryTotals.COUNT_METRIC, CdcDeliveryTotals.TOTAL_MILLIS_METRIC -> true;
+                        default -> false;
+                    });
                 measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
@@ -1041,8 +1103,9 @@ public final class ObservationPublisher {
                         capture != null ? capture.initialLoad() == null ? null : capture.initialLoad().at(at)
                                 : measuredCapture == null ? initialLoadAt(pipelineId, at) : measuredCapture.initialLoad());
                 measuredSuccessfully = true;
-                if (requirePreparedState && actual == PipelineState.RUNNING && delivered != null) {
-                    startupEvidence = delivered.startupEvidence();
+                // Carried totals have a different origin from the current execution's native delivery.
+                if (requirePreparedState && actual == PipelineState.RUNNING && nativeDelivery != null && !unavailable) {
+                    startupEvidence = nativeDelivery.startupEvidence();
                 }
             } catch (TapstateException unavailable) {
                 if (actual != PipelineState.FAILED) throw unavailable;
@@ -1062,7 +1125,9 @@ public final class ObservationPublisher {
             if (!stillCurrent.getAsBoolean()) {
                 return Optional.empty();
             }
-            save(observations, published, requirePreparedState ? checkpoint.epoch() : null, scope);
+            if (continuation == null) save(observations, published, requirePreparedState ? checkpoint.epoch() : null, scope);
+            else if (!observations.saveResumed(storedFacts.project(published, scope), checkpoint.epoch(), continuation))
+                return Optional.empty();
             if (!stillCurrent.getAsBoolean()) {
                 return Optional.empty();
             }
@@ -1246,13 +1311,14 @@ public final class ObservationPublisher {
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
             SnapshotReading loaded, SnapshotReading readThisRun) {
         return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone, rebuildExpected,
-                loaded, readThisRun, deliveries.apply(pipelineId));
+                loaded, readThisRun, nativeFacts(pipelineId, at, captures.apply(pipelineId),
+                        deliveries.apply(pipelineId), stages.apply(pipelineId)));
     }
 
     private List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
-            SnapshotReading loaded, SnapshotReading readThisRun, DeliveryReading delivered) {
+            SnapshotReading loaded, SnapshotReading readThisRun, List<MetricFact> movementFacts) {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
@@ -1331,9 +1397,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         readingsAt(pipelineId, JOIN_RECOMPUTE_ROWS_TOTAL_METRIC, "{row}", at, JOIN_NAMESPACE_ATTRIBUTE,
                 rebuildExpected).ifPresent(facts::add);
-        movement(pipelineId, at, captures.apply(pipelineId), delivered)
-                .forEach(facts::add);
-        spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
+        facts.addAll(movementFacts);
         load(pipelineId, at, loaded).forEach(facts::add);
         runLoad(pipelineId, at, readThisRun).ifPresent(facts::add);
         return facts;
@@ -1558,6 +1622,14 @@ public final class ObservationPublisher {
         return facts;
     }
 
+    /** Project the capture, delivery and stage values collected from one native Job sample. */
+    public static List<MetricFact> nativeFacts(String pipelineId, Instant at, CaptureReading captured,
+            DeliveryReading delivered, StageReading stages) {
+        var facts = movement(pipelineId, at, captured, delivered);
+        spent(pipelineId, at, stages).ifPresent(facts::add);
+        return facts;
+    }
+
     /**
      * The facts a pipeline's movement makes: how many rows of each table and operation crossed each end of
      * it, and how old the newest row of each table to reach a target is. Empty for a pipeline reporting
@@ -1578,7 +1650,7 @@ public final class ObservationPublisher {
      * for another; each is left out on its own account, and a check covering several would be a second
      * place for the same decision to be made.
      */
-    private List<MetricFact> movement(
+    private static List<MetricFact> movement(
             String pipelineId, Instant at, CaptureReading captured, DeliveryReading delivered) {
         List<MetricFact> facts = new ArrayList<>();
         List<MetricPoint> rows = new ArrayList<>();
