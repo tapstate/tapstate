@@ -29,6 +29,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.function.Supplier;
 
 /**
@@ -49,6 +50,10 @@ import java.util.function.Supplier;
  * the backpressure that bounds them belong to the runtime, not this writer.
  */
 final class PdkSinkWriter implements SinkWriter {
+
+    // PDK alternatives and target transactions can be keyed by thread name on a shared connector.
+    private static final ThreadFactory WRITER_THREADS =
+            Thread.ofPlatform().daemon().name("tapstate-sink-write-", 1).factory();
 
     private final PdkConnector connector;
     private final WriteRecordFunction write;
@@ -71,8 +76,7 @@ final class PdkSinkWriter implements SinkWriter {
     private volatile Thread writeThread;
     private boolean delivering;
     private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
-        Thread thread = new Thread(task, "tapstate-sink-write");
-        thread.setDaemon(true);
+        Thread thread = WRITER_THREADS.newThread(task);
         writeThread = thread;
         return thread;
     });
@@ -381,20 +385,19 @@ final class PdkSinkWriter implements SinkWriter {
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
             int submittedRows = rows.size();
-            WriteReceipt receipt = new WriteReceipt();
+            var outcome = new BatchOutcome();
             try {
-                write.writeRecord(connector.context(), rows, table, receipt::accept);
+                write.writeRecord(connector.context(), rows, table, outcome::accept);
+                if (outcome.failure != null) throw outcome.failure;
             } catch (Throwable failure) {
                 operation(table.getId(), failure);
                 throw failure;
             }
             operation(table.getId(), null);
-            written += receipt.written;
-            if (receipt.reported && !receipt.hasErrors) {
-                // Successful writeRecord completion with a receipt covers the submitted rows.
-                // Its change counts can be lower after no-ops or higher after a key change.
-                acknowledgedRows += submittedRows;
-            }
+            written += outcome.written;
+            // The synchronous writer completed this table's submitted events without errors.
+            // Physical change counts can be lower for no-ops or higher for a key change.
+            if (outcome.reported) acknowledgedRows += submittedRows;
         }
         return new WriteResult(written, acknowledgedRows);
     }
@@ -404,15 +407,19 @@ final class PdkSinkWriter implements SinkWriter {
         return plan == null ? original : plan.target();
     }
 
-    private static final class WriteReceipt {
+    private static final class BatchOutcome {
         private long written;
         private boolean reported;
-        private boolean hasErrors;
+        private Throwable failure;
 
-        private void accept(WriteListResult<TapRecordEvent> result) {
+        void accept(WriteListResult<TapRecordEvent> result) {
+            var errors = result.getErrorMap();
+            if (failure == null && errors != null && !errors.isEmpty()) {
+                failure = errors.values().iterator().next();
+                if (failure == null) failure = new IllegalStateException("Connector rejected a row without a cause");
+            }
             written += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
             reported = true;
-            hasErrors |= result.getErrorMap() != null && !result.getErrorMap().isEmpty();
         }
     }
 

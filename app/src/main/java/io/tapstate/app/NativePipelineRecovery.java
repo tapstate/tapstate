@@ -69,7 +69,25 @@ final class NativePipelineRecovery {
                 .map(io.tapstate.core.lifecycle.ObservationFailure::code).orElse(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
     }
     StoreBackedDagSource.CapturedStartGuard capturedStartGuard() {
-        return this::inspectCaptured;
+        return new StoreBackedDagSource.CapturedStartGuard() {
+            @Override public Inspection inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
+                return inspectCaptured(pass,snapshot,models);
+            }
+            @Override public void retireCoveredKeyMoves(PipelineConvergencePass pass) {
+                requireAvailable();
+                retireCovered(pass);
+            }
+        };
+    }
+
+    private boolean retireCovered(PipelineConvergencePass pass) {
+        var id = pass.scope().pipelineId();
+        var windows = configuration.keyMoveWindows();
+        var retained = windows.read(id);
+        if (retained.isEmpty()) return true;
+        var window = retained.get();
+        return window.scope().equals(pass.scope()) && views instanceof SrsStoreViews sources
+                && KeyMoveRecovery.retire(windows, window, sources, () -> pass.requirePipeline(id));
     }
 
     StoreBackedDagSource.CapturedStartGuard.Inspection inspectCaptured(
@@ -96,9 +114,11 @@ final class NativePipelineRecovery {
             var retained = captures.retainedPlanningModels(pass, snapshot, models,
                     guard -> preparer.verifyRetainedSourcesAndCheckSinkModels(scope, inputs, original, guard));
             requireAvailable();
+            if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
             return new StoreBackedDagSource.CapturedStartGuard.Inspection(Map.of(), retained);
         }
         preparer.verifyRetainedSources(scope, inputs);
+        if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
         if(!summary.orElseThrow().targetScope().equals(scope))throw fenced();
         var contexts=new LinkedHashMap<String,SourceResource>();
         for(var ref:pipeline.sources())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),

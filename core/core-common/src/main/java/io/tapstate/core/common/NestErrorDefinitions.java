@@ -89,6 +89,9 @@ public final class NestErrorDefinitions {
     public static final ProductErrorDefinition ROLLUP_EVALUATION_FAILED =
             DEFINITIONS.define(36, Severity.ERROR, Set.of("field", "root", "expression", "reason"));
 
+    public static final ProductErrorDefinition ROOT_HANDOVER_UNCONFIRMED =
+            DEFINITIONS.define(37, Severity.ERROR, Set.of("node"));
+
     private NestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

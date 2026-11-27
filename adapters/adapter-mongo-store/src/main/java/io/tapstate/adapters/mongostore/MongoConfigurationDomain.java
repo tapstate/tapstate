@@ -1500,6 +1500,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
     }
 
+    public io.tapstate.spi.store.PipelineKeyMoveWindows keyMoveWindows() {
+        requireOpen();
+        return new MongoKeyMoveWindowStore(connection.database(), this::requireOpen);
+    }
+
     public io.tapstate.spi.store.PipelineIntentStore intents() {
         requireOpen();
         return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings,

@@ -34,6 +34,7 @@ class NativeRetainedSelectionGuardTest {
         verify(f.summaries).readForCaptureStartup("flow");
         verify(f.preparer, never()).verifyRetainedSources(any(), any());
         verify(f.configuration, never()).requiredNotes();
+        verify(f.configuration, never()).keyMoveWindows();
 
         doReturn(true).when(f.preparer).verifyRetainedSourcesAndCheckSinkModels(eq(f.scope), eq(f.inputs),
                 eq(f.fence), any());
@@ -119,6 +120,7 @@ class NativeRetainedSelectionGuardTest {
             snapshot = ReadOnlyArtifactSnapshot.capture(artifacts);
             models = SourceModelSnapshot.capture("flow", List.of(source), mock(SchemaStore.class));
             inputs = models.preparationInputs(scope, pipeline, pipeline, Map.of(source.id(), source));
+            when(configuration.keyMoveWindows()).thenReturn(mock(PipelineKeyMoveWindows.class));
             when(configuration.cacheRecoveries()).thenReturn(summaries);
             when(pass.scope()).thenReturn(scope);
             when(pass.claim()).thenReturn(fence);

@@ -117,8 +117,12 @@ class AnOrJoinFollowsTheFirstAlternativeThatMatchesTest {
                 source -> List.of(upstream.get(source)), vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
                 JoinStoresBinding.onTheCluster(), DimensionRowDisplacedAlert.NONE, new NodeWidth("j", 4, 1, null));
 
-        List<Edge> fromLocations = dag.getInboundEdges("j").stream()
-                .filter(edge -> edge.getSourceName().equals("location_src"))
+        var locationRouters = dag.getOutboundEdges("location_src");
+        assertThat(locationRouters).hasSize(2).allSatisfy(edge ->
+                assertThat(edge.getRoutingPolicy()).isEqualTo(Edge.RoutingPolicy.ISOLATED));
+        List<Edge> fromLocations = locationRouters.stream()
+                .flatMap(edge -> dag.getOutboundEdges(edge.getDestName()).stream())
+                .filter(edge -> edge.getDestName().equals("j"))
                 .sorted(Comparator.comparingInt(Edge::getDestOrdinal))
                 .toList();
         assertThat(fromLocations).extracting(Edge::getDestOrdinal).containsExactly(1, 2);

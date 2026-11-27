@@ -49,6 +49,140 @@ class MongoPipelineIntentStoreIT {
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final String HASH = CanonicalHash.of(pipeline());
 
+    private static io.tapstate.spi.store.PipelineKeyMoveWindows.Range point(io.tapstate.core.event.SourceOrder order) {
+        return new io.tapstate.spi.store.PipelineKeyMoveWindows.Range(order.epoch(), order.seq(), order.seq());
+    }
+
+    @Test
+    void replayStopsBeforeReuseAndBothDurableFloorsMustCoverTheExactInterval() {
+        withConfiguration((domain, database, scope) -> {
+            var windows = domain.keyMoveWindows();
+            var first = new io.tapstate.core.event.SourceOrder(3, 7);
+            var last = new io.tapstate.core.event.SourceOrder(3, 12);
+            var other = new io.tapstate.core.event.SourceOrder(1, 2);
+            var orders = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
+            var items = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("channel", "source2", "items", "capture");
+            windows.requireClear("flow");
+            assertThatThrownBy(() -> windows.arm(scope, 40, "expired", orders, point(first), null,
+                    () -> { throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }))
+                    .isInstanceOf(TapstateException.class);
+            windows.requireClear("flow");
+            var initial = windows.arm(scope, 41, "activation", orders, point(first), null, () -> {});
+            windows.arm(scope, 41, "activation", orders, point(last), initial, () -> {});
+            var current = windows.arm(scope, 41, "activation", items, point(other), initial, () -> {});
+            assertThat(current.ranges().get(orders)).isEqualTo(new io.tapstate.spi.store.PipelineKeyMoveWindows.Range(3, 7, 12));
+            var covered = Map.of(orders, last, items, other);
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                var takeover = reopened.keyMoveWindows();
+                assertThatThrownBy(() -> takeover.requireClear("flow")).isInstanceOfSatisfying(
+                        TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+                assertThatThrownBy(() -> takeover.arm(scope, 42, "replacement", orders, point(last), null, () -> {})).isInstanceOf(TapstateException.class);
+                assertThat(takeover.read("flow")).contains(current);
+            }
+            assertThat(windows.retire(initial, covered, covered)).isFalse();
+            assertThat(windows.retire(current, Map.of(orders, last), covered)).isFalse();
+            assertThat(windows.retire(current, covered, Map.of(orders, first, items, other))).isFalse();
+            assertThat(windows.retire(current, covered, covered)).isTrue();
+            var next = windows.arm(scope, 42, "replacement", orders, point(first), null, () -> {});
+            assertThat(windows.retire(current, covered, covered)).isFalse();
+            assertThat(windows.read("flow")).contains(next);
+        });
+    }
+
+    @Test
+    void aLegacyConfigurationCanStartWithoutEnrollingInKeyMoves() {
+        withConfiguration((domain, database, scope) -> {
+            var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+            var config = new Document("_id", "config");
+            schema.updateOne(config, new Document("$unset", new Document("pipelineKeyMoveWindowVersion", "")));
+            SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database).drop();
+            var original = schema.find(config).first();
+            try (var reopened = MongoConfigurationDomain.openExisting(settings(database))) {
+                var windows = reopened.keyMoveWindows();
+                windows.requireClear(scope.pipelineId());
+                var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
+                assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream,
+                        point(new io.tapstate.core.event.SourceOrder(1, 2)), null, () -> {}))
+                        .isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code().code()).isEqualTo("TS0480044"));
+                assertThat(windows.read(scope.pipelineId())).isEmpty();
+            }
+            assertThat(schema.find(config).first()).isEqualTo(original);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .doesNotContain(SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.collectionName());
+        });
+    }
+
+    @Test
+    void disappearanceOfTheWindowCollectionRefusesTheNextAdmission() {
+        withConfiguration((domain, database, scope) -> {
+            var windows = domain.keyMoveWindows();
+            var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "input", "orders", null);
+            var changes = point(new io.tapstate.core.event.SourceOrder(1, 2));
+            var last = windows.arm(scope, 42, "activation", stream, changes, null, () -> {});
+            SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.on(database).drop();
+            assertThatThrownBy(() -> windows.requireClear(scope.pipelineId())).isInstanceOfSatisfying(
+                    TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+            assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream, changes, last, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(database.listCollectionNames()).doesNotContain(SystemCollections.PIPELINE_KEY_MOVE_WINDOWS.collectionName());
+        });
+    }
+
+    @Test
+    void droppingTheCollectionDuringFirstAdmissionCannotRecreateIt() {
+        withConfiguration((domain, database, scope) -> {
+            var table = SystemCollections.PIPELINE_KEY_MOVE_WINDOWS;
+            var removed = new java.util.concurrent.atomic.AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("insert")
+                            && table.collectionName().equals(event.getCommand().getString("insert").getValue())
+                            && removed.compareAndSet(false, true)) {
+                        table.on(database).drop();
+                    }
+                }
+            };
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build();
+            var orders = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "source", "orders", null);
+            var change = point(new io.tapstate.core.event.SourceOrder(1, 9));
+            try (var client = MongoClients.create(settings)) {
+                var windows = new MongoKeyMoveWindowStore(client.getDatabase(database.getName()), () -> {});
+                assertThatThrownBy(() -> windows.arm(scope, 42, "activation", orders, change, null, () -> {}))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+                assertThat(removed).isTrue();
+            }
+            try (var retained = MongoConfigurationDomain.openExisting(settings(database))) {
+                assertThatThrownBy(() -> retained.keyMoveWindows().requireClear(scope.pipelineId()))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                e -> assertThat(e.code()).isEqualTo(IoError.KEY_MOVE_RECOVERY_UNCERTAIN));
+            }
+            assertThat(database.listCollectionNames()).doesNotContain(table.collectionName());
+        });
+    }
+
+    @Test
+    void aRefusedExtensionRestoresOnlyTheRangeItActuallyExtended() {
+        withConfiguration((domain, database, scope) -> {
+            var windows = domain.keyMoveWindows();
+            var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream("chain", "input", "orders", null);
+            var first = point(new io.tapstate.core.event.SourceOrder(1, 2));
+            var last = point(new io.tapstate.core.event.SourceOrder(1, 6));
+            var admitted = windows.arm(scope, 42, "activation", stream, first, null, () -> {});
+            Runnable lost = () -> { throw new IllegalStateException("execution stopped"); };
+            assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream, last, admitted, lost))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThat(windows.read(scope.pipelineId())).contains(admitted);
+            var later = point(new io.tapstate.core.event.SourceOrder(1, 9));
+            assertThatThrownBy(() -> windows.arm(scope, 42, "activation", stream, last, admitted, () -> {
+                windows.arm(scope, 42, "activation", stream, later, null, () -> {});
+                lost.run();
+            })).isInstanceOf(IllegalStateException.class);
+            assertThat(windows.read(scope.pipelineId()).orElseThrow().ranges().get(stream).last()).isEqualTo(9);
+        });
+    }
+
     @Test
     void displayReadsIntentsInOnlyOneConfigurationSnapshot() {
         withConfiguration((domain, database, scope) -> {

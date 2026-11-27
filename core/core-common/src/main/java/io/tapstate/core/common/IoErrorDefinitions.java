@@ -93,6 +93,12 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition PIPELINE_COMMIT_OUTCOME_UNKNOWN =
             DEFINITIONS.define(42, Severity.ERROR, Set.of(PIPELINE));
 
+    public static final ProductErrorDefinition KEY_MOVE_RECOVERY_UNCERTAIN =
+            DEFINITIONS.define(43, Severity.ERROR, Set.of(PIPELINE));
+
+    public static final ProductErrorDefinition KEY_MOVE_NOT_INSTALLED =
+            DEFINITIONS.define(44, Severity.ERROR, Set.of(PIPELINE));
+
     private IoErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
