@@ -388,12 +388,20 @@ class ThreeLayerRestartContinuationIT {
                     originalConfiguration = installationFacts(configuration);
                     assertThat(chains.countDocuments()).isOne(); originalChain = chains.find().first();
                     assertThat(originalChain.get("checkpoint", Document.class)).isNotEmpty();
-                    long outageLogOffset = Files.size(first.output());
+                    long outageLogOffset = together ? 0 : Files.size(first.output());
                     CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec(); paused = true;
                     mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
                     mongo.delete(source, TABLE, Map.of("id", 3L));
-                    Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
-                            () -> recordedNodeSessionLoss(first.output(), outageLogOffset), first::tail);
+                    if (together) {
+                        var entry = http.send(java.net.http.HttpRequest.newBuilder(first.baseUrl().resolve("/auth/storage-entry"))
+                                .timeout(Duration.ofSeconds(30)).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                        assertThat(entry.statusCode()).isEqualTo(200);
+                        assertThat(Document.parse(entry.body()))
+                                .containsEntry("entry", "UNAVAILABLE").containsEntry("businessReady", false);
+                    } else {
+                        Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
+                                () -> recordedNodeSessionLoss(first.output(), outageLogOffset), first::tail);
+                    }
                     assertThat(first.isAlive()).isTrue();
                     if (!together) {
                         assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
