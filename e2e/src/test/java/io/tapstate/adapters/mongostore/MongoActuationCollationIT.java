@@ -2,11 +2,13 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoCommandException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Collation;
 import com.mongodb.client.model.CreateCollectionOptions;
+import com.mongodb.event.CommandFailedEvent;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.dsl.DslParser;
@@ -27,6 +29,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -40,6 +43,7 @@ class MongoActuationCollationIT {
 
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--bind_ip_all", "--setParameter", "enableTestCommands=1")
             .withTmpFs(Map.of("/data/db", "rw", "/data/configdb", "rw"));
 
     @Test void aDelayedAuditDoesNotReopenBatchReadsAfterANonSimpleCollationIsObserved() throws Exception {
@@ -84,6 +88,27 @@ class MongoActuationCollationIT {
             var database = client.getDatabase("actuation_simple_collation");
             database.createCollection(INTENTS);
             assertThat(intentCommands(intentStore(client, database))).containsExactly("aggregate");
+        }
+    }
+
+    @Test void aDeniedCollationAuditStillReadsTheIntentCollection() {
+        var auditFailures = new ArrayList<Throwable>();
+        var observeDenial = new CommandListener() {
+            @Override public void commandFailed(CommandFailedEvent event) {
+                if (event.getCommandName().equals("listCollections")) auditFailures.add(event.getThrowable());
+            }
+        };
+        try (var client = observedClient(observeDenial)) {
+            var database = client.getDatabase("actuation_denied_collation_audit");
+            database.createCollection(INTENTS);
+            var store = intentStore(client, database);
+            client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("listCollections")).append("errorCode", 13)));
+
+            assertThat(intentCommands(store)).containsExactly("find");
+            assertThat(auditFailures).singleElement().isInstanceOfSatisfying(MongoCommandException.class,
+                    failure -> assertThat(failure.getErrorCode()).isEqualTo(13));
         }
     }
 
