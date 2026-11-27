@@ -367,7 +367,12 @@ public final class PipelineConverger {
         }
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             PipelineState from = StateJson.parse(current.stateJson());
-            CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
+            var transition = !rebuild && !purgeState && (target == PipelineState.PAUSED && from == PipelineState.RUNNING
+                    || target == PipelineState.RUNNING && from == PipelineState.PAUSED)
+                    ? actuator.resumeMetricTransition(from, target) : null;
+            CasOutcome outcome = transition == null
+                    ? state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant())
+                    : state.transitionMetrics(pipelineId, current.epoch(), targetJson, clock.instant(), transition);
             if (outcome instanceof CasOutcome.Applied applied) {
                 if (stopBeforePublication && !purgeState) return ConvergeResult.converged(applied.next());
                 if (target == PipelineState.FAILED) {

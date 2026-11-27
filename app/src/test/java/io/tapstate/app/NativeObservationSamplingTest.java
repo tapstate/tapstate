@@ -83,7 +83,7 @@ class NativeObservationSamplingTest {
         assertThat(f.publish(CONFIG)).isEmpty();
 
         verify(f.publisher).publishScoped(SCOPE, f.state, f.observations, null);
-        verify(f.publisher, never()).publishRunning(any(), any(), any(), any(), any());
+        verify(f.publisher, never()).publishRunning(any(), any(), any(), any(), any(), any());
     }
 
     @Test void aDifferentCacheCheckpointFallsBackWithoutReadingConfiguration() {
@@ -123,7 +123,7 @@ class NativeObservationSamplingTest {
         when(f.captures.observationSample(any(), any(), any(), any())).thenReturn(Optional.of(
                 new ObservationPublisher.CaptureSample(SnapshotReading.NONE, SnapshotReading.NONE, Map.of(), null)));
         var projected = new Observation(PIPELINE, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
-        when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any())).thenAnswer(call -> {
+        when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any(), isNull())).thenAnswer(call -> {
             call.<ObservationStore>getArgument(2).save(projected, CHECKPOINT.epoch());
             return Optional.of(projected);
         });
@@ -176,7 +176,7 @@ class NativeObservationSamplingTest {
             writeGuard.get().run();
             return null;
         }).when(writer).save(f.running, CHECKPOINT.epoch());
-        when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any())).thenAnswer(call -> {
+        when(f.publisher.publishRunning(eq(SCOPE), eq(CHECKPOINT), any(), any(), any(), isNull())).thenAnswer(call -> {
             call.<ObservationStore>getArgument(2).save(f.running, CHECKPOINT.epoch());
             return Optional.of(f.running);
         });
