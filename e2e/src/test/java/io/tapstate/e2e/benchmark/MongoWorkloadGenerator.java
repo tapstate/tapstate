@@ -451,6 +451,7 @@ public final class MongoWorkloadGenerator {
         long total = states.stream().mapToLong(state -> state.stream.requested.total()).sum();
         long deadline = start + liveDuration.toNanos();
         long next = start;
+        boolean recovering = false;
         for (long sent = 0; sent < total;) {
             for (var state : states) {
                 if (state.submitted == state.stream.requested.total()) {
@@ -473,7 +474,14 @@ public final class MongoWorkloadGenerator {
                     return;
                 }
                 sent++;
-                next = now - next >= interval ? now + interval : next + interval;
+                long lateness = now - next;
+                // Keep the original cadence for one overdue slot. Rebase when the delay persists.
+                boolean recoverOne = lateness >= interval && lateness < 2 * interval && !recovering;
+                if (lateness >= interval && !recoverOne) {
+                    next = now;
+                }
+                next += interval;
+                recovering = recoverOne;
             }
         }
         long remainder;

@@ -43,6 +43,7 @@ import org.bson.BsonType;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 @RequiresDocker
@@ -205,6 +206,51 @@ class MongoWorkloadGeneratorIT {
             warmChanges.forEach(event -> warmKeys.add(event.getDocumentKey().getInt64("_id").getValue()));
             assertTrue(scoreChanges.stream().noneMatch(event ->
                     warmKeys.contains(event.getDocumentKey().getInt64("_id").getValue())));
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "11, true, 0 21 23 30 40 50",
+            "19, false, 0 29 31 41 51",
+            "31, false, 0 41 51"
+    })
+    void livePacingRecoversAtMostOneOverdueSlot(long overshootMillis, boolean complete, String expectedWrites)
+            throws Exception {
+        withSource(source -> {
+            String id = "map.live.basic.standard";
+            var clock = new AtomicLong();
+            var scoredStart = new AtomicLong(-1);
+            var overshot = new AtomicBoolean();
+            var writes = new ArrayList<Long>();
+            var observed = observingPhases(source, () -> {}, () -> {
+                if (scoredStart.get() >= 0) {
+                    writes.add(TimeUnit.NANOSECONDS.toMillis(clock.get() - scoredStart.get()));
+                }
+                clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(2));
+            });
+            var generator = new MongoWorkloadGenerator(observed, WorkloadRecipe.fromCatalog(definition(id),
+                    Map.of("records", 40), null), id, 17, clock::get, delay -> {
+                        clock.addAndGet(delay);
+                        if (scoredStart.get() >= 0 && overshot.compareAndSet(false, true)) {
+                            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(overshootMillis));
+                        }
+                    });
+            var prepared = generator.prepare(generator.calibrateStringLengths());
+            var result = prepared.inject(new LiveWindow(100, Duration.ofMillis(30), Duration.ofMillis(60)),
+                    null, null, () -> scoredStart.set(clock.get()));
+
+            assertTrue(result.warmup().complete(), result::toString);
+            var measured = result.measured();
+            var records = measured.streams().get("records");
+            assertEquals(complete, measured.complete(), result::toString);
+            assertEquals(6, records.planned().total());
+            assertEquals(writes.size(), readHistory(source, "records", records).size());
+            assertEquals(writes.size(), records.submittedOperations());
+            assertEquals(records.submittedOperations(), records.acknowledged().total());
+            assertEquals(records.acknowledged(), records.observed());
+            assertEquals(java.util.Arrays.stream(expectedWrites.split(" ")).map(Long::valueOf).toList(), writes);
+            assertTrue(measured.writeNanos() >= TimeUnit.MILLISECONDS.toNanos(60));
         });
     }
 
