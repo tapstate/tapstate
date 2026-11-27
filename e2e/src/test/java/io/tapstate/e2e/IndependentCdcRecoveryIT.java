@@ -120,26 +120,7 @@ class IndependentCdcRecoveryIT {
             var jvm = List.of("-Xmx768m", "-XX:ActiveProcessorCount=2");
             try (var first = launch(fixture, jvm)) {
                 ControlPlane control = loggedIn(first, fixture);
-                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, fixture.connector());
-                control.apply(Map.of(
-                        "source.tap.yml", source(ROOT_SOURCE, fixture.source()),
-                        "target.tap.yml", Workspaces.targetYaml("support_target", fixture.rootTarget(), Map.of(
-                                "hold_writes", fixture.signals().toString(), "write_witness", witness.directory().toString())),
-                        "pipeline.tap.yml", """
-                                version: tapstate/v1
-                                kind: pipeline
-                                id: support_pipeline
-                                source: [{ id: support_source, srs: false }]
-                                settings: { read_mode: cdc_only }
-                                serve:
-                                  from: support_case
-                                  sync: [{ source: support_target, write_mode: append }]
-                                """));
-                control.discoverSchema(ROOT_SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", fixture.source().toString()));
-                control.lifecycle(ROOT_PIPELINE, LifecycleVerb.START);
-                awaitState(control, ROOT_PIPELINE, PipelineState.RUNNING);
-                Await.until("the direct capture to start", TIMEOUT,
-                        () -> activeStreams(CdcRecoveryFixture.streams(fixture.source())) == 1, () -> streamText(fixture));
+                startAppendPipeline(control, fixture, witness);
                 CdcRecoveryFixture.change(fixture.source(), 1, ROOT, "1", "", "confirmed");
                 awaitReceiptPosition(fixture, 1);
                 Files.createFile(marker);
@@ -174,6 +155,76 @@ class IndependentCdcRecoveryIT {
                 assertThat(witness.rowsOf(ROOT)).filteredOn(row -> row.id().equals("1")).hasSize(1);
             }
         }
+    }
+
+    @Test
+    void anUnconfirmedAppendStaysFailedWhenItsDriverLeaves(@TempDir Path temporary) throws Exception {
+        try (var fixture = fixture(temporary, "unconfirmed_append_handover");
+                var cluster = TwoMemberCluster.startPrepared(fixture.storage());
+                var reader = MongoClients.create(fixture.storage().cacheUri())) {
+            cluster.awaitBothMembers();
+            ControlPlane control = cluster.first();
+            var witness = new WriteWitness(temporary.resolve("writes"));
+            startAppendPipeline(control, fixture, witness);
+            CdcRecoveryFixture.change(fixture.source(), 1, ROOT, "1", "", "confirmed");
+            awaitReceiptPosition(fixture, 1);
+            String driver = control.pipelineControllerOf(ROOT_PIPELINE).orElseThrow();
+            long execution = control.executionGenerationOf(ROOT_PIPELINE).orElseThrow();
+            ControlPlane survivor = cluster.memberOtherThan(driver);
+            var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(reader.getDatabase(fixture.storage().cacheDatabase()));
+            var claimKey = new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", ROOT_PIPELINE);
+
+            var marker = Files.createFile(fixture.signals().resolve("omit-result"));
+            CdcRecoveryFixture.change(fixture.source(), 2, ROOT, "2", "", "unconfirmed");
+            awaitState(control, ROOT_PIPELINE, PipelineState.FAILED);
+            // The driver can see Jet's wrapper when another member checks the receipt.
+            assertThat(Files.readString(cluster.processCarrying(TwoMemberCluster.NODE_A).output())
+                    + Files.readString(cluster.processCarrying(TwoMemberCluster.NODE_B).output()))
+                    .contains("TS0440018");
+            var failedClaim = claims.find(claimKey).first();
+            cluster.processCarrying(driver).kill();
+            Files.delete(marker);
+
+            Await.until("the surviving member to take over the failed run", TIMEOUT,
+                    () -> survivor.pipelineControllerOf(ROOT_PIPELINE).filter(owner -> !owner.equals(driver)).isPresent()
+                            && survivor.observedAgeMillis(ROOT_PIPELINE).filter(age -> age < 1_000).isPresent(),
+                    () -> "controller=" + survivor.pipelineControllerOf(ROOT_PIPELINE)
+                            + ", state=" + survivor.state(ROOT_PIPELINE));
+            assertThat(survivor.executionGenerationOf(ROOT_PIPELINE))
+                    .as("the surviving holder must not replace an execution that failed its receipt check")
+                    .contains(execution);
+            assertThat(survivor.state(ROOT_PIPELINE)).contains(PipelineState.FAILED);
+            assertThat(receiptPosition(fixture)).isEqualTo(1);
+            assertThat(witness.rowsOf(ROOT)).filteredOn(row -> row.id().equals("2")).hasSize(1);
+            assertThat(failedClaim).isNotNull();
+            assertThat(failedClaim.getLong("failureClaimGeneration"))
+                    .as("the receipt failure must be recorded under the failed execution before handover")
+                    .isEqualTo(failedClaim.getLong("executionClaimGeneration"));
+            assertThat(failedClaim.getBoolean("failureAfterMemberLoss")).isFalse();
+        }
+    }
+
+    private static void startAppendPipeline(ControlPlane control, Fixture fixture, WriteWitness witness) {
+        control.registerConnector(E2eConnectorJar.CONNECTOR_ID, fixture.connector());
+        control.apply(Map.of(
+                "source.tap.yml", source(ROOT_SOURCE, fixture.source()),
+                "target.tap.yml", Workspaces.targetYaml("support_target", fixture.rootTarget(), Map.of(
+                        "hold_writes", fixture.signals().toString(), "write_witness", witness.directory().toString())),
+                "pipeline.tap.yml", """
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: support_pipeline
+                        source: [{ id: support_source, srs: false }]
+                        settings: { read_mode: cdc_only }
+                        serve:
+                          from: support_case
+                          sync: [{ source: support_target, write_mode: append }]
+                        """));
+        control.discoverSchema(ROOT_SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", fixture.source().toString()));
+        control.lifecycle(ROOT_PIPELINE, LifecycleVerb.START);
+        awaitState(control, ROOT_PIPELINE, PipelineState.RUNNING);
+        Await.until("the direct capture to start", TIMEOUT,
+                () -> activeStreams(CdcRecoveryFixture.streams(fixture.source())) == 1, () -> streamText(fixture));
     }
 
     private static long receiptPosition(Fixture fixture) {
