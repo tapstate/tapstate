@@ -655,6 +655,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         if (!successfulBoundedJob(pipeline)) {
             return false;
         }
+        if (progress != PipelineRunProgressEvents.NONE) {
+            // Jet completion proves the original job ran, even if its RUNNING transition was missed.
+            progress.publish(new PipelineRunProgressEvents.Event(pass.intent(), command, PipelineRunStage.ENGINE_RUNNING,
+                    PipelineRunProgressEvents.Edge.REACHED, null, progressStartRevision));
+        }
         boolean complete;
         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_TARGET_CONFIRM)) {
             complete = capture.loadDelivered(pipeline) && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();

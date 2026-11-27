@@ -255,6 +255,7 @@ class NativePipelineRunProgressPublisherTest {
             if (state == PipelineState.COMPLETED) {
                 assertThat(progress.runFailed()).isFalse();
                 assertThat(progress.milestones()).containsExactly(started.milestones().getFirst(),
+                        new PipelineRunProgress.Milestone(PipelineRunStage.ENGINE_RUNNING, null),
                         new PipelineRunProgress.Milestone(PipelineRunStage.INITIAL_LOAD_COMPLETED, at),
                         new PipelineRunProgress.Milestone(PipelineRunStage.RUN_COMPLETED, at));
             } else {
@@ -262,5 +263,27 @@ class NativePipelineRunProgressPublisherTest {
                 assertThat(progress.milestones()).isEqualTo(started.milestones());
             }
         }
+    }
+
+    @Test
+    void aBoundedDeliveryEventProvesExecutionWithoutOverwritingAKnownRunningTime() {
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var intent = new PipelineIntentSnapshot(scope, 4,
+                new DesiredState("orders", PipelineState.RUNNING, "a".repeat(64)));
+        var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
+                new WorkloadOwner("node", "boot"), 1, 2, 3);
+        var at = Instant.parse("2026-11-26T10:00:00Z");
+        var delivery = new PipelineRunProgressEvents.Event(intent, claim, PipelineRunStage.INITIAL_LOAD_COMPLETED,
+                PipelineRunProgressEvents.Edge.REACHED, at, 4);
+        var start = NativePipelineRunProgressQuery.accepted(scope, 4, null, 3);
+        var knownRunningTime = at.minusSeconds(1);
+
+        assertThat(delivery.applyTo(start).milestones()).containsExactly(start.milestones().getFirst(),
+                new PipelineRunProgress.Milestone(PipelineRunStage.ENGINE_RUNNING, null),
+                new PipelineRunProgress.Milestone(PipelineRunStage.INITIAL_LOAD_COMPLETED, at));
+        assertThat(delivery.applyTo(start.reach(PipelineRunStage.ENGINE_RUNNING, knownRunningTime)).milestones())
+                .containsExactly(start.milestones().getFirst(),
+                        new PipelineRunProgress.Milestone(PipelineRunStage.ENGINE_RUNNING, knownRunningTime),
+                        new PipelineRunProgress.Milestone(PipelineRunStage.INITIAL_LOAD_COMPLETED, at));
     }
 }

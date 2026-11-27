@@ -109,16 +109,21 @@ final class NativePipelineRunProgressPublisher implements PipelineRunProgressEve
     @Override public void observation(PipelineIntentSnapshot intent, WorkloadClaimFence claim, Observation observation) {
         var load = observation.initialLoad();
         var at = observation.observedAt();
+        boolean completed = observation.state() == PipelineState.COMPLETED;
         if (load != null && !load.tables().isEmpty() && !load.readMode().equals("cdc_only") && at != null
-                && (observation.state() == PipelineState.RUNNING || observation.state() == PipelineState.COMPLETED)) {
+                && (observation.state() == PipelineState.RUNNING || completed)) {
             var counts = new PipelineRunProgress.LoadProgress(load.landedTables(), load.tables().size());
             offer(new EventKey(intent.scope(), claim, counts), true, 2,
-                    () -> update(intent, claim, 0, Execution.REQUIRE_BOUND, progress -> progress.observeInitialLoad(counts, at)));
+                    () -> update(intent, claim, 0, Execution.REQUIRE_BOUND, progress -> {
+                        var confirmed = completed ? progress.reach(PipelineRunStage.ENGINE_RUNNING, null) : progress;
+                        return confirmed.observeInitialLoad(counts, at);
+                    }));
         }
         switch (observation.state()) {
             case COMPLETED -> offer(new EventKey(intent.scope(), claim, PipelineRunStage.RUN_COMPLETED), true, 2,
                     () -> update(intent, claim, 0, Execution.REQUIRE_BOUND,
-                            progress -> progress.reach(PipelineRunStage.RUN_COMPLETED, at)));
+                            progress -> progress.reach(PipelineRunStage.ENGINE_RUNNING, null)
+                                    .reach(PipelineRunStage.RUN_COMPLETED, at)));
             case STOPPED, FAILED -> offer(new EventKey(intent.scope(), claim, List.of(intent.intentRevision(), observation.state())),
                     true, 2, () -> update(intent, claim, 0, Execution.KEEP,
                             observation.state() == PipelineState.FAILED ? PipelineRunProgress::markRunFailed : PipelineRunProgress::inactive,

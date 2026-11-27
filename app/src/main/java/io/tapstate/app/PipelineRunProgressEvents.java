@@ -25,7 +25,12 @@ interface PipelineRunProgressEvents {
             return switch (edge) {
                 case ENTERED -> progress.enter(stage, at);
                 case LEFT -> progress.leave(stage, activitySince, false);
-                case REACHED -> progress.reach(stage, at);
+                case REACHED -> {
+                    // This explicit landing event is emitted by the successful bounded job's completion check.
+                    var confirmed = stage == PipelineRunStage.INITIAL_LOAD_COMPLETED
+                            ? progress.reach(PipelineRunStage.ENGINE_RUNNING, null) : progress;
+                    yield confirmed.reach(stage, at);
+                }
                 case FAILED -> progress.leave(stage, activitySince, true);
             };
         }

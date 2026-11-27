@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.runtime.engine.Engine;
@@ -436,6 +437,29 @@ class ScopedEngineLifecycleActuatorTest {
         when(fixedCapture.isCapturing("p")).thenReturn(true);
 
         assertThat(actuator().isCarryingAJob("p")).isFalse();
+    }
+
+    @Test void aFastBoundedJobProvesItRanBeforeItsTargetAcknowledgementArrives() {
+        boundedCapture();
+        when(previous.completed()).thenReturn(true);
+        when(previous.isCarryingAJob()).thenReturn(false);
+        when(previous.status()).thenReturn(com.hazelcast.jet.core.JobStatus.COMPLETED);
+        when(fixedCapture.loadDelivered("p")).thenReturn(false);
+        var progress = new ArrayList<PipelineRunProgressEvents.Event>();
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions, progress::add);
+
+        assertThat(actor.completion("p")).isEmpty();
+        assertThat(progress).singleElement().satisfies(event -> {
+            assertThat(event.claim()).isEqualTo(claim(1));
+            assertThat(event.stage()).isEqualTo(PipelineRunStage.ENGINE_RUNNING);
+            assertThat(event.edge()).isEqualTo(PipelineRunProgressEvents.Edge.REACHED);
+            assertThat(event.at()).isNull();
+        });
+
+        when(fixedCapture.loadDelivered("p")).thenReturn(true);
+        assertThat(actor.completion("p")).contains(new LifecycleActuator.Completion("71", claim(1)));
+        assertThat(progress.getLast().stage()).isEqualTo(PipelineRunStage.INITIAL_LOAD_COMPLETED);
     }
 
     private void boundedCapture() {
