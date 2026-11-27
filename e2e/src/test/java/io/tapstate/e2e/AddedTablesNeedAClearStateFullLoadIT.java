@@ -102,7 +102,9 @@ class AddedTablesNeedAClearStateFullLoadIT {
             assertThat(String.valueOf(refusal.get("message"))).contains("Clear all state", "full load");
             assertThat(intent(storage)).as("a refused start or resume never commits a new desired intent or revision")
                     .isEqualTo(originalIntent);
-            assertThat(control.state(PIPELINE)).contains(retained);
+            Await.until("the retained state after a refused start or resume", Duration.ofSeconds(10),
+                    () -> control.state(PIPELINE).filter(retained::equals).isPresent(),
+                    () -> "state=" + control.state(PIPELINE));
             Saved refused = state(documents, shared, 1);
             assertThat(refused.key()).isEqualTo(before.key());
             assertThat(refused.tables()).containsExactly(ORDERS);

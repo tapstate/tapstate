@@ -209,6 +209,14 @@ class MongoAlertReceiverStoreIT {
             long before = raw(f).getLong("writeFence");
             assertThatThrownBy(() -> transaction(f, s -> f.store.fenceReceiverUse(s, captured))).isInstanceOf(TapstateException.class);
             assertThat(raw(f).getLong("writeFence")).isEqualTo(before);
+
+            var keys = SystemCollections.CLUSTER_KEYS.on(f.database);
+            keys.updateOne(new Document(), new Document("$set", new Document("sourceWriteFence", -1L)));
+            var invalid = keys.find().first();
+            String keyId = f.domain.alertReadKeyId(invalid);
+            assertThat(MongoAlertReceiverStoreIT.<Boolean>transaction(f, session ->
+                    f.domain.fenceAlertKey(session, keyId, invalid))).isFalse();
+            assertThat(keys.find().first()).isEqualTo(invalid);
         });
     }
 

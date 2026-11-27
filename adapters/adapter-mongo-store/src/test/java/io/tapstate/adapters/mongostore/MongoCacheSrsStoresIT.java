@@ -50,7 +50,7 @@ class MongoCacheSrsStoresIT {
             MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
             try {
                 assertThat(states.read("pipeline")).isPresent();
-                assertReadBudget(commands, 4);
+                assertThat(commands).containsExactly("aggregate:cache_identity");
                 commands.clear();
                 assertThat(observations.read("pipeline")).contains(stopped);
                 assertReadBudget(commands, 5);
