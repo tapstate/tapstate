@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.ResumeMetrics;
 import org.bson.Document;
 
 import java.time.Instant;
@@ -25,7 +26,7 @@ import java.util.function.Supplier;
 import java.util.Optional;
 
 /** Writes the native checkpoint within each caller's original CACHE transaction. */
-final class MongoCachePipelineStateStore implements StateStore {
+final class MongoCachePipelineStateStore implements StateStore, StateStore.MetricReader {
     private static final int MAX_CALLERS = 1024;
     private static final class Lane {
         private final String pipeline;
@@ -162,12 +163,22 @@ final class MongoCachePipelineStateStore implements StateStore {
         return Optional.of(access.readCheckpoint(structures));
     }
 
+    @Override public Optional<ResumeMetrics.Checkpoint> readForMetrics(String pipelineId) {
+        access.requirePipeline(pipelineId);
+        return Optional.of(access.readCheckpoint(structures, true, row -> MongoResumeWindow.checkpoint(access, row)));
+    }
+
     @Override public void create(String pipelineId, String stateJson, Instant touchTime) {
         access.requirePipeline(pipelineId);
         throw MongoCachePipelineAccess.fenced();
     }
 
     @Override public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
+        return transitionMetrics(pipelineId, expectedEpoch, nextStateJson, touchTime, null);
+    }
+
+    @Override public CasOutcome transitionMetrics(String pipelineId, long expectedEpoch, String nextStateJson,
+            Instant touchTime, ResumeMetrics.Transition transition) {
         access.requirePipeline(pipelineId); Objects.requireNonNull(nextStateJson, "stateJson"); Objects.requireNonNull(touchTime, "touchTime");
         if (expectedEpoch < 0) throw new IllegalArgumentException("expected epoch must be nonnegative");
         return access.checkpointWithPreparedState((session, current) -> {
@@ -178,6 +189,7 @@ final class MongoCachePipelineStateStore implements StateStore {
             var previous = MongoStateStore.leaseRecovery(current);
             boolean failed = io.tapstate.core.lifecycle.StateJson.of(io.tapstate.core.lifecycle.PipelineState.FAILED).equals(nextStateJson);
             if (previous != null && !failed) values.append("leaseRecovery", null);
+            MongoResumeMetrics.transition(access, session, current, values, transition);
             access.updateState(session, current, values, true);
             return new CasOutcome.Applied(new CheckpointDoc(pipelineId, nextStateJson, epoch + 1,
                     Instant.ofEpochMilli(touchTime.toEpochMilli()), failed ? previous : null));

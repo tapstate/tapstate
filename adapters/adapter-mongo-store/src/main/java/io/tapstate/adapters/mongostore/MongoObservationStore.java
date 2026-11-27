@@ -166,7 +166,7 @@ public final class MongoObservationStore implements ObservationStore {
      * One metric as stored: its name, kind and unit, and its points. The kind is stored by its constant's
      * name, the way the state is, so the stored word and the type it names cannot drift apart.
      */
-    private static Document toDocument(MetricFact fact) {
+    static Document toDocument(MetricFact fact) {
         List<Document> points = new ArrayList<>();
         for (MetricPoint point : fact.points()) {
             // Attributes sorted by key: a document that lists the same point's attributes in two orders on
@@ -204,7 +204,7 @@ public final class MongoObservationStore implements ObservationStore {
      * document was written before facts travelled), and a cell of the wrong shape, or a fact this version
      * refuses to build, is corruption of this field.
      */
-    private static List<MetricFact> readFacts(Document document, String id) {
+    static List<MetricFact> readFacts(Document document, String id) {
         Object raw = document.get("facts");
         if (raw == null) {
             return List.of();
