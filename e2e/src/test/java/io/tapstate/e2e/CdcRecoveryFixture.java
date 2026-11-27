@@ -138,6 +138,8 @@ public final class CdcRecoveryFixture {
                     }
                 }
                 write.writeRecord(context, events, table, value -> {
+                    // Simulate a connector that applies the write and returns without a result callback.
+                    if (configured != null && Files.exists(Path.of(String.valueOf(configured)).resolve("omit-result"))) return;
                     Object replyHold=context.getConnectionConfig().getObject("hold_result");
                     Object replyId=context.getConnectionConfig().getObject("hold_result_id");
                     Path signals=replyHold == null ? null : Path.of(String.valueOf(replyHold));
