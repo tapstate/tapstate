@@ -361,16 +361,19 @@ final class StartFlow {
     }
 
     void reportRerunStartFailure(String id, StartChecks checks) {
-        var clear = server.status(id).stopDetails();
-        // Status can still carry a failure from the previous run.
-        if (IoErrorDefinitions.PIPELINE_CLEAR_UNPROVEN.code().equals(clear.failureCode())) {
+        StatusOutcome status = server.status(id);
+        var clear = status.stopDetails();
+        boolean clearing = "CLEARING".equals(clear.state());
+        // Only an observed status can carry a failure from the previous run.
+        if (clear.failureCode() != null && (clearing && status instanceof StatusOutcome.NoObservation
+                || IoErrorDefinitions.PIPELINE_CLEAR_UNPROVEN.code().equals(clear.failureCode()))) {
             reporting.rejection(clear.failureCode(), clear.failureMessage(), clear.failureParams());
             return;
         }
         String retry = startCommand(id) + answersFor(checks);
         if ("CLEARED".equals(clear.state())) {
             err.println(verb + ": " + id + " state is cleared. Start it with: " + retry);
-        } else if ("CLEARING".equals(clear.state())) {
+        } else if (clearing) {
             err.println(verb + ": " + id + " is still clearing. After clearing completes, run: " + retry);
         } else {
             err.println(verb + ": " + id + " clear result is unconfirmed. Check its status before retrying Start.");
