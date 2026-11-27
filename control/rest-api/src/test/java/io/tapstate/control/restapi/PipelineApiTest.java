@@ -800,6 +800,47 @@ class PipelineApiTest {
     }
 
     @Test
+    void pipelineIdAvailabilityIsWriteScopedAndCoversDraftsAndPublishedArtifacts() {
+        String write = machineToken(Scope.WRITE);
+        assertAvailability("new-id", write, true);
+        assertAvailability("pl1", write, false);
+        assertAvailability("src_x", write, false);
+
+        var draft = """
+                {"pipelineId":"draft-only","mode":"dag","name":"Orders",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+        assertThat(client().post().uri("/api/pipelines/draft-only/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + write)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity().getStatusCode())
+                .isEqualTo(HttpStatus.CREATED);
+        assertAvailability("draft-only", write, false);
+
+        for (String query : List.of("", "?id=", "?id=invalid.dot")) {
+            assertThat(client().get().uri("/api/pipelines:id-availability" + query)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + write)
+                    .<HttpStatus>exchange((request, response) -> (HttpStatus) response.getStatusCode()))
+                    .isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+        assertThat(client().get().uri("/api/pipelines:id-availability?id=new-id")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .<HttpStatus>exchange((request, response) -> (HttpStatus) response.getStatusCode()))
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(client().get().uri("/api/pipelines:id-availability?id=new-id")
+                .<HttpStatus>exchange((request, response) -> (HttpStatus) response.getStatusCode()))
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    private void assertAvailability(String id, String token, boolean available) {
+        ResponseEntity<Map> result = client().get()
+                .uri(uriBuilder -> uriBuilder.path("/api/pipelines:id-availability").queryParam("id", id).build())
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token).retrieve().toEntity(Map.class);
+        assertThat(result.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(result.getHeaders().getCacheControl()).isEqualTo("no-store");
+        assertThat(result.getBody()).isEqualTo(Map.of("available", available));
+    }
+
+    @Test
     void draftCreationEncodesPipelineIdInLocationHeader() {
         String id = "pipeline with spaces";
         String draft = """
@@ -1441,7 +1482,9 @@ class PipelineApiTest {
                 assertThat(ControlOperations.registry().ids())
                         .as("a projected pipeline verb must be registered")
                         .contains(verb.value());
-                if (!"pipeline.delete".equals(verb.value())) {
+                if (Set.of("pipeline.delete", "pipeline.id-availability").contains(verb.value())) {
+                    assertThat(cliExposed).doesNotContain(verb.value());
+                } else {
                     assertThat(cliExposed).contains(verb.value());
                 }
             }
@@ -1452,7 +1495,7 @@ class PipelineApiTest {
                         + "operations, and derived schemas — projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder(
                         "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
-                        "pipeline.update", "pipeline.delete",
+                        "pipeline.update", "pipeline.delete", "pipeline.id-availability",
                         "pipeline.preview",
                         "pipeline.start", "pipeline.start-checks", "pipeline.stop", "pipeline.pause",
                         "pipeline.resume",

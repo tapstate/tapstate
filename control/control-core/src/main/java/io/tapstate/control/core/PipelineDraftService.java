@@ -79,6 +79,21 @@ public final class PipelineDraftService {
         this.artifacts = artifacts;
     }
 
+    /** Observes a new Pipeline ID without reserving it or inspecting an occupied definition. */
+    public boolean idAvailable(String pipelineId) {
+        if (pipelineId == null || pipelineId.isBlank()) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "id must be non-blank"), null);
+        }
+        DslParser.idCharacterRequirement(pipelineId).ifPresent(required -> {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "id must be " + required), null);
+        });
+        return !store.idOccupied(pipelineId).orElseGet(() -> {
+            // Portable stores can supply their own exact reads instead of the native combined observation.
+            if (artifacts == null) throw new IllegalStateException("artifact store is not configured");
+            return store.get(pipelineId).isPresent() || artifacts.getResource(pipelineId).isPresent();
+        });
+    }
+
     public Optional<PipelineDraft> find(String pipelineId) {
         return store.get(Objects.requireNonNull(pipelineId, "pipelineId"));
     }

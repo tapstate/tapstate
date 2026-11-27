@@ -57,6 +57,26 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     }
 
     @Override
+    public Optional<Boolean> idOccupied(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return Optional.of(StoreIo.call(() -> {
+            var key = new Document("_id", pipelineId);
+            var idOnly = new Document("_id", 1);
+            if (artifacts.withReadPreference(com.mongodb.ReadPreference.primary()).find(key)
+                    .projection(idOnly).first() != null) return true;
+            var row = drafts.withReadPreference(com.mongodb.ReadPreference.primary()).find(key)
+                    .projection(idOnly.append("deleted", 1).append(REVISION, 1)).first();
+            if (row == null) return false;
+            if (!Boolean.TRUE.equals(row.getBoolean("deleted"))) return true;
+            if (!(row.get(REVISION) instanceof Number)) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", pipelineId, "field", REVISION), null);
+            }
+            return false;
+        }));
+    }
+
+    @Override
     public List<PipelineDraft> list() {
         return StoreIo.call(() -> {
             List<PipelineDraft> result = new ArrayList<>();

@@ -40,6 +40,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final Logger LOG = Logger.getLogger(MongoConfigurationDraftStore.class.getName());
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> drafts;
     private final MongoCollection<Document> versions;
     private final MongoConfigurationArtifactStore artifacts;
@@ -48,6 +49,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
     MongoConfigurationDraftStore(MongoClient client, MongoDatabase database, SourceConfigCipherProvider ciphers,
             MongoConfigurationArtifactStore artifacts) {
         this.client = Objects.requireNonNull(client, "client");
+        this.database = Objects.requireNonNull(database, "database");
         this.drafts = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
         this.versions = SystemCollections.CONFIGURATION_VERSION.on(database);
@@ -77,6 +79,48 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
             Document row = drafts.find(new Document("_id", id)).first();
             return row == null || deleted(row) ? Optional.empty() : Optional.of(codec.decode(row));
         });
+    }
+
+    @Override public Optional<Boolean> idOccupied(String id) {
+        Objects.requireNonNull(id, "id");
+        return Optional.of(StoreIo.call(() -> {
+            var stages = MongoStartConfigRead.root();
+            stages.add(new Document("$project", new Document("_id", 1)));
+            var kindCollections = artifacts.artifactIdCollections();
+            // All authoring kinds share the create-only ID namespace, including those that are not Pipelines.
+            for (int i = 0; i < kindCollections.size(); i++) {
+                stages.add(occupancyLookup(kindCollections.get(i), "artifact" + i, id, new Document("_id", 1)));
+            }
+            var deleted = new Document("$eq", List.of("$deleted", true));
+            var draftHeader = new Document("_id", 1).append("deleted", deleted)
+                    .append("tombstone", new Document("$cond",
+                            List.of(deleted, MongoStartConfigRead.boundedValue(), false)));
+            stages.add(occupancyLookup(SystemCollections.CONFIG_PIPELINE_DRAFTS.collectionName(), "draft", id, draftHeader));
+            Document result = MongoValidationClaimObservation.lacksSnapshotRead(client)
+                    ? transaction(session -> MongoStartConfigRead.snapshot(database, session, stages))
+                    : MongoStartConfigRead.snapshot(database, stages);
+            if (result == null) throw unreadableIdObservation(id);
+            for (int i = 0; i < kindCollections.size(); i++) {
+                if (!result.getList("artifact" + i, Document.class).isEmpty()) return true;
+            }
+            List<Document> found = result.getList("draft", Document.class);
+            if (found.isEmpty()) return false;
+            var draft = found.getFirst();
+            if (!Boolean.TRUE.equals(draft.get("deleted"))) return true;
+            if (!(draft.get("tombstone") instanceof Document tombstone)) throw unreadableIdObservation(id);
+            codec.tombstoneRevision(tombstone);
+            return false;
+        }));
+    }
+
+    private static Document occupancyLookup(String collection, String field, String id, Document projection) {
+        return new Document("$lookup", new Document("from", collection).append("as", field)
+                .append("pipeline", List.of(new Document("$match", new Document("_id", id)),
+                        new Document("$project", projection))));
+    }
+
+    private static TapstateException unreadableIdObservation(String id) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", "identity"), null);
     }
 
     @Override public List<PipelineDraft> list() { return list(0, Integer.MAX_VALUE); }
