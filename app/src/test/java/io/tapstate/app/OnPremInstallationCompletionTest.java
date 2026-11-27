@@ -556,6 +556,38 @@ class OnPremInstallationCompletionTest {
         }
     }
 
+    @Test void retainedInstallationRetriesItsOriginalOwnerAfterTransientCacheFailure() {
+        try (var f = new Fixture(directory.resolve("retained-owner-cache-outage"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var cacheReachable = new AtomicBoolean(true);
+            var refusedReads = new AtomicInteger();
+            var scope = f.preparation.businessScope();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            when(f.cache.loadBusinessScope(scope)).thenAnswer(ignored -> {
+                if (!cacheReachable.get()) {
+                    refusedReads.incrementAndGet();
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "test CACHE outage"), null);
+                }
+                return scope;
+            });
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            cacheReachable.set(false);
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(refusedReads.get()).isPositive());
+            assertThat(f.completions).hasValue(0);
+
+            cacheReachable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
         try (var f = new Fixture(directory.resolve("retained-catalog"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
