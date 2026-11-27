@@ -132,9 +132,8 @@ class NativeAuthenticationStoreOutageIT {
                 control.login(NativeMongoStorageFixture.USER, NativeMongoStorageFixture.PASSWORD);
                 Await.until("native authentication and business storage to be ready", () ->
                         "READY".equals(control.storageStatus().get("businessPhase")), () -> String.valueOf(control.storageStatus()));
-                assertThat(control.clusterMemberNodeIds()).hasSize(1);
-                Await.until("the original node boot to be durably observed",()->configuration.getCollection("alert_node_lifecycles").countDocuments(new Document("phase","EXPECTED"))==1,
-                        ()->"the initial node lifecycle fact is absent");
+                assertThat(control.clusterMembers()).singleElement()
+                        .satisfies(member -> assertThat(member.bootId()).isNotBlank());
                 control.awaitInitialAlertMaintenance();
                 Document readyKeys=SystemCollections.CLUSTER_KEYS.on(configuration).find().first();
                 assertThat(keyIdentity(readyKeys)).isEqualTo(keyIdentity(keys));

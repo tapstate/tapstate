@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorError;
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
@@ -50,6 +51,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -341,6 +343,72 @@ class ExecutionAuthorizationTest {
                 "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
         assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
         assertThat(marked.failureAfterMemberLoss()).isFalse();
+    }
+
+    @Test
+    void anUnconfirmedReceiptMarksItsRunEvenWhenTheWriteStageSucceeded() {
+        ExecutionFence fence = submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var batch = List.of(Envelope.insert(1L, "orders", Map.of("id", 1), null));
+        var receipt = new WriteResult(1, 0);
+        var failure = unconfirmedReceipt();
+        var fact = new FailureFact(failure);
+        var sink = mock(SinkWriter.class);
+        when(sink.write(batch)).thenReturn(CompletableFuture.completedFuture(receipt));
+        when(sink.failureFact(failure)).thenReturn(fact);
+
+        try (var authorization = guard(claims);
+                var writer = FencedSinkWriterFactory.guarded(sink, fence, authorization)) {
+            assertThat(writer.write(batch).toCompletableFuture().join()).isEqualTo(receipt);
+            assertThat(claims.read(key).orElseThrow().claim().failureClaimGeneration()).isZero();
+
+            assertThat(writer.failureFact(failure)).isSameAs(fact);
+
+            var marked = claims.read(key).orElseThrow().claim();
+            assertThat(marked.failureClaimGeneration()).isEqualTo(fence.claimGeneration());
+            assertThat(marked.failureAfterMemberLoss()).isFalse();
+        }
+    }
+
+    @Test
+    void otherWriterDiagnosticsAreForwardedWithoutMarkingTheRun() {
+        ExecutionFence fence = submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var sink = mock(SinkWriter.class);
+        var coordinated = new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
+                Map.of("expected", 1, "accepted", 0L), null);
+
+        try (var authorization = guard(claims);
+                var writer = FencedSinkWriterFactory.guarded(sink, fence, authorization)) {
+            for (var failure : List.of(coordinated, new IllegalStateException("writer failed"))) {
+                var fact = new FailureFact(failure);
+                when(sink.failureFact(failure)).thenReturn(fact);
+                assertThat(writer.failureFact(failure)).isSameAs(fact);
+                assertThat(claims.read(key).orElseThrow().claim().failureClaimGeneration()).isZero();
+            }
+        }
+    }
+
+    @Test
+    void aReceiptFailureReportedAfterClosingDoesNotMarkTheRun() {
+        ExecutionFence fence = submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var failure = unconfirmedReceipt();
+        var sink = mock(SinkWriter.class);
+
+        try (var authorization = guard(claims)) {
+            var writer = FencedSinkWriterFactory.guarded(sink, fence, authorization);
+            writer.close();
+
+            assertThat(writer.failureFact(failure)).isEqualTo(FailureFact.unavailable(failure));
+            assertThat(claims.read(key).orElseThrow().claim().failureClaimGeneration()).isZero();
+            verify(sink, never()).failureFact(failure);
+        }
+    }
+
+    private static TapstateException unconfirmedReceipt() {
+        return new TapstateException(EngineError.SINK_WRITE_UNCONFIRMED,
+                Map.of("expected", 1, "accepted", 0L), null);
     }
 
     @Test

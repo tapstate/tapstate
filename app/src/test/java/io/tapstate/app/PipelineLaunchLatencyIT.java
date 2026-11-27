@@ -331,14 +331,14 @@ class PipelineLaunchLatencyIT {
         }
     }
 
-    private static final class LaunchFixture implements AutoCloseable {
+    static final class LaunchFixture implements AutoCloseable {
         private final ConfigurableApplicationContext application;
         private ConfigurableApplicationContext business;
         private HazelcastInstance member;
 
-        private LaunchFixture(ConfigurableApplicationContext application) { this.application = application; }
+        LaunchFixture(ConfigurableApplicationContext application) { this.application = application; }
 
-        private ConfigurableApplicationContext awaitBusiness() {
+        ConfigurableApplicationContext awaitBusiness() {
             NativeAppStorage.awaitBusiness(application);
             business = NativeAppStorage.business(application);
             member = business.getBean(HazelcastInstance.class);
@@ -580,7 +580,7 @@ class PipelineLaunchLatencyIT {
         }
     }
 
-    private static Map<String, Object> draft(String id) {
+    static Map<String, Object> draft(String id) {
         return Map.of("pipelineId", id, "mode", "wizard", "name", "Order view", "wizard", Map.of(
                 "root", Map.of("id", "root", "sourceId", "launch-input", "table", "orders", "key", List.of("_id"), "preTransforms", List.of()),
                 "related", List.of(related("customer", "customers", "object"), related("lines", "lines", "array")),
@@ -595,7 +595,7 @@ class PipelineLaunchLatencyIT {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> request(HttpClient http, String origin, String cookie, String method,
+    static Map<String, Object> request(HttpClient http, String origin, String cookie, String method,
             String path, Object body, int expected) throws Exception {
         return request(http,origin,cookie,method,path,body,expected,ignored -> {});
     }
@@ -627,7 +627,7 @@ class PipelineLaunchLatencyIT {
         } finally { TRACES.remove(traceId); }
     }
 
-    private static MongoDBContainer mongo() {
+    static MongoDBContainer mongo() {
         return new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
                 .withTmpFs(Map.of("/data/db", "rw", "/data/configdb", "rw"))
                 .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig().withMemory(768L * 1024 * 1024).withNanoCPUs(1_000_000_000L))
