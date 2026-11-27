@@ -1078,7 +1078,8 @@ public final class ObservationPublisher {
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun, resumed));
                 if (state != null && state.unavailable())
                     measured.removeIf(fact -> switch (fact.name()) {
-                        case RECORDS_METRIC, BYTES_METRIC, RECORD_DELIVERY_DURATION_METRIC, PROCESS_DURATION_METRIC -> true;
+                        case RECORDS_METRIC, BYTES_METRIC, RECORD_DELIVERY_DURATION_METRIC, PROCESS_DURATION_METRIC,
+                                CdcDeliveryTotals.COUNT_METRIC, CdcDeliveryTotals.TOTAL_MILLIS_METRIC -> true;
                         default -> false;
                     });
                 measured.addAll(aggregateFacts(pipelineId, at, aggregateReadings.get().apply(pipelineId)));

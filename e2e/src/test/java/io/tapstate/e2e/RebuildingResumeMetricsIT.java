@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.core.JobStatus;
+import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -14,7 +15,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -95,7 +98,35 @@ class RebuildingResumeMetricsIT {
                     () -> "target rows=" + files.count(targetAddress, "late"));
             awaitRecordsOut(control, writes, beforeResume + 2, restartProducer ? beforeResume : 0,
                     () -> { if (restartProducer) server.publishObservationsOnce(); });
+            if (!restartProducer) assertCompactHandoffWithholdsCdcTotals(storage, server, control);
         }
+    }
+
+    private static void assertCompactHandoffWithholdsCdcTotals(PreparedNativeStore storage,
+            InProcessServer server, ControlPlane control) {
+        assertThat(server.stopPublishingObservations()).isEqualTo(1);
+        assertThat(control.metricFacts(PIPELINE)).extracting(fact -> fact.get("name"))
+                .contains(CdcDeliveryTotals.COUNT_METRIC, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, "tapstate.pipeline.records");
+        try (var client = MongoClients.create(storage.cacheUri())) {
+            var checkpoints = client.getDatabase(storage.cacheDatabase()).getCollection("pipeline_state");
+            var id = new Document("_id", PIPELINE);
+            var applied = checkpoints.find(id).first().get("resumeMetrics", Document.class).get("applied", Document.class);
+            var marker = new Document("unavailableRevision", applied.getLong("revision"))
+                    .append("jobId", applied.get("baseline", Document.class).getLong("jobId"));
+            var update = checkpoints.updateOne(id, new Document("$set", new Document("resumeMetrics", marker)));
+            assertThat(update.getModifiedCount()).isOne();
+        }
+
+        var facts = Await.answered("a new publication with the handoff's cumulative record counts withheld", WAIT, () -> {
+            server.publishObservationsOnce();
+            var reading = control.metricFacts(PIPELINE);
+            return reading.stream().noneMatch(fact -> "tapstate.pipeline.records".equals(fact.get("name")))
+                    ? Optional.of(reading) : Optional.empty();
+        });
+        assertThat(facts).anySatisfy(fact -> assertThat(fact)
+                .containsEntry("name", "tapstate.pipeline.lag").containsEntry("type", "gauge"));
+        assertThat(facts).extracting(fact -> fact.get("name")).as("CDC totals without a continuation baseline")
+                .doesNotContain(CdcDeliveryTotals.COUNT_METRIC, CdcDeliveryTotals.TOTAL_MILLIS_METRIC);
     }
 
     private static void pauseAndRebuildAfterRestart(InProcessServer server, Set<HazelcastInstance> existingMembers,
