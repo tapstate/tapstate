@@ -467,6 +467,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return true;
     }
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
+        return allocate(expected, topologyRevision, nodeIds, 0L);
+    }
+
+    @Override public Optional<WorkloadClaim> advanceResumeExecution(WorkloadClaim expected, long topologyRevision,
+            Set<String> nodeIds, long revision) {
+        if (revision < 1 || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
+            throw new IllegalArgumentException("invalid resume allocation");
+        return allocate(expected, topologyRevision, nodeIds, revision);
+    }
+
+    private Optional<WorkloadClaim> allocate(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds,
+            long revision) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
         if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION) {
             return MongoCachePipelineStateStore.writeTransaction(client, expected.key().resourceId(), () -> transaction(false, null, (store, session) -> {
@@ -475,7 +487,12 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     // Preserve existing refusal diagnostics and the original node-backed lease path.
                     validateMutationScope(session, store, expected);
                     var advanced = store.advanceExecution(expected, topologyRevision, nodeIds);
-                    if (advanced.isPresent()) fenceProgress(session, storedScope(session, expected.key()));
+                    if (advanced.isPresent()) {
+                        var access = new MongoCachePipelineAccess(client, database, storedScope(session, expected.key()), null, requireActive);
+                        var row = access.state(session, true);
+                        access.updateState(session, row, MongoResumeMetrics.advance(row, WorkloadClaimFence.from(expected),
+                                WorkloadClaimFence.from(advanced.orElseThrow()), revision), false);
+                    }
                     return advanced;
                 }
                 var advanced = first.orElseThrow();
@@ -484,7 +501,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
                 var state = access.stateRow(session);
                 access.requirePreparedClaim(advanced.row());
-                access.updateState(session, state, new Document(), false);
+                access.updateState(session, state, MongoResumeMetrics.advance(state, WorkloadClaimFence.from(expected),
+                        WorkloadClaimFence.from(advanced.claim()), revision), false);
                 return Optional.of(advanced.claim());
             }, true));
         }

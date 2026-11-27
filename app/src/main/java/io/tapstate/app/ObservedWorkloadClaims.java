@@ -73,6 +73,9 @@ class ObservedWorkloadClaims implements WorkloadClaimStore {
     public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope){return call(false,()->delegate.readPipeline(scope));}
     public Optional<WorkloadClaim> renew(WorkloadClaim expected,Duration ttl){return call(true,()->delegate.renew(expected,ttl));}
     public boolean release(WorkloadClaim expected){return call(true,()->delegate.release(expected));}
+    public Optional<WorkloadClaim> advanceResumeExecution(WorkloadClaim expected, long revision, Set<String> members, long intentRevision) {
+        return call(true, () -> delegate.advanceResumeExecution(expected, revision, members, intentRevision));
+    }
     public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected,long revision,Set<String> members){return call(true,()->delegate.advanceExecution(expected,revision,members));}
     public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected,boolean loss){return call(true,()->delegate.recordExecutionFailure(expected,loss));}
     public Optional<WorkloadClaimReading> read(WorkloadClaimKey key){return call(false,()->delegate.read(key));}

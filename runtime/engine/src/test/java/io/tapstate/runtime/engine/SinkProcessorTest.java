@@ -16,6 +16,7 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -391,6 +392,40 @@ class SinkProcessorTest {
                 failure -> assertThat(failure.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
         assertThat(ack.calls).isEmpty();
         assertThat(replies).isEmpty();
+    }
+
+    @Test
+    void an_invalid_receipt_keeps_the_batch_position_and_its_bound_unacknowledged() throws Exception {
+        for (var receipt : java.util.Arrays.asList(null, new WriteResult(0), new WriteResult(1), new WriteResult(3))) {
+            for (var frontier : List.of(new ContiguousPrefix(AXES), SettledFloor.forRoutedWriter(AXES, 32))) {
+                var calls = new ArrayList<String>();
+                var ack = new SinkAck() {
+                    @Override public void advance(String chain, ChainPosition point) { calls.add(point.token()); }
+                    @Override public void bounded(String chain, SourceOrder through) { calls.add("bound " + through.seq()); }
+                };
+                var processor = init(new SinkProcessor(receiptWriter(receipt), ack, frontier, 1, 2));
+                var inbox = new TestInbox();
+                inbox.addAll(List.of(at("orders", "p1"), at("orders", "p2")));
+                processor.process(0, inbox);
+                processor.tryProcessWatermark(boundAt("orders", 2));
+                assertThatThrownBy(processor::complete).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(EngineError.SINK_WRITE_UNCONFIRMED);
+                    assertThat(failure.args()).containsEntry("expected", 2)
+                            .containsEntry("accepted", receipt == null ? 0L : receipt.acknowledgedRows());
+                });
+                processor.close();
+                assertThat(calls).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void a_ddl_only_batch_can_settle_with_zero_acknowledged_rows() throws Exception {
+        var processor = init(new SinkProcessor(receiptWriter(new WriteResult(0)), 1, 1));
+        var inbox = new TestInbox();
+        inbox.add(Envelope.ddl(1L, "orders", Map.of()));
+        pump(processor, inbox);
+        assertThat(inbox.isEmpty()).isTrue();
     }
 
     private static SinkWriter receiptWriter(WriteResult result) {
@@ -1058,12 +1093,12 @@ class SinkProcessorTest {
 
     /** Hands out futures the test completes by hand, to observe the in-flight bound. */
     private static final class ManualWriter implements SinkWriter {
-        private final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
+        private final Map<CompletableFuture<WriteResult>, Integer> pending = new LinkedHashMap<>();
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             CompletableFuture<WriteResult> future = new CompletableFuture<>();
-            pending.add(future);
+            pending.put(future, records.size());
             return future;
         }
 
@@ -1072,20 +1107,15 @@ class SinkProcessorTest {
         }
 
         void completeOldest() {
-            for (CompletableFuture<WriteResult> f : pending) {
-                if (!f.isDone()) {
-                    f.complete(new WriteResult(1));
+            for (var write : pending.entrySet()) {
+                if (write.getKey().complete(new WriteResult(write.getValue()))) {
                     return;
                 }
             }
         }
 
         void completeAll() {
-            for (CompletableFuture<WriteResult> f : pending) {
-                if (!f.isDone()) {
-                    f.complete(new WriteResult(1));
-                }
-            }
+            pending.forEach((future, size) -> future.complete(new WriteResult(size)));
         }
 
         @Override

@@ -149,7 +149,9 @@ public enum EngineError implements TapstateErrorCode {
 
     KEY_MOVE_WRITE_UNCONFIRMED(EngineErrorDefinitions.KEY_MOVE_WRITE_UNCONFIRMED),
 
-    TARGET_KEY_ORDER_UNKNOWN(EngineErrorDefinitions.TARGET_KEY_ORDER_UNKNOWN);
+    TARGET_KEY_ORDER_UNKNOWN(EngineErrorDefinitions.TARGET_KEY_ORDER_UNKNOWN),
+
+    SINK_WRITE_UNCONFIRMED(EngineErrorDefinitions.SINK_WRITE_UNCONFIRMED);
 
     private final ProductErrorDefinition definition;
 
