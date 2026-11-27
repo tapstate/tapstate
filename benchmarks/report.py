@@ -7,7 +7,8 @@ import catalog
 import verdict
 
 CASE_CONDITIONS = baseline_schema.CASE_CONDITIONS
-ARM_CONDITIONS = ("effective_input_rows", "mongo_topology", "target_delay_millis", "database_conditions")
+ARM_CONDITIONS = ("effective_input_rows", "mongo_topology", "target_delay_millis", "database_conditions",
+                  "source_window_protocol")
 OOM_ATTRIBUTIONS = {"observed-java-out-of-memory", "observed-op-oom-kill"}
 
 
@@ -175,7 +176,7 @@ def summarize_repeats(results):
                 continue
             conditions = {key: row[key] for key in (*CASE_CONDITIONS, "run_id")}
             conditions["op_boot_sha256"] = arm.get("op_boot_sha256")
-            conditions.update({key: arm.get(key) for key in ARM_CONDITIONS})
+            conditions.update({key: arm[key] for key in ARM_CONDITIONS if key in arm})
             for metric, value, source in eligible_metrics(arm):
                 if valid_metric_value(metric, value):
                     binding = {**conditions, **metric_conditions(arm, metric), "metric_source": source}
@@ -192,6 +193,8 @@ def summarize_repeats(results):
 
 
 def eligible_metrics(arm):
+    if arm.get("paired_source_comparable") is False:
+        return
     if arm.get("measurement_status") == "eligible":
         yield "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"), "completion observation"
     latency = arm.get("live_latency", {})

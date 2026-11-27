@@ -40,9 +40,16 @@ returns the stored BSON statistics and the time spent writing and reading back.
 
 Each preparation supports one change workload. After establishing reader state, use
 `prewrite()` for a fixed backlog or `inject()` for paced warm-up and measurement
-windows. The source reports contain separate per-stream resume boundaries, operation
-counts, and ordering digests. Retain reports from incomplete phases and inspect their
-submitted, acknowledged and observed counts before using them for measurement.
+windows. Live writes stop at the scheduled deadline. Each phase reports actual
+submissions and acknowledgements, rates over the active write window, and whether
+the last in-window submission was acknowledged after the deadline. Target drain
+and readback use the verified source history. Fixed backlog execution verifies the
+full planned batch. Per-stream resume boundaries, operation counts, and ordering
+digests also remain available for incomplete phases.
+
+The live source protocol is a baseline comparison condition. Slow-target arms
+with different source sequences retain their results and are ineligible for
+paired performance comparisons.
 
 Run the bounded replica-set witness from the repository root:
 

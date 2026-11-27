@@ -211,11 +211,12 @@ class MongoWorkloadGeneratorIT {
 
     @ParameterizedTest
     @CsvSource({
-            "11, true, 0 21 23 30 40 50",
-            "19, false, 0 29 31 41 51",
+            "11, false, 0 21 31 41 51",
+            "19, true, 0 29 39 49 59",
             "31, false, 0 41 51"
     })
-    void livePacingRecoversAtMostOneOverdueSlot(long overshootMillis, boolean complete, String expectedWrites)
+    void liveWindowCompletesWithTheWritesSubmittedBeforeItsCutoff(
+            long overshootMillis, boolean acknowledgedAfterWindow, String expectedWrites)
             throws Exception {
         withSource(source -> {
             String id = "map.live.basic.standard";
@@ -243,14 +244,16 @@ class MongoWorkloadGeneratorIT {
             assertTrue(result.warmup().complete(), result::toString);
             var measured = result.measured();
             var records = measured.streams().get("records");
-            assertEquals(complete, measured.complete(), result::toString);
+            assertTrue(measured.complete(), result::toString);
             assertEquals(6, records.planned().total());
             assertEquals(writes.size(), readHistory(source, "records", records).size());
             assertEquals(writes.size(), records.submittedOperations());
             assertEquals(records.submittedOperations(), records.acknowledged().total());
             assertEquals(records.acknowledged(), records.observed());
             assertEquals(java.util.Arrays.stream(expectedWrites.split(" ")).map(Long::valueOf).toList(), writes);
-            assertTrue(measured.writeNanos() >= TimeUnit.MILLISECONDS.toNanos(60));
+            assertEquals(TimeUnit.MILLISECONDS.toNanos(60), measured.scheduledWindowNanos());
+            assertEquals(writes.size() / 0.06, measured.actualSubmittedEventsPerSecond(), 1e-9);
+            assertEquals(acknowledgedAfterWindow, measured.acknowledgedAfterWindow());
         });
     }
 
@@ -325,7 +328,7 @@ class MongoWorkloadGeneratorIT {
     }
 
     @Test
-    void aFinalAcknowledgementPastTheWindowKeepsHistoryButCannotQualify() throws Exception {
+    void aWriteSubmittedInTheWindowCanBeAcknowledgedAfterItsCutoff() throws Exception {
         withSource(source -> {
             String id = "copy.live.basic.standard";
             var writes = new AtomicInteger();
@@ -340,12 +343,18 @@ class MongoWorkloadGeneratorIT {
                     new Mix(100, 0, 0), null, () -> {});
 
             assertTrue(result.warmup().complete(), result::toString);
-            assertFalse(result.measured().complete());
-            assertEquals(TimeUnit.SECONDS.toNanos(6), result.measured().writeNanos());
-            var measured = result.measured().streams().get("records");
+            var phase = result.measured();
+            assertTrue(phase.complete(), phase::toString);
+            assertTrue(phase.acknowledgedAfterWindow());
+            assertEquals(TimeUnit.SECONDS.toNanos(2), phase.scheduledWindowNanos());
+            assertEquals(TimeUnit.SECONDS.toNanos(6), phase.writeNanos());
+            assertEquals(1.0, phase.actualSubmittedEventsPerSecond());
+            assertEquals(1.0, phase.actualAcknowledgedEventsPerSecond());
+            var measured = phase.streams().get("records");
+            assertEquals(2, measured.submittedOperations());
             assertEquals(new Operations(2, 0, 0), measured.acknowledged());
             assertEquals(measured.acknowledged(), measured.observed());
-            assertTrue(measured.error().contains("acknowledgement exceeded"));
+            assertNull(measured.error());
             assertNotNull(measured.sourceSequenceSha256());
         });
     }

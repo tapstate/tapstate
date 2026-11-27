@@ -103,7 +103,7 @@ class BenchmarkLatencyProbeTest {
         var stream = new StreamReport(count, count, count, null, first, last, null, events.length, 0,
                 null, digest(entries), null);
         return new PhaseReport("fixture", Instant.ofEpochMilli(start), Instant.ofEpochMilli(end), 0, 0,
-                null, null, 0, 0, null, Map.of("records", stream), true);
+                null, null, null, false, 0, 0, null, Map.of("records", stream), true);
     }
 
     private static List<Confirmation> observed(Event... events) {

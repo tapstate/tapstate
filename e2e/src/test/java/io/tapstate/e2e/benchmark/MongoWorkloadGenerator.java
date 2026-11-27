@@ -87,7 +87,8 @@ public final class MongoWorkloadGenerator {
     }
 
     public record PhaseReport(String name, Instant startedAt, Instant writesFinishedAt, long writeNanos, long historyNanos, Long generatorProcessCpuNanos,
-                              Integer requestedEventsPerSecond, double actualSubmittedEventsPerSecond,
+                              Integer requestedEventsPerSecond, Long scheduledWindowNanos, boolean acknowledgedAfterWindow,
+                              double actualSubmittedEventsPerSecond,
                               double actualAcknowledgedEventsPerSecond, Latency sourceRequestLatency,
                               Map<String, StreamReport> streams, boolean complete) {
     }
@@ -369,6 +370,8 @@ public final class MongoWorkloadGenerator {
         Instant writesFinishedAt;
         long duration;
         long historyNanos;
+        Long scheduledWindow = liveDuration == null ? null : liveDuration.toNanos();
+        boolean acknowledgedAfterWindow = false;
         Long writerCpu;
         Throwable primary = null;
         try {
@@ -377,12 +380,17 @@ public final class MongoWorkloadGenerator {
             if (rate == null) {
                 prewriteBatches(states, lengths, delays);
             } else {
-                injectPaced(states, lengths, rate, liveDuration, delays, start);
+                acknowledgedAfterWindow = injectPaced(states, lengths, rate, scheduledWindow, delays, start);
             }
             duration = nanoClock.getAsLong() - start;
-            if (liveDuration != null && (duration < liveDuration.toNanos()
-                    || Thread.currentThread().isInterrupted())) {
-                for (var state : states) state.recordError("The live write window ended before its scheduled boundary");
+            if (scheduledWindow != null) {
+                for (var state : states) {
+                    if (duration < scheduledWindow || Thread.currentThread().isInterrupted()) {
+                        state.recordError("The live write window ended before its scheduled boundary");
+                    } else if (state.submitted == 0 && state.stream.requested.total() > 0) {
+                        state.recordError("No source events were submitted during the live write window");
+                    }
+                }
             }
             writesFinishedAt = Instant.now();
             writerCpu = cpuElapsed(cpu);
@@ -404,7 +412,8 @@ public final class MongoWorkloadGenerator {
         } finally {
             closeStreams(states, primary);
         }
-        return report(name, states, rate, startedAt, writesFinishedAt, duration, historyNanos, writerCpu, delays);
+        return report(name, states, rate, scheduledWindow, acknowledgedAfterWindow,
+                startedAt, writesFinishedAt, duration, historyNanos, writerCpu, delays);
     }
 
     private static void closeStreams(List<StreamState> states, Throwable primary) {
@@ -445,49 +454,47 @@ public final class MongoWorkloadGenerator {
         } while (remaining);
     }
 
-    private void injectPaced(List<StreamState> states, Map<String, Integer> lengths, int rate, Duration liveDuration,
-                             Delays delays, long start) {
+    private boolean injectPaced(List<StreamState> states, Map<String, Integer> lengths, int rate, long windowNanos,
+                                Delays delays, long start) {
         long interval = TimeUnit.SECONDS.toNanos(1) / rate;
         long total = states.stream().mapToLong(state -> state.stream.requested.total()).sum();
-        long deadline = start + liveDuration.toNanos();
+        long deadline = start + windowNanos;
         long next = start;
-        boolean recovering = false;
         for (long sent = 0; sent < total;) {
             for (var state : states) {
                 if (state.submitted == state.stream.requested.total()) {
                     continue;
                 }
+                long due = Math.min(next, deadline);
                 long delay;
-                while ((delay = next - nanoClock.getAsLong()) > 0 && !Thread.currentThread().isInterrupted()) {
+                while ((delay = due - nanoClock.getAsLong()) > 0 && !Thread.currentThread().isInterrupted()) {
                     waitNanos.accept(delay);
                 }
-                long now = nanoClock.getAsLong();
-                if (now >= deadline || Thread.currentThread().isInterrupted()) {
-                    return;
+                if (nanoClock.getAsLong() >= deadline || Thread.currentThread().isInterrupted()) {
+                    return false;
                 }
                 var event = state.stream.next();
-                if (!state.write(List.of(write(state.name(), event, lengths.get(state.name()))), List.of(event), delays)) {
-                    return;
+                var command = write(state.name(), event, lengths.get(state.name()));
+                long now = nanoClock.getAsLong();
+                if (now >= deadline || Thread.currentThread().isInterrupted()) {
+                    return false;
+                }
+                if (!state.write(List.of(command), List.of(event), delays)) {
+                    return false;
                 }
                 if (nanoClock.getAsLong() > deadline) {
-                    state.recordError("The final write acknowledgement exceeded the scheduled window");
-                    return;
+                    return true;
                 }
                 sent++;
-                long lateness = now - next;
-                // Keep the original cadence for one overdue slot. Rebase when the delay persists.
-                boolean recoverOne = lateness >= interval && lateness < 2 * interval && !recovering;
-                if (lateness >= interval && !recoverOne) {
-                    next = now;
-                }
-                next += interval;
-                recovering = recoverOne;
+                // A missed interval does not create an obligation to catch up to the planned total.
+                next = now - next >= interval ? now + interval : next + interval;
             }
         }
         long remainder;
         while ((remainder = deadline - nanoClock.getAsLong()) > 0 && !Thread.currentThread().isInterrupted()) {
             waitNanos.accept(remainder);
         }
+        return false;
     }
 
     private WriteModel<BsonDocument> write(String name, Event event, int length) {
@@ -499,7 +506,8 @@ public final class MongoWorkloadGenerator {
         };
     }
 
-    private static PhaseReport report(String name, List<StreamState> states, Integer rate, Instant startedAt, Instant writesFinishedAt,
+    private static PhaseReport report(String name, List<StreamState> states, Integer rate, Long scheduledWindow,
+                                      boolean acknowledgedAfterWindow, Instant startedAt, Instant writesFinishedAt,
                                       long writeNanos, long historyNanos, Long cpu, Delays delays) {
         Map<String, StreamReport> results = new LinkedHashMap<>();
         boolean complete = true;
@@ -507,13 +515,16 @@ public final class MongoWorkloadGenerator {
         long acknowledged = 0;
         for (var state : states) {
             results.put(state.name(), state.report());
-            complete &= state.error == null && state.stream.requested.equals(state.acknowledged)
-                    && state.acknowledged.equals(state.observed);
+            complete &= state.error == null && state.submitted == state.acknowledged.total()
+                    && state.acknowledged.equals(state.observed)
+                    && (scheduledWindow != null || state.stream.requested.equals(state.acknowledged));
             submitted += state.submitted;
             acknowledged += state.acknowledged.total();
         }
-        double seconds = writeNanos / 1_000_000_000.0;
+        long activeNanos = scheduledWindow == null ? writeNanos : Math.min(writeNanos, scheduledWindow);
+        double seconds = activeNanos / 1_000_000_000.0;
         return new PhaseReport(name, startedAt, writesFinishedAt, writeNanos, historyNanos, cpu, rate,
+                scheduledWindow, acknowledgedAfterWindow,
                 seconds > 0 ? submitted / seconds : 0, seconds > 0 ? acknowledged / seconds : 0,
                 delays.report(), Map.copyOf(results), complete);
     }
@@ -529,7 +540,7 @@ public final class MongoWorkloadGenerator {
             result.put(stream.input.name(), new StreamReport(new Operations(stream.requested), zero, zero,
                     null, null, null, null, 0, 0, null, null, reason));
         }
-        return new PhaseReport(name, null, null, 0, 0, null, rate, 0, 0, new Delays().report(), Map.copyOf(result), false);
+        return new PhaseReport(name, null, null, 0, 0, null, rate, null, false, 0, 0, new Delays().report(), Map.copyOf(result), false);
     }
 
     private static Long cpuNanos() {

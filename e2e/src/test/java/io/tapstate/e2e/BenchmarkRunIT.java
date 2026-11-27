@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.ReadConcern;
 import com.mongodb.WriteConcern;
@@ -160,17 +161,24 @@ class BenchmarkRunIT {
         long restricted = (long) limited.get("target_majority_visible_before_drain");
         var sourceUnlimited = JSON.valueToTree(unlimited.get("source_window"));
         var sourceLimited = JSON.valueToTree(limited.get("source_window"));
-        var first = sourceUnlimited.path(RECORDS);
-        var second = sourceLimited.path(RECORDS);
-        if (!first.path("sequence_sha256").equals(second.path("sequence_sha256"))
-                || !first.path("acknowledged").equals(second.path("acknowledged"))
-                || restricted >= unrestricted) {
+        boolean sourceMatches = sameSourceWrites(sourceUnlimited, sourceLimited)
+                && sameSourceWrites(JSON.valueToTree(unlimited.get("warmup")), JSON.valueToTree(limited.get("warmup")));
+        if (sourceMatches && restricted >= unrestricted) {
             throw new Unverified("The matched slow-target pair did not show reduced target confirmations under identical input");
         }
-        evidence.result.put("backpressure_pair", Map.of("same_source_sequence", true,
+        unlimited.put("paired_source_comparable", sourceMatches);
+        limited.put("paired_source_comparable", sourceMatches);
+        evidence.result.put("backpressure_pair", Map.of("same_source_sequence", sourceMatches,
                 "unlimited_target_majority_visible_at_drain", unrestricted, "limited_target_majority_visible_at_drain", restricted,
                 "source_rate_unlimited", sourceUnlimited.path("acknowledged_per_second"),
                 "source_rate_limited", sourceLimited.path("acknowledged_per_second")));
+    }
+
+    private static boolean sameSourceWrites(JsonNode firstPhase, JsonNode secondPhase) {
+        var first = firstPhase.path(RECORDS);
+        var second = secondPhase.path(RECORDS);
+        return first.path("sequence_sha256").equals(second.path("sequence_sha256"))
+                && first.path("acknowledged").equals(second.path("acknowledged"));
     }
 
     private static void recordFailure(Evidence evidence, Throwable failure) {
@@ -618,8 +626,7 @@ class BenchmarkRunIT {
                         }
                         evidence.window("drain");
                     });
-            evidence.result.put("warmup", phase(result.warmup()));
-            evidence.result.put("source_window", phase(result.measured()));
+            recordLiveSource(evidence, result);
             if (!result.measured().complete()) {
                 throw new Unverified("Live source window was incomplete");
             }
@@ -1016,8 +1023,7 @@ class BenchmarkRunIT {
         var run = operators.scenario.equals("join-lifecycle-release")
                 ? prepared.injectSteadyCycleWithWarmupReport(windowSize, afterWarmup, afterWrites)
                 : prepared.injectWithWarmupReport(windowSize, mix, hot, afterWarmup, afterWrites);
-        evidence.result.put("warmup", phase(run.warmup()));
-        evidence.result.put("source_window", phase(run.measured()));
+        recordLiveSource(evidence, run);
         if (!run.measured().complete()) {
             throw new Unverified("The operator live source window was incomplete");
         }
@@ -1171,6 +1177,12 @@ class BenchmarkRunIT {
         evidence.result.put("target_collections", target.listCollectionNames().into(new ArrayList<>()));
     }
 
+    private static void recordLiveSource(Evidence evidence, MongoWorkloadGenerator.Live run) {
+        evidence.result.put("source_window_protocol", "deadline-actual-events-v1");
+        evidence.result.put("warmup", phase(run.warmup()));
+        evidence.result.put("source_window", phase(run.measured()));
+    }
+
     private static Map<String, Object> phase(MongoWorkloadGenerator.PhaseReport report) {
         var result = new LinkedHashMap<String, Object>();
         result.put("complete", report.complete());
@@ -1179,6 +1191,11 @@ class BenchmarkRunIT {
         result.put("generator_process_cpu_nanos", report.generatorProcessCpuNanos());
         result.put("write_nanos", report.writeNanos());
         result.put("history_nanos", report.historyNanos());
+        if (report.requestedEventsPerSecond() != null) {
+            result.put("requested_events_per_second", report.requestedEventsPerSecond());
+            result.put("scheduled_window_nanos", report.scheduledWindowNanos());
+            result.put("acknowledged_after_window", report.acknowledgedAfterWindow());
+        }
         result.put("submitted_per_second", report.actualSubmittedEventsPerSecond());
         result.put("acknowledged_per_second", report.actualAcknowledgedEventsPerSecond());
         report.streams().forEach((name, stream) -> {

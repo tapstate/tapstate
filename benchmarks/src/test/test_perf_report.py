@@ -319,6 +319,35 @@ class PerfReportTest(unittest.TestCase):
         result = report.reconcile(self.manifest, [self.summary], self.baseline)
         self.assertEqual("incompatible", result["results"][0]["comparisons"]["status"])
 
+    def test_timed_source_window_requires_a_matching_baseline_protocol(self):
+        case = self.row["case_id"]
+        protocol = "deadline-actual-events-v1"
+        self.row["source_window_protocol"] = protocol
+        self.row["resources"]["scope"] = self.baseline["cases"][case]["resources"]["scope"] = "op"
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        row = result["results"][0]
+        self.assertEqual("completed", row["status"])
+        self.assertEqual("incompatible", row["comparisons"]["status"])
+        [metric] = list(report.source_metrics(row))
+        self.assertEqual(protocol, metric[2]["conditions"]["source_window_protocol"])
+
+        self.baseline["cases"][case]["source_window_protocol"] = protocol
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        self.assertEqual("fixture-comparison", result["results"][0]["comparisons"]["status"])
+
+    def test_different_paired_source_sequences_keep_execution_but_exclude_metrics(self):
+        case = self.row["case_id"]
+        reference = self.baseline["cases"][case]
+        self.row["paired_arms"] = {name: dict(self.row, paired_source_comparable=False)
+                                  for name in ("unlimited", "limited")}
+        reference["paired_arms"] = {name: dict(reference) for name in ("unlimited", "limited")}
+
+        result = report.reconcile(self.manifest, [self.summary], self.baseline)
+        row = result["results"][0]
+        self.assertEqual("completed", row["status"])
+        self.assertEqual("no-eligible-observation", row["comparisons"]["status"])
+        self.assertEqual({}, result["statistics"])
+
     def test_completed_arms_do_not_qualify_an_incomplete_baseline_repeat(self):
         self.row["paired_arms"] = {"limited": copy.deepcopy(self.row)}
         baseline = self.baseline["cases"][self.row["case_id"]]

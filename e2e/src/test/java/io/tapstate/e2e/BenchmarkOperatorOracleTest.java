@@ -76,7 +76,7 @@ class BenchmarkOperatorOracleTest {
         var stream = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.StreamReport(
                 operations, operations, operations, null, null, null, null, 8, 0, "sequence", null, null);
         var report = new io.tapstate.e2e.benchmark.MongoWorkloadGenerator.PhaseReport(
-                "warmup", null, null, 1, 1, null, 8, 8, 8, null, Map.of("records", stream), true);
+                "warmup", null, null, 1, 1, null, 8, 1L, false, 8, 8, null, Map.of("records", stream), true);
         var expected = BenchmarkRunIT.expectedCapturedInputs(Map.of("records", 3L), report);
         assertEquals(Map.of("records", 11L), expected);
         assertTrue(BenchmarkRunIT.capturedInputsMatch(expected, Map.of("records", 11L)));
