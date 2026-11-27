@@ -5,6 +5,7 @@ import io.tapstate.core.logging.PipelineAttribution;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.ResumeMetrics;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Duration;
@@ -90,6 +91,9 @@ final class ProcessObservationWriter implements AutoCloseable {
     }
 
     interface ActiveStore extends ObservationStore { Runnable writeGuard(); }
+
+    // Two bounded window documents, their in-memory slots and a second encoding for the active batch.
+    private static final long RESUME_PUBLICATION_BYTES = 2048;
 
     Stage stage(PipelineConvergencePass pass) { return new Stage(pass); }
 
@@ -180,7 +184,8 @@ final class ProcessObservationWriter implements AutoCloseable {
         stage.committed.add(committed);
         stage.sampled = sampled == null ? null : sampled.guardedBy(stage.original);
         stage.failed = failed;
-        stage.bytes = estimatedBytes(stage.observation) + (sampled == null ? 0 : sampled.bytes());
+        stage.bytes = estimatedBytes(stage.observation) + (sampled == null ? 0 : sampled.bytes())
+                + (stage.publication == null ? 0 : RESUME_PUBLICATION_BYTES);
         boolean accepted;
         synchronized (pending) {
             Stage previous = pending.get(stage.pipeline());
@@ -543,6 +548,7 @@ final class ProcessObservationWriter implements AutoCloseable {
         private final Runnable original;
         private final List<Runnable> committed = new ArrayList<>();
         private Observation observation;
+        private ResumeMetrics.Publication publication;
         private long epoch;
         private long bytes;
         private Runnable failed = () -> {};
@@ -559,7 +565,7 @@ final class ProcessObservationWriter implements AutoCloseable {
         String pipeline() { return pass.scope().pipelineId(); }
 
         MongoCacheDomain.ObservationWrite write() {
-            return new MongoCacheDomain.ObservationWrite(pass.scope(), claim, active, observation, epoch);
+            return new MongoCacheDomain.ObservationWrite(pass.scope(), claim, active, observation, epoch, publication);
         }
 
         ObservationStore wrap(ObservationStore destination) {
@@ -569,8 +575,14 @@ final class ProcessObservationWriter implements AutoCloseable {
                 @Override public void save(Observation value) { throw new IllegalArgumentException("an observation requires its measured checkpoint epoch"); }
                 @Override public void save(Observation value, long checkpointEpoch) {
                     observation = value;
+                    publication = null;
                     epoch = checkpointEpoch;
                     active = () -> { originalGuard.run(); measured.run(); };
+                }
+                @Override public boolean saveResumed(Observation value, long checkpointEpoch, ResumeMetrics.Publication resume) {
+                    save(value, checkpointEpoch);
+                    publication = resume;
+                    return true;
                 }
                 @Override public void afterSave(Runnable action) { committed.add(action); }
                 @Override public Optional<Observation> read(String pipeline) { return destination.read(pipeline); }

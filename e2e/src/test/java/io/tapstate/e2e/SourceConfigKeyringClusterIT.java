@@ -114,10 +114,15 @@ class SourceConfigKeyringClusterIT {
                     TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage, LEASE)) {
                 var configuration = metadataDatabase(raw, storage.configurationDatabase());
                 var cache = metadataDatabase(raw, storage.cacheDatabase());
-                assertThat(cluster.awaitBothMembers()).hasSize(2);
-                Await.until("both original boots to complete monitoring enrollment before the renewal-only interval", WAIT,
-                        () -> configuration.getCollection("alert_node_lifecycles").countDocuments(new Document("phase", "EXPECTED")) == 2,
-                        () -> "the original monitoring facts are incomplete");
+                assertThat(cluster.awaitBothMembers()).containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                var members = cluster.first().clusterMembers();
+                assertThat(members).extracting(ClusterMemberFacts::nodeId)
+                        .containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                for (var member : members) {
+                    var session = nativeLiveClaim(cache, storage.clusterId(), member.nodeId());
+                    assertThat(session).as("live CACHE session of %s", member.nodeId()).isNotNull();
+                    assertThat(member.bootId()).isNotBlank().isEqualTo(session.getString("ownerBootId"));
+                }
                 cluster.first().awaitInitialAlertMaintenance();
                 cluster.second().awaitInitialAlertMaintenance();
                 Resource readable = source("survives_key_conflict", "key-conflict-whole-config-sentinel");

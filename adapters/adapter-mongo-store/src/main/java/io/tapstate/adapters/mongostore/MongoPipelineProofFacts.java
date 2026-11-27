@@ -84,9 +84,17 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
 
     /** The four original authority facts, from a single server snapshot. */
     static Authority readAuthority(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key) {
+        return readAuthority(snapshot, scope, key, false);
+    }
+
+    static Authority readAuthority(MongoDatabase snapshot, PipelineIntentScope scope, WorkloadClaimKey key, boolean resume) {
         var stages = authorityStages(scope, key);
+        // Keep the existing inline checkpoint budget independent of the joined observation's size.
+        if (resume) stages.add(MongoResumeWindow.lookup(new Document("$arrayElemAt", List.of("$checkpoint.row", 0))));
         var captured = SystemCollections.CACHE_IDENTITY.on(snapshot).aggregate(stages).collation(SIMPLE).first();
-        return authority(captured);
+        var facts = authority(captured);
+        if (resume && facts != null) facts.checkpoint().put(MongoResumeWindow.PRIOR, captured.get(MongoResumeWindow.PRIOR));
+        return facts;
     }
 
     record PipelineAuthority(Authority facts, Document node) {}

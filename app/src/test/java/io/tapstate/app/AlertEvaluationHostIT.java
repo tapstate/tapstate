@@ -106,7 +106,9 @@ class AlertEvaluationHostIT {
             var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent,ACTIVE));
             assertThat(f.evaluator.accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null)))
                     .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
-            baseline.set(f.store.planning());assertThat(baseline.get().schedules()).hasSize(1);
+            baseline.set(f.store.planning());
+            assertThat(baseline.get().schedules()).extracting(row -> row.value().key().channelType())
+                    .containsExactlyInAnyOrder(AlertChannelPolicy.CLOUD_EVENTS.typeId(), AlertChannelPolicy.CLOUD_EMAIL.typeId());
             var before=f.store.state(binding.key(),f.reads()).orElseThrow().value();
             f.now.set(T.plusSeconds(29));advance.set(true);
             assertThatCode(()->assertThat(f.evaluator.accept(binding,2,

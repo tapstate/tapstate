@@ -44,6 +44,9 @@ public final class EngineErrorDefinitions {
     public static final ProductErrorDefinition TARGET_KEY_ORDER_UNKNOWN =
             DEFINITIONS.define(17, Severity.ERROR, Set.of("node", "stream"));
 
+    public static final ProductErrorDefinition SINK_WRITE_UNCONFIRMED =
+            DEFINITIONS.define(18, Severity.ERROR, Set.of("expected", "accepted"));
+
     private EngineErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

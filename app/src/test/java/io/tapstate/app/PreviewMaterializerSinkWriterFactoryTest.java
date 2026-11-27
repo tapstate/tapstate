@@ -55,7 +55,7 @@ class PreviewMaterializerSinkWriterFactoryTest {
                 .toCompletableFuture().join();
 
         Map<String, String> rows = member.getMap(mapName);
-        assertThat(result.written()).isEqualTo(3);
+        assertThat(result).isEqualTo(new WriteResult(3, 4));
         assertThat(rows.keySet()).containsExactlyInAnyOrder("append:00000000000000000000", "append:00000000000000000001",
                 "append:00000000000000000002");
         assertThat(PreviewDocumentStorage.decode(rows.get("append:00000000000000000002")))
@@ -93,6 +93,17 @@ class PreviewMaterializerSinkWriterFactoryTest {
                 .toCompletableFuture().join();
         assertThat(rows).isEmpty();
         writer.close();
+    }
+
+    @Test
+    void upsertPreviewAcknowledgesAnAbsentAfterImageWithoutMaterializingIt() {
+        String mapName = mapName();
+        try (SinkWriter writer = factory(mapName, Map.of("orders", List.of("id")), WriteMode.UPSERT).getEx()) {
+            var receipt = writer.write(List.of(Envelope.update(1L, "orders", Map.of("id", 1), null, null)))
+                    .toCompletableFuture().join();
+            assertThat(receipt).isEqualTo(new WriteResult(0, 1));
+            assertThat((Map<?, ?>) member.getMap(mapName)).isEmpty();
+        }
     }
 
     @Test
