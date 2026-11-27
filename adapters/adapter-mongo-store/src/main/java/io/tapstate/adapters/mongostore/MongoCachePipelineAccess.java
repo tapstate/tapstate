@@ -103,20 +103,31 @@ final class MongoCachePipelineAccess {
     }
 
     CheckpointDoc readCheckpoint(MongoStructureProof structures) {
+        return readCheckpoint(structures, false, MongoStateStore::toCheckpoint);
+    }
+
+    <T> T readCheckpoint(MongoStructureProof structures, boolean resume, Function<Document, T> decode) {
         try {
             if (!unpreparedModels && authoringModels == null && StoreIo.call(() -> MongoReadBudget.supportsSnapshotReads(client))) {
                 var facts = MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
                     requireActive.run();
                     var snapshot = database.withReadPreference(com.mongodb.ReadPreference.primary()).withReadConcern(ReadConcern.SNAPSHOT);
                     var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
-                    var captured = MongoPipelineProofFacts.readAuthority(snapshot, scope, key);
+                    var captured = MongoPipelineProofFacts.readAuthority(snapshot, scope, key, resume);
                     if (captured != null) validateAuthority(captured);
                     requireActive.run();
                     return captured;
                 }));
-                if (facts != null) return MongoStateStore.toCheckpoint(facts.checkpoint());
+                if (facts != null) return decode.apply(facts.checkpoint());
             }
-            return transaction(session -> MongoStateStore.toCheckpoint(state(session, true)));
+            return transaction(session -> {
+                if (!resume) return decode.apply(state(session, true));
+                var state = SystemCollections.CACHE_PIPELINE_STATE.on(database).aggregate(session, java.util.List.of(
+                        new Document("$match", new Document("_id", scope.pipelineId())), MongoResumeWindow.lookup("$$ROOT"))).first();
+                validateState(state);
+                requirePreparedClaim(session, true);
+                return decode.apply(state);
+            });
         }
         catch (RuntimeException failure) {
             if (structures != null) structures.clear();

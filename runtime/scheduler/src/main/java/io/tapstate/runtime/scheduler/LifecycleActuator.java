@@ -16,6 +16,11 @@ import io.tapstate.spi.store.WorkloadClaimFence;
  * is the only verb that can also be asked to throw away what the pipeline has.
  */
 public interface LifecycleActuator {
+    default io.tapstate.spi.store.ResumeMetrics.Transition resumeMetricTransition(
+            io.tapstate.core.lifecycle.PipelineState from, io.tapstate.core.lifecycle.PipelineState to) {
+        return null;
+    }
+
     record SourceRecovery(io.tapstate.core.common.FailureFact failure) {}
 
     /** Handles a recoverable source exit while the original running intent remains current. */
