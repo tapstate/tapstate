@@ -615,7 +615,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
                 if (!inFlight.isEmpty()) return wrote;
                 var batch = List.of(queuedMove.row());
                 inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
-                        queuedMove.order(), queuedMove.reply(), batch.size()));
+                        queuedMove.order(), queuedMove.reply(), EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
                 queuedMove = null;
                 return true;
             }
@@ -629,10 +629,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             oldestQueuedCdcByStream.remove(stream);
             List<Envelope> batch = new ArrayList<>(queue.size());
             long firstOrder = queue.peek().order();
-            int dataEvents = 0;
             for (Queued row : queue) {
                 batch.add(row.row());
-                if (laneCoordination && row.row().op() != io.tapstate.core.event.Op.DDL) dataEvents++;
             }
             queuedRows -= batch.size();
             // Tallied while the rows are still here and counted only once the write settles. Holding the
@@ -640,7 +638,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             // write; this keeps one number per table and operation in it instead.
             var positions = positionsOf(batch);
             var delivered = DeliveredRows.of(batch);
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder, null, dataEvents));
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder, null,
+                    laneCoordination ? EngineError.KEY_MOVE_WRITE_UNCONFIRMED : EngineError.SINK_WRITE_UNCONFIRMED));
         }
         // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
         // backpressures upstream until reapSettled frees a slot on a later call.
@@ -903,11 +902,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             SettledWrite settled;
             try {
                 settled = settle(batch.future());
-                WriteResult result = settled.result();
-                if (batch.expectedWrites() > 0 && (result == null || result.acknowledgedRows() != batch.expectedWrites())) {
-                    throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
-                            Map.of("expected", batch.expectedWrites(), "accepted", result == null ? 0L : result.acknowledgedRows()), null);
-                }
+                batch.requireConfirmation(settled.result());
                 if (batch.reply() != null) laneAcknowledgments.accept(batch.reply());
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
@@ -930,11 +925,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             // this processor's queue and in flight at the target is part of that, not noise around it.
             long settledAt = clock.getAsLong();
             batch.delivered().foldDurationsInto(settledDurations, settledAt);
-            // A partial receipt only identifies a count. It cannot tell us which event times to sample.
-            WriteResult result = settled.result();
-            if (result != null && result.acknowledgedRows() == batch.delivered().rowCount()) {
-                cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settled.acknowledgedAtMillis());
-            }
+            cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settled.acknowledgedAtMillis());
             reportDelivered(batch.delivered().tables());
             return true;
         });
@@ -1051,7 +1042,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
     private record InFlightBatch(CompletableFuture<SettledWrite> future, List<ChainEntry> positions,
-            DeliveredRows delivered, long firstOrder, SinkLaneAcks.Ticket reply, int expectedWrites) {
+            DeliveredRows delivered, long firstOrder, SinkLaneAcks.Ticket reply, EngineError receiptError) {
+        void requireConfirmation(WriteResult receipt) {
+            int expected = delivered.rowCount();
+            long accepted = receipt == null ? 0L : receipt.acknowledgedRows();
+            if (expected > 0 && accepted != expected) {
+                throw new TapstateException(receiptError, Map.of("expected", expected, "accepted", accepted), null);
+            }
+        }
     }
 
     /** A row taken in and not yet handed to the writer, with the number it was taken in under. */

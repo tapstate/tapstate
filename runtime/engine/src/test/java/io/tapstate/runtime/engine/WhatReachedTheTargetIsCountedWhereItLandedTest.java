@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -23,6 +24,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Where rows delivered to a target are counted, and where they are not. The boundary is the whole of what
@@ -64,6 +67,32 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.latestRows()).isEqualTo(Map.of("orders", Map.of("i", 2L)));
         // Two rows of {id: <number>} at ten bytes each: two for the field's name, eight for the number.
         assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 20L));
+    }
+
+    @ParameterizedTest(name = "written={0}, acknowledgedRows={1}")
+    @CsvSource({"0, 0", "1, 1", "2, 2", "0, 2"})
+    void insert_delivery_count_respects_the_writer_receipt(long written, long acknowledgedRows) throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        SinkProcessor processor = init(writer, delivery);
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(row("orders", 1L), row("orders", 2L)));
+        processor.process(0, inbox);
+        assertThat(writer.pending.values()).containsExactly(2);
+
+        writer.completeNext(new WriteResult(written, acknowledgedRows));
+        try {
+            drain(processor);
+        } catch (TapstateException rejection) {
+            assertThat(acknowledgedRows).as("rejected receipt for a two-row batch").isLessThan(2);
+            assertThat(delivery.rows).isEmpty();
+            return;
+        }
+
+        Map<String, Map<String, Long>> reported = delivery.rows.isEmpty() ? Map.of() : delivery.latestRows();
+        long insertCount = reported.getOrDefault("orders", Map.of()).getOrDefault("i", 0L);
+        assertThat(insertCount).as("delivered INSERTs for %s acknowledged rows", acknowledgedRows)
+                .isEqualTo(acknowledgedRows);
     }
 
     @Test
@@ -133,7 +162,7 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
     }
 
     @Test
-    void omits_partial_acknowledgements_from_cdc_and_resumes_with_the_next_complete_batch() throws Exception {
+    void a_partial_receipt_fails_before_publishing_any_delivery_sample() throws Exception {
         RecordingDelivery delivery = new RecordingDelivery();
         ManualWriter writer = new ManualWriter();
         long now = 1_700_000_000_000L;
@@ -144,14 +173,15 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
                 update("orders", now - 600).withPosition(change)));
         processor.process(0, inbox);
         writer.completeNext(new WriteResult(2, 1));
-        processor.tryProcess();
-        assertThat(delivery.cdc).containsExactly(CdcDeliveryTotals.ZERO);
-
-        inbox.add(row("orders", now - 200).withPosition(change));
-        processor.process(0, inbox);
-        writer.completeAll();
-        drain(processor);
-        assertThat(delivery.cdc.getLast()).isEqualTo(new CdcDeliveryTotals(1, 200));
+        assertThatThrownBy(processor::tryProcess).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(EngineError.SINK_WRITE_UNCONFIRMED);
+            assertThat(failure.args()).containsEntry("expected", 2).containsEntry("accepted", 1L);
+        });
+        assertThat(delivery.rows).isEmpty();
+        assertThat(delivery.bytes).isEmpty();
+        assertThat(delivery.eventTimes).isEmpty();
+        assertThat(delivery.durations).isEmpty();
+        assertThat(delivery.cdc).isEmpty();
     }
 
     /**
