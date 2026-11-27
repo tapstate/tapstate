@@ -59,13 +59,9 @@ public final class OfficialConnectors {
 
     private static Map<String, List<String>> databaseKinds() {
         Map<String, List<String>> kinds = new LinkedHashMap<>();
-        kinds.put("mysql", List.of(
-                "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc"));
-        kinds.put("postgres", List.of(
-                "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
-                "tencent-db-postgres"));
-        kinds.put("mongodb", List.of(
-                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb"));
+        kinds.put("mysql", List.of("mysql", "aws-rds-mysql", "mysql-pxc"));
+        kinds.put("postgres", List.of("postgres"));
+        kinds.put("mongodb", List.of("mongodb", "mongodb-atlas"));
         kinds.put("oracle", List.of("oracle"));
         kinds.put("sqlserver", List.of("sqlserver"));
         return Collections.unmodifiableMap(kinds);

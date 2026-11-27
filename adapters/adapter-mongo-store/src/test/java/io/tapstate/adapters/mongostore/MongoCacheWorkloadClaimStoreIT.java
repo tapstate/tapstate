@@ -980,6 +980,29 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @Test void knownPipelineRenewalWriteConflictKeepsItsEvidenceAndOriginalFence() {
+        withBusiness(f -> {
+            try (var observed = client(new CommandListener() { })) {
+                var operations = new MongoClaimOperations(observed);
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()),
+                        SCOPE, ACTIVE, null, operations);
+                var original = claims.withDeadline(deadline(), () -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).claim();
+                failCommand(f, new Document("failCommands", List.of("findAndModify")).append("errorCode", 112)
+                        .append("errorLabels", List.of("TransientTransactionError")), new Document("times", 1));
+                try {
+                    assertThatThrownBy(() -> claims.withRenewalDeadline(deadline(), ACTIVE, () -> claims.renew(original, TTL)))
+                            .isInstanceOfSatisfying(io.tapstate.spi.store.WorkloadClaimRenewalException.class,
+                                    failure -> assertThat(failure.isWriteConflict()).isTrue());
+                } finally {
+                    failCommand(f, new Document(), "off");
+                    claims.awaitQuiescence(deadline());
+                }
+                var retry = claims.withRenewalDeadline(deadline(), ACTIVE, () -> claims.renew(original, TTL)).orElseThrow();
+                assertThat(WorkloadClaimFence.from(retry)).isEqualTo(WorkloadClaimFence.from(original));
+            }
+        });
+    }
+
     @Test void aTimedOutSnapshotPinRetainsItsConsumerOnlyUntilTheOriginalWorkerFinishes() {
         withBusiness(f -> {
             var operations = new MongoClaimOperations(f.admin());

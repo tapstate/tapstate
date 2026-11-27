@@ -14,8 +14,13 @@ import java.util.Objects;
  *
  * @param source the name the plan calls the source by
  * @param event  the change itself
+ * @param ownerKey the state bucket this processor may mutate for an addressed input
  */
-public record SourceChange(String source, Envelope event) {
+public record SourceChange(String source, Envelope event, String ownerKey) {
+
+    public SourceChange(String source, Envelope event) {
+        this(source, event, null);
+    }
 
     public SourceChange {
         Objects.requireNonNull(source, "source");

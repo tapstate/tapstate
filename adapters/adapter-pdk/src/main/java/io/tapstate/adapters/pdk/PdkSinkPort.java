@@ -14,6 +14,7 @@ import java.util.Objects;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import io.tapstate.spi.sink.TargetTable;
+import io.tapstate.spi.sink.TargetKeyConstraints;
 import java.util.Map;
 
 /**
@@ -249,6 +250,50 @@ public final class PdkSinkPort implements SinkPort {
                 && (preparations == null || !PdkTargetIdentityPlanner.hasFlexibleColumns(config.connectorId()))) {
             throw PdkSinkWriter.writeFailed(config.connectorId(), new IllegalStateException(
                     "an undecided script decimal requires a flexible target and scoped preparation"));
+        }
+    }
+
+    /** Reads target equality once, after preparation, for this execution's parallel write routing. */
+    public Map<String, TargetKeyConstraints> inspectTargetConstraints(
+            SinkConfig config, Map<String, TargetTable> targets) {
+        requireInputs(config);
+        requireActive();
+        var ref = provisioner.resolve(config.connectorId());
+        var drive = configuredDrive(config, ref);
+        var connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
+                stateStore, null, drive.scopes(), purpose);
+        try {
+            return connector.underLoader(() -> {
+                initialize(connector);
+                var byTable = new java.util.LinkedHashMap<String, TargetKeyConstraints>();
+                var byStream = new java.util.LinkedHashMap<String, TargetKeyConstraints>();
+                for (var entry : targets.entrySet()) {
+                    TargetTable target = entry.getValue();
+                    var evidence = byTable.get(target.name());
+                    if (evidence == null) {
+                        try {
+                            evidence = PdkSinkKeyConstraints.read(connector, target);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw interrupted;
+                        } catch (Exception unavailable) {
+                            // Unsupported server catalogs provide no proof to the ordering protocol.
+                            evidence = TargetKeyConstraints.unknown();
+                        }
+                        connector.requireActive();
+                        byTable.put(target.name(), evidence);
+                    }
+                    byStream.put(entry.getKey(), evidence);
+                }
+                return Map.copyOf(byStream);
+            });
+        } catch (TapstateException coded) {
+            throw coded;
+        } catch (Throwable failure) {
+            throw PdkSinkWriter.writeFailed(connector.connectorId(), failure);
+        } finally {
+            try { connector.stopQuietly(); connector.close(); }
+            finally { operationObserver.close(); }
         }
     }
 

@@ -440,10 +440,16 @@ class PipelineDagBuilderTest {
                 FromRef.literal("j"), List.of("j"))).withJoin(joinBinding()), null, null, wide);
 
         assertThat(vertexNames(dag))
-                .containsExactlyInAnyOrder("orders_src", "customers_src", "j", "j:project", "serve.sync_1");
+                .containsExactlyInAnyOrder("orders_src", "customers_src", "j:fact-owners:0",
+                        "j:dimension-owners:1", "j", "j:project", "serve.sync_1");
+        for (String owners : List.of("j:fact-owners:0", "j:dimension-owners:1")) {
+            assertThat(dag.getInboundEdges(owners).getFirst().getRoutingPolicy()).isEqualTo(Edge.RoutingPolicy.ISOLATED);
+        }
         assertThat(edges(dag)).contains(
-                edge("orders_src", "j", 0, 0),
-                edge("customers_src", "j", 0, 1),
+                edge("orders_src", "j:fact-owners:0", 0, 0),
+                edge("j:fact-owners:0", "j", 0, 0),
+                edge("customers_src", "j:dimension-owners:1", 0, 0),
+                edge("j:dimension-owners:1", "j", 0, 1),
                 edge("j", "j:project", 0, 0),
                 edge("j:project", "serve.sync_1", 0, 0));
         Edge projection = dag.getInboundEdges("j:project").getFirst();

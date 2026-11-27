@@ -153,8 +153,13 @@ final class StoreBackedDagSource implements DagSource {
     interface CapturedStartGuard {
         record Inspection(Map<String, String> connectorHashes, SourceModelSnapshot models) {}
         Inspection inspect(PipelineConvergencePass pass, ReadOnlyArtifactSnapshot artifacts, SourceModelSnapshot models);
+        default void retireCoveredKeyMoves(PipelineConvergencePass pass) {}
         CapturedStartGuard NONE = (pass, artifacts, models) -> new Inspection(Map.of(), models);
     }
+    @Override public void retireCoveredKeyMoves(PipelineConvergencePass pass) {
+        capturedStartGuard.retireCoveredKeyMoves(pass);
+    }
+
     private final CapturedStartGuard capturedStartGuard;
     private final java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads;
     private final java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> initialReceipts;
@@ -1441,6 +1446,35 @@ final class StoreBackedDagSource implements DagSource {
         return targets;
     }
 
+    /** Direct native copies guard source-known unique values before the first row-key fan-out. */
+    private Map<String, Set<String>> rawCopyMoveColumns(PipelineResource pipeline,
+            Map<String, SourceVertex> vertices, Map<String, String> keysByTable,
+            Map<String, List<String>> keysBySource, Set<String> steps, Map<String, TargetTable> models) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) return Map.of();
+        boolean nativeUpsert = serve.sync().stream().anyMatch(sync -> {
+            if (writeMode(sync.writeMode()) != WriteMode.UPSERT || ddl(sync.ddl()) == DdlPolicy.APPLY) return false;
+            var sink = StoredArtifacts.requireSource(artifacts(), sync.source());
+            return Set.of("mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb")
+                    .contains(sink.connector());
+        });
+        if (!nativeUpsert) return Map.of();
+        var inputs = new LinkedHashSet<String>();
+        for (var ref : refsOf(serve.from())) {
+            var view = inlineViewNamed(pipeline, ref);
+            var producer = view == null ? ref : view.from();
+            inputs.addAll(upstreams(producer, keysByTable, keysBySource, vertices, steps));
+        }
+        if (!vertices.keySet().containsAll(inputs)) return Map.of();
+        var result = new LinkedHashMap<String, Set<String>>();
+        for (String input : inputs) {
+            var model = models.get(vertices.get(input).stream());
+            if (model == null || model.unwindIdentity() != null
+                    || model.fields().stream().noneMatch(TargetField::primaryKey)) return Map.of();
+            result.put(input, SourceMoveColumns.uniqueColumns(model));
+        }
+        return result;
+    }
+
     /**
      * The write-side model for what each nest in this pipeline emits, keyed by the stream it emits under.
      *
@@ -2425,8 +2459,9 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
+        var rawModels = sourceTargets(sourceVertices);
         Map<String, AggregateStepSpec> aggregates = compiledAggregates(
-                pipeline, sourceTargets(sourceVertices), sourceVertices, compiledJoins);
+                pipeline, rawModels, sourceVertices, compiledJoins);
         // Aggregate state is committed under the execution's claim; a run bound to no execution has none.
         AggregateStores aggregateStores = manifest != null ? AggregateStores.bound(manifest)
                 : (member, step, kind) -> {
@@ -2445,8 +2480,19 @@ final class StoreBackedDagSource implements DagSource {
                 // have durably acknowledged, which only a run bound to an execution can read.
                 operators == null ? ReplayFloorFactory.NONE : new ScopedSrsReplayFloorFactory(scopedSources, scopedDirect),
                 io.tapstate.runtime.engine.aggregate.AggregateProcessor.Sweep.DEFAULT);
+        var operatorKeys = captureBindings == null || snapshotOnly ? Map.<String, Set<String>>of()
+                : SourceMoveColumns.forDirectInputs(stepsById, compiledJoins,
+                        operators == null ? Map.of() : operators.coordinates().nests(),
+                        ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
+                        sourceVertices.keySet());
+        if (captureBindings != null && !snapshotOnly) {
+            rawCopyMoveColumns(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, rawModels)
+                    .forEach((source, columns) -> operatorKeys.computeIfAbsent(source, key -> new LinkedHashSet<>())
+                            .addAll(columns));
+        }
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
+                key -> sourceVertex(sourceVertices.get(key), operatorKeys.getOrDefault(key, Set.of()),
+                        axes, snapshotOnly, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
@@ -3953,7 +3999,7 @@ final class StoreBackedDagSource implements DagSource {
      * writer fills.
      */
     private ProcessorMetaSupplier sourceVertex(
-            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
+            SourceVertex vertex, Set<String> operatorKeys, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
             boolean direct,PipelineCaptureBindings captureBindings, long sourceEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
@@ -3970,16 +4016,26 @@ final class StoreBackedDagSource implements DagSource {
                         order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
             }
             if (!captureBindings.snapshots().isEmpty()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            var model = modelForVertex(vertex);
+            var table = model == null ? null : discoveredTable(model, vertex.table());
+            if (table == null) throw new TapstateException(IoError.PIPELINE_CAPTURE_IDENTITY_UNPROVEN, Map.of("pipeline", vertex.pipelineId()), null);
+            String physical = vertex.resolution().chainId().value();
+            var stream = new io.tapstate.spi.store.PipelineKeyMoveWindows.Stream(physical, vertex.sourceId(), vertex.table(),
+                    direct ? captureBindings.requireDirect(vertex.sourceId(), physical, vertex.table()).context().captureId() : null);
+            var keys = new LinkedHashSet<>(table.primaryKey());
+            keys.addAll(operatorKeys);
+            var guard = new ScopedKeyMoveGuard(captureBindings.original(), List.copyOf(keys), stream);
             if (direct) {
                 var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
                 return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.loadEpoch(),
-                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
+                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
+                        readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())), guard);
             }
             var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
             return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
                     source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
                     order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
-                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.artifactId())));
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.artifactId())), guard);
         }
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
@@ -3990,7 +4046,8 @@ final class StoreBackedDagSource implements DagSource {
             return SrsSourceProcessor.directMetaSupplier(vertex.pipelineId(),
                     vertex.resolution().ringName(vertex.table()), vertex.stream(),
                     sourceEpoch,
-                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.artifactId())));
         }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
         // after one run dies the head can sit far below what this pipeline already landed, and starting there

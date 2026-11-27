@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.jet.Traverser;
 import com.hazelcast.jet.Traversers;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Processor;
@@ -42,6 +43,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     }
 
     private final FlatMapper<Envelope, Object> flatMapper;
+    private FlatMapper<PreparedTransformRows, Object> preparedMapper;
     private final TransformPort port;
     private final LevelBounds bounds;
     // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
@@ -74,17 +76,19 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
             // the outbox's pace, which is the substrate's time and not this stage's.
             long started = timer.begin();
             try {
-                List<Envelope> outputs = port.transform(event);
-                if (outputs.isEmpty() && !event.positions().isEmpty()) {
-                    // No record will carry this position to the sink, so settle it on the same ordered edge.
-                    return Traversers.singleton(new SettledPositions(event.positions()));
-                }
-                return Traversers.traverseIterable(outputs)
-                        .map(out -> out.withPositions(event.positions()));
+                return outputs(port.transform(event), event);
             } finally {
                 timer.end(started);
             }
         });
+    }
+
+    /** Applies the same position and filtered-row contract to normal and admitted transform output. */
+    static Traverser<Object> outputs(List<Envelope> outputs, Envelope event) {
+        if (outputs.isEmpty() && !event.positions().isEmpty()) {
+            return Traversers.singleton(new SettledPositions(event.positions()));
+        }
+        return Traversers.traverseIterable(outputs).map(out -> out.withPositions(event.positions()));
     }
 
     /** A meta-supplier for a vertex that propagates no frontier, for a job built without one. */
@@ -175,6 +179,12 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
             return tryEmit(item);
         }
         try {
+            if (item instanceof PreparedTransformRows rows) {
+                if (preparedMapper == null) {
+                    preparedMapper = flatMapper(prepared -> Traversers.traverseIterable(prepared.rows()));
+                }
+                return preparedMapper.tryProcess(rows);
+            }
             return flatMapper.tryProcess((Envelope) item);
         } catch (RuntimeException | Error failure) {
             // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet

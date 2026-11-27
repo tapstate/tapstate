@@ -2754,7 +2754,7 @@ class MongoSrsConsumerStoreIT {
             System.out.println("ARRIVAL_COMMANDS checkpoint=" + checkpointed + " siblings=" + siblings + " count=" + commands.size() + " commands=" + commands);
             assertThat(progress.revision()).isEqualTo(checkpointed ? 2 : 1);
             assertThat(cursor(f, B)).isEqualTo(sibling);
-            assertThat(commands).hasSize(checkpointed ? 12 : 6);
+            assertThat(commands).hasSize(checkpointed ? 8 : 6);
             assertThat(commands).doesNotContain("find:workload_claims", "find:pipeline_state");
         });
     }

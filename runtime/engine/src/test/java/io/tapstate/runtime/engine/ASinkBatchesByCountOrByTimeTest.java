@@ -1,19 +1,23 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
@@ -197,6 +201,166 @@ class ASinkBatchesByCountOrByTimeTest {
                 .containsExactly("orders=o1");
     }
 
+    @Test
+    void aNativeWriterMustConfirmTheMoveBeforeSubmittingOldKeyReuse() throws Exception {
+        var writer = new ManualWriter();
+        var ack = new RecordingAck();
+        var sink = sink(writer, ack, new ContiguousPrefix(AXES), 32, 20)
+                .withNativeTargets(Map.of("orders", new SinkTarget("orders", List.of("id"))));
+        var move = Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 2), null)
+                .withPosition(new ChainPosition(new SourceOrder(1, 2), "move"));
+        var inbox = inbox(row("orders", 1), move, row("orders", 1));
+        sink.process(0, inbox);
+        elapse(20);
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(1));
+        writer.completeAll();
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(1), List.of(2));
+        writer.pending.getLast().complete(new WriteResult(0));
+        assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+        assertThat(ack.calls).isEmpty();
+        assertThat(writer.batches).hasSize(2);
+    }
+
+    @Test
+    void ordinaryUpdatesAtANativeWriterStillShareABatch() throws Exception {
+        var writer = new RecordingWriter();
+        var sink = sink(writer, null, null, 3, 20)
+                .withLaneCoordination()
+                .withNativeTargets(Map.of("orders", new SinkTarget("orders", List.of("tenant", "id"))));
+        var before = Map.<String, Object>of("tenant", "t", "id", 4, "value", 1);
+        var after = Map.<String, Object>of("tenant", "t", "id", 4, "value", 2);
+        sink.process(0, inbox(row("orders", 1), Envelope.update(2, "orders", before, after, null), row("orders", 3)));
+        assertThat(writer.batches).containsExactly(List.of(1, 4, 3));
+    }
+
+    @Test
+    void aWriterFenceFlushesPrecedingRowsAndWaitsForTheirAcceptance() throws Exception {
+        var writer = new ManualWriter();
+        var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
+        var sink = sink(writer, null, null, 32, 20)
+                .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
+        var ticket = laneTicket(1);
+        var input = inbox(row("orders", 1), row("orders", 2),
+                new SinkLaneCommand.Fence("old", ticket), row("orders", 3));
+
+        sink.process(0, input);
+
+        assertThat(writer.batches).containsExactly(List.of(1, 2));
+        assertThat(input.size()).isEqualTo(1);
+        assertThat(confirmed).isEmpty();
+        writer.pending.getFirst().complete(new WriteResult(2));
+        sink.tryProcess();
+        assertThat(confirmed).containsExactly(ticket);
+        sink.process(0, input);
+        assertThat(input.size()).isZero();
+        assertThat(writer.batches).containsExactly(List.of(1, 2));
+        elapse(20);
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(1, 2), List.of(3));
+    }
+
+    @Test
+    void aPartlyAcceptedPredecessorCannotConfirmAWriterFence() throws Exception {
+        var writer = new ManualWriter();
+        var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
+        var ack = new RecordingAck();
+        var sink = sink(writer, ack, new ContiguousPrefix(AXES), 32, 20)
+                .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
+        sink.process(0, inbox(at("orders", 1), at("orders", 2),
+                new SinkLaneCommand.Fence("old", laneTicket(1))));
+        writer.pending.getFirst().complete(new WriteResult(1));
+
+        assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+        assertThat(confirmed).isEmpty();
+        assertThat(ack.calls).isEmpty();
+    }
+
+    @Test
+    void aNativeLaneMoveIsIsolatedAndAcknowledgedAfterItsWrite() throws Exception {
+        var writer = new ManualWriter();
+        var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
+        var sink = sink(writer, null, null, 32, 20)
+                .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
+        var ticket = laneTicket(2);
+        var move = Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 2), null);
+        var input = inbox(row("orders", 4), new SinkLaneCommand.Move("new", move, ticket), row("orders", 1));
+
+        sink.process(0, input);
+        assertThat(writer.batches).containsExactly(List.of(4));
+        assertThat(confirmed).isEmpty();
+        writer.pending.getFirst().complete(new WriteResult(1));
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(4), List.of(2));
+        assertThat(confirmed).isEmpty();
+        writer.pending.getLast().complete(new WriteResult(1));
+        sink.tryProcess();
+        assertThat(confirmed).containsExactly(ticket);
+        sink.process(0, input);
+        elapse(20);
+        sink.tryProcess();
+        assertThat(writer.batches).containsExactly(List.of(4), List.of(2), List.of(1));
+    }
+
+    @Test
+    void aFailedOrUnconfirmedLaneMoveKeepsItsFollowerAndSourcePositionHeld() throws Exception {
+        for (boolean disconnected : List.of(true, false)) {
+            var writer = new ManualWriter();
+            var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
+            var ack = new RecordingAck();
+            var sink = sink(writer, ack, new ContiguousPrefix(AXES), 32, 20)
+                    .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
+            var move = Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 2), null)
+                    .withPosition(new ChainPosition(new SourceOrder(1, 2), "move"));
+            var input = inbox(new SinkLaneCommand.Move("new", move, laneTicket(2)), row("orders", 1));
+            sink.process(0, input);
+            if (disconnected) {
+                writer.pending.getFirst().completeExceptionally(new IllegalStateException("disconnected"));
+                assertThatThrownBy(sink::tryProcess).hasMessage("disconnected");
+            } else {
+                writer.pending.getFirst().complete(new WriteResult(0));
+                assertThatThrownBy(sink::tryProcess).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+            }
+            assertThat(confirmed).isEmpty();
+            assertThat(ack.calls).isEmpty();
+            assertThat(writer.batches).containsExactly(List.of(2));
+        }
+    }
+
+    private static SinkLaneAcks.Ticket laneTicket(long sequence) {
+        return new SinkLaneAcks.Ticket(new UUID(0, 1), new UUID(0, 2), sequence);
+    }
+
+    @Test
+    void anIgnoredSchemaEventDoesNotMakeAConfirmedDataBatchLookPartial() throws Exception {
+        var batches = new ArrayList<List<Envelope>>();
+        var confirmed = new ArrayList<SinkLaneAcks.Ticket>();
+        var writer = new SinkWriter() {
+            @Override public CompletionStage<WriteResult> write(List<Envelope> records) {
+                batches.add(List.copyOf(records));
+                return CompletableFuture.completedFuture(new WriteResult(
+                        records.stream().filter(row -> row.op() != Op.DDL).count()));
+            }
+            @Override public void close() {}
+        };
+        var sink = sink(writer, null, null, 32, 20)
+                .withLaneCoordination().withLaneAcknowledgments(confirmed::add);
+        var ticket = laneTicket(1);
+        var input = inbox(row("orders", 1), Envelope.ddl(2, "orders", Map.of()),
+                row("orders", 3), new SinkLaneCommand.Fence("old", ticket));
+
+        sink.process(0, input);
+        sink.tryProcess();
+
+        assertThat(batches).hasSize(1);
+        assertThat(batches.getFirst()).extracting(Envelope::op).containsExactly(Op.INSERT, Op.DDL, Op.INSERT);
+        assertThat(confirmed).containsExactly(ticket);
+    }
+
     private SinkProcessor sink(SinkWriter writer, SinkAck ack, SinkFrontier frontier, int maxRecords,
             long maxWaitMillis) throws Exception {
         SinkProcessor sink = new SinkProcessor(writer, ack, frontier, 1, maxRecords, FrontierGauge.none(),
@@ -245,10 +409,10 @@ class ASinkBatchesByCountOrByTimeTest {
     }
 
     /** Records each batch's ids and stream, and settles only when the test says so. */
-    private static final class ManualWriter implements SinkWriter {
-        private final List<List<Object>> batches = new ArrayList<>();
+    private static class ManualWriter implements SinkWriter {
+        final List<List<Object>> batches = new ArrayList<>();
         private final List<String> streams = new ArrayList<>();
-        private final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
+        final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {

@@ -5,6 +5,7 @@ import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
+import com.hazelcast.jet.datamodel.Tuple2;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
@@ -72,15 +73,6 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * here rather than leaving the record to grow unnoticed.
      */
     static final int DEPARTED_REGISTRATIONS = 2;
-
-    /**
-     * The rows this namespace holds a second time, keyed by the value they held <em>before</em>, drawn only
-     * for a lookup made for an {@code orOn} alternative. There the key is an ordinary column rather than
-     * what identifies the row, so it can be edited, and the entry under the value it left would otherwise
-     * go on answering for a row that no longer carries it. Only an update with an earlier row can say
-     * where it was; anything else is passed over.
-     */
-    static final int DEPARTED_ROWS = 3;
 
     private final NestLookup lookup;
     private final NestStore<Map<String, Object>> store;
@@ -152,19 +144,6 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         }
         if (ordinal == ROWS) {
             processRows(inbox);
-            return;
-        }
-        if (ordinal == DEPARTED_ROWS) {
-            for (Object item; (item = inbox.peek()) != null; ) {
-                if (!(item instanceof SettledPositions)) {
-                    depart((Envelope) item);
-                }
-                inbox.remove();
-                if (!flush()) {
-                    return;
-                }
-            }
-            flush();
             return;
         }
         Set<Object> filed = ordinal == REGISTRATIONS
@@ -240,6 +219,12 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
                 inbox.remove();
                 continue;
             }
+            if (filedRows.isEmpty() && inbox.peek() instanceof Tuple2<?, ?> departure) {
+                depart((Envelope) departure.f1());
+                inbox.remove();
+                if (!flush()) return;
+                continue;
+            }
             Map<Object, Set<Object>> buckets;
             if (filedRows.isEmpty()) {
                 buckets = fileRows(inbox);
@@ -291,8 +276,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         Set<List<Object>> keys = new LinkedHashSet<>();
         long bytes = 0;
         for (Object item : inbox) {
-            if (item instanceof SettledPositions || rows.size() >= ROW_BATCH_LIMIT) return rows;
-            Envelope event = (Envelope) item;
+            if (!(item instanceof Envelope event) || rows.size() >= ROW_BATCH_LIMIT) return rows;
             List<Object> key = NestKeys.valuesOf(NestKeys.rowOf(event), lookup.partitionKey(), lookup.mapName());
             if (keys.contains(key)) return rows;
             // This bounds logical row payload as well as count; it is not a measurement of heap use.
@@ -605,31 +589,17 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         return lookup.alternative() && key.contains(null);
     }
 
-    /**
-     * Takes a row out from under the alternative key it held before an update, where the update moved it to
-     * another value. Only while the entry there is still that same row: another row may have been filed
-     * under the value since, and the two deliveries of these edges reach this vertex in no fixed order. The
-     * documents naming the value it left are woken, so they fall through to their next alternative.
-     */
+    /** A move and later reuse of its old key arrive on the same owner FIFO. */
     private void depart(Envelope event) {
-        if (event.op() != io.tapstate.core.event.Op.UPDATE) {
-            return;
-        }
         Map<String, Object> was = event.before();
-        if (was == null || !was.keySet().containsAll(lookup.partitionKey())) {
-            return;
-        }
         List<Object> left = NestKeys.valuesOf(was, lookup.partitionKey(), lookup.mapName());
-        if (left.contains(null)
-                || left.equals(NestKeys.valuesOf(NestKeys.rowOf(event), lookup.partitionKey(), lookup.mapName()))) {
-            return;
-        }
+        if (matchesNothing(left)) return;
         Map<String, Object> filed = store.load(left);
-        if (filed == null || filed.isEmpty() || !sameRow(filed, was)) {
-            return;
-        }
-        store.save(left, NestLookup.gone(), false);
-        wake(left, event, false);
+        // Different source rows can share an alternative value. Only remove its current owner.
+        if (lookup.alternative() && (filed == null || filed.isEmpty() || !sameRow(filed, was))) return;
+        boolean firstFiling = filed == null;
+        store.save(left, NestLookup.gone(), firstFiling);
+        wake(left, event, firstFiling);
     }
 
     /** Whether a filed entry is the row an earlier image describes, by what identifies it where that is known. */
