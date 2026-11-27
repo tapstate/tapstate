@@ -613,17 +613,7 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(process.process.isAlive()).isTrue(); assertThat(process.process.pid()).isEqualTo(firstPid);
                     assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class)).containsEntry("entry", "FIRST_ADMIN_REQUIRED");
                 });
-                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.CONFIGURED);
-                assertComposedConfiguration(admin.getDatabase(config), admin.getDatabase(cache), (String) planned.get("operationId"));
-                assertThat(admin.getDatabase(cache).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
-                assertThat(admin.getDatabase(cache).listCollectionNames()).contains("validation_runs");
-                assertThat(files.capability()).isEmpty();
-                var identity = admin.getDatabase(cache).getCollection("cache_identity").find().first();
-                assertThat(identity.getString("authPreparationId")).isEqualTo(planned.get("operationId"));
-                assertThat(identity.getString("businessPreparationId")).isEqualTo(planned.get("operationId"));
-                assertThat(identity.getLong("authGeneration")).isEqualTo(1L);
-                assertThat(admin.getDatabase(cache).getCollection("workload_claims").countDocuments()).isPositive();
-                assertThat(admin.getDatabase(config).getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
+                verifyRecoveredOpInstallation(files, admin.getDatabase(config), admin.getDatabase(cache), planned);
                 assertThatThrownBy(() -> management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().toBodilessEntity())
                         .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
                 assertThat(process.process.pid()).isEqualTo(firstPid);
@@ -1143,22 +1133,7 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(post.apply("/api/storage/recovery/status",Map.of("operationId",planned.get("operationId"))).get("phase")).isEqualTo("COMPLETE");
                     assertThat(root.runtime().businessStarted()).isTrue();
                 });
-                for(String id:List.of("a","b")) {
-                    var intent=root.runtime().requireConfiguration().intents().load(id).orElseThrow();
-                    assertThat(intent.desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
-                    assertThat(intent.scope().stateGeneration()).isEqualTo(2);
-                    assertThat(root.runtime().requireConfiguration().preparations().read(id).orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
-                }
-                assertThat(admin.getDatabase(cacheDb).getCollection("pipeline_state").countDocuments()).isZero();
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
-                var businessOwner=(NativeBusinessContext)root.runtime().business().orElseThrow();
-                var child=(org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner,"context");
-                var catalog=child.getBean(io.tapstate.control.core.PipelineCatalogService.class);
-                for(String id:List.of("a","b")) {
-                    var item=catalog.find(id).orElseThrow();
-                    assertThat(item.status().displayState()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
-                    assertThat(item.status().observedState()).isNull();
-                }
+                var catalog = verifyRecoveredPipelinesRemainStopped(root, admin.getDatabase(cacheDb));
                 var recoveryService=application.getBean(io.tapstate.control.core.StorageRecoveryService.class);
                 var delegate=(io.tapstate.control.core.StorageRecoveryService.Inspector)org.springframework.test.util.ReflectionTestUtils.getField(recoveryService,"inspector");
                 org.springframework.test.util.ReflectionTestUtils.setField(recoveryService,"inspector",new io.tapstate.control.core.StorageRecoveryService.Inspector() {
@@ -1351,13 +1326,7 @@ class ManagedMongoStoreIsolationIT {
                         .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
                 orphan.deleteOne(new Document("_id", "unknown-history"));
                 var planned = cloudPost(application, cookie, "/api/storage/recovery/plan", Map.of("scope", "CLUSTER", "pipelineIds", List.of()));
-                assertThat(planned).containsEntry("phase", "PLANNED").containsEntry("affectedPipelineIds", List.of());
-                assertThat(((Map<?,?>)planned.get("definitionHashes")).containsKey("atlas-store")).isTrue();
-                assertThat(root.runtime().business()).isEmpty();
-                var recoverySnapshot = cloudPost(application, cookie, "/api/storage/status", Map.of());
-                assertThat(recoverySnapshot).containsEntry("operationId", planned.get("operationId"));
-                assertThat(((List<?>)recoverySnapshot.get("allowedActions")).contains("storage.recovery.confirm")).isTrue();
-                assertThat(((List<?>)recoverySnapshot.get("allowedActions")).contains("storage.setup.commit")).isFalse();
+                verifyInitialCloudRecoveryPlan(root, application, cookie, planned);
                 if (!fault.equals("normal")) failNextSetupCompletion(root.runtime().requireConfiguration());
                 var confirmation = Map.<String,Object>of("operationId", planned.get("operationId"), "planHash", planned.get("planHash"),
                         "controlRevision", planned.get("controlRevision"), "confirmed", true);
@@ -1374,15 +1343,8 @@ class ManagedMongoStoreIsolationIT {
                                 CloudConnectorTestInputs.seedDirectory(), seeds)) {
                             var resumedRoot = resumed.getBean(StorageRoot.class);
                             String resumedCookie = exchangeCookie(resumed, "restarted"); var originalPlan = planned;
-                            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
-                                assertThat(cloudPost(resumed, resumedCookie, "/api/storage/recovery/status", Map.of("operationId", originalPlan.get("operationId"))))
-                                        .containsEntry("phase", "COMPLETE");
-                                assertThat(resumedRoot.runtime().businessStarted()).isTrue();
-                            });
-                            assertThat(admin.getDatabase(configDb).getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
-                            assertThat(admin.getDatabase(cacheDb).getCollection("cache_identity").find().first().get("businessPreparationId"))
-                                    .isEqualTo(originalPlan.get("operationId"));
-                            assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                            verifyRestartedInitialCloudRecovery(resumed, resumedRoot, resumedCookie, originalPlan, admin.getDatabase(configDb), admin.getDatabase(cacheDb), originalBinding);
+
                         }
                         return;
                     }
@@ -1390,14 +1352,7 @@ class ManagedMongoStoreIsolationIT {
                         var oldPlan = planned; var oldConfirmation = confirmation; String oldCookie = cookie;
                         admin.getDatabase(cacheDb).drop();
                         cookie = exchangeCookie(application, "restarted");
-                        assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(3);
-                        assertCloudStatus(application, oldCookie, 401);
-                        String currentCookie = cookie;
-                        assertThat(cloudPost(application, cookie, "/api/storage/status", Map.of())).containsEntry("operationId", oldPlan.get("operationId"));
-                        assertThat(cloudPost(application, cookie, "/api/storage/recovery/status", Map.of("operationId", oldPlan.get("operationId"))))
-                                .containsEntry("phase", "RUNNING");
-                        assertThatThrownBy(() -> cloudPost(application, currentCookie, "/api/storage/recovery/confirm", oldConfirmation))
-                                .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                        verifyRepeatedInitialCacheLoss(root, application, cookie, oldCookie, oldPlan, oldConfirmation);
                         planned = cloudPost(application, cookie, "/api/storage/recovery/plan", Map.of("scope", "CLUSTER", "pipelineIds", List.of(),
                                 "previousOperationId", oldPlan.get("operationId")));
                         assertThat(planned).containsEntry("phase", "PLANNED");
@@ -1408,19 +1363,8 @@ class ManagedMongoStoreIsolationIT {
                     }
                     cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation);
                 }
-                String acceptedCookie = cookie; var acceptedPlan = planned;
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
-                    assertThat(cloudPost(application, acceptedCookie, "/api/storage/recovery/status", Map.of("operationId", acceptedPlan.get("operationId"))))
-                            .containsEntry("phase", "COMPLETE");
-                    assertThat(root.runtime().businessStarted()).isTrue();
-                });
-                assertThat(root.runtime().requireConfiguration().setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
-                assertThat(cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation)).containsEntry("phase", "COMPLETE");
-                assertThat(admin.getDatabase(configDb).getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
-                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
-                assertThat(admin.getDatabase(cacheDb).getCollection("cache_identity").find().first().get("businessPreparationId"))
-                        .isEqualTo(planned.get("operationId"));
+                verifyCompletedInitialCloudRecovery(application, cookie, planned, confirmation, admin.getDatabase(configDb), admin.getDatabase(cacheDb), originalBinding);
+
             }
         }
     }
@@ -1713,68 +1657,19 @@ class ManagedMongoStoreIsolationIT {
                                     failure -> assertThat(failure.getResponseBodyAsString()).contains("\"code\":\"TS0210030\""));
                     org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> injected.get() != null && !root.initialActivationPending());
                 }
-                else try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
-                    var commit = callers.submit(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request));
-                    try {
-                        assertThat(committedBoundary.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                        var loginEntered = new java.util.concurrent.CountDownLatch(1);
-                        var login = callers.submit(() -> { loginEntered.countDown(); return root.managedAuthentication(); });
-                        assertThat(loginEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                        var whileCommitting = login.get(5, java.util.concurrent.TimeUnit.SECONDS);
-                        assertThat(whileCommitting.service()).isSameAs(oldContext.service());
-                        whileCommitting.requireActive().run();
-                        assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
-                        deliverGrant.countDown();
-                        assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS).get("setupPhase")).isIn("STORAGE_BOUND", "COMPLETE");
-                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).until(root.runtime()::businessStarted);
-                        assertThatThrownBy(() -> whileCommitting.requireActive().run()).isInstanceOf(TapstateException.class);
-                        root.managedAuthentication().requireActive().run();
-                        assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
-                    } finally { deliverGrant.countDown(); }
+                else {
+                    verifyCloudLoginDuringCommit(application, root, oldContext, temporary, request, admin.getDatabase(cacheDb),
+                            new CloudCommitBarrier(committedBoundary, deliverGrant));
                 }
-                assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
-                assertComposedConfiguration(admin.getDatabase(configDb), admin.getDatabase(cacheDb), null);
-                assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
-                assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
-                var sessions = admin.getDatabase(cacheDb).getCollection("cloud_sessions");
-                if (failAfterCompletion) {
-                    assertThat(sessions.countDocuments()).isZero();
-                    assertCloudStatus(application, temporary, 401);
-                } else {
-                    assertThat(sessions.countDocuments()).isOne();
-                    assertThat(sessions.find(new Document("jwtId", "old")).first())
-                            .isNotNull().containsEntry("revoked", false);
-                    assertThat(cloudPost(application, temporary, "/api/storage/status", Map.of()))
-                            .containsEntry("businessPhase", "READY").containsEntry("operationId", original.operationId());
-                }
-                assertThatThrownBy(() -> oldContext.service().exchangeCode("late", "127.0.0.1")).isInstanceOf(TapstateException.class);
-                assertThatThrownBy(() -> exchangeCookie(application, "old")).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
-                String fresh = exchangeCookie(application, "fresh");
-                assertThat(cloudPost(application, fresh, "/api/storage/setup/commit", request)).containsEntry("setupPhase", "COMPLETE");
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
-                assertThat(cloudPost(application, fresh, "/api/storage/status", Map.of())).containsEntry("businessPhase", "READY");
-                assertThat(ProcessHandle.current().pid()).isEqualTo(pid);
-                String sources = rootClient(application).get().uri("/api/sources").header("Cookie", fresh).retrieve().body(String.class);
-                assertThat(sources).contains("atlas-store").doesNotContain(PASSWORD, "BEGIN CERTIFICATE");
-                var saved = (SourceResource)configuration.artifacts().get("atlas-store").orElseThrow();
-                assertThat(saved.config()).containsEntry("tlsCaPem", TLS.ca());
-                assertThat(root.runtime().current().orElseThrow().binding().cache().caPem()).isEqualTo(TLS.ca());
-                assertThat(trace).doesNotExist();
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                    var row = admin.getDatabase(cacheDb).getCollection("connection_test_results").find(new Document("_id", "atlas-store")).first();
-                    assertThat(row).isNotNull(); assertThat(row.getInteger("formatVersion")).isEqualTo(2);
-                });
-                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
-                assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
-                assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                verifyCompletedCloudSetup(configuration, admin, configDb, cacheDb);
+                verifyCloudCutoverSessions(application, admin.getDatabase(cacheDb), temporary, original, failAfterCompletion);
+                String fresh = activateFreshCloudSession(application, root, oldContext, request, pid);
+                verifyPublishedCloudStorage(application, fresh, configuration, admin, configDb, cacheDb, trace);
                 Document originalNodeClaim = admin.getDatabase(cacheDb).getCollection("workload_claims")
-                        .find().projection(new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                        .find(new Document("_id.resourceType", "NODE_SESSION"))
+                        .projection(new Document("ownerNodeId", 1).append("ownerBootId", 1)
                                 .append("claimGeneration", 1).append("executionGeneration", 1)).first();
-                try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
-                    assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
-                    assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
-                }
+                verifyCloudConfigPermissions(configUser, configDb, cacheDb, masterDb);
                 // A real CACHE authorization failure cannot reopen the closed bootstrap owner.
                 var bindingBeforeOutage = configuration.bindings().load().orElseThrow();
                 var sourceBeforeOutage = configuration.artifacts().get("atlas-store").orElseThrow();
@@ -1782,38 +1677,13 @@ class ManagedMongoStoreIsolationIT {
                 admin.getDatabase("admin").runCommand(new Document("updateUser", customerUser)
                         .append("roles", List.of(new Document("role", "readWrite").append("db", masterDb))));
                 try {
-                    assertThatThrownBy(() -> cloudPost(application, fresh, "/api/storage/status", Map.of()))
-                            .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
-                                assertThat(failure.getStatusCode().value()).isEqualTo(503);
-                                assertThat(failure.getResponseBodyAsString()).contains("TS0210030");
-                            });
-                    rootClient(application).get().uri("/auth/exchange?code=cache-outage").exchange((outageRequest, response) -> {
-                        assertThat(response.getStatusCode().value()).isEqualTo(503);
-                        assertThat(response.getHeaders().getFirst("Set-Cookie")).isNull();
-                        assertThat(response.bodyTo(String.class)).contains("TS0210030");
-                        return null;
-                    });
-                    assertThat(sdk.consumed).doesNotContain("cache-outage");
-                    assertThatThrownBy(() -> oldContext.service().exchangeCode("late-during-cache-outage", "127.0.0.1"))
-                            .isInstanceOfSatisfying(TapstateException.class,
-                                    failure -> assertThat(failure.code()).isEqualTo(io.tapstate.control.core.ControlError.UNAUTHENTICATED));
-                    assertThat(sdk.consumed).contains("late-during-cache-outage");
-                    assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
-                    assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
-                    assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
+                    verifyCloudCachePermissionLoss(application, fresh, oldContext, sdk, configuration, admin, configDb);
                 } finally {
                     admin.getDatabase("admin").runCommand(new Document("updateUser", customerUser).append("roles",
                             List.of(cacheDb, masterDb).stream().map(database ->
                                     new Document("role", "readWrite").append("db", database)).toList()));
                 }
-                assertCloudStatus(application, temporary, 401);
-                String afterOutage = exchangeCookie(application, "after-cache-outage");
-                assertThat(cloudPost(application, afterOutage, "/api/storage/status", Map.of()))
-                        .containsEntry("setupPhase", "COMPLETE");
-                assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
-                assertThat(configuration.bindings().load().orElseThrow().equals(bindingBeforeOutage)).isTrue();
-                assertThat(configuration.artifacts().get("atlas-store").orElseThrow().equals(sourceBeforeOutage)).isTrue();
-                assertThat(configuration.setupStates().load()).isEqualTo(setupBeforeOutage);
+                verifyCloudPermissionRecovery(application, root, configuration, temporary, bindingBeforeOutage, sourceBeforeOutage, setupBeforeOutage);
                 var owner = (NativeBusinessContext)root.runtime().business().orElseThrow();
                 var child = (org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(owner, "context");
                 var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
@@ -1821,34 +1691,162 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(rootClient(application).get().uri("/healthz").retrieve().toBodilessEntity().getStatusCode().value()).isEqualTo(200);
                 // Losing CACHE permission stops the member without releasing a claim it can no
                 // longer prove. Its original lease expires; shutdown must not reacquire it to release it.
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-                    var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
-                            new Document("$project", new Document("ownerNodeId", 1).append("ownerBootId", 1)
-                                    .append("claimGeneration", 1).append("executionGeneration", 1)
-                                    .append("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
-                            .into(new ArrayList<>());
-                    assertThat(claims).hasSize(1);
-                    Document claim = new Document(claims.getFirst());
-                    assertThat(claim.remove("leased")).isEqualTo(false);
-                    assertThat(claim).isEqualTo(originalNodeClaim);
-                });
+                awaitOriginalNodeClaimExpiry(admin.getDatabase(cacheDb), originalNodeClaim);
             }
             // A new process context reconstructs clients from the same persisted bundle, never a probe file.
             if (failAfterCompletion) admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of()));
             try (var restarted = cloudRecoveryRoot(uri(configUser, configDb), new RecoverySdk(cluster), CloudConnectorTestInputs.seedDirectory(), seeds)) {
-                if (failAfterCompletion) {
-                    assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
-                    admin.getDatabase("admin").runCommand(new Document("updateUser", configUser)
-                            .append("roles", List.of(new Document("role", "readWrite").append("db", configDb))));
-                    String reauthenticated = exchangeCookie(restarted, "restarted");
-                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20))
-                            .until(restarted.getBean(StorageRoot.class).runtime()::businessStarted);
-                    assertThat(cloudPost(restarted, reauthenticated, "/api/storage/status", Map.of())).containsEntry("businessPhase", "READY");
-                }
-                assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
-                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                verifyCloudSetupRestart(restarted, admin, configUser, configDb, failAfterCompletion);
             }
         }
+    }
+
+    private record CloudCommitBarrier(java.util.concurrent.CountDownLatch committed,
+            java.util.concurrent.CountDownLatch grant) {}
+
+    private static void verifyCloudLoginDuringCommit(ConfigurableApplicationContext application, StorageRoot root,
+            io.tapstate.control.core.ManagedAuthenticationContext oldContext, String temporary, Map<String, Object> request,
+            MongoDatabase cache, CloudCommitBarrier barrier) throws Exception {
+        var committedBoundary = barrier.committed();
+        var deliverGrant = barrier.grant();
+        try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var commit = callers.submit(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request));
+            try {
+                assertThat(committedBoundary.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var loginEntered = new java.util.concurrent.CountDownLatch(1);
+                var login = callers.submit(() -> { loginEntered.countDown(); return root.managedAuthentication(); });
+                assertThat(loginEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var whileCommitting = login.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertThat(whileCommitting.service()).isSameAs(oldContext.service());
+                whileCommitting.requireActive().run();
+                assertThat(cache.listCollectionNames().into(new ArrayList<>())).isEmpty();
+                deliverGrant.countDown();
+                assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS).get("setupPhase")).isIn("STORAGE_BOUND", "COMPLETE");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).until(root.runtime()::businessStarted);
+                var requireActive = whileCommitting.requireActive();
+                assertThatThrownBy(requireActive::run).isInstanceOf(TapstateException.class);
+                root.managedAuthentication().requireActive().run();
+                assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
+            } finally { deliverGrant.countDown(); }
+        }
+    }
+
+    private static void verifyCompletedCloudSetup(io.tapstate.adapters.mongostore.MongoConfigurationDomain configuration,
+            MongoClient admin, String configDb, String cacheDb) {
+        assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+        assertComposedConfiguration(admin.getDatabase(configDb), admin.getDatabase(cacheDb), null);
+        assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
+        assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
+    }
+
+    private static void verifyCloudCutoverSessions(ConfigurableApplicationContext application, MongoDatabase cache,
+            String temporary, StorageSetupScope original, boolean failAfterCompletion) {
+        var sessions = cache.getCollection("cloud_sessions");
+        if (failAfterCompletion) {
+            assertThat(sessions.countDocuments()).isZero();
+            assertCloudStatus(application, temporary, 401);
+        } else {
+            assertThat(sessions.countDocuments()).isOne();
+            assertThat(sessions.find(new Document("jwtId", "old")).first())
+                    .isNotNull().containsEntry("revoked", false);
+            assertThat(cloudPost(application, temporary, "/api/storage/status", Map.of()))
+                    .containsEntry("businessPhase", "READY").containsEntry("operationId", original.operationId());
+        }
+    }
+
+    private static String activateFreshCloudSession(ConfigurableApplicationContext application, StorageRoot root,
+            io.tapstate.control.core.ManagedAuthenticationContext oldContext, Map<String, Object> request, long pid) {
+        var oldAuthentication = oldContext.service();
+        assertThatThrownBy(() -> oldAuthentication.exchangeCode("late", "127.0.0.1")).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> exchangeCookie(application, "old")).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+        String fresh = exchangeCookie(application, "fresh");
+        assertThat(cloudPost(application, fresh, "/api/storage/setup/commit", request)).containsEntry("setupPhase", "COMPLETE");
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
+        assertThat(cloudPost(application, fresh, "/api/storage/status", Map.of())).containsEntry("businessPhase", "READY");
+        assertThat(ProcessHandle.current().pid()).isEqualTo(pid);
+        return fresh;
+    }
+
+    private static void verifyPublishedCloudStorage(ConfigurableApplicationContext application, String fresh,
+            io.tapstate.adapters.mongostore.MongoConfigurationDomain configuration, MongoClient admin,
+            String configDb, String cacheDb, Path trace) {
+        var root = application.getBean(StorageRoot.class);
+        String sources = rootClient(application).get().uri("/api/sources").header("Cookie", fresh).retrieve().body(String.class);
+        assertThat(sources).contains("atlas-store").doesNotContain(PASSWORD, "BEGIN CERTIFICATE");
+        var saved = (SourceResource)configuration.artifacts().get("atlas-store").orElseThrow();
+        assertThat(saved.config()).containsEntry("tlsCaPem", TLS.ca());
+        assertThat(root.runtime().current().orElseThrow().binding().cache().caPem()).isEqualTo(TLS.ca());
+        assertThat(trace).doesNotExist();
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            var row = admin.getDatabase(cacheDb).getCollection("connection_test_results").find(new Document("_id", "atlas-store")).first();
+            assertThat(row).isNotNull(); assertThat(row.getInteger("formatVersion")).isEqualTo(2);
+        });
+        assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+        assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
+        assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
+        verifySingleRuntimeClaim(admin.getDatabase(cacheDb));
+    }
+
+    private static void verifyCloudConfigPermissions(String configUser, String configDb,
+            String cacheDb, String masterDb) {
+        try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
+            assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
+            assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
+        }
+    }
+
+    private static void verifyCloudCachePermissionLoss(ConfigurableApplicationContext application, String fresh,
+            io.tapstate.control.core.ManagedAuthenticationContext oldContext, RecoverySdk sdk,
+            io.tapstate.adapters.mongostore.MongoConfigurationDomain configuration, MongoClient admin, String configDb) {
+        Map<String, Object> statusRequest = Map.of();
+        assertThatThrownBy(() -> cloudPost(application, fresh, "/api/storage/status", statusRequest))
+                .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
+                    assertThat(failure.getStatusCode().value()).isEqualTo(503);
+                    assertThat(failure.getResponseBodyAsString()).contains("TS0210030");
+                });
+        rootClient(application).get().uri("/auth/exchange?code=cache-outage").exchange((outageRequest, response) -> {
+            assertThat(response.getStatusCode().value()).isEqualTo(503);
+            assertThat(response.getHeaders().getFirst("Set-Cookie")).isNull();
+            assertThat(response.bodyTo(String.class)).contains("TS0210030");
+            return null;
+        });
+        assertThat(sdk.consumed).doesNotContain("cache-outage");
+        var oldAuthentication = oldContext.service();
+        assertThatThrownBy(() -> oldAuthentication.exchangeCode("late-during-cache-outage", "127.0.0.1"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(io.tapstate.control.core.ControlError.UNAUTHENTICATED));
+        assertThat(sdk.consumed).contains("late-during-cache-outage");
+        assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+        assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+        assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
+    }
+
+    private static void verifyCloudPermissionRecovery(ConfigurableApplicationContext application, StorageRoot root,
+            io.tapstate.adapters.mongostore.MongoConfigurationDomain configuration, String temporary,
+            StorageBinding bindingBeforeOutage, io.tapstate.core.model.Resource sourceBeforeOutage, StorageSetupStateStore.Status setupBeforeOutage) {
+        assertCloudStatus(application, temporary, 401);
+        String afterOutage = exchangeCookie(application, "after-cache-outage");
+        assertThat(cloudPost(application, afterOutage, "/api/storage/status", Map.of()))
+                .containsEntry("setupPhase", "COMPLETE");
+        assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
+        assertThat(configuration.bindings().load().orElseThrow().equals(bindingBeforeOutage)).isTrue();
+        assertThat(configuration.artifacts().get("atlas-store").orElseThrow().equals(sourceBeforeOutage)).isTrue();
+        assertThat(configuration.setupStates().load()).isEqualTo(setupBeforeOutage);
+    }
+
+    private static void verifyCloudSetupRestart(ConfigurableApplicationContext restarted, MongoClient admin,
+            String configUser, String configDb, boolean failAfterCompletion) {
+        if (failAfterCompletion) {
+            assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_UNAVAILABLE);
+            admin.getDatabase("admin").runCommand(new Document("updateUser", configUser)
+                    .append("roles", List.of(new Document("role", "readWrite").append("db", configDb))));
+            String reauthenticated = exchangeCookie(restarted, "restarted");
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20))
+                    .until(restarted.getBean(StorageRoot.class).runtime()::businessStarted);
+            assertThat(cloudPost(restarted, reauthenticated, "/api/storage/status", Map.of())).containsEntry("businessPhase", "READY");
+        }
+        assertThat(restarted.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+        assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
     }
 
     @Test void setupCommitCannotLoseItsLiveCreationGrantToConcurrentLogin() throws Exception {
@@ -2260,174 +2258,247 @@ class ManagedMongoStoreIsolationIT {
                 try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
                     assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
                 }
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
+                verifySingleRuntimeClaim(admin.getDatabase(cacheDb));
                 assertThat(admin.getDatabase(configDb).listCollectionNames().into(new ArrayList<>())).doesNotContain(
                         "workload_claims", "system_meta", "operator_state", "op_sessions", "srs_meta");
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).doesNotContain("users", "cluster_keys", "system_meta", "operator_state", "srs_meta");
-                var current = root.runtime().current().orElseThrow();
-                var modelSource = new SourceResource("model_source", null, "mongodb", Map.of("uri", uri(masterUser, masterDb)),
-                        io.tapstate.core.model.SourceMode.SNAPSHOT, List.of(io.tapstate.core.model.TableRef.literal("orders")), null, null);
-                root.runtime().requireConfiguration().artifacts().create(modelSource);
-                root.runtime().requireConfiguration().artifacts().create(new io.tapstate.core.model.PipelineResource("model_flow", null,
-                        List.of(io.tapstate.core.model.SourceRef.spec("model_source", false)), null, null, null, null, null));
-                current.cache().schemas(current.preparation().businessScope(), () -> {}).save(new io.tapstate.spi.store.DiscoveredSourceModel(
-                        "model_source", "mongodb", 1L, new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
-                        List.of(new io.tapstate.spi.store.SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
-                client.post().uri("/api/pipelines/model_flow:accept-derived-schema").header("Authorization", "Bearer " + login.token())
-                        .retrieve().toBodilessEntity();
-                var modelScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
-                        current.preparation().authScope().cacheIncarnation(), "model_flow", 1);
-                assertThat(current.cache().unpreparedPipelineDerivedSchemas(modelScope, null, () -> {}).latest("model_flow", "model_source.orders").orElseThrow().schema())
-                        .containsEntry("id", "INT64 NULL");
-                root.runtime().requireConfiguration().artifacts().create(new SourceResource("pending_model", null, "mongodb",
-                        Map.of("uri", uri(masterUser, masterDb)), io.tapstate.core.model.SourceMode.SNAPSHOT, null, null, null));
-                root.runtime().requireConfiguration().artifacts().create(new io.tapstate.core.model.PipelineResource("partial_model_flow", null,
-                        List.of(io.tapstate.core.model.SourceRef.spec("pending_model", false), io.tapstate.core.model.SourceRef.spec("model_source", false)),
-                        null, null, null, null, null));
-                var child = (ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(root.runtime().business().orElseThrow(), "context");
-                child.getBean(io.tapstate.control.core.SchemaDerivation.class).derive("partial_model_flow");
-                var partialScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
-                        current.preparation().authScope().cacheIncarnation(), "partial_model_flow", 1);
-                assertThat(current.cache().unpreparedPipelineDerivedSchemas(partialScope, null, () -> {}).latest("partial_model_flow", "model_source.orders"))
-                        .isPresent();
-                assertThat(root.runtime().requireConfiguration().preparations().read("model_flow").orElseThrow().phase())
-                        .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
-                assertThat(root.runtime().requireConfiguration().preparations().read("partial_model_flow").orElseThrow().phase())
-                        .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
-                var originalModelFlow = root.runtime().requireConfiguration().artifacts().get("model_flow").orElseThrow();
-                client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
-                        .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
-                        .retrieve().toBodilessEntity();
-                assertThat(root.runtime().requireConfiguration().artifacts().get("model_flow")).isEmpty();
-                assertThat(root.runtime().requireConfiguration().pipelineStates().read("model_flow").orElseThrow().phase())
-                        .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
-                var configuration = root.runtime().requireConfiguration();
-                configuration.artifacts().create(originalModelFlow);
-                var reusedScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
-                        current.preparation().authScope().cacheIncarnation(), "model_flow", 2);
-                var inputs = SourceModelSnapshot.capture("model_flow", List.of(modelSource),
-                        current.cache().schemas(current.preparation().businessScope(), () -> {}))
-                        .preparationInputs(reusedScope, (io.tapstate.core.model.PipelineResource)originalModelFlow,
-                                (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
-                child.getBean(PipelineFirstStatePreparer.class).prepare(reusedScope, inputs);
-                var driving = child.getBean(PipelineActuationOwnership.class);
-                assertThat(configuration.intents().pipelineIds()).doesNotContain(reusedScope.pipelineId());
-                PipelineActuationOwnership.Execution execution;
-                PipelineActuationOwnership.Control seedControl;
-                // Keep the manually seeded run under control while convergence scans desired intents.
-                var fixtureAdmission = (java.util.concurrent.locks.ReentrantLock)
-                        org.springframework.test.util.ReflectionTestUtils.getField(driving, "ioAdmission");
-                fixtureAdmission.lock();
-                try {
-                    var permitted = driving.permit(reusedScope);
-                    assertThat(permitted.granted()).isTrue();
-                    execution = driving.beginExecution(reusedScope, io.tapstate.spi.store.WorkloadClaimFence.from(permitted.claim()));
-                    assertThat(execution.allowed()).isTrue();
-                    seedControl = driving.control(reusedScope);
-                } finally {
-                    fixtureAdmission.unlock();
-                }
-                io.tapstate.runtime.engine.Engine.Run retainedRun;
-                try (seedControl) {
-                    var completedDag=new com.hazelcast.jet.core.DAG();
-                    completedDag.newVertex("done",com.hazelcast.jet.core.ProcessorMetaSupplier.forceTotalParallelismOne(
-                            com.hazelcast.jet.core.ProcessorSupplier.of((com.hazelcast.function.SupplierEx<com.hazelcast.jet.core.Processor>) FinishedPipelineProcessor::new)));
-                    retainedRun=child.getBean(io.tapstate.runtime.engine.Engine.class).submitRun("model_flow",completedDag,Map.of(),
-                            io.tapstate.runtime.engine.nest.NestSettings.defaults(),new io.tapstate.runtime.engine.OperatorRunManifest("model_flow",execution.fence(),List.of()));
-                    assertThat(retainedRun.awaitTerminal(Duration.ofSeconds(15))).isTrue();
-                }
-                String role = "retire_until_commit_" + suffix;
-                admin.getDatabase("admin").runCommand(new Document("createRole", role).append("privileges", List.of(
-                        new Document("resource", new Document("db", configDb).append("collection", ""))
-                                .append("actions", List.of("find", "insert", "update", "createIndex", "listIndexes", "listCollections"))))
-                        .append("roles", List.of()));
-                admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of(new Document("role", role).append("db", "admin"))));
-                try {
-                    assertThatThrownBy(() -> client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
-                            .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
-                            .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.HttpServerErrorException.class);
-                    assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().phase())
-                            .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
-                    assertThat(configuration.artifacts().get("model_flow")).isPresent();
-                    assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").find(new Document("pipelineScope.pipelineId", "model_flow"))
-                            .first()).containsKey("pipelineRetirement");
-                } finally {
-                    admin.getDatabase("admin").runCommand(new Document("updateUser", configUser)
-                            .append("roles", List.of(new Document("role", "readWrite").append("db", configDb))));
-                }
-                client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
-                        .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
-                        .retrieve().toBodilessEntity();
-                assertThat(configuration.artifacts().get("model_flow")).isEmpty();
-                assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().phase())
-                        .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
-                configuration.artifacts().create(originalModelFlow);
-                assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().stateGeneration()).isEqualTo(3);
-                assertThat(child.getBean(io.tapstate.runtime.engine.Engine.class).captureRun("model_flow").orElseThrow().jobId()).isEqualTo(retainedRun.jobId());
-                client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
-                        .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
-                        .retrieve().toBodilessEntity();
-                assertThat(configuration.artifacts().get("model_flow")).isEmpty();
-                configuration.artifacts().create(originalModelFlow);
-                var beforeFull = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
-                        current.preparation().authScope().cacheIncarnation(), "model_flow", 4);
-                var fullInputs = SourceModelSnapshot.capture("model_flow", List.of(modelSource),
-                        current.cache().schemas(current.preparation().businessScope(), () -> {}))
-                        .preparationInputs(beforeFull, (io.tapstate.core.model.PipelineResource)originalModelFlow,
-                                (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
-                child.getBean(PipelineFirstStatePreparer.class).prepare(beforeFull, fullInputs);
-                // The fixture seeds the accepted stop intent; the production driver performs the actual replacement.
-                child.getBean(io.tapstate.spi.store.StorePort.class).desired().save(new io.tapstate.core.lifecycle.DesiredState("model_flow",
-                        io.tapstate.core.lifecycle.PipelineState.STOPPED, io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow), true));
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> {
-                    child.getBean(ConvergenceDriver.class).reconcile();
-                    var mapping = configuration.pipelineStates().read("model_flow").orElseThrow();
-                    return mapping.phase() == io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE && mapping.stateGeneration() == 5;
-                });
-                var serverFailure = new AtomicReference<Throwable>();
-                var deletion = child.getBean(io.tapstate.control.core.ArtifactMutationService.PipelineDeletion.class);
-                org.springframework.test.util.ReflectionTestUtils.setField(child.getBean(io.tapstate.control.core.ArtifactMutationService.class), "pipelineDeletion",
-                        (io.tapstate.control.core.ArtifactMutationService.PipelineDeletion)(definition, expected) -> {
-                            try {
-                                var command = deletion.prepare(definition, expected);
-                                return () -> { try { command.run(); } catch (RuntimeException | Error failure) { serverFailure.set(failure); throw failure; } };
-                            } catch (RuntimeException | Error failure) { serverFailure.set(failure); throw failure; }
-                        });
-                // Publication can precede the previous synchronous pass's finally block; only its busy fence is retried.
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
-                    try {
-                        client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
-                                .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")
-                                .retrieve().toBodilessEntity();
-                    } catch (org.springframework.web.client.RestClientResponseException busy) {
-                        var body = (Map<?,?>)io.tapstate.core.common.JsonReader.parse(busy.getResponseBodyAsString());
-                        if (busy.getStatusCode().value() == 500 && "TS0480009".equals(body.get("code")))
-                            throw new AssertionError("the native control is not yet available",serverFailure.get());
-                        throw busy;
-                    }
-                });
-                assertThat(configuration.artifacts().get("model_flow")).isEmpty();
-                var businessOwner = (NativeBusinessContext)root.runtime().business().orElseThrow();
-                var businessContext = (org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner, "context");
-                var originalMember = businessContext.getBean(com.hazelcast.core.HazelcastInstance.class);
-                var originalNode = businessContext.getBean(NodeSessionLease.class).currentFence().orElseThrow();
-                businessOwner.close();
-                assertThat(originalMember.getLifecycleService().isRunning()).isFalse();
-                assertThat(current.cache().workloadClaims(current.preparation().businessScope()).read(originalNode.key()).orElseThrow().leased()).isFalse();
-                assertThat(root.runtime().businessStarted()).isFalse();
-                String degraded = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + login.token())
-                        .body(Map.of()).retrieve().body(String.class);
-                assertThat(((Map<?,?>)io.tapstate.core.common.JsonReader.parse(degraded)).get("businessPhase"))
-                        .isEqualTo("AUTH_READY");
-                admin.getDatabase(cacheDb).getCollection("op_sessions").drop();
-                assertThatThrownBy(() -> client.post().uri("/auth/login")
-                        .body(Map.of("username", "admin", "password", "sentinel-login-password", "createSession", false))
-                        .retrieve().body(String.class))
-                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                                failure -> assertThat(failure.getStatusCode().value()).isEqualTo(503));
+                verifyNativeModelLifecycle(root, admin, new NativeRootStores(configDb, cacheDb, masterDb, configUser, masterUser), original, client, login, suffix);
+
             }
         }
+    }
+
+    private static void verifyInitialCloudRecoveryPlan(StorageRoot root, ConfigurableApplicationContext application, String cookie, Map<String, Object> planned) {
+        assertThat(planned).containsEntry("phase", "PLANNED").containsEntry("affectedPipelineIds", List.of());
+        assertThat(((Map<?,?>)planned.get("definitionHashes")).containsKey("atlas-store")).isTrue();
+        assertThat(root.runtime().business()).isEmpty();
+        var recoverySnapshot = cloudPost(application, cookie, "/api/storage/status", Map.of());
+        assertThat(recoverySnapshot).containsEntry("operationId", planned.get("operationId"));
+        assertThat(((List<?>)recoverySnapshot.get("allowedActions")).contains("storage.recovery.confirm")).isTrue();
+        assertThat(((List<?>)recoverySnapshot.get("allowedActions")).contains("storage.setup.commit")).isFalse();
+    }
+
+    private static void verifyCompletedInitialCloudRecovery(ConfigurableApplicationContext application,
+            String cookie, Map<String, Object> planned, Map<String, Object> confirmation, MongoDatabase config,
+            MongoDatabase cache, Document originalBinding) {
+        var root = application.getBean(StorageRoot.class);
+        String acceptedCookie = cookie; var acceptedPlan = planned;
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+            assertThat(cloudPost(application, acceptedCookie, "/api/storage/recovery/status", Map.of("operationId", acceptedPlan.get("operationId"))))
+                    .containsEntry("phase", "COMPLETE");
+            assertThat(root.runtime().businessStarted()).isTrue();
+        });
+        assertThat(root.runtime().requireConfiguration().setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+        assertThat(cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation)).containsEntry("phase", "COMPLETE");
+        assertThat(config.getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
+        assertThat(config.getCollection("sources").countDocuments()).isOne();
+        verifySingleRuntimeClaim(cache);
+        assertThat(cache.getCollection("cache_identity").find().first().get("businessPreparationId"))
+                .isEqualTo(planned.get("operationId"));
+    }
+
+    private static void verifyRestartedInitialCloudRecovery(ConfigurableApplicationContext resumed, StorageRoot resumedRoot,
+            String resumedCookie, Map<String, Object> originalPlan, MongoDatabase config,
+            MongoDatabase cache, Document originalBinding) {
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+            assertThat(cloudPost(resumed, resumedCookie, "/api/storage/recovery/status", Map.of("operationId", originalPlan.get("operationId"))))
+                    .containsEntry("phase", "COMPLETE");
+            assertThat(resumedRoot.runtime().businessStarted()).isTrue();
+        });
+        assertThat(config.getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
+        assertThat(cache.getCollection("cache_identity").find().first().get("businessPreparationId"))
+                .isEqualTo(originalPlan.get("operationId"));
+        verifySingleRuntimeClaim(cache);
+    }
+
+    private static void verifyRepeatedInitialCacheLoss(StorageRoot root, ConfigurableApplicationContext application,
+            String cookie, String oldCookie, Map<String, Object> oldPlan, Map<String, Object> oldConfirmation) {
+        assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(3);
+        assertCloudStatus(application, oldCookie, 401);
+        String currentCookie = cookie;
+        assertThat(cloudPost(application, cookie, "/api/storage/status", Map.of())).containsEntry("operationId", oldPlan.get("operationId"));
+        assertThat(cloudPost(application, cookie, "/api/storage/recovery/status", Map.of("operationId", oldPlan.get("operationId"))))
+                .containsEntry("phase", "RUNNING");
+        assertThatThrownBy(() -> cloudPost(application, currentCookie, "/api/storage/recovery/confirm", oldConfirmation))
+                .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+    }
+
+    private static void verifyNativeBusinessShutdown(StorageRoot root, StorageRuntime.Bound current,
+            org.springframework.web.client.RestClient client, io.tapstate.control.restapi.LoginResponse login,
+            MongoDatabase cache) {
+        var businessOwner = (NativeBusinessContext)root.runtime().business().orElseThrow();
+        var businessContext = (org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner, "context");
+        var originalMember = businessContext.getBean(com.hazelcast.core.HazelcastInstance.class);
+        var originalNode = businessContext.getBean(NodeSessionLease.class).currentFence().orElseThrow();
+        businessOwner.close();
+        assertThat(originalMember.getLifecycleService().isRunning()).isFalse();
+        assertThat(current.cache().workloadClaims(current.preparation().businessScope()).read(originalNode.key()).orElseThrow().leased()).isFalse();
+        assertThat(root.runtime().businessStarted()).isFalse();
+        String degraded = client.post().uri("/api/storage/status").header("Authorization", "Bearer " + login.token())
+                .body(Map.of()).retrieve().body(String.class);
+        assertThat(((Map<?,?>)io.tapstate.core.common.JsonReader.parse(degraded)).get("businessPhase"))
+                .isEqualTo("AUTH_READY");
+        cache.getCollection("op_sessions").drop();
+        assertThatThrownBy(() -> loginWithoutSession(client))
+                .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                        failure -> assertThat(failure.getStatusCode().value()).isEqualTo(503));
+    }
+
+    private static void loginWithoutSession(org.springframework.web.client.RestClient client) {
+        client.post().uri("/auth/login")
+                .body(Map.of("username", "admin", "password", "sentinel-login-password", "createSession", false))
+                .retrieve().body(String.class);
+    }
+
+    private record NativeRootStores(String config, String cache, String master, String configUser, String masterUser) {}
+
+    private static void verifyNativeModelLifecycle(StorageRoot root, MongoClient admin, NativeRootStores stores,
+            StorageSetupScope original, org.springframework.web.client.RestClient client,
+            io.tapstate.control.restapi.LoginResponse login, String suffix) {
+        String configDb = stores.config(), cacheDb = stores.cache(), masterDb = stores.master();
+        String configUser = stores.configUser(), masterUser = stores.masterUser();
+        var current = root.runtime().current().orElseThrow();
+        var modelSource = new SourceResource("model_source", null, "mongodb", Map.of("uri", uri(masterUser, masterDb)),
+                io.tapstate.core.model.SourceMode.SNAPSHOT, List.of(io.tapstate.core.model.TableRef.literal("orders")), null, null);
+        root.runtime().requireConfiguration().artifacts().create(modelSource);
+        root.runtime().requireConfiguration().artifacts().create(new io.tapstate.core.model.PipelineResource("model_flow", null,
+                List.of(io.tapstate.core.model.SourceRef.spec("model_source", false)), null, null, null, null, null));
+        current.cache().schemas(current.preparation().businessScope(), () -> {}).save(new io.tapstate.spi.store.DiscoveredSourceModel(
+                "model_source", "mongodb", 1L, new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                List.of(new io.tapstate.spi.store.SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
+        client.post().uri("/api/pipelines/model_flow:accept-derived-schema").header("Authorization", "Bearer " + login.token())
+                .retrieve().toBodilessEntity();
+        var modelScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                current.preparation().authScope().cacheIncarnation(), "model_flow", 1);
+        assertThat(current.cache().unpreparedPipelineDerivedSchemas(modelScope, null, () -> {}).latest("model_flow", "model_source.orders").orElseThrow().schema())
+                .containsEntry("id", "INT64 NULL");
+        root.runtime().requireConfiguration().artifacts().create(new SourceResource("pending_model", null, "mongodb",
+                Map.of("uri", uri(masterUser, masterDb)), io.tapstate.core.model.SourceMode.SNAPSHOT, null, null, null));
+        root.runtime().requireConfiguration().artifacts().create(new io.tapstate.core.model.PipelineResource("partial_model_flow", null,
+                List.of(io.tapstate.core.model.SourceRef.spec("pending_model", false), io.tapstate.core.model.SourceRef.spec("model_source", false)),
+                null, null, null, null, null));
+        var child = (ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(root.runtime().business().orElseThrow(), "context");
+        child.getBean(io.tapstate.control.core.SchemaDerivation.class).derive("partial_model_flow");
+        var partialScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                current.preparation().authScope().cacheIncarnation(), "partial_model_flow", 1);
+        assertThat(current.cache().unpreparedPipelineDerivedSchemas(partialScope, null, () -> {}).latest("partial_model_flow", "model_source.orders"))
+                .isPresent();
+        assertThat(root.runtime().requireConfiguration().preparations().read("model_flow").orElseThrow().phase())
+                .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
+        assertThat(root.runtime().requireConfiguration().preparations().read("partial_model_flow").orElseThrow().phase())
+                .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
+        verifySingleRuntimeClaim(admin.getDatabase(cacheDb));
+        var originalModelFlow = root.runtime().requireConfiguration().artifacts().get("model_flow").orElseThrow();
+        deleteNativeModelFlow(client, login, originalModelFlow);
+        assertThat(root.runtime().requireConfiguration().artifacts().get("model_flow")).isEmpty();
+        assertThat(root.runtime().requireConfiguration().pipelineStates().read("model_flow").orElseThrow().phase())
+                .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
+        var configuration = root.runtime().requireConfiguration();
+        configuration.artifacts().create(originalModelFlow);
+        var reusedScope = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                current.preparation().authScope().cacheIncarnation(), "model_flow", 2);
+        var inputs = SourceModelSnapshot.capture("model_flow", List.of(modelSource),
+                current.cache().schemas(current.preparation().businessScope(), () -> {}))
+                .preparationInputs(reusedScope, (io.tapstate.core.model.PipelineResource)originalModelFlow,
+                        (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
+        child.getBean(PipelineFirstStatePreparer.class).prepare(reusedScope, inputs);
+        var driving = child.getBean(PipelineActuationOwnership.class);
+        assertThat(configuration.intents().pipelineIds()).doesNotContain(reusedScope.pipelineId());
+        PipelineActuationOwnership.Execution execution;
+        PipelineActuationOwnership.Control seedControl;
+        // Keep the manually seeded run under control while convergence scans desired intents.
+        var fixtureAdmission = (java.util.concurrent.locks.ReentrantLock)
+                org.springframework.test.util.ReflectionTestUtils.getField(driving, "ioAdmission");
+        fixtureAdmission.lock();
+        try {
+            var permitted = driving.permit(reusedScope);
+            assertThat(permitted.granted()).isTrue();
+            execution = driving.beginExecution(reusedScope, io.tapstate.spi.store.WorkloadClaimFence.from(permitted.claim()));
+            assertThat(execution.allowed()).isTrue();
+            seedControl = driving.control(reusedScope);
+        } finally {
+            fixtureAdmission.unlock();
+        }
+        io.tapstate.runtime.engine.Engine.Run retainedRun;
+        try (seedControl) {
+            var completedDag=new com.hazelcast.jet.core.DAG();
+            completedDag.newVertex("done",com.hazelcast.jet.core.ProcessorMetaSupplier.forceTotalParallelismOne(
+                    com.hazelcast.jet.core.ProcessorSupplier.of((com.hazelcast.function.SupplierEx<com.hazelcast.jet.core.Processor>) FinishedPipelineProcessor::new)));
+            retainedRun=child.getBean(io.tapstate.runtime.engine.Engine.class).submitRun("model_flow",completedDag,Map.of(),
+                    io.tapstate.runtime.engine.nest.NestSettings.defaults(),new io.tapstate.runtime.engine.OperatorRunManifest("model_flow",execution.fence(),List.of()));
+            assertThat(retainedRun.awaitTerminal(Duration.ofSeconds(15))).isTrue();
+        }
+        String role = "retire_until_commit_" + suffix;
+        admin.getDatabase("admin").runCommand(new Document("createRole", role).append("privileges", List.of(
+                new Document("resource", new Document("db", configDb).append("collection", ""))
+                        .append("actions", List.of("find", "insert", "update", "createIndex", "listIndexes", "listCollections"))))
+                .append("roles", List.of()));
+        admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of(new Document("role", role).append("db", "admin"))));
+        try {
+            assertThatThrownBy(() -> deleteNativeModelFlow(client, login, originalModelFlow)).isInstanceOf(org.springframework.web.client.HttpServerErrorException.class);
+            assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().phase())
+                    .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+            assertThat(configuration.artifacts().get("model_flow")).isPresent();
+            assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").find(new Document("pipelineScope.pipelineId", "model_flow"))
+                    .first()).containsKey("pipelineRetirement");
+        } finally {
+            admin.getDatabase("admin").runCommand(new Document("updateUser", configUser)
+                    .append("roles", List.of(new Document("role", "readWrite").append("db", configDb))));
+        }
+        deleteNativeModelFlow(client, login, originalModelFlow);
+        assertThat(configuration.artifacts().get("model_flow")).isEmpty();
+        assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().phase())
+                .isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED);
+        configuration.artifacts().create(originalModelFlow);
+        assertThat(configuration.pipelineStates().read("model_flow").orElseThrow().stateGeneration()).isEqualTo(3);
+        assertThat(child.getBean(io.tapstate.runtime.engine.Engine.class).captureRun("model_flow").orElseThrow().jobId()).isEqualTo(retainedRun.jobId());
+        deleteNativeModelFlow(client, login, originalModelFlow);
+        assertThat(configuration.artifacts().get("model_flow")).isEmpty();
+        configuration.artifacts().create(originalModelFlow);
+        var beforeFull = new io.tapstate.spi.store.PipelineIntentScope(original.clusterId(), 1,
+                current.preparation().authScope().cacheIncarnation(), "model_flow", 4);
+        var fullInputs = SourceModelSnapshot.capture("model_flow", List.of(modelSource),
+                current.cache().schemas(current.preparation().businessScope(), () -> {}))
+                .preparationInputs(beforeFull, (io.tapstate.core.model.PipelineResource)originalModelFlow,
+                        (io.tapstate.core.model.PipelineResource)originalModelFlow, Map.of(modelSource.id(), modelSource));
+        child.getBean(PipelineFirstStatePreparer.class).prepare(beforeFull, fullInputs);
+        // The fixture seeds the accepted stop intent; the production driver performs the actual replacement.
+        child.getBean(io.tapstate.spi.store.StorePort.class).desired().save(new io.tapstate.core.lifecycle.DesiredState("model_flow",
+                io.tapstate.core.lifecycle.PipelineState.STOPPED, io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow), true));
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> {
+            child.getBean(ConvergenceDriver.class).reconcile();
+            var mapping = configuration.pipelineStates().read("model_flow").orElseThrow();
+            return mapping.phase() == io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE && mapping.stateGeneration() == 5;
+        });
+        var serverFailure = new AtomicReference<Throwable>();
+        var deletion = child.getBean(io.tapstate.control.core.ArtifactMutationService.PipelineDeletion.class);
+        org.springframework.test.util.ReflectionTestUtils.setField(child.getBean(io.tapstate.control.core.ArtifactMutationService.class), "pipelineDeletion",
+                (io.tapstate.control.core.ArtifactMutationService.PipelineDeletion)(definition, expected) -> {
+                    try {
+                        var command = deletion.prepare(definition, expected);
+                        return () -> { try { command.run(); } catch (RuntimeException | Error failure) { serverFailure.set(failure); throw failure; } };
+                    } catch (RuntimeException | Error failure) { serverFailure.set(failure); throw failure; }
+                });
+        // Publication can precede the previous synchronous pass's finally block; only its busy fence is retried.
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+            try {
+                deleteNativeModelFlow(client, login, originalModelFlow);
+            } catch (org.springframework.web.client.RestClientResponseException busy) {
+                var body = (Map<?,?>)io.tapstate.core.common.JsonReader.parse(busy.getResponseBodyAsString());
+                if (busy.getStatusCode().value() == 500 && "TS0480009".equals(body.get("code")))
+                    throw new AssertionError("the native control is not yet available",serverFailure.get());
+                throw busy;
+            }
+        });
+        assertThat(configuration.artifacts().get("model_flow")).isEmpty();
+        verifyNativeBusinessShutdown(root, current, client, login, admin.getDatabase(cacheDb));
+    }
+
+    private static void deleteNativeModelFlow(org.springframework.web.client.RestClient client,
+            io.tapstate.control.restapi.LoginResponse login, io.tapstate.core.model.Resource modelFlow) {
+        client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
+                .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(modelFlow) + "\"")
+                .retrieve().toBodilessEntity();
     }
 
     private static final class FinishedPipelineProcessor extends com.hazelcast.jet.core.AbstractProcessor {
@@ -2749,6 +2820,69 @@ class ManagedMongoStoreIsolationIT {
                     new User("admin", new BCryptPasswordHasher().hash("sentinel-login-password"), "admin"));
             return new NativeDatabases(config, cache, master, configUser, cacheUser, masterUser, initial.preparation());
         }
+    }
+
+    private static void verifyRecoveredOpInstallation(InstallationFiles files, MongoDatabase config,
+            MongoDatabase cache, Map<?, ?> planned) {
+        assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.CONFIGURED);
+        assertComposedConfiguration(config, cache, (String) planned.get("operationId"));
+        assertThat(cache.getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
+        assertThat(cache.listCollectionNames()).contains("validation_runs");
+        assertThat(files.capability()).isEmpty();
+        var identity = cache.getCollection("cache_identity").find().first();
+        assertThat(identity.getString("authPreparationId")).isEqualTo(planned.get("operationId"));
+        assertThat(identity.getString("businessPreparationId")).isEqualTo(planned.get("operationId"));
+        assertThat(identity.getLong("authGeneration")).isEqualTo(1L);
+        verifyRuntimeClaimsExist(cache);
+        assertThat(config.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
+    }
+
+    private static io.tapstate.control.core.PipelineCatalogService verifyRecoveredPipelinesRemainStopped(
+            StorageRoot root, MongoDatabase cache) {
+        for(String id:List.of("a","b")) {
+            var intent=root.runtime().requireConfiguration().intents().load(id).orElseThrow();
+            assertThat(intent.desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
+            assertThat(intent.scope().stateGeneration()).isEqualTo(2);
+            assertThat(root.runtime().requireConfiguration().preparations().read(id).orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+        }
+        assertThat(cache.getCollection("pipeline_state").countDocuments()).isZero();
+        verifySingleRuntimeClaim(cache);
+        var businessOwner=(NativeBusinessContext)root.runtime().business().orElseThrow();
+        var child=(org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner,"context");
+        var catalog=child.getBean(io.tapstate.control.core.PipelineCatalogService.class);
+        for(String id:List.of("a","b")) {
+            var item=catalog.find(id).orElseThrow();
+            assertThat(item.status().displayState()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
+            assertThat(item.status().observedState()).isNull();
+        }
+        return catalog;
+    }
+
+    private static void verifyRuntimeClaimsExist(MongoDatabase cache) {
+        assertThat(countRuntimeClaims(cache)).isPositive();
+    }
+
+    private static void verifySingleRuntimeClaim(MongoDatabase cache) {
+        assertThat(countRuntimeClaims(cache)).isOne();
+    }
+
+    private static long countRuntimeClaims(MongoDatabase cache) {
+        return cache.getCollection("workload_claims").countDocuments(new Document("_id.resourceType", new Document("$exists", true)));
+    }
+
+    private static void awaitOriginalNodeClaimExpiry(MongoDatabase cache, Document originalNodeClaim) {
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            var claims = cache.getCollection("workload_claims").aggregate(List.of(
+                    new Document("$match", new Document("_id", new Document("$ne", "business-preparation"))),
+                    new Document("$project", new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                            .append("claimGeneration", 1).append("executionGeneration", 1)
+                            .append("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                    .into(new ArrayList<>());
+            assertThat(claims).hasSize(1);
+            Document claim = new Document(claims.getFirst());
+            assertThat(claim.remove("leased")).isEqualTo(false);
+            assertThat(claim).isEqualTo(originalNodeClaim);
+        });
     }
 
     private static void assertNativeDatabasePlacement(MongoClient admin, NativeDatabases set) {

@@ -278,7 +278,8 @@ class MongoCacheRecoveryStoreIT {
                 assertThatThrownBy(() -> derived.pin("a","step",0)).isInstanceOf(TapstateException.class);
                 assertThatThrownBy(() -> cache.unpreparedPipelineDerivedSchemas(scope,node,ACTIVE).latest("a","step")).isInstanceOf(TapstateException.class);
                 assertThat(f.cache.getCollection("pipeline_state").countDocuments()).isZero();
-                assertThat(f.cache.getCollection("workload_claims").countDocuments()).isOne();
+                assertThat(f.cache.getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isOne();
             }
         });
     }
@@ -390,7 +391,8 @@ class MongoCacheRecoveryStoreIT {
                 assertThat(f.domain.intents().startRecovered(permission,stopped.intentRevision(),hash)).isFalse();
                 assertThat(f.domain.intents().load("a").orElseThrow().intentRevision()).isEqualTo(stopped.intentRevision()+1);
                 assertThat(f.domain.intents().load("b").orElseThrow().desired().targetState()).isEqualTo(PipelineState.STOPPED);
-                assertThat(f.cache.getCollection("workload_claims").countDocuments()).isEqualTo(2);
+                assertThat(f.cache.getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isEqualTo(2);
                 assertThat(f.cache.getCollection("pipeline_state").countDocuments()).isOne();
                 assertThat(reservation.claim().claimGeneration()).isEqualTo(1);
             }

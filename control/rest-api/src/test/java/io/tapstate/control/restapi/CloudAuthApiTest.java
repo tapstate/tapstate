@@ -29,6 +29,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -76,6 +77,30 @@ class CloudAuthApiTest {
         return Optional.of(new CloudLoginIdentity(IDENTITY, "stable-user", "jti-a", Scope.WRITE,
                 NOW.plusSeconds(900)));
     }, sessions);
+
+    @Test
+    void rejectedSignInLinkReturnsLocalizedRecoveryWithoutSettingACookie() throws Exception {
+        CloudAuthenticationService refusing = new CloudAuthenticationService((code, cluster) -> {
+            throw new TapstateException(ControlError.CLOUD_SIGN_IN_LINK_INVALID, Map.of(), null);
+        }, (jwt, identity, audience) -> {
+            throw new AssertionError("The session must not be established after a refused exchange");
+        }, sessions);
+        beans.registerSingleton("cloudAuthentication", refusing);
+        MockMvc mvc = mvc(AuthenticationMode.CLOUD, false, false);
+
+        var response = mvc.perform(handoff("refused-code-sentinel").header(HttpHeaders.ACCEPT_LANGUAGE, "zh-CN"))
+                .andExpect(status().isUnauthorized()).andReturn().getResponse();
+
+        assertThat(JsonReader.parse(response.getContentAsString(StandardCharsets.UTF_8)))
+                .isEqualTo(Map.of(
+                        "code", "TS0210035", "params", Map.of(),
+                        "message", "\u767b\u5f55\u94fe\u63a5\u5df2\u5931\u6548\u3002",
+                        "solution", "\u8bf7\u8fd4\u56de Cloud "
+                                + "\u63a7\u5236\u53f0\uff0c\u5728\u76ee\u6807\u96c6\u7fa4\u4e0a\u91cd\u65b0\u70b9\u51fb\u300c\u8fdb\u5165\u300d\u3002"));
+        assertThat(response.getHeader(HttpHeaders.SET_COOKIE)).isNull();
+        assertThat(response.getHeader(HttpHeaders.LOCATION)).isNull();
+        assertThat(store.records).isEmpty();
+    }
 
     @ParameterizedTest
     @MethodSource("invalidHosts")

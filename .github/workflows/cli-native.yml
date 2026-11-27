@@ -12,6 +12,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - cli/native-smoke.sh
       - .github/liberica-nik.lock.json
       - .github/scripts/install-liberica-nik.sh
       - .github/workflows/cli-native.yml
