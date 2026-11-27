@@ -24,7 +24,7 @@
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoKeyedStateStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoAiProviderSettingsStoreIT", "method": "encryptedCredentialsSurviveRotationAndCannotCrossWorkspaceOrEndpoint"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsIT", "method": "encryptedConfigurationSurvivesReopenAndExplicitDeletionWithoutAnyCache"},
-  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoValidationAiSchemaCompositionIT", "method": "firstValidationPreparationPreservesTheActivatedVersionFence"},
+  {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoValidationAiSchemaCompositionIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoPipelineIntentStoreIT"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "sharedNoteLookupsRespectPipelineNodeSettingsAndTheCurrentArtifactHash"},
   {"module": "adapters/adapter-mongo-store", "class": "io.tapstate.adapters.mongostore.MongoCapturePreparationsIT", "method": "aVersionedCaptureGrantRequiresTheExactPreparedRevisionAndRetainsItsArtifact"},
