@@ -1005,42 +1005,15 @@ def published_policy(root, source, examples, sources, mode):
     return dict(cases=policies, ledger_serializer=dict(helper_sources=helper_sources, aliases=aliases), gate_sha256=gate_hash, published_source_sha256=digest(source.read_bytes()), synthetic_source_sha256=digest(synthetic_source.read_bytes()))
 
 
-def csv_string(term, source, enum_context):
-    string_literal = r'"(?:\\.|[^"\\])*"'
-    if not re.fullmatch(string_literal, term):
-        field = re.fullmatch(r'([\w$]+(?:\s*\.\s*[\w$]+)*)\s*\.\s*([\w$]+)', term)
-        require(field is not None, 'CSV constant expressions require independent enumeration')
-        lookup, offset = enum_context
-        owner = re.sub(r'\s+', '', field[1])
-        _, target = lookup.resolve(source, owner, offset)
-        require(target is not None, 'CSV constant owner is outside known sources: ' + owner)
-        path, node = target
-        context = lookup.context(path)
-        require('\\u' not in context['text'], 'CSV constant source requires Java Unicode preprocessing')
-        start = node['start'] + 1
-        body = context['clean'][start:node['end']]
-        declaration = (r'(?<![\w$])public\s+static\s+final\s+String\s+'
-                       + re.escape(field[2]) + r'\s*=([^;]*);')
-        matches = [match for match in re.finditer(declaration, body)
-                   if body.count('{', 0, match.start()) == body.count('}', 0, match.start())]
-        require(len(matches) == 1, 'CSV constant needs one declared public static final String: ' + term)
-        match = matches[0]
-        term = uncomment(context['text'][start + match.start(1):start + match.end(1)]).strip()
-        require(re.fullmatch(string_literal, term) is not None, 'CSV constant needs a literal initializer: ' + field[2])
-    return literals(term, '')[0]
-
-
-def csv_literals(value, source, enum_context):
-    """Read CSV strings built from literals and source-bound qualified constants."""
+def csv_literals(value):
+    """Admit literal strings only; Java constant scope requires independent enumeration."""
     value = uncomment(value).strip()
     if value.startswith('{') and value.endswith('}'):
         value = value[1:-1]
-    rows = []
-    for entry in split_values(value):
-        operators = [match.start() for match in re.finditer(r'\+', masked(entry))]
-        terms = (entry[left + 1:right].strip() for left, right in zip([-1, *operators], [*operators, len(entry)]))
-        rows.append(''.join(csv_string(term, source, enum_context) for term in terms))
-    return rows
+    entries = split_values(value)
+    require(all(re.fullmatch(r'"(?:\\.|[^"\\])*"', item) for item in entries),
+            'CSV constant expressions require independent enumeration')
+    return literals(value, '')
 
 
 def csv_record(row, delimiter):
@@ -1169,12 +1142,12 @@ def source_parameters(root, source, declaration, sources, lookup=None):
                 'nondefault CSV options require independent enumeration')
         delimiter = re.fullmatch(r"'(.)'", options['delimiter']) if 'delimiter' in options else None
         require('delimiter' not in options or delimiter is not None, 'unsupported CSV delimiter literal')
-        null_values = csv_literals(options['nullValues'], source, enum_context) if 'nullValues' in options else []
+        null_values = csv_literals(options['nullValues']) if 'nullValues' in options else []
         if 'textBlock' in options:
             require('value' not in options, 'mixed CSV text block and value source')
             rows = csv_text_block(options['textBlock'])
         else:
-            rows = csv_literals(options.get('value', argument), source, enum_context)
+            rows = csv_literals(options.get('value', argument))
         for row in rows:
             parsed = csv_record(row, delimiter.group(1) if delimiter else ',')
             values.append([None if value in null_values else value for value in parsed])

@@ -14,8 +14,6 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -39,12 +37,15 @@ class ResumeMetricProjectionTest {
         assertThat(ResumeMetricProjection.apply(baseline, List.of(), window)).isEmpty();
     }
 
-    @ParameterizedTest
-    @CsvSource({
-            CdcDeliveryTotals.COUNT_METRIC + ", {record}",
-            CdcDeliveryTotals.TOTAL_MILLIS_METRIC + ", ms"
-    })
-    void idleSinkCounterKeepsSavedOutputVisible(String name, String unit) {
+    @Test void idleSinkDeliveryCountKeepsSavedOutputVisible() {
+        assertIdleSinkCounterKeepsSavedOutputVisible(CdcDeliveryTotals.COUNT_METRIC, "{record}");
+    }
+
+    @Test void idleSinkDeliveryDurationKeepsSavedOutputVisible() {
+        assertIdleSinkCounterKeepsSavedOutputVisible(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, "ms");
+    }
+
+    private void assertIdleSinkCounterKeepsSavedOutputVisible(String name, String unit) {
         var saved = records("insert", OLD, 7);
         var baseline = new ResumeMetrics.Baseline(2, 1, FENCE, 8, List.of(saved), false);
         var idle = MetricFact.single(name, MetricType.COUNTER, unit,

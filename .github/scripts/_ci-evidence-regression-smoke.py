@@ -862,32 +862,6 @@ class SourceIdentityTests(unittest.TestCase):
                 self.assertTrue(inv['complete'], inv['unresolved'])
                 self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
 
-    def test_csv_concatenation_resolves_the_qualified_string_field(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            definition = root / 'core/src/main/java/metrics/Counters.java'
-            definition.parent.mkdir(parents=True)
-            declaration = '@ParameterizedTest @CsvSource({Counters.COUNT + ", records+events", "literal, ms"}) ' \
-                'void counter(String name, String unit) {}'
-            preamble = 'import metrics.Counters;'
-            field = 'public static final String COUNT = "rows";'
-            counter_source = ('package metrics; public class Counters { '
-                              'static class Other { public static final String COUNT = "other"; } '
-                              '// public static final String COUNT = "comment";\n' + field + '}')
-            definition.write_text(counter_source)
-            _, inv = self.inventory(root, declaration, preamble=preamble)
-            self.assertTrue(inv['complete'], inv['unresolved'])
-            expected = [evidence.argument_digest([['java.lang.String', name], ['java.lang.String', unit]])
-                        for name, unit in [('rows', 'records+events'), ('literal', 'ms')]]
-            self.assertEqual(inv['methods'][0]['argument_digests'], expected)
-            self.assertEqual(inv['sources'][definition.relative_to(root).as_posix()],
-                             hashlib.sha256(definition.read_bytes()).hexdigest())
-
-            definition.write_text(counter_source.replace('"rows"', 'System.getProperty("rows")'))
-            _, invalid = self.inventory(root, declaration, preamble=preamble)
-            self.assertFalse(invalid['complete'])
-            self.assertIsNone(invalid['methods'][0]['mapping'])
-
     def test_csv_text_block_uses_java_whitespace_without_losing_content(self):
         for character in ('\u00a0', '\v', '\u2028'):
             with self.subTest(character=repr(character)), tempfile.TemporaryDirectory() as temporary:
