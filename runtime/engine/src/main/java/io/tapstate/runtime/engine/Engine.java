@@ -13,11 +13,11 @@ import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
-import io.tapstate.core.lifecycle.DeliveryReading;
-import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestOrigin;
@@ -244,6 +244,9 @@ public final class Engine {
         }
     }
 
+    public record RunMetrics(long jobId, OperatorRunManifest manifest, CaptureReading captured,
+            DeliveryReading delivered, StageReading stages) {}
+
     /** A local, non-serializable handle for the one concrete job whose configuration was verified. */
     public final class Run {
         private final String pipelineId;
@@ -262,6 +265,15 @@ public final class Engine {
                     || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
             return originalManifest;
         }
+        /** Read all producer windows from one collection on the captured Job. */
+        public Optional<RunMetrics> metrics() {
+            if (!isCarryingAJob()) return Optional.empty();
+            var manifest = operatorManifest();
+            var collected = job.getMetrics();
+            return Optional.of(new RunMetrics(jobId(), manifest, SourceArrivals.reading(collected),
+                    deliveryIn(collected), stageDurationsIn(collected)));
+        }
+
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
         public boolean completed() {
             return !isLost() && job.getStatus() == JobStatus.COMPLETED
@@ -771,18 +783,6 @@ public final class Engine {
         return job == null ? null : cdcDeliveryIn(job.getMetrics());
     }
 
-    /** Projects one scrape of the job's confirmed deliveries and pending writes. */
-    public DeliveryReading deliveryReading(String pipelineId, Instant now) {
-        Job job = liveJob(pipelineId);
-        if (job == null) return DeliveryReading.NONE;
-        JobMetrics metrics = job.getMetrics();
-        var since = countingSinceIn(metrics);
-        if (since.isEmpty()) return DeliveryReading.NONE;
-        return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics),
-                highestIn(metrics, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(since.getAsLong()),
-                settledDurationsIn(metrics), cdcDeliveryIn(metrics), pendingCdcWriteIn(metrics, now));
-    }
-
     /** An empty sink supplies no evidence about source capture progress. */
     static PendingCdcWrite pendingCdcWriteIn(JobMetrics metrics, Instant now) {
         PendingCdcWrite oldest = null;
@@ -983,6 +983,19 @@ public final class Engine {
             return OptionalLong.empty();
         }
         return countingSinceIn(job.getMetrics());
+    }
+
+    public DeliveryReading deliveryReading(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? DeliveryReading.NONE : deliveryIn(job.getMetrics());
+    }
+
+    private static DeliveryReading deliveryIn(JobMetrics collected) {
+        var start = countingSinceIn(collected);
+        if (start.isEmpty()) return DeliveryReading.NONE;
+        return new DeliveryReading(deliveredRowsIn(collected), settledBytesIn(collected),
+                highestIn(collected, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(start.getAsLong()),
+                settledDurationsIn(collected), cdcDeliveryIn(collected), pendingCdcWriteIn(collected, Instant.now()));
     }
 
     private static OptionalLong countingSinceIn(JobMetrics collected) {

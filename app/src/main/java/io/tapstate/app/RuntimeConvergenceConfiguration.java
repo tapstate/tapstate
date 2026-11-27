@@ -115,7 +115,7 @@ class RuntimeConvergenceConfiguration {
                 // rows counted where a source handed them over. On its own it says a pipeline is reading;
                 // beside the far end it says whether what it reads is arriving, which neither answers.
                 captureCoordinator::capturedRows,
-                id -> engine.deliveryReading(id, Instant.now()),
+                engine::deliveryReading,
                 // Where the run spends its time, per stage of the graph, as the processors time their own
                 // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
                 engine::stageDurations,
@@ -124,7 +124,16 @@ class RuntimeConvergenceConfiguration {
                         executionPlans.current(List.of(id)).get(id),
                         Instant.now()),
                 (id, at) -> captureCoordinator.measurements(id, executionPlans.current(List.of(id)).get(id), at),
-                Clock.systemUTC()).withAggregateReadings(engine::aggregateReadings);
+                Clock.systemUTC()).withAggregateReadings(engine::aggregateReadings)
+                .withResumeSample((scope, binding, at) -> {
+                    var expected = new ExecutionFence(scope, binding.fence());
+                    return engine.captureRun(scope.pipelineId())
+                            .filter(run -> run.jobId() != binding.baseline().jobId()
+                                    && expected.equals(run.operatorManifest().executionIdentity()))
+                            .flatMap(Engine.Run::metrics)
+                            .map(sample -> ObservationPublisher.NativeSample.from(sample.jobId(), scope.pipelineId(), at,
+                                    sample.captured(), sample.delivered(), sample.stages()));
+                });
     }
 
     /**

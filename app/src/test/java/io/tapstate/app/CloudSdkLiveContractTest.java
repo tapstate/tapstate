@@ -20,6 +20,7 @@ import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -56,6 +57,46 @@ class CloudSdkLiveContractTest {
     private static final String REQUEST_AUDIENCE = "cluster.dev.cloud.tapstate.com";
     private static final String TOKEN = "shared-static-token-sentinel";
     private static final String KID = "test-key-one";
+
+    @ParameterizedTest
+    @CsvSource({
+        "401, exchange.code-expired, TS0210035",
+        "401, exchange.code-consumed, TS0210035",
+        "401, exchange.code-cluster-mismatch, TS0210021",
+        "503, sdk.unavailable, TS0210021",
+        "503, exchange.code-expired, TS0210021"
+    })
+    void classifiesExchangeRefusalsFromThePackagedSdk(int status, String upstreamCode, String expectedCode)
+            throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/api/auth/exchange", exchange -> respond(exchange, status,
+                Map.of("code", upstreamCode, "msg", "provider-message-sentinel")));
+        server.start();
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl(baseUrl);
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+            CloudSessionStore store = mock(CloudSessionStore.class);
+            CloudSessionIdentity deployment = new CloudSessionIdentity(
+                    baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER);
+            CloudAuthenticationService authentication = new CloudAuthenticationService(bridge, bridge,
+                    new CloudSessionService(store, deployment, mock(TokenSecrets.class), Clock.systemUTC()));
+
+            assertThatThrownBy(() -> authentication.exchangeCode("request-code-sentinel", REQUEST_AUDIENCE))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code().code()).isEqualTo(expectedCode))
+                    .hasNoCause()
+                    .hasMessageNotContaining("provider-message-sentinel")
+                    .hasMessageNotContaining("request-code-sentinel");
+            verifyNoInteractions(store);
+        } finally {
+            server.stop(0);
+        }
+    }
 
     @Test
     void currentAddressProviderTreatsCloudFailuresAsUnavailableAndLogsOnlyBoundedMetadata() throws Exception {

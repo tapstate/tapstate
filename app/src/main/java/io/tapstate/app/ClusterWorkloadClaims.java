@@ -258,6 +258,11 @@ final class ClusterWorkloadClaims {
         return call(()->store.read(key));
     }
 
+    Optional<WorkloadClaim> advanceResumeExecution(WorkloadClaim expected, Set<String> nodes, long revision) {
+        if (!membership.businessEligible()) return Optional.empty();
+        return call(() -> store.advanceResumeExecution(expected, expected.topologyRevision(), nodes, revision));
+    }
+
     Optional<WorkloadClaim> advanceExecution(
             WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds) {
         if (!membership.businessEligible()) {
