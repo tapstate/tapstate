@@ -176,6 +176,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
     private final Map<String, ArrayDeque<Queued>> queued = new LinkedHashMap<>();
     // When each queued stream's oldest row was taken in, by the clock the wait is measured against.
     private final Map<String, Long> waitingSince = new LinkedHashMap<>();
+    private final Map<String, Long> oldestQueuedCdcByStream = new LinkedHashMap<>();
     private int queuedRows;
     private Map<String, SinkTarget> nativeTargets = Map.of();
     private QueuedMove queuedMove;
@@ -567,6 +568,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             waitingSince.put(row.src(), nanoClock.getAsLong());
         }
         queue.add(new Queued(nextOrder++, row));
+        if (DeliveredRows.hasCdcTimestamp(row)) {
+            oldestQueuedCdcByStream.merge(row.src(), row.ts(), Math::min);
+        }
         queuedRows++;
     }
 
@@ -622,6 +626,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             wrote = true;
             ArrayDeque<Queued> queue = queued.remove(stream);
             waitingSince.remove(stream);
+            oldestQueuedCdcByStream.remove(stream);
             List<Envelope> batch = new ArrayList<>(queue.size());
             long firstOrder = queue.peek().order();
             for (Queued row : queue) {
@@ -698,12 +703,24 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
         Map<String, Long> queuedByStream = new LinkedHashMap<>();
         queued.forEach((stream, rows) -> queuedByStream.put(stream, (long) rows.size()));
         Map<String, Long> inFlightByTable = new LinkedHashMap<>();
+        long oldestCdc = Long.MAX_VALUE;
+        for (long eventMillis : oldestQueuedCdcByStream.values()) {
+            oldestCdc = Math.min(oldestCdc, eventMillis);
+        }
         for (InFlightBatch batch : inFlight) {
+            if (!batch.future().isDone()) {
+                oldestCdc = Math.min(oldestCdc, batch.delivered().oldestCdcTimestamp());
+            }
             batch.delivered().rows().forEach((table, byOp) -> inFlightByTable.merge(
                     table, byOp.values().stream().mapToLong(Long::longValue).sum(), Long::sum));
         }
-        if (queuedMove != null) queuedByStream.merge(queuedMove.row().src(), 1L, Long::sum);
+        if (queuedMove != null) {
+            Envelope move = queuedMove.row();
+            queuedByStream.merge(move.src(), 1L, Long::sum);
+            if (DeliveredRows.hasCdcTimestamp(move)) oldestCdc = Math.min(oldestCdc, move.ts());
+        }
         delivery.waiting(queuedByStream, inFlightByTable);
+        delivery.oldestPendingCdc(oldestCdc == Long.MAX_VALUE ? 0 : oldestCdc);
     }
 
     /**
@@ -864,6 +881,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             return;
         }
         closed = true;
+        delivery.oldestPendingCdc(0);
         try {
             if (ack != null) closeStep("SinkAck.flushOnClose", ack::flushOnClose);
         } finally {
@@ -1049,7 +1067,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      */
     private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
             Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes, List<Long> cdcTimes,
-            int rowCount) {
+            int rowCount, long oldestCdcTimestamp) {
 
         /** The tables this batch settled rows of, which are the ones whose readings have moved. */
         Set<String> tables() {
@@ -1063,6 +1081,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             Map<String, List<Long>> stamps = new LinkedHashMap<>();
             List<Long> cdcTimes = new ArrayList<>();
             int rowCount = 0;
+            long oldestCdcTimestamp = Long.MAX_VALUE;
             for (Envelope event : batch) {
                 if (event.op() != Op.DDL) {
                     rowCount++;
@@ -1080,9 +1099,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
                 stamps.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(event.ts());
                 if (hasCdcTimestamp(event)) {
                     cdcTimes.add(event.ts());
+                    oldestCdcTimestamp = Math.min(oldestCdcTimestamp, event.ts());
                 }
             }
-            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount);
+            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount, oldestCdcTimestamp);
         }
 
         private static boolean hasCdcTimestamp(Envelope event) {

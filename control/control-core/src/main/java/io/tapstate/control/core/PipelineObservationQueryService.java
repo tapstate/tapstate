@@ -3,14 +3,16 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ExecutionPlans;
-import io.tapstate.core.lifecycle.LifecycleError;
-import io.tapstate.core.lifecycle.Observation;
-import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.InitialLoad;
-import java.time.Clock;
-import java.time.Duration;
+import io.tapstate.core.lifecycle.LifecycleError;
+import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.ObservationStore;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -110,9 +112,12 @@ public final class PipelineObservationQueryService {
 
     /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
     public Optional<PipelineStatus> findStatus(String pipelineId) {
+        return findObservation(pipelineId).map(this::statusOf);
+    }
+
+    Optional<Observation> findObservation(String pipelineId) {
         Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
-        return observations.read(pipelineId)
-                .map(this::statusOf);
+        return observations.read(pipelineId);
     }
 
     /** One read keeps state, measurement times and snapshot progress on the same publication. */
@@ -163,6 +168,24 @@ public final class PipelineObservationQueryService {
 
     Map<String, PipelineState> currentEngineStates(Map<String, io.tapstate.spi.store.PipelineIntentScope> scopes) {
         return diagnostics.currentStates(scopes);
+    }
+
+    PipelineCatalogItem.SyncLag syncLagOf(Observation observation) {
+        var now = clock.instant();
+        if (observation != null && observation.state() == PipelineState.RUNNING
+                && PendingCdcWrite.isCurrent(observation.observedAt(), now)) {
+            for (var fact : observation.facts()) {
+                if (!PendingCdcWrite.METRIC.equals(fact.name()) || fact.type() != MetricType.GAUGE
+                        || !"ms".equals(fact.unit()) || fact.points().size() != 1) continue;
+                var point = fact.points().getFirst();
+                if (point.value() != null && point.value() >= 0
+                        && PendingCdcWrite.isCurrent(point.observedAt(), now)) {
+                    return new PipelineCatalogItem.SyncLag(PipelineCatalogItem.SyncLagState.BEHIND,
+                            point.value(), point.observedAt());
+                }
+            }
+        }
+        return new PipelineCatalogItem.SyncLag(PipelineCatalogItem.SyncLagState.UNKNOWN, null, null);
     }
 
     PipelineStatus statusOf(Observation observation) {

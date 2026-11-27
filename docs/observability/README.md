@@ -146,6 +146,14 @@ are target-confirmed tables out of that run's complete initial-load table set, n
 
 The optional projection is unavailable for old observations, unverified execution bindings, or stale
 observations. A mismatched replacement execution never inherits the preceding run's partial counts.
+The Pipeline catalog (`GET /api/pipelines`) exposes `syncLag` for running pipelines.
+`BEHIND` carries `lowerBoundMillis` and `observedAt`. The duration measures the oldest
+timestamped CDC row observed waiting for its target write at that sample. A pipeline can
+have additional, older work upstream. `UNKNOWN` means that a current pending-write
+sample is unavailable. An empty sink queue alone cannot establish that capture has
+reached the source. The sample expires after 60 seconds and the duration stays fixed
+at its recorded observation time.
+
 Normal cleanup of a completed bounded execution can retain its target-confirmed final facts without an
 active plan; those facts describe the completed run. The projection is for display, not pipeline recovery,
 and it does not make separate status, metrics, and snapshot requests a transactional snapshot.
