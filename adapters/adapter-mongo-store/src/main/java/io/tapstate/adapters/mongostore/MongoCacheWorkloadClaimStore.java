@@ -669,31 +669,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             java.util.function.Consumer<T> verifyCommitted, boolean inspectOnFailure) {
         return MongoStructureFailureScope.observe(client, operations.budget(), inspectOnFailure, () -> StoreIo.call(() -> {
             try {
-                if(operations.budget()==null)operations.requireAdmission();
-                requireActive.run();
-                requireValidationAuthority();
-                var budget = operations.budget();
-                if (budget != null) {
-                    var result = boundedTransaction(callback, budget);
-                    if (verifyCommitted != null) verifyCommitted.accept(result);
-                    return result;
-                }
-                for (int attempt = 0; ; attempt++) {
-                    T committed;
-                    try {
-                        committed = MongoCacheAdmissionQueue.driverTransaction(client, operations, TRANSACTION,
-                                session -> checkedAttempt(session, null, callback));
-                    } catch (MongoException conflict) {
-                        // A duplicate-key error aborts its transaction; retry the original callback,
-                        // never keep using that session or adopt another scope.
-                        if (attempt >= 2 || ErrorCategory.fromErrorCode(conflict.getCode()) != ErrorCategory.DUPLICATE_KEY) throw conflict;
-                        continue;
-                    }
-                    // CONFIG registration verifies the exact committed owner without replaying a CACHE write on failure.
-                    if (verifyCommitted == null) requireValidationAuthority();
-                    else verifyCommitted.accept(committed);
-                    return committed;
-                }
+                return runTransaction(callback, verifyCommitted);
             } catch (RuntimeException failed) {
                 operations.structures.clear();
                 // A known closed/revoked owner is diagnosed before a driver's closed-client failure.
@@ -701,6 +677,36 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 throw failed;
             }
         }));
+    }
+
+    private <T> T runTransaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
+            java.util.function.Consumer<T> verifyCommitted) {
+        if (operations.budget() == null) operations.requireAdmission();
+        requireActive.run();
+        requireValidationAuthority();
+        var budget = operations.budget();
+        if (budget != null) {
+            var result = boundedTransaction(callback, budget);
+            if (verifyCommitted != null) verifyCommitted.accept(result);
+            return result;
+        }
+        T committed = unboundedTransaction(callback);
+        // CONFIG registration verifies the exact committed owner without replaying a CACHE write on failure.
+        if (verifyCommitted == null) requireValidationAuthority();
+        else verifyCommitted.accept(committed);
+        return committed;
+    }
+
+    private <T> T unboundedTransaction(BiFunction<ClientSession, MongoReadBudget, T> callback) {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return MongoCacheAdmissionQueue.driverTransaction(client, operations, TRANSACTION,
+                        session -> checkedAttempt(session, null, callback));
+            } catch (MongoException conflict) {
+                // A duplicate-key error aborts its transaction; retry the original callback in a new session.
+                if (attempt >= 2 || ErrorCategory.fromErrorCode(conflict.getCode()) != ErrorCategory.DUPLICATE_KEY) throw conflict;
+            }
+        }
     }
 
     private <T> T attempt(ClientSession session, boolean admission, PipelineIntentScope pipeline,

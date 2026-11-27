@@ -137,8 +137,9 @@ class MongoCacheMetadataStoresIT {
             var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
             table.on(f.database).drop();
             f.database.createView(table.collectionName(), "unavailable_claims", List.of());
-            assertNoClaimCatalogReads(() -> assertThatThrownBy(() ->
-                    claims.acquire(key, new WorkloadOwner("node", "boot"), 1, Duration.ofSeconds(30)))
+            var owner = new WorkloadOwner("node", "boot");
+            var ttl = Duration.ofSeconds(30);
+            assertNoClaimCatalogReads(() -> assertThatThrownBy(() -> claims.acquire(key, owner, 1, ttl))
                     .isInstanceOf(TapstateException.class));
             assertThat(f.admissions()).isZero();
         });
@@ -214,12 +215,12 @@ class MongoCacheMetadataStoresIT {
                     dropped.set(true);
                 }
             });
+            var ttl = Duration.ofSeconds(30);
+            org.assertj.core.api.ThrowableAssert.ThrowingCallable acquire = processOwned
+                    ? () -> claims.acquireProcessNode(key, owner, ttl)
+                    : () -> claims.acquire(key, owner, 1, ttl);
             try {
-                assertThatThrownBy(() -> {
-                    var ttl = Duration.ofSeconds(30);
-                    if (processOwned) claims.acquireProcessNode(key, owner, ttl);
-                    else claims.acquire(key, owner, 1, ttl);
-                }).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(acquire).isInstanceOf(TapstateException.class);
             } finally {
                 MongoCommandObservation.COLLECTIONS.remove();
             }

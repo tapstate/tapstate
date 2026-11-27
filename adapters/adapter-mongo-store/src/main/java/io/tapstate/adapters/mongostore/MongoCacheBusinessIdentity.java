@@ -11,6 +11,11 @@ import java.util.List;
 
 /** Business readiness is independent from authentication-only generation changes. */
 final class MongoCacheBusinessIdentity {
+    private static final String CLUSTER_ROW_ID = "cluster";
+    private static final String CLUSTER_ID = "clusterId";
+    private static final String BINDING_VERSION = "bindingVersion";
+    private static final String CACHE_INCARNATION = "cacheIncarnation";
+    private static final String BUSINESS_PREPARATION_ID = "businessPreparationId";
     static final String CLAIM_NAMESPACE_PROOF_VERSION = "claimNamespaceProofVersion";
     static final int CLAIM_NAMESPACE_PROOF_V1 = 1;
     private static final String SCHEMA = "schema";
@@ -24,7 +29,7 @@ final class MongoCacheBusinessIdentity {
     /** Keeps the original readiness predicates within the caller's transaction snapshot. */
     void requireReadyCombined(ClientSession session) {
         var result = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
-                MongoPipelineObservationRead.match(new Document("_id", "cluster")),
+                MongoPipelineObservationRead.match(new Document("_id", CLUSTER_ROW_ID)),
                 MongoPipelineObservationRead.boundedRow(), MongoPipelineObservationRead.originalRow(),
                 MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"))).first();
         if (result != null && !MongoPipelineObservationRead.overflow(result, SCHEMA, 1)) {
@@ -44,7 +49,7 @@ final class MongoCacheBusinessIdentity {
     private Document readyIdentity(ClientSession session, String maintenance) {
         // Keep both facts in the original transaction snapshot without a second round trip.
         var row = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
-                new Document("$match", new Document("_id", "cluster")),
+                new Document("$match", new Document("_id", CLUSTER_ROW_ID)),
                 new Document("$project", new Document("identity", "$$ROOT")),
                 new Document("$lookup", new Document("from", SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())
                         .append("pipeline", List.of(new Document("$match", new Document("_id", "business"))))
@@ -58,7 +63,7 @@ final class MongoCacheBusinessIdentity {
     }
 
     Document readReadyIdentity(ClientSession session) {
-        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", CLUSTER_ROW_ID)).first();
         requireReadyIdentity(identity, scope);
         return identity;
     }
@@ -79,8 +84,8 @@ final class MongoCacheBusinessIdentity {
     }
 
     private static void requireReadyIdentity(Document identity, CacheBusinessScope scope) {
-        if (identity == null || !scope.clusterId().equals(identity.get("clusterId")) || !Long.valueOf(scope.bindingVersion()).equals(identity.get("bindingVersion"))
-                || !scope.cacheIncarnation().equals(identity.get("cacheIncarnation")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
+        if (identity == null || !scope.clusterId().equals(identity.get(CLUSTER_ID)) || !Long.valueOf(scope.bindingVersion()).equals(identity.get(BINDING_VERSION))
+                || !scope.cacheIncarnation().equals(identity.get(CACHE_INCARNATION)) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || !MongoCacheIdentity.READY.equals(identity.get("businessPhase"))) throw businessFenced();
     }
 
@@ -95,7 +100,7 @@ final class MongoCacheBusinessIdentity {
             if (!scope.equals(MongoValidationSchema.scope(marker)) || !"READY".equals(marker.get("phase"))
                     && (maintenance == null || !maintenance.equals(marker.get("operationId")))) throw businessFenced();
         }
-        if (!(identity.get("businessPreparationId") instanceof String operation) || operation.isBlank()
+        if (!(identity.get(BUSINESS_PREPARATION_ID) instanceof String operation) || operation.isBlank()
                 || !operation.equals(schema.get("operationId")) || !(schema.get("epoch") instanceof Long epoch) || epoch < 1) throw unreadable();
     }
 
@@ -109,16 +114,16 @@ final class MongoCacheBusinessIdentity {
         if (row.containsKey(CLAIM_NAMESPACE_PROOF_VERSION)
                 && (!Integer.valueOf(CLAIM_NAMESPACE_PROOF_V1).equals(row.get(CLAIM_NAMESPACE_PROOF_VERSION))
                 || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)
-                        .find(session, claimNamespaceRecord(scope, row.getString("businessPreparationId"))).first() == null)) {
+                        .find(session, claimNamespaceRecord(scope, row.getString(BUSINESS_PREPARATION_ID))).first() == null)) {
             throw unreadableClaimNamespace();
         }
         admitClaim(session, row);
     }
 
     static Document claimNamespaceRecord(CacheBusinessScope scope, String preparationId) {
-        return new Document("_id", "business-preparation").append("clusterId", scope.clusterId())
-                .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
-                .append("businessPreparationId", preparationId);
+        return new Document("_id", "business-preparation").append(CLUSTER_ID, scope.clusterId())
+                .append(BINDING_VERSION, scope.bindingVersion()).append(CACHE_INCARNATION, scope.cacheIncarnation())
+                .append(BUSINESS_PREPARATION_ID, preparationId);
     }
 
     static TapstateException unreadableClaimNamespace() {
@@ -130,13 +135,13 @@ final class MongoCacheBusinessIdentity {
     Document admitRetainedCapture(ClientSession session, io.tapstate.spi.store.WorkloadClaimKey key) {
         var id = MongoWorkloadClaimStore.id(key);
         var captured = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
-                new Document("$match", new Document("_id", "cluster")),
+                new Document("$match", new Document("_id", CLUSTER_ROW_ID)),
                 new Document("$project", new Document("identity", "$$ROOT")),
                 MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"),
                 MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, CAPTURE, id,
                         List.of(MongoWorkloadClaimStore.leaseRemaining(true))))).first();
         var identity = captured == null ? null : captured.get("identity", Document.class);
-        if (identity != null && "cluster".equals(identity.get("_id"))
+        if (identity != null && CLUSTER_ROW_ID.equals(identity.get("_id"))
                 && !MongoCaptureStartupRows.ambiguous(captured, SCHEMA, "business")
                 && !MongoCaptureStartupRows.ambiguous(captured, CAPTURE, id)) {
             var schema = MongoCaptureStartupRows.get(captured, SCHEMA);
@@ -189,8 +194,8 @@ final class MongoCacheBusinessIdentity {
     }
 
     private Document identityFilter() {
-        return new Document("_id", "cluster").append("clusterId", scope.clusterId())
-                .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation());
+        return new Document("_id", CLUSTER_ROW_ID).append(CLUSTER_ID, scope.clusterId())
+                .append(BINDING_VERSION, scope.bindingVersion()).append(CACHE_INCARNATION, scope.cacheIncarnation());
     }
     private static long admissionRevision(Document row) {
         if (!(row.get("claimAdmissionFence") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE) throw unreadable();
