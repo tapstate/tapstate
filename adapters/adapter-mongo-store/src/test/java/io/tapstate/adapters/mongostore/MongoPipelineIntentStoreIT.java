@@ -603,11 +603,12 @@ class MongoPipelineIntentStoreIT {
     @Test
     void stopThenStartCoalescesIntoOneLatestValueWithTheOriginalOneTimeStamp() {
         withConfiguration((domain, database, scope) -> {
+            readyForActuation(domain, database, scope);
             var store = domain.intents();
-            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.STOPPED, true, false, null))).isTrue();
-            assertThat(store.compareAndSet(scope, 1, intent(PipelineState.RUNNING, true, true, 12L))).isTrue();
+            assertThat(store.compareAndSet(scope, 1, intent(PipelineState.STOPPED, true, false, null))).isTrue();
+            assertThat(store.compareAndSet(scope, 2, intent(PipelineState.RUNNING, true, true, 12L))).isTrue();
             assertThat(store.load("flow")).get().satisfies(snapshot -> {
-                assertThat(snapshot.intentRevision()).isEqualTo(2);
+                assertThat(snapshot.intentRevision()).isEqualTo(3);
                 assertThat(snapshot.scope()).isEqualTo(scope);
                 assertThat(snapshot.desired().revision()).isEqualTo(HASH);
                 assertThat(snapshot.desired().purgeState()).isTrue();
