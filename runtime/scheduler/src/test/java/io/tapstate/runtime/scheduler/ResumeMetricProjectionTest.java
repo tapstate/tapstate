@@ -1,5 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
+import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
@@ -12,6 +14,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -33,6 +37,25 @@ class ResumeMetricProjectionTest {
                     assertThat(point.observedAt()).isEqualTo(NEW);
                 });
         assertThat(ResumeMetricProjection.apply(baseline, List.of(), window)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            CdcDeliveryTotals.COUNT_METRIC + ", {record}",
+            CdcDeliveryTotals.TOTAL_MILLIS_METRIC + ", ms"
+    })
+    void idleSinkCounterKeepsSavedOutputVisible(String name, String unit) {
+        var saved = records("insert", OLD, 7);
+        var baseline = new ResumeMetrics.Baseline(2, 1, FENCE, 8, List.of(saved), false);
+        var idle = MetricFact.single(name, MetricType.COUNTER, unit,
+                MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, "p"), NEW, NEW, 0));
+        var window = ResumeMetricProjection.window(3, 12, ResumeMetrics.Prior.ABSENT,
+                Map.of(ResumeMetrics.Producer.OUT, NEW.toEpochMilli()));
+
+        var expected = MetricFact.single(saved.name(), saved.type(), saved.unit(),
+                MetricPoint.accumulated(saved.points().getFirst().attributes(), OLD, NEW, 7));
+        assertThat(ResumeMetricProjection.apply(baseline, List.of(idle), window))
+                .containsExactlyInAnyOrder(idle, expected);
     }
 
     @Test void onlyTheRestartedProducerLosesItsBaselineAcrossPublications() {

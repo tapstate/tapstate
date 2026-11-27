@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
@@ -11,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 @RequiresDocker
 class RebuildingResumeMetricsIT {
@@ -53,9 +56,18 @@ class RebuildingResumeMetricsIT {
                     () -> control.state(PIPELINE).filter(PipelineState.PAUSED::equals).isPresent(),
                     () -> "state=" + control.state(PIPELINE));
             long beforeResume = writes.rows().size();
+            holds.read("early");
             control.lifecycle(PIPELINE, LifecycleVerb.RESUME);
             Await.answered("resume to allocate a replacement execution", WAIT,
                     () -> control.executionGenerationOf(PIPELINE).filter(generation -> generation > original));
+            Await.until("the idle replacement sink to publish its CDC counter", WAIT,
+                    () -> control.metricFacts(PIPELINE).stream()
+                            .anyMatch(fact -> CdcDeliveryTotals.COUNT_METRIC.equals(fact.get("name"))),
+                    () -> control.metrics(PIPELINE));
+            assertThat((long) writes.rows().size()).isEqualTo(beforeResume);
+            assertThat(control.recordsOut(PIPELINE)).as("records.out before the replacement delivers a row")
+                    .contains(beforeResume);
+            holds.releaseRead("early");
             holds.releaseRead("late");
             Await.until("both rows from the held table to reach the target", WAIT,
                     () -> files.count(targetAddress, "late") == 2,

@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -100,7 +101,11 @@ final class ResumeMetricProjection {
     private static Producer producer(MetricFact fact, MetricPoint point) {
         var direction = point.attributes().get(io.tapstate.core.lifecycle.MetricAttributes.DIRECTION);
         if (direction != null) return "in".equals(direction) ? Producer.IN : Producer.OUT;
-        return fact.name().equals("tapstate.pipeline.record.delivery.duration") ? Producer.OUT : Producer.STAGE;
+        return switch (fact.name()) {
+            case "tapstate.pipeline.record.delivery.duration", CdcDeliveryTotals.COUNT_METRIC,
+                    CdcDeliveryTotals.TOTAL_MILLIS_METRIC -> Producer.OUT;
+            default -> Producer.STAGE;
+        };
     }
 
     private static HistogramValue add(HistogramValue left, HistogramValue right) {
