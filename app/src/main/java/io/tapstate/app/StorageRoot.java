@@ -20,6 +20,9 @@ import org.slf4j.LoggerFactory;
 final class StorageRoot implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(StorageRoot.class);
     private static final long RETAINED_CONFIGURATION_CHECK_NANOS = TimeUnit.SECONDS.toNanos(5);
+    private static final long RETAINED_ADMISSION_POLL_MILLIS = 250;
+    private static final long RETAINED_COMPLETION_RETRY_MILLIS = 1500;
+    private static final long RETAINED_COMPLETION_RETRY_MAX_MILLIS = 6000;
     enum Phase { CONFIGURATION_REQUIRED, CONFIGURATION_UNAVAILABLE, SETUP_REQUIRED, CACHE_UNAVAILABLE, AUTH_READY, BUSINESS_READY }
     private final CloudRuntimeSettings cloud;
     // Publishes an owner identity; the runtime synchronizes its own mutable lifecycle.
@@ -325,14 +328,18 @@ final class StorageRoot implements AutoCloseable {
     private void completeRetainedInstallationOwned() {
         if (!installationCompletionPending()) return;
         var original = runtime;
-        if (original.businessStarted() && tryCompleteRetainedInstallation()) return;
         if (original.cleanupRequired()) return;
         var business = original.businessForLiveness();
-        if (business.isPresent()) {
-            var bound = original.boundForObservation().orElseThrow(StorageRuntime::unavailable);
-            observeRetainedInstallation(new RetainedInstallationOwner(original, bound, business.orElseThrow()),
-                    System.nanoTime() + RETAINED_CONFIGURATION_CHECK_NANOS);
+        if (business.isEmpty()) return;
+        var bound = original.boundForObservation().orElseThrow(StorageRuntime::unavailable);
+        var owner = new RetainedInstallationOwner(original, bound, business.orElseThrow());
+        synchronized (activationLock) {
+            if (owner.equals(retainedInstallationOwner)) return;
         }
+        boolean admitted = original.businessStarted();
+        if (admitted && tryCompleteRetainedInstallation()) return;
+        observeRetainedInstallation(owner, System.nanoTime() + RETAINED_CONFIGURATION_CHECK_NANOS,
+                admitted ? RETAINED_COMPLETION_RETRY_MILLIS : RETAINED_ADMISSION_POLL_MILLIS);
     }
 
     private boolean tryCompleteRetainedInstallation() {
@@ -350,17 +357,17 @@ final class StorageRoot implements AutoCloseable {
     }
 
     // Keep the published member alive while it waits for admission. Only the same owner may resume the handoff.
-    private void observeRetainedInstallation(RetainedInstallationOwner original, long nextConfigurationCheck) {
+    private void observeRetainedInstallation(RetainedInstallationOwner original, long nextConfigurationCheck, long delayMillis) {
         synchronized (activationLock) {
             requireOpen();
             if (original.equals(retainedInstallationOwner)) return;
             retainedInstallationOwner = original;
-            activationWorker().schedule(() -> continueRetainedInstallation(original, nextConfigurationCheck),
-                    250, TimeUnit.MILLISECONDS);
+            activationWorker().schedule(() -> continueRetainedInstallation(original, nextConfigurationCheck, delayMillis),
+                    delayMillis, TimeUnit.MILLISECONDS);
         }
     }
 
-    private void continueRetainedInstallation(RetainedInstallationOwner original, long nextConfigurationCheck) {
+    private void continueRetainedInstallation(RetainedInstallationOwner original, long nextConfigurationCheck, long delayMillis) {
         try {
             lifecycle(() -> {
                 synchronized (activationLock) {
@@ -372,13 +379,17 @@ final class StorageRoot implements AutoCloseable {
                         && runtime.businessForLiveness().orElse(null) == original.business()
                         && installationCompletionPending()) {
                     long configurationCheck = nextConfigurationCheck;
+                    long nextDelay = RETAINED_ADMISSION_POLL_MILLIS;
                     if (runtime.businessStarted()) {
                         if (tryCompleteRetainedInstallation()) return null;
+                        // Leave the lifecycle monitor free between failed attempts that may wait on the file lock.
+                        nextDelay = Math.clamp(delayMillis * 2, RETAINED_COMPLETION_RETRY_MILLIS,
+                                RETAINED_COMPLETION_RETRY_MAX_MILLIS);
                     } else if (System.nanoTime() - configurationCheck >= 0) {
                         checkRetainedInstallationConfiguration(original);
                         configurationCheck = System.nanoTime() + RETAINED_CONFIGURATION_CHECK_NANOS;
                     }
-                    observeRetainedInstallation(original, configurationCheck);
+                    observeRetainedInstallation(original, configurationCheck, nextDelay);
                 }
                 return null;
             });

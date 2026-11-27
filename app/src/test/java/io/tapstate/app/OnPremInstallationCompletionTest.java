@@ -634,8 +634,10 @@ class OnPremInstallationCompletionTest {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
             var available = new AtomicBoolean();
             var lockWaitRefused = new AtomicBoolean();
+            var lockWaitAttempts = new AtomicInteger();
             when(f.business.available()).thenAnswer(ignored -> available.get());
             doAnswer(invocation -> {
+                if (available.get()) lockWaitAttempts.incrementAndGet();
                 try {
                     return invocation.callRealMethod();
                 } catch (TapstateException refused) {
@@ -658,6 +660,9 @@ class OnPremInstallationCompletionTest {
                 available.set(true);
                 org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(25))
                         .untilAsserted(() -> assertThat(lockWaitRefused).isTrue());
+                org.awaitility.Awaitility.await().during(java.time.Duration.ofMillis(800))
+                        .atMost(java.time.Duration.ofSeconds(1))
+                        .untilAsserted(() -> assertThat(lockWaitAttempts).hasValue(1));
                 assertThat(f.completions).hasValue(0);
             } finally {
                 blocker.getOutputStream().close();
