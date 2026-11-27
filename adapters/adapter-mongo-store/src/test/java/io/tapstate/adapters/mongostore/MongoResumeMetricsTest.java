@@ -5,11 +5,15 @@ import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.ResumeMetrics;
@@ -18,14 +22,23 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Instant;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class MongoResumeMetricsTest {
@@ -113,6 +126,58 @@ class MongoResumeMetricsTest {
         encoded.get("in", Document.class).remove("carry");
         assertThatThrownBy(() -> MongoResumeWindow.decode(row, ID)).isInstanceOfSatisfying(TapstateException.class,
                 error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+    }
+
+    @Test void recoveryDistinguishesAnAbsentObservationFromLegacyTotalsAndARecordedWindow() {
+        var resumed = rebuild(pause(SAVED, SAVED), JOB);
+        var state = state(MongoResumeMetrics.advance(resumed, ORIGINAL, NEXT, 3), 3).append("touchMillis", 0L);
+        state.append(MongoResumeWindow.PRIOR, List.of());
+        assertThat(MongoResumeWindow.checkpoint(access, state).prior()).isEqualTo(ResumeMetrics.Prior.ABSENT);
+
+        var id = MongoCachePipelineObservationStore.keyOfFence(access, 3, NEXT);
+        var row = new Document("_id", id).append("pipelineId", ID)
+                .append("flatKeys", List.of("bytes.in", "records.out"));
+        state.put(MongoResumeWindow.PRIOR, List.of(row));
+        assertThat(MongoResumeWindow.checkpoint(access, state).prior()).isEqualTo(
+                new ResumeMetrics.Prior(true, null, null, Set.of(ResumeMetrics.Producer.IN, ResumeMetrics.Producer.OUT)));
+
+        var window = new ResumeMetrics.Window(3, JOB + 1, Map.of(ResumeMetrics.Producer.STAGE, new ResumeMetrics.Slot(42, false)));
+        row.remove("flatKeys");
+        row.append("cumulative", List.of("stage")).append("observedAt", Date.from(Instant.EPOCH))
+                .append(MongoResumeWindow.FIELD, MongoResumeWindow.encode(window));
+        assertThat(MongoResumeWindow.checkpoint(access, state).prior()).isEqualTo(
+                new ResumeMetrics.Prior(true, Instant.EPOCH, window, Set.of(ResumeMetrics.Producer.STAGE)));
+
+        row.put("_id", MongoCachePipelineObservationStore.keyOfFence(access, 3, ORIGINAL));
+        assertThatThrownBy(() -> MongoResumeWindow.checkpoint(access, state))
+                .isInstanceOfSatisfying(TapstateException.class, ex -> assertThat(ex.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+    }
+
+    @Test void aLatePublicationCannotReplaceOrRecreateTheObservationItSampled() {
+        var sink = new MongoCachePipelineObservationStore(access);
+        var window = new ResumeMetrics.Window(3, JOB + 1, Map.of(ResumeMetrics.Producer.OUT, new ResumeMetrics.Slot(0, true)));
+        var prior = new ResumeMetrics.Prior(true, Instant.EPOCH, window, Set.of(ResumeMetrics.Producer.OUT));
+        var key = new ResumeMetrics.ObservationKey(SCOPE, 3, ORIGINAL);
+        var publication = new ResumeMetrics.Publication(key, prior, window);
+        var reading = new Observation(ID, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH);
+        assertThat(sink.saveResumed(reading, 3, publication)).isFalse();
+        verifyNoInteractions(database);
+
+        var later = new Observation(ID, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, Instant.EPOCH.plusSeconds(1));
+        assertThatThrownBy(() -> sink.saveResumed(later, 4, publication))
+                .isInstanceOfSatisfying(TapstateException.class, ex -> assertThat(ex.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        verifyNoInteractions(database);
+
+        MongoCollection<Document> collection = mock();
+        when(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(database)).thenReturn(collection);
+        when(collection.withWriteConcern(any())).thenReturn(collection);
+        when(collection.updateOne(any(Bson.class), anyList(), any(UpdateOptions.class)))
+                .thenReturn(UpdateResult.acknowledged(0, 0L, null));
+        assertThat(sink.saveResumed(later, 3, publication)).isFalse();
+        var expected = new Document("_id", MongoCachePipelineObservationStore.keyOfFence(access, 3, ORIGINAL))
+                .append("pipelineId", new Document("$exists", true)).append("observedAt", Date.from(Instant.EPOCH))
+                .append(MongoResumeWindow.FIELD, MongoResumeWindow.encode(window));
+        verify(collection).updateOne(eq(expected), anyList(), argThat(options -> !options.isUpsert()));
     }
 
     private Document pause(MetricFact saved, MetricFact sampled) {
