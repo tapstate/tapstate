@@ -44,6 +44,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -614,12 +615,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config) || streamPreparer != null
                 ? new CompletableFuture<>() : null;
         CdcDelivery delivery = new CdcDelivery();
+        var boundary = start instanceof CaptureStart.At at ? new InitialCdcBoundary(at.instant()) : null;
         var recovery = new StreamRecovery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
                 connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
         Thread thread = new Thread(
                 () -> streamLoop(connector, config, resumeAt, resumePosition, startAt, listener, stream, preflight,
-                        acknowledgements, delivery, recovery),
+                        acknowledgements, delivery, recovery, boundary),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
@@ -1344,7 +1346,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt,
             SourcePosition resumePosition, Long startAt,
             CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
-            Acknowledgements acknowledgements, CdcDelivery delivery, StreamRecovery recovery) {
+            Acknowledgements acknowledgements, CdcDelivery delivery, StreamRecovery recovery,
+            InitialCdcBoundary boundary) {
         var interrupted = new AtomicReference<Throwable>();
         try {
             Map<String, TapTable> tables = connector.underLoader(() -> {
@@ -1410,7 +1413,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                             .filter(Objects::nonNull).distinct().forEach(table->reportOperation(connector,table,SourceOperationObserver.Capability.STREAM_READ,null));
                     try {
                         acknowledgements.applyIfDue();
-                        delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                        delivery.accept(() -> {
+                            if (boundary != null && boundary.pending()) {
+                                boundary.deliver(connector, declared, listener, events, offset);
+                            } else {
+                                handOver(connector, declared, listener, events, offset);
+                            }
+                        });
                     } catch (RuntimeException | Error downstreamFailure) {
                         recovery.finishInvocation();
                         callbackFailed.set(true);
@@ -1573,6 +1582,49 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             decoded.add(TapEventCodec.decodeChange(change, connector.conversions(), declaredTypes(declared, change)));
         }
         listener.onBatch(decoded, position(connector, offset));
+    }
+
+    /** One timestamp-start subscription's search for its first deliverable change. Resume uses the saved position. */
+    private static final class InitialCdcBoundary {
+        private volatile Instant cutoff;
+
+        private InitialCdcBoundary(Instant cutoff) {
+            this.cutoff = cutoff;
+        }
+
+        private boolean pending() {
+            return cutoff != null;
+        }
+
+        private synchronized void deliver(PdkConnector connector, Map<String, PdkRowSchema> declared,
+                CaptureListener listener, List<TapEvent> events, Object offset) {
+            if (!pending()) {
+                handOver(connector, declared, listener, events, offset);
+                return;
+            }
+            for (int i = 0; i < events.size(); i++) {
+                TapEvent change = events.get(i);
+                if (change instanceof ControlEvent) {
+                    continue;
+                }
+                if (!(change instanceof TapBaseEvent event)) {
+                    throw new IllegalArgumentException("unmapped change event type: " + change.getClass().getName());
+                }
+                Long time = TapEventCodec.sourceTime(event);
+                if (time == null) {
+                    throw new TapstateException(ConnectorError.PROJECTION_FAILED, Map.of(
+                            "connector", connector.connectorId(),
+                            "detail", "The CDC change has neither referenceTime nor time for start_from " + cutoff),
+                            null);
+                }
+                if (!Instant.ofEpochMilli(time).isBefore(cutoff)) {
+                    handOver(connector, declared, listener, events.subList(i, events.size()), offset);
+                    cutoff = null;
+                    return;
+                }
+            }
+            // Keep the initial anchor until there is a change the pipeline can confirm.
+        }
     }
 
     /**
