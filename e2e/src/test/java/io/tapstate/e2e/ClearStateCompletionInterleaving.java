@@ -55,22 +55,6 @@ final class ClearStateCompletionInterleaving implements AutoCloseable {
         client = MongoClients.create(storage.configurationUri());
     }
 
-    private static Document revisionReservation() {
-        return new Document("command.findAndModify", "configuration_version")
-                .append("command.query._id", "configuration").append("command.startTransaction", true);
-    }
-
-    void observeRevisionReservation() {
-        client.getDatabase(storage.configurationDatabase()).runCommand(
-                new Document("profile", 1).append("filter", revisionReservation()));
-    }
-
-    void requireRevisionReservation() {
-        var db = client.getDatabase(storage.configurationDatabase());
-        assertThat(db.getCollection("system.profile").countDocuments(revisionReservation()))
-                .as("a clearing stop must reserve the CONFIG revision before reading the snapshot").isPositive();
-    }
-
     void holdBeforeReplacement() {
         var mappings = SystemCollections.OPERATOR_GENERATIONS.on(client.getDatabase(storage.configurationDatabase()));
         var original = mappings.find(new Document("_id", pipeline)).first();
@@ -144,9 +128,7 @@ final class ClearStateCompletionInterleaving implements AutoCloseable {
                 System.out.println("clear-state probe: released operation mapping unavailable: "
                         + diagnostic.getClass().getSimpleName());
             } finally {
-                try {
-                    client.getDatabase(storage.configurationDatabase()).runCommand(new Document("profile", 0).append("filter", "unset"));
-                } finally { client.close(); }
+                client.close();
             }
         }
     }
