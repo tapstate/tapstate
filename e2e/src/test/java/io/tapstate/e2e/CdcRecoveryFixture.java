@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.TapEvent;
+import io.tapdata.entity.event.control.HeartbeatEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
@@ -18,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -61,8 +63,17 @@ public final class CdcRecoveryFixture {
 
     static void change(Path source, long sequence, String table, String id, String before, String after)
             throws IOException {
-        append(source, sequence + "," + System.currentTimeMillis() + ","
+        changeAt(source, sequence, Instant.now(), table, id, before, after);
+    }
+
+    static void changeAt(Path source, long sequence, Instant time, String table, String id, String before, String after)
+            throws IOException {
+        append(source, sequence + "," + time.toEpochMilli() + ","
                 + table + "," + id + "," + before + "," + after + "\n");
+    }
+
+    static void heartbeat(Path source, long sequence) throws IOException {
+        changeAt(source, sequence, Instant.now(), "", "", "", "");
     }
 
     static void updates(Path source, long firstSequence, int count, String table, String id) throws IOException {
@@ -207,6 +218,13 @@ public final class CdcRecoveryFixture {
                     long through = delivered;
                     for (Change change : changes(source)) {
                         if (change.sequence() <= delivered) continue;
+                        if (change.table().isEmpty()) {
+                            if (through == delivered) {
+                                through = change.sequence();
+                                batch.add(new HeartbeatEvent().init());
+                            }
+                            break;
+                        }
                         through = change.sequence();
                         if (tables.contains(change.table())) batch.add(change.event());
                         if (batch.size() >= size) break;

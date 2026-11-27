@@ -618,7 +618,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config) || streamPreparer != null
                 ? new CompletableFuture<>() : null;
         CdcDelivery delivery = new CdcDelivery();
-        var boundary = start instanceof CaptureStart.At at ? new InitialCdcBoundary(at.instant()) : null;
+        Instant cutoff = switch (start) {
+            case CaptureStart.At at -> at.instant();
+            case CaptureStart.Resume resume -> resume.pendingStartAt();
+            default -> null;
+        };
+        var boundary = cutoff == null ? null : new InitialCdcBoundary(cutoff);
         var recovery = new StreamRecovery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
                 connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
@@ -1630,7 +1635,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         listener.onBatch(decoded, position(connector, offset));
     }
 
-    /** One timestamp-start subscription's search for its first deliverable change. Resume uses the saved position. */
+    /** One subscription's search for the first deliverable change at its initial timestamp cutoff. */
     private static final class InitialCdcBoundary {
         private volatile Instant cutoff;
 
@@ -1648,11 +1653,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 handOver(connector, declared, listener, events, offset);
                 return;
             }
+            boolean hasChanges = false;
             for (int i = 0; i < events.size(); i++) {
                 TapEvent change = events.get(i);
                 if (change instanceof ControlEvent) {
                     continue;
                 }
+                hasChanges = true;
                 if (!(change instanceof TapBaseEvent event)) {
                     throw new IllegalArgumentException("unmapped change event type: " + change.getClass().getName());
                 }
@@ -1669,7 +1676,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     return;
                 }
             }
-            // Keep the initial anchor until there is a change the pipeline can confirm.
+            // A positioned heartbeat covers no rows and leaves the cutoff pending.
+            if (!hasChanges && offset != null) {
+                handOver(connector, declared, listener, events, offset);
+            }
         }
     }
 
