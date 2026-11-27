@@ -155,14 +155,18 @@ final class AtlasRuntime implements AutoCloseable {
             else if (firstBoot) control.bootstrapAndLogin("e2e", "e2e-password");
             else control.login("e2e", "e2e-password");
         } else if (cookie == null) {
-            String code = UUID.randomUUID().toString();
-            codes.put(code, server.baseUrl().getHost());
-            cookie = control.exchangeCloudCode(code);
+            cookie = control.exchangeCloudCode(issueExchangeCode(server));
         } else {
             control.useCloudSessionCookie(cookie);
         }
         if (prepared != null) prepared.awaitBusiness(control);
         return control;
+    }
+
+    String issueExchangeCode(ServerHandle server) {
+        String code = UUID.randomUUID().toString();
+        codes.put(code, server.baseUrl().getHost());
+        return code;
     }
 
     void register(ControlPlane control, String... connectors) {
