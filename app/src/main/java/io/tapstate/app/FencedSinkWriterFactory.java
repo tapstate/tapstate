@@ -2,7 +2,9 @@ package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -158,7 +160,14 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
 
         @Override
         public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
-            return closing ? io.tapstate.core.common.FailureFact.unavailable(failure) : delegate.failureFact(failure);
+            if (closing) {
+                return io.tapstate.core.common.FailureFact.unavailable(failure);
+            }
+            // The processor checks the receipt after the delegate's write stage succeeds.
+            if (failure instanceof TapstateException coded && coded.code() == EngineError.SINK_WRITE_UNCONFIRMED) {
+                authorization.recordSinkWriteFailure(fence);
+            }
+            return delegate.failureFact(failure);
         }
 
         @Override
