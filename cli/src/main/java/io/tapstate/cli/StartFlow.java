@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.IoErrorDefinitions;
+
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -360,7 +362,8 @@ final class StartFlow {
 
     void reportRerunStartFailure(String id, StartChecks checks) {
         var clear = server.status(id).stopDetails();
-        if (clear.failureCode() != null) {
+        // Status can still carry a failure from the previous run.
+        if (IoErrorDefinitions.PIPELINE_CLEAR_UNPROVEN.code().equals(clear.failureCode())) {
             reporting.rejection(clear.failureCode(), clear.failureMessage(), clear.failureParams());
             return;
         }
