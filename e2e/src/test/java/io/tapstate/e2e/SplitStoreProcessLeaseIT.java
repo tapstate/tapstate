@@ -99,11 +99,8 @@ class SplitStoreProcessLeaseIT {
                             .filter(member -> member.nodeId().equals(NODES.getFirst()))
                             .map(ClusterMemberFacts::bootId).toList().equals(List.of(replacementBoot)),
                     () -> "the surviving member has not observed the replacement session");
-            var after=configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>());assertThat(after).hasSize(1);
-            var originalIdentity=new Document(keys.getFirst());originalIdentity.remove("sourceWriteFence");
-            var replacementIdentity=new Document(after.getFirst());replacementIdentity.remove("sourceWriteFence");
-            assertThat(replacementIdentity).isEqualTo(originalIdentity);
-            assertThat(after.getFirst().getLong("sourceWriteFence")).isGreaterThanOrEqualTo(keys.getFirst().getLong("sourceWriteFence")+2);
+            assertThat(configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>()))
+                    .as("replacement reuses the original CONFIG key without a write").isEqualTo(keys);
             assertThat(configObserver.getDatabase(configDb).listCollectionNames().into(new ArrayList<>()))
                     .doesNotContain("workload_claims", "keyring_acks", "source_config_keyring_sessions");
             assertThat(cluster.unattributedConnections()).isZero();
