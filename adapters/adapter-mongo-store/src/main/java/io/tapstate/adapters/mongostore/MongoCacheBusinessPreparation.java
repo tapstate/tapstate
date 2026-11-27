@@ -67,13 +67,17 @@ final class MongoCacheBusinessPreparation {
                         requireOnlyAuthCollections();
                         structure.prepareBusinessInTransaction(session, active);
                         MongoCacheClusterMembershipStore.prepareInitial(session, database, original.businessScope(), original.operationId());
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).insertOne(session,
+                                MongoCacheBusinessIdentity.claimNamespaceRecord(original.businessScope(), original.operationId()));
                         Document filter = new Document("_id", "cluster").append("clusterId", original.authScope().clusterId())
                                 .append("bindingVersion", original.authScope().bindingVersion()).append("cacheIncarnation", original.authScope().cacheIncarnation())
                                 .append("businessPhase", CREATING).append("businessPreparationId", original.operationId())
                                 .append("claimAdmissionFence", new Document("$exists", false))
                                 .append("businessRetirementId", new Document("$exists", false));
                         if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, filter, new Document("$set", new Document("businessPhase", "READY")
-                                .append("businessPreparationId", original.operationId()).append("claimAdmissionFence", 0L))).getMatchedCount() != 1) throw refused();
+                                .append("businessPreparationId", original.operationId()).append("claimAdmissionFence", 0L)
+                                .append(MongoCacheBusinessIdentity.CLAIM_NAMESPACE_PROOF_VERSION,
+                                        MongoCacheBusinessIdentity.CLAIM_NAMESPACE_PROOF_V1))).getMatchedCount() != 1) throw refused();
                         SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", 1)
                                 .append("epoch", 1L).append("operationId", original.operationId()).append("phase", "READY"));
                         active.run();

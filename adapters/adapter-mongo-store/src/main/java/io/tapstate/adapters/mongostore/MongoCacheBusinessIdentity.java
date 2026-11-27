@@ -11,6 +11,8 @@ import java.util.List;
 
 /** Business readiness is independent from authentication-only generation changes. */
 final class MongoCacheBusinessIdentity {
+    static final String CLAIM_NAMESPACE_PROOF_VERSION = "claimNamespaceProofVersion";
+    static final int CLAIM_NAMESPACE_PROOF_V1 = 1;
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     MongoCacheBusinessIdentity(MongoDatabase database, CacheBusinessScope scope) { this.database = database; this.scope = scope; }
@@ -97,6 +99,28 @@ final class MongoCacheBusinessIdentity {
     /** Claim admission is infrequent; protected event writes continue to contend on their own claim. */
     void admitClaim(ClientSession session) {
         admitClaim(session, readyIdentity(session));
+    }
+
+    void admitUpsertingClaim(ClientSession session) {
+        var row = readyIdentity(session);
+        if (row.containsKey(CLAIM_NAMESPACE_PROOF_VERSION)
+                && (!Integer.valueOf(CLAIM_NAMESPACE_PROOF_V1).equals(row.get(CLAIM_NAMESPACE_PROOF_VERSION))
+                || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)
+                        .find(session, claimNamespaceRecord(scope, row.getString("businessPreparationId"))).first() == null)) {
+            throw unreadableClaimNamespace();
+        }
+        admitClaim(session, row);
+    }
+
+    static Document claimNamespaceRecord(CacheBusinessScope scope, String preparationId) {
+        return new Document("_id", "business-preparation").append("clusterId", scope.clusterId())
+                .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
+                .append("businessPreparationId", preparationId);
+    }
+
+    static TapstateException unreadableClaimNamespace() {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", "cache-business", "field", "workload-claims"), null);
     }
 
     /** A Capture claim and CACHE admission share the same original transaction snapshot. */

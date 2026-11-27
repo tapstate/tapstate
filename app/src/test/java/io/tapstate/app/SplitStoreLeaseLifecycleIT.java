@@ -123,7 +123,8 @@ class SplitStoreLeaseLifecycleIT {
                 assertThat(ReflectionTestUtils.getField(lease, "provenUntil")).isEqualTo(originalDeadline);
                 await().atMost(Duration.ofSeconds(10)).until(() -> !member.getLifecycleService().isRunning());
                 assertThat(root.runtime().requireConfiguration().artifacts().get("views")).isPresent();
-                assertThat(observer.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
+                assertThat(observer.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isEqualTo(1);
             } finally {
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }

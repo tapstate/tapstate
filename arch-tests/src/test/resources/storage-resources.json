@@ -3019,17 +3019,18 @@
     },
     {
       "id": "mongo.cache.cache_identity",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "cache_identity"
       ],
-      "responsibility": "Bound CACHE identity with separate authentication/business preparation.",
+      "responsibility": "Bound CACHE identity with separate authentication/business preparation. A versioned claim namespace proof is published only with READY during native creation of a business scope, in the same CACHE transaction as its prepared workload_claims record. A legacy scope without the version continues unchanged and is never backfilled by startup or admission.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoCacheIdentity"
+        "io.tapstate.adapters.mongostore.MongoCacheIdentity",
+        "io.tapstate.adapters.mongostore.MongoCacheBusinessPreparation"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheIdentity"
@@ -3038,7 +3039,8 @@
       "consistency": "cache",
       "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "e2e/src/test/java/io/tapstate/e2e/AClaimCannotRecreateItsDroppedCacheCollectionIT.java"
       ]
     },
     {
@@ -3215,35 +3217,38 @@
     },
     {
       "id": "mongo.cache.workload_claims",
-      "resourceVersion": 4,
-      "proposalVersion": 5,
+      "resourceVersion": 5,
+      "proposalVersion": 6,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "workload_claims"
       ],
-      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences. Independent VALIDATION ownership per Cluster/Pipeline uses the existing complete lease/generation fence. Its original claim and validation control are born together under an independent CONFIG validation capability and a valid NODE_SESSION. Cancellation and closed-predecessor replacement preserve known counters; ordinary validation admission does not depend on production claims/state and refuses missing original state. A first manual COUNT validation claim may retain a server-timed initial owner and execution lease in the original CACHE birth transaction. Authority requires the same CONFIG preparation to be COMPLETE.",
+      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences. Independent VALIDATION ownership per Cluster/Pipeline uses the existing complete lease/generation fence. Its original claim and validation control are born together under an independent CONFIG validation capability and a valid NODE_SESSION. Cancellation and closed-predecessor replacement preserve known counters; ordinary validation admission does not depend on production claims/state and refuses missing original state. A first manual COUNT validation claim may retain a server-timed initial owner and execution lease in the original CACHE birth transaction. Authority requires the same CONFIG preparation to be COMPLETE. For a newly prepared business scope, a reserved singleton record binds this collection to the original scope and preparation operation. Controlled new-scope preparation writes the record with the claim proof version and READY in the original CACHE transaction. Admission that can create claims uses the original session to verify the record before upsert on a protected scope. A legacy scope keeps its prior admission behavior without creating a preparation record.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore",
         "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations",
         "io.tapstate.adapters.mongostore.MongoValidationControlStore",
-        "io.tapstate.adapters.mongostore.MongoValidationCachePreparations"
+        "io.tapstate.adapters.mongostore.MongoValidationCachePreparations",
+        "io.tapstate.adapters.mongostore.MongoCacheBusinessPreparation"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore",
         "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations",
         "io.tapstate.adapters.mongostore.MongoValidationControlStore",
-        "io.tapstate.adapters.mongostore.MongoValidationCachePreparations"
+        "io.tapstate.adapters.mongostore.MongoValidationCachePreparations",
+        "io.tapstate.adapters.mongostore.MongoCacheBusinessIdentity"
       ],
       "recovery": "shared-srs-replacement-workload_claims",
       "consistency": "shared-srs-cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction. Manual COUNT uses the existing single claim and its existing fields, with no extra rows or lease history.",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction. Manual COUNT uses the existing single claim and its existing fields, with no extra rows or lease history. Claim namespace proof uses at most one bounded record per prepared CACHE database.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationIndependentPreparationIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationIndependentPreparationIT.java",
+        "e2e/src/test/java/io/tapstate/e2e/AClaimCannotRecreateItsDroppedCacheCollectionIT.java"
       ]
     },
     {

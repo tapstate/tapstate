@@ -622,7 +622,8 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(identity.getString("authPreparationId")).isEqualTo(planned.get("operationId"));
                 assertThat(identity.getString("businessPreparationId")).isEqualTo(planned.get("operationId"));
                 assertThat(identity.getLong("authGeneration")).isEqualTo(1L);
-                assertThat(admin.getDatabase(cache).getCollection("workload_claims").countDocuments()).isPositive();
+                assertThat(admin.getDatabase(cache).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isPositive();
                 assertThat(admin.getDatabase(config).getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
                 assertThatThrownBy(() -> management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().toBodilessEntity())
                         .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
@@ -1150,7 +1151,8 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(root.runtime().requireConfiguration().preparations().read(id).orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
                 }
                 assertThat(admin.getDatabase(cacheDb).getCollection("pipeline_state").countDocuments()).isZero();
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isOne();
                 var businessOwner=(NativeBusinessContext)root.runtime().business().orElseThrow();
                 var child=(org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner,"context");
                 var catalog=child.getBean(io.tapstate.control.core.PipelineCatalogService.class);
@@ -1382,7 +1384,8 @@ class ManagedMongoStoreIsolationIT {
                             assertThat(admin.getDatabase(configDb).getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
                             assertThat(admin.getDatabase(cacheDb).getCollection("cache_identity").find().first().get("businessPreparationId"))
                                     .isEqualTo(originalPlan.get("operationId"));
-                            assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                            assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isOne();
                         }
                         return;
                     }
@@ -1418,7 +1421,8 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(cloudPost(application, cookie, "/api/storage/recovery/confirm", confirmation)).containsEntry("phase", "COMPLETE");
                 assertThat(admin.getDatabase(configDb).getCollection("storage_binding").find().first()).isEqualTo(originalBinding);
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isOne();
                 assertThat(admin.getDatabase(cacheDb).getCollection("cache_identity").find().first().get("businessPreparationId"))
                         .isEqualTo(planned.get("operationId"));
             }
@@ -1767,9 +1771,11 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
                 assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isOne();
                 Document originalNodeClaim = admin.getDatabase(cacheDb).getCollection("workload_claims")
-                        .find().projection(new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                        .find(new Document("_id.resourceType", "NODE_SESSION"))
+                        .projection(new Document("ownerNodeId", 1).append("ownerBootId", 1)
                                 .append("claimGeneration", 1).append("executionGeneration", 1)).first();
                 try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
                     assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
@@ -1823,6 +1829,7 @@ class ManagedMongoStoreIsolationIT {
                 // longer prove. Its original lease expires; shutdown must not reacquire it to release it.
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
                     var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
+                            new Document("$match", new Document("_id.resourceType", "NODE_SESSION")),
                             new Document("$project", new Document("ownerNodeId", 1).append("ownerBootId", 1)
                                     .append("claimGeneration", 1).append("executionGeneration", 1)
                                     .append("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
@@ -2260,7 +2267,8 @@ class ManagedMongoStoreIsolationIT {
                 try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
                     assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
                 }
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isEqualTo(1);
                 assertThat(admin.getDatabase(configDb).listCollectionNames().into(new ArrayList<>())).doesNotContain(
                         "workload_claims", "system_meta", "operator_state", "op_sessions", "srs_meta");
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).doesNotContain("users", "cluster_keys", "system_meta", "operator_state", "srs_meta");
@@ -2294,7 +2302,8 @@ class ManagedMongoStoreIsolationIT {
                         .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
                 assertThat(root.runtime().requireConfiguration().preparations().read("partial_model_flow").orElseThrow().phase())
                         .isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.UNASSIGNED);
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isEqualTo(1);
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .countDocuments(new Document("_id.resourceType", new Document("$exists", true)))).isEqualTo(1);
                 var originalModelFlow = root.runtime().requireConfiguration().artifacts().get("model_flow").orElseThrow();
                 client.delete().uri("/api/artifacts/model_flow").header("Authorization", "Bearer " + login.token())
                         .header("If-Match", "\"" + io.tapstate.core.model.canonical.CanonicalHash.of(originalModelFlow) + "\"")

@@ -9,7 +9,6 @@ import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
-import com.mongodb.connection.ClusterType;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
@@ -23,7 +22,6 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
-import org.bson.BsonBinary;
 import org.bson.BsonDocument;
 import org.bson.BsonString;
 import org.bson.Document;
@@ -236,22 +234,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     private WorkloadClaimAttempt acquireInPreparedNamespace(Function<MongoWorkloadClaimStore, WorkloadClaimAttempt> acquire) {
-        return StoreIo.call(() -> {
-            requireActive.run();
-            // A load-balanced transaction pins a connection. Its catalog reads use the isolated pool.
-            var catalog = client.getClusterDescription().getType() == ClusterType.LOAD_BALANCED
-                    ? Objects.requireNonNull(nodeSessionClient, "isolated catalog pool").get().getDatabase(database.getName())
-                    : database;
-            var observed = claimCollectionId(catalog);
-            // Views of the same live business scope retain one physical identity across claim attempts.
-            if (!operations.retainClaimNamespace(scope, observed)) throw unreadableClaimCollection();
-            return transaction(true, (store, session) -> {
-                var result = acquire.apply(store);
-                // The committed catalog cannot see a namespace implicitly created by this transaction.
-                if (!observed.equals(claimCollectionId(catalog))) throw unreadableClaimCollection();
-                return result;
-            });
-        });
+        return transaction((session, budget) -> {
+            new MongoCacheBusinessIdentity(database, scope).admitUpsertingClaim(session);
+            return acquire.apply(raw.inStrictSession(session));
+        }, null, false);
     }
 
     @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
@@ -676,7 +662,12 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private <T> T transaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
             java.util.function.Consumer<T> verifyCommitted) {
-        return MongoStructureFailureScope.inspectOnFailure(client, operations.budget(), () -> StoreIo.call(() -> {
+        return transaction(callback, verifyCommitted, true);
+    }
+
+    private <T> T transaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
+            java.util.function.Consumer<T> verifyCommitted, boolean inspectOnFailure) {
+        return MongoStructureFailureScope.observe(client, operations.budget(), inspectOnFailure, () -> StoreIo.call(() -> {
             try {
                 if(operations.budget()==null)operations.requireAdmission();
                 requireActive.run();
@@ -852,29 +843,9 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
 
     static void requireCollection(MongoDatabase database) {
-        claimCollection(database);
-    }
-
-    private BsonBinary claimCollectionId(MongoDatabase catalog) {
-        var budget = operations.budget();
-        var scopedDatabase = budget == null ? catalog : budget.database(catalog);
-        var metadata = claimCollection(scopedDatabase);
-        if (budget != null) budget.remainingMillis();
-        // Compare the catalog identity in BSON regardless of the client's UUID representation.
-        if (!(metadata.get("info") instanceof BsonDocument info) || !(info.get("uuid") instanceof BsonBinary id))
-            throw unreadableClaimCollection();
-        return id;
-    }
-
-    private static BsonDocument claimCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
         var found = database.listCollections(BsonDocument.class).filter(new Document("name", table.collectionName())).first();
-        if (found == null || !new BsonString("collection").equals(found.get("type"))) throw unreadableClaimCollection();
-        return found;
-    }
-
-    private static TapstateException unreadableClaimCollection() {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", "cache-business", "field", "workload-claims"), null);
+        if (found == null || !new BsonString("collection").equals(found.get("type")))
+            throw MongoCacheBusinessIdentity.unreadableClaimNamespace();
     }
 }
