@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /** The converge loop's fixed physical state view; the original claim is captured before each write's callbacks. */
@@ -17,6 +18,7 @@ public final class ScopedPipelineStateStore implements StateStore {
     private final Supplier<WorkloadClaimFence> originalClaim;
     private final PipelineStoreViews views;
     private final Runnable requireActive;
+    private final AtomicReference<ResumeMetrics.Checkpoint> measured = new AtomicReference<>();
     public ScopedPipelineStateStore(PipelineIntentScope scope,Supplier<WorkloadClaimFence> originalClaim,PipelineStoreViews views,Runnable requireActive) {
         this(scope, 0L, originalClaim, views, requireActive);
     }
@@ -32,20 +34,18 @@ public final class ScopedPipelineStateStore implements StateStore {
         this.scope = Objects.requireNonNull(scope,"scope"); this.originalClaim = Objects.requireNonNull(originalClaim,"originalClaim");
         this.views = Objects.requireNonNull(views,"views"); this.requireActive = Objects.requireNonNull(requireActive,"requireActive");
     }
-    private volatile ResumeMetrics.Checkpoint measured;
-
     public boolean unavailable() {
-        var current = measured;
+        var current = measured.get();
         return intentRevision > 0 && current != null && current.unavailableRevision() == intentRevision;
     }
 
     public ResumeMetrics.Binding latestBinding() {
-        var current = measured;
+        var current = measured.get();
         return current == null ? null : current.applied();
     }
 
     public ResumeMetrics.Binding applied(CheckpointDoc expected) {
-        var current = measured;
+        var current = measured.get();
         if (current == null || !current.state().equals(expected)) return null;
         var applied = current.applied();
         return applied != null && applied.revision() == intentRevision && applied.fence().equals(originalClaim.get())
@@ -64,7 +64,7 @@ public final class ScopedPipelineStateStore implements StateStore {
         var store = views.pipelineStates(scope);
         if (!(store instanceof StateStore.MetricReader reader)) return store.read(pipelineId);
         var reading = reader.readForMetrics(pipelineId);
-        measured = reading.orElse(null);
+        measured.set(reading.orElse(null));
         return reading.map(ResumeMetrics.Checkpoint::state);
     }
     @Override public CasOutcome compareAndSwap(String pipelineId,long epoch,String next,Instant at) {
