@@ -162,7 +162,11 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
 before = termios.tcgetattr(fd)
 out = bytearray()
 acted = False
+resized = False
 password_sent = False
+quit_action = action in ("normal", "login", "resize")
+quit_requested_at = None
+quit_confirmed = False
 deadline = time.time() + 15
 timed_out = True
 
@@ -187,18 +191,24 @@ while time.time() < deadline:
     # It is a stable readiness signal for sending lifecycle input; the old title text
     # was removed when the header became context-aware.
     screen_ready = b"Tapstate" in out
-    if action == "resize":
-        if not acted and b"Terminal size too small:" in out:
+    if action == "resize" and not resized:
+        if b"Terminal size too small:" in out:
             fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 88, 0, 0))
             os.kill(pid, signal.SIGWINCH)
-            acted = True
-        elif acted and screen_ready:
-            os.write(fd, b"q")
-            action = "resize-finished"
+            resized = True
         continue
+
+    # Confirm only after the frame prompted by this quit request has appeared.
+    if quit_requested_at is not None and not quit_confirmed:
+        if out.find(b"Confirm Quit", quit_requested_at) >= 0:
+            os.write(fd, b"\r")
+            quit_confirmed = True
+        continue
+
     if acted or not screen_ready:
         continue
-    if action == "normal" or action == "login":
+    if quit_action:
+        quit_requested_at = len(out)
         os.write(fd, b"q")
         acted = True
     elif action == "eof":
@@ -245,7 +255,8 @@ sys.stdout.write(f"__TAPSTATE_PTY_RESTORED__{int(restored)}\n")
 sys.stdout.write(f"__TAPSTATE_PTY_LEAVE_ALT__{leave_alt}\n")
 sys.stdout.write(f"__TAPSTATE_PTY_SHOW_CURSOR__{show_cursor}\n")
 sys.stdout.flush()
-sys.exit(0 if acted and not timed_out and restored and expected_exit else 1)
+interaction_completed = quit_confirmed if quit_action else acted
+sys.exit(0 if interaction_completed and not timed_out and restored and expected_exit else 1)
 PY
 )
   PTY_RC=$?
