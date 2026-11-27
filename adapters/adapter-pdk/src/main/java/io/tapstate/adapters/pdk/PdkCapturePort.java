@@ -1367,7 +1367,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     () -> prepareStreamForRead(connector, config, delivery, interrupted));
             if (!prepareStreamHost(config, tables, delivery, preflight) || delivery.closed) return;
             if (preflight != null) preflight.complete(null);
-            connector.underLoader(() -> {
+            Throwable downstreamFailure = connector.underLoader(() -> {
                 if (delivery.closed) return null;
                 // streamRead is handed only stream names, so the connector reads each changed table's
                 // schema off the context's table map and its resume position off the offset argument -
@@ -1383,20 +1383,22 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 if (delivery.closed) return null;
                 notifyStreamStarted(connector, listener, resumePosition, startOffset);
                 Map<String, PdkRowSchema> declared = declaredTypes(tables);
-                var callbackFailed = new AtomicBoolean();
+                var callbackFailure = new AtomicReference<Throwable>();
                 StreamReadConsumer consumer = streamConsumer(connector, declared, listener,
-                        acknowledgements, delivery, recovery, boundary, callbackFailed);
+                        acknowledgements, delivery, recovery, boundary, callbackFailure);
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 if (delivery.closed || !recovery.beginInvocation()) return null;
                 try { stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer); }
                 catch (Throwable failure) {
                     // Stop the observation timer before operation reporting or PDK retry classification can block.
                     recovery.finishInvocation();
-                    recordStreamReadFailure(connector, config, tables, delivery, callbackFailed, interrupted, failure);
+                    recordStreamReadFailure(connector, config, tables, delivery, callbackFailure, interrupted, failure);
                     throw failure;
                 } finally { recovery.finishInvocation(); }
-                return null;
+                // A connector can return normally after its delivery worker throws.
+                return callbackFailure.get();
             });
+            if (downstreamFailure != null) throw downstreamFailure;
         } catch (Throwable failure) {
             reportStreamFailure(connector, listener, preflight, delivery, recovery, interrupted, failure);
         }
@@ -1451,7 +1453,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     private StreamReadConsumer streamConsumer(PdkConnector connector, Map<String, PdkRowSchema> declared,
             CaptureListener listener, Acknowledgements acknowledgements, CdcDelivery delivery,
-            StreamRecovery recovery, InitialCdcBoundary boundary, AtomicBoolean callbackFailed) {
+            StreamRecovery recovery, InitialCdcBoundary boundary, AtomicReference<Throwable> callbackFailure) {
         return StreamReadConsumer.create((events, offset) -> {
             // Every delivery is the moment to hand the connector what its source may release: this
             // is the connector's own delivery thread, the one thread any connector can safely be
@@ -1476,7 +1478,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 });
             } catch (RuntimeException | Error downstreamFailure) {
                 recovery.finishInvocation();
-                callbackFailed.set(true);
+                callbackFailure.compareAndSet(null, downstreamFailure);
                 throw downstreamFailure;
             }
         }).stateListener((oldState, newState) -> {
@@ -1486,9 +1488,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     private void recordStreamReadFailure(PdkConnector connector, CaptureConfig config, Map<String, TapTable> tables,
-            CdcDelivery delivery, AtomicBoolean callbackFailed, AtomicReference<Throwable> interrupted,
+            CdcDelivery delivery, AtomicReference<Throwable> callbackFailure, AtomicReference<Throwable> interrupted,
             Throwable failure) {
-        if (delivery.closed || callbackFailed.get()) return;
+        if (delivery.closed || callbackFailure.get() != null) return;
         for (String table : config.streams().isEmpty() ? tables.keySet() : config.streams()) {
             reportOperation(connector, table, SourceOperationObserver.Capability.STREAM_READ, failure);
         }

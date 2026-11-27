@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -21,6 +22,39 @@ class DirectTimestampHeartbeatIT {
     private static final String SOURCE = "quiet_source";
     private static final Instant CUTOFF = Instant.parse("2026-01-01T00:00:01Z");
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
+
+    @Test
+    void anUntimedChangeOnAConnectorWorkerFailsThePipeline(@TempDir Path directory) throws Exception {
+        DockerGate.require();
+        Path source = Files.createDirectory(directory.resolve("source"));
+        Path target = Files.createDirectory(directory.resolve("target"));
+        FileEndpoints.replaceTable(source.resolve("orders.csv"), "id,priority\n");
+        Path delegate = E2eConnectorJar.buildInto(Files.createDirectory(directory.resolve("connector")));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, CdcRecoveryFixture.connectorJar(delegate));
+            Map<String, String> resources = workspace(source, target);
+            control.apply(Map.of("source.tap.yml", resources.get("source.tap.yml")));
+            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            control.apply(resources);
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            Await.until("the timestamp stream to start", TIMEOUT,
+                    () -> streamHasLine(source, "START 0 orders"), () -> control.logs(PIPELINE));
+
+            CdcRecoveryFixture.deliverUntimedChangeOnWorker(source);
+            Await.until("the worker to throw and the stream read to return", TIMEOUT,
+                    () -> streamHasLine(source, "CALLBACK_FAILED") && streamHasLine(source, "END 0"),
+                    () -> control.logs(PIPELINE));
+            Await.until("the pipeline to expose the projection failure", TIMEOUT,
+                    () -> control.state(PIPELINE).orElse(null) == PipelineState.FAILED
+                            && control.failureCode(PIPELINE).isPresent(),
+                    () -> "state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
+            assertThat(control.failureCode(PIPELINE)).contains(ConnectorError.PROJECTION_FAILED.code());
+            assertThat(rows(target)).isEmpty();
+        }
+    }
 
     @Test
     void quietCheckpointsAdvanceAndTheRestartKeepsFiltering(@TempDir Path directory) throws Exception {

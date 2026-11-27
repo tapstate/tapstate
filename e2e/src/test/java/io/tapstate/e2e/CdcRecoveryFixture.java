@@ -76,6 +76,10 @@ public final class CdcRecoveryFixture {
         changeAt(source, sequence, Instant.now(), "", "", "", "");
     }
 
+    static void deliverUntimedChangeOnWorker(Path source) throws IOException {
+        Files.createFile(source.resolve("untimed-worker-delivery"));
+    }
+
     static void updates(Path source, long firstSequence, int count, String table, String id) throws IOException {
         StringBuilder batch = new StringBuilder();
         long timestamp = System.currentTimeMillis();
@@ -202,7 +206,7 @@ public final class CdcRecoveryFixture {
         }
 
         private void tail(TapConnectionContext context, List<String> tables, Object offset, int size,
-                StreamReadConsumer consumer) {
+                StreamReadConsumer consumer) throws InterruptedException {
             if (!(offset instanceof Map<?, ?> position) || !(position.get("sequence") instanceof Number number)) {
                 throw new IllegalArgumentException("the recovery fixture requires its recorded source position");
             }
@@ -214,6 +218,18 @@ public final class CdcRecoveryFixture {
             try {
                 while (!stopped && !Thread.currentThread().isInterrupted()
                         && !Files.exists(source.resolve("end-stream"))) {
+                    if (Files.exists(source.resolve("untimed-worker-delivery"))) {
+                        var event = TapInsertRecordEvent.create().table(tables.getFirst())
+                                .after(Map.of("id", "untimed", "priority", "invalid"));
+                        event.setReferenceTime(null);
+                        event.setTime(null);
+                        long next = delivered + 1;
+                        Thread worker = Thread.ofVirtual().uncaughtExceptionHandler(
+                                (thread, failure) -> note(witness, "CALLBACK_FAILED"))
+                                .start(() -> consumer.accept(List.of(event), position(next)));
+                        worker.join();
+                        return;
+                    }
                     List<TapEvent> batch = new ArrayList<>();
                     long through = delivered;
                     for (Change change : changes(source)) {
