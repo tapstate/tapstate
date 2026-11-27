@@ -310,7 +310,7 @@ public class CsvConnector implements TapConnector {
                 // source that names no position leaves that join to guesswork, which a snapshot followed by
                 // a tail refuses rather than papers over. Every stream-capable connector the ecosystem ships
                 // declares this -- the only ones that do not are its own benchmark fixtures.
-                .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
+                .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context, tableNames(context)))
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
                 .supportClearTable((context, event) -> clear(context, event.getTableId()))
@@ -454,7 +454,7 @@ public class CsvConnector implements TapConnector {
         Map<String, Long> delivered = new LinkedHashMap<>();
         var connection = context.getConnectionConfig();
         if (connection != null && Boolean.parseBoolean(String.valueOf(connection.getObject(START_AFTER_EXISTING_ROWS)))) {
-            delivered.putAll(highWaterMarks(context));
+            delivered.putAll(highWaterMarks(context, tables));
         }
         consumer.streamReadStarted();
         if (cdcRejected(context)) {
@@ -495,13 +495,11 @@ public class CsvConnector implements TapConnector {
      * holds, and zero for a table with no rows yet. Serializable on purpose -- a recorded position is
      * written down and read back by a later run, so it outlives the process that sampled it.
      *
-     * <p>This connector does not yet resume from one: its tail re-reads from the beginning and the sink
-     * absorbs the overlap, so the value is honest about where the stream stood without being acted on.
-     * Making the tail start here is what a resume witness needs, and it belongs with that witness.
+     * <p>The default tail replays the table. Fixtures can opt in to starting at this position.
      */
-    private static LinkedHashMap<String, Long> highWaterMarks(TapConnectionContext context) {
+    private static LinkedHashMap<String, Long> highWaterMarks(TapConnectionContext context, List<String> tables) {
         LinkedHashMap<String, Long> marks = new LinkedHashMap<>();
-        for (String table : tableNames(context)) {
+        for (String table : tables) {
             long high = 0;
             for (Map<String, Object> row : rows(file(context, table))) {
                 high = Math.max(high, idOf(row));

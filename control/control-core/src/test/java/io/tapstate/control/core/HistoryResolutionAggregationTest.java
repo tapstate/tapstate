@@ -185,6 +185,35 @@ class HistoryResolutionAggregationTest {
 
     @ParameterizedTest
     @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void aRetainedStartupBaselineRequiresBothObservedZeros(HistoryResolution resolution) {
+        Instant first = Instant.parse("2026-09-21T10:00:00Z");
+        Instant origin = first.minusSeconds(40);
+        var evidence = new RateSample.StartupEvidence(1, 2, origin);
+        var right = new RateSample("orders", first.plusSeconds(10), Map.of("records.out", 4L, "bytes.out", 100L),
+                Map.of(), first.minusSeconds(30), evidence);
+        for (Map<String, Long> counters : List.of(
+                Map.of("recordCount", 0L), Map.of("records.out", 0L, "bytes.out", 0L))) {
+            var store = new HistoryTestSupport.MutableHistory();
+            store.add(new RateSample("orders", first, counters, Map.of(), null, evidence));
+            store.add(right);
+            var answer = service(store, 2, 25_000).query(new PipelineHistoryQuery("orders", first,
+                    first.plusSeconds(20), resolution, 20, List.of(), null));
+            var measured = points(answer).stream()
+                    .filter(point -> point.recordsOut() != null || point.bytesOut() != null).toList();
+            if (counters.containsKey("records.out")) {
+                assertThat(measured).singleElement().satisfies(point -> {
+                    assertThat(point.intervalStart()).isEqualTo(first);
+                    assertThat(point.recordsOut().delta()).isEqualByComparingTo("4");
+                    assertThat(point.bytesOut().delta()).isEqualByComparingTo("100");
+                });
+            } else {
+                assertThat(measured).isEmpty();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
     void theSameStartupSamplesWithoutEvidenceOnlyMeasureTheLaterIdleInterval(HistoryResolution resolution) {
         String from = "2026-09-21T10:00:00Z";
         Instant firstObservedAt = Instant.parse(from);

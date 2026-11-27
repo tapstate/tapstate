@@ -226,7 +226,8 @@ public final class HistoryAggregator {
         if (left == null || boundary == StartReason.GAP || left.countingSince() != null
                 || right.countingSince() == null || left.startupEvidence() == null
                 || !left.startupEvidence().sameExecution(right.startupEvidence())
-                || left.counters().containsKey(RECORDS_OUT) || left.counters().containsKey(BYTES_OUT)
+                || left.counters().getOrDefault(RECORDS_OUT, 0L) != 0
+                || left.counters().getOrDefault(BYTES_OUT, 0L) != 0
                 || right.counters().getOrDefault(RECORDS_OUT, -1L) <= 0
                 || right.counters().getOrDefault(BYTES_OUT, -1L) < 0) {
             return null;
@@ -240,7 +241,8 @@ public final class HistoryAggregator {
         }
         Instant baseline = origin;
         if (origin.isBefore(left.observedAt())) {
-            if (previousOrigin == null) return null;
+            if (previousOrigin == null || left.counters().getOrDefault(RECORDS_OUT, -1L) != 0
+                    || left.counters().getOrDefault(BYTES_OUT, -1L) != 0) return null;
             baseline = left.observedAt();
         }
         return !baseline.isBefore(from) && baseline.isBefore(right.observedAt()) ? baseline : null;

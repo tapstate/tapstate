@@ -38,6 +38,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -978,7 +979,8 @@ public final class Engine {
         JobMetrics metrics = job.getMetrics();
         var evidence = execution.isPresent() && execution.equals(JetLiveExecution.forHistory(member, jobId))
                 ? new RateSample.StartupEvidence(jobId, execution.getAsLong(),
-                        outboundZeroAt(metrics, com.hazelcast.jet.Util.idToString(execution.getAsLong())))
+                        outboundZeroAt(metrics, com.hazelcast.jet.Util.idToString(execution.getAsLong()),
+                                JetLiveExecution.historyParticipantAddresses(member, jobId, execution.getAsLong())))
                 : null;
         return deliveryIn(metrics, evidence);
     }
@@ -998,14 +1000,32 @@ public final class Engine {
                 Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics), evidence);
     }
 
-    static Instant outboundZeroAt(JobMetrics metrics, String execution) {
+    static Instant outboundZeroAt(JobMetrics metrics, String execution, Set<String> participants) {
+        if (participants.isEmpty()) return null;
+        // Job metrics combine independently collected member snapshots. A member's entire snapshot can be absent.
+        Set<String> reported = new HashSet<>();
+        for (Measurement point : metrics.get(MetricNames.EXECUTION_START_TIME)) {
+            if (execution.equals(point.tag(MetricTags.EXECUTION))) reported.add(point.tag(MetricTags.ADDRESS));
+        }
+        if (!reported.equals(participants)) return null;
+
         Map<CdcWriterScrape, Long> starts = new HashMap<>();
         for (Measurement point : metrics.get(JetDeliveryGauge.SINCE_METRIC)) {
             var writer = CdcWriterScrape.of(point);
             if (!execution.equals(writer.execution()) || writer.member() == null
                     || writer.vertex() == null || writer.processor() == null || point.value() <= 0
+                    || !reported.contains(point.tag(MetricTags.ADDRESS))
                     || starts.putIfAbsent(writer, point.value()) != null) return null;
         }
+        Set<CdcWriterScrape> writers = new HashSet<>();
+        for (Measurement point : metrics.get(MetricNames.RECEIVED_COUNT)) {
+            // Jet emits a received count for each sink tasklet input, even before the tasklet receives a row.
+            if (execution.equals(point.tag(MetricTags.EXECUTION))
+                    && SinkProcessor.class.getSimpleName().equals(point.tag(MetricTags.PROCESSOR_TYPE))) {
+                writers.add(CdcWriterScrape.of(point));
+            }
+        }
+        if (!writers.equals(starts.keySet())) return null;
         for (String name : metrics.metrics()) {
             if (JetDeliveryGauge.deliveredOf(name) == null && JetDeliveryGauge.carriedTableOf(name) == null) continue;
             for (Measurement point : metrics.get(name)) {

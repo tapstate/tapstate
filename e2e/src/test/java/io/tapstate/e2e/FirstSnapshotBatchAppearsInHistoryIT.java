@@ -59,9 +59,14 @@ class FirstSnapshotBatchAppearsInHistoryIT {
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             var history = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(mongo.getDatabase(storage.cacheDatabase()));
             var filter = new Document("pipelineId", PIPELINE);
-            Await.until("a retained zero baseline while the snapshot is held", WAIT,
-                    () -> history.find(new Document(filter).append("startupEvidence.zeroAt", new Document("$exists", true))
-                            .append("countingSince", new Document("$exists", false))).first() != null,
+            Await.until("a retained zero baseline while the snapshot is held", WAIT, () -> {
+                var sample = history.find(new Document(filter).append("startupEvidence.zeroAt", new Document("$exists", true))
+                        .append("countingSince", new Document("$exists", false))).first();
+                if (sample == null) return false;
+                var counters = sample.get("counters", Document.class);
+                return Long.valueOf(0).equals(counters.getLong("records.out"))
+                        && Long.valueOf(0).equals(counters.getLong("bytes.out"));
+            },
                     () -> history.find(filter).sort(new Document("observedAt", -1)).limit(3)
                             .into(new java.util.ArrayList<>()) + control.logs(PIPELINE));
             assertThat(endpoints.count(EndpointAddress.uri(target.toString()), TABLE)).isZero();

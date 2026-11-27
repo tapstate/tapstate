@@ -8,6 +8,8 @@ import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.impl.JetServiceBackend;
 import java.io.Serializable;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Exact local live execution identity from the pinned Jet implementation. No metrics, arrival order
@@ -36,6 +38,14 @@ public final class JetLiveExecution {
         long execution = context.executionId();
         return execution != 0 && (status == JobStatus.STARTING || status == JobStatus.RUNNING)
                 ? OptionalLong.of(execution) : OptionalLong.empty();
+    }
+
+    static Set<String> historyParticipantAddresses(HazelcastInstance member, long jobId, long executionId) {
+        var actual = localMember(member);
+        if (actual == null) return Set.of();
+        var context = jetService(actual).getJobExecutionService().getExecutionContext(executionId);
+        if (context == null || context.jobId() != jobId || context.participants() == null) return Set.of();
+        return context.participants().stream().map(Object::toString).collect(Collectors.toSet());
     }
 
     enum StartupPhase { PROCESSOR, PLANNING }
