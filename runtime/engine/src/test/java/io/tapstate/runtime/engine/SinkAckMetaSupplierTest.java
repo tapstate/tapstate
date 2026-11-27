@@ -330,7 +330,7 @@ class SinkAckMetaSupplierTest {
 
     private ProcessorSupplier openingSupplier(OpeningRecorder recorder, SupplierEx<SinkFrontier> frontier) throws Exception {
         var meta = SinkProcessor.nativeMetaSupplier("sink", recorder, frontier == null ? null : ignored -> null,
-                frontier == null ? () -> null : frontier, null, 1, 100, 0, Map.of());
+                frontier == null ? () -> null : frontier, null, 1, 100, 0, Map.of(), Map.of());
         var address = member.getCluster().getLocalMember().getAddress();
         meta.init(new TestProcessorMetaSupplierContext().setHazelcastInstance(member).setTotalParallelism(4).setLocalParallelism(4));
         var supplier = meta.get(List.of(address)).apply(address);

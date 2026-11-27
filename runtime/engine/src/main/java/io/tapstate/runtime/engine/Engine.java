@@ -12,6 +12,7 @@ import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
@@ -775,6 +776,44 @@ public final class Engine {
         return job == null ? Map.of() : settledDurationsIn(job.getMetrics());
     }
 
+    /** CDC-only measurements, summed over writers in the same job. */
+    public CdcDeliveryTotals cdcDelivery(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? null : cdcDeliveryIn(job.getMetrics());
+    }
+
+    static CdcDeliveryTotals cdcDeliveryIn(JobMetrics metrics) {
+        var counts = metrics.get(JetDeliveryGauge.CDC_COUNT);
+        var totals = metrics.get(JetDeliveryGauge.CDC_TOTAL_MILLIS);
+        if (counts.isEmpty() || counts.size() != totals.size()) {
+            return null;
+        }
+        Map<CdcWriterScrape, Long> millisByWriter = new HashMap<>();
+        for (Measurement total : totals) {
+            if (millisByWriter.put(CdcWriterScrape.of(total), total.value()) != null) {
+                return null;
+            }
+        }
+        long count = 0;
+        long millis = 0;
+        for (Measurement measurement : counts) {
+            Long total = millisByWriter.remove(CdcWriterScrape.of(measurement));
+            if (total == null) {
+                return null;
+            }
+            count += measurement.value();
+            millis += total;
+        }
+        return new CdcDeliveryTotals(count, millis);
+    }
+
+    private record CdcWriterScrape(String member, String execution, String vertex, String processor, long timestamp) {
+        static CdcWriterScrape of(Measurement measurement) {
+            return new CdcWriterScrape(measurement.tag(MetricTags.MEMBER), measurement.tag(MetricTags.EXECUTION),
+                    measurement.tag(MetricTags.VERTEX), measurement.tag(MetricTags.PROCESSOR), measurement.timestamp());
+        }
+    }
+
     /**
      * The delivery-duration distributions in {@code collected}, by table. A table is read back only when
      * all three of its parts are present and its buckets are as many as the registered bounds need: a
@@ -907,7 +946,7 @@ public final class Engine {
 
     /**
      * The moment the pipeline's live job began counting what it has delivered, as epoch milliseconds;
-     * empty when it has no live job or nothing has counted yet.
+     * empty when no live writer reports its start.
      *
      * <p>The <strong>latest</strong> start among its sinks, not the earliest, and the choice is a trade
      * rather than a plain reading. A total summed over sinks that began at different moments is not exactly
@@ -938,7 +977,7 @@ public final class Engine {
         if (start.isEmpty()) return DeliveryReading.NONE;
         return new DeliveryReading(deliveredRowsIn(collected), settledBytesIn(collected),
                 highestIn(collected, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(start.getAsLong()),
-                settledDurationsIn(collected));
+                settledDurationsIn(collected), cdcDeliveryIn(collected));
     }
 
     private static OptionalLong countingSinceIn(JobMetrics collected) {

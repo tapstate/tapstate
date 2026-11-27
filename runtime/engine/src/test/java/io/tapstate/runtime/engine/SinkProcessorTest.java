@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import com.hazelcast.jet.core.test.TestSupport;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -17,6 +18,7 @@ import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -358,6 +360,46 @@ class SinkProcessorTest {
         assertThatThrownBy(() -> pump(processor, inbox)).isSameAs(boom);
         // p2's write failed, so it must not settle and close p1: nothing is durably acked.
         assertThat(ack.calls).isEmpty();
+    }
+
+    @Test
+    void a_coordinated_no_op_settles_and_advances_the_frontier() throws Exception {
+        var ack = new RecordingAck();
+        var processor = init(new SinkProcessor(
+                receiptWriter(new WriteResult(0, 1)), ack, new ContiguousPrefix(), 1, 1)
+                .withLaneCoordination().withLaneAcknowledgments(ticket -> {}));
+        var inbox = new TestInbox();
+        inbox.addAll(List.of(at("orders", "p1"), at("orders", "p2")));
+
+        pump(processor, inbox);
+
+        assertThat(ack.calls).containsExactly("orders=p1");
+    }
+
+    @Test
+    void physical_changes_without_a_receipt_cannot_release_a_coordinated_fence() throws Exception {
+        var ack = new RecordingAck();
+        var replies = new ArrayList<SinkLaneAcks.Ticket>();
+        var processor = init(new SinkProcessor(
+                receiptWriter(new WriteResult(1, 0)), ack, new ContiguousPrefix(), 1, 1)
+                .withLaneCoordination().withLaneAcknowledgments(replies::add));
+        var ticket = new SinkLaneAcks.Ticket(UUID.randomUUID(), UUID.randomUUID(), 1);
+        var inbox = new TestInbox();
+        inbox.addAll(List.of(at("orders", "p1"), new SinkLaneCommand.Fence("orders", ticket)));
+
+        assertThatThrownBy(() -> pump(processor, inbox)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
+        assertThat(ack.calls).isEmpty();
+        assertThat(replies).isEmpty();
+    }
+
+    private static SinkWriter receiptWriter(WriteResult result) {
+        return new SinkWriter() {
+            @Override public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return CompletableFuture.completedFuture(result);
+            }
+            @Override public void close() {}
+        };
     }
 
     // ---- the shape of frontier is settled while the graph is compiled -------------------------

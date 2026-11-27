@@ -642,7 +642,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     private static WorkloadClaimKey pipelineKey(PipelineIntentScope value) { return new WorkloadClaimKey(value.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, value.pipelineId()); }
     private static TapstateException unreadableScope() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "workload", "field", "pipeline-claim-scope"), null); }
-    static TapstateException claimFenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }
+    static TapstateException claimFenced() { return claimFenced(null); }
+
+    static TapstateException claimFenced(InterruptedException cause) {
+        return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), cause);
+    }
 
     private <T> T transaction(boolean admission, BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation) {
         return transaction(admission, null, operation);
@@ -787,10 +791,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     }
                 }
                 if (failed instanceof RenewalWriteConflict) {
-                    throw new WorkloadClaimRenewalException(owned.released()
-                            ? WorkloadClaimRenewalException.Reason.WRITE_CONFLICT
-                            : WorkloadClaimRenewalException.Reason.UNCONFIRMED,
-                            "Mongo Pipeline renewal WriteConflict code=112");
+                    throw WorkloadClaimRenewalException.writeConflict(owned.released());
                 }
                 if (operations.nodeSessionRenewal() && (retryCommit || failed instanceof MongoException mongo
                         && (committedAck || !owned.released() || mongo.hasErrorLabel("UnknownTransactionCommitResult")))) {

@@ -115,7 +115,16 @@ class MongoCacheClusterMembershipStoreIT {
                         .append("mode", "alwaysOn").append("data", new Document("failCommands", commands)
                                 .append("blockConnection", true).append("blockTimeMS", 20000)))
                         .get("count")).longValue();
-                var result = worker.submit(() -> reader.read("cluster-a"));
+                var result = worker.submit(() -> {
+                    if ("abortTransaction".equals(stalledCommand)) {
+                        reader.read("cluster-a");
+                    } else {
+                        var selected = List.of(SystemCollections.CACHE_IDENTITY);
+                        MongoStructureInspection.inspect(f.database,
+                                MongoStructureInspection.namespaces(selected, selected, Duration.ofSeconds(5)),
+                                new MongoReadBudget(Duration.ofSeconds(5)));
+                    }
+                });
                 try {
                     assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS))
                             .isInstanceOf(java.util.concurrent.ExecutionException.class)

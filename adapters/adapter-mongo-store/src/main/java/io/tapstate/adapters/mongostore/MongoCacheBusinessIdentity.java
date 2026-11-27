@@ -11,6 +11,9 @@ import java.util.List;
 
 /** Business readiness is independent from authentication-only generation changes. */
 final class MongoCacheBusinessIdentity {
+    private static final String SCHEMA = "schema";
+    private static final String CAPTURE = "capture";
+
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     MongoCacheBusinessIdentity(MongoDatabase database, CacheBusinessScope scope) { this.database = database; this.scope = scope; }
@@ -21,11 +24,11 @@ final class MongoCacheBusinessIdentity {
         var result = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
                 MongoPipelineObservationRead.match(new Document("_id", "cluster")),
                 MongoPipelineObservationRead.boundedRow(), MongoPipelineObservationRead.originalRow(),
-                MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"))).first();
-        if (result != null && !MongoPipelineObservationRead.overflow(result, "schema", 1)) {
+                MongoPipelineObservationRead.one(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"))).first();
+        if (result != null && !MongoPipelineObservationRead.overflow(result, SCHEMA, 1)) {
             var identity = result.get("body", Document.class);
             if (identity.containsKey("_id")) {
-                requireObservedReady(identity, MongoPipelineObservationRead.single(result, "schema"), scope);
+                requireObservedReady(identity, MongoPipelineObservationRead.single(result, SCHEMA), scope);
                 return;
             }
         }
@@ -43,10 +46,10 @@ final class MongoCacheBusinessIdentity {
                 new Document("$project", new Document("identity", "$$ROOT")),
                 new Document("$lookup", new Document("from", SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())
                         .append("pipeline", List.of(new Document("$match", new Document("_id", "business"))))
-                        .append("as", "schema")))).first();
+                        .append("as", SCHEMA)))).first();
         Document identity = row == null ? null : row.get("identity", Document.class);
         requireReadyIdentity(identity, scope);
-        var schemas = row.getList("schema", Document.class);
+        var schemas = row.getList(SCHEMA, Document.class);
         Document schema = schemas.isEmpty() ? null : schemas.getFirst();
         requireReadySchema(identity, schema, scope, maintenance);
         return identity;
@@ -105,22 +108,24 @@ final class MongoCacheBusinessIdentity {
         var captured = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
                 new Document("$match", new Document("_id", "cluster")),
                 new Document("$project", new Document("identity", "$$ROOT")),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business"),
-                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "capture", id,
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, SCHEMA, "business"),
+                MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, CAPTURE, id,
                         List.of(MongoWorkloadClaimStore.leaseRemaining(true))))).first();
         var identity = captured == null ? null : captured.get("identity", Document.class);
-        var schema = MongoCaptureStartupRows.get(captured, "schema");
-        var claim = MongoCaptureStartupRows.get(captured, "capture");
-        if (identity == null || !"cluster".equals(identity.get("_id")) || schema == null || claim == null
-                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
-                || MongoCaptureStartupRows.ambiguous(captured, "capture", id)) {
-            admitClaim(session);
-            return new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
-                    .inStrictSession(session).readWithRemainingLease(key);
+        if (identity != null && "cluster".equals(identity.get("_id"))
+                && !MongoCaptureStartupRows.ambiguous(captured, SCHEMA, "business")
+                && !MongoCaptureStartupRows.ambiguous(captured, CAPTURE, id)) {
+            var schema = MongoCaptureStartupRows.get(captured, SCHEMA);
+            var claim = MongoCaptureStartupRows.get(captured, CAPTURE);
+            if (schema != null && claim != null) {
+                requireObservedReady(identity, schema, scope);
+                admitClaim(session, identity);
+                return claim;
+            }
         }
-        requireObservedReady(identity, schema, scope);
-        admitClaim(session, identity);
-        return claim;
+        admitClaim(session);
+        return new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                .inStrictSession(session).readWithRemainingLease(key);
     }
 
     void admitClaim(ClientSession session, Document row) {

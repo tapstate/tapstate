@@ -69,9 +69,13 @@ class AlertEvaluationHostIT {
                         .filter(row->"alert_cleanup".equals(row.getString("name"))).findFirst().orElseThrow();
                 episodes.dropIndex("alert_cleanup");
                 try {
-                    await().atMost(Duration.ofSeconds(12)).untilAsserted(()->assertThatThrownBy(
-                            ()->f.store().state(key,f.reads())).isInstanceOfSatisfying(TapstateException.class,
-                            error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE)));
+                    assertThat(f.store().state(key, f.reads())).isEmpty();
+                    assertThat(f.configuration().inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                            .anySatisfy(difference -> {
+                                assertThat(difference.collection()).isEqualTo("alert_episodes");
+                                assertThat(difference.index()).isEqualTo("alert_cleanup");
+                                assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                            });
                 } finally {
                     episodes.createIndex(index.get("key",Document.class),new com.mongodb.client.model.IndexOptions().name("alert_cleanup"));
                 }
@@ -235,7 +239,7 @@ class AlertEvaluationHostIT {
                 var intent=configuration.intents().loadForActuation("orders").orElseThrow();var claim=claims.acquirePipeline(scope,OWNER,1,TTL).claim();
                 var token=new TokenRecord("operator","ADMIN","isolated-test-hash",false,T);configuration.tokens().save(token);
                 var access=new AlertStore.Access(new AlertTestAuthority(AlertTestAuthority.Mechanism.MACHINE_TOKEN,"installation-a","operator","ADMIN",token.authenticationBinding(),null),ACTIVE,ACTIVE,()->"");
-                var storeHost=cloud?new AlertStore.Host(fixtureScope,setup,deployment,ACTIVE,new AlertIntent.SystemRoute("managed-route","managed-binding",1),new AlertIntent.SdkTarget("managed-target",fixtureScope.clusterId(),"binding-a"),r->Optional.empty(),Set.of()):new AlertStore.Host(fixtureScope,setup,deployment,ACTIVE);
+                var storeHost=cloud?new AlertStore.Host(fixtureScope,setup,deployment,ACTIVE,new AlertIntent.SystemRoute("managed-route","managed-binding",1),new AlertIntent.SdkTarget("managed-target",fixtureScope.clusterId(),"binding-a"),r->Optional.empty(),Set.of(AlertChannelPolicy.CLOUD_EVENTS,AlertChannelPolicy.CLOUD_EMAIL)):new AlertStore.Host(fixtureScope,setup,deployment,ACTIVE);
                 var store=configuration.alerts(storeHost,BuiltinAlarmTypes.catalog(),clock);
                 if(cloud)access=AlertStore.Access.cloud("operator",fixtureScope.authorityId(),"ADMIN",ACTIVE,ACTIVE);
                 var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,fixtureScope,"rule"),deployment,T,"operator");

@@ -28,9 +28,7 @@ final class PipelineConnectorUsage implements ConnectorUsageQuery {
 
     @Override public List<Version> forPipeline(String pipelineId) {
         active.run();
-        var original = intents.load(pipelineId);
-        if (original.isEmpty() || original.orElseThrow().deleted()) return List.of();
-        var current = intents.connectorBindings().load(original.orElseThrow().scope());
+        var current = intents.connectorBindings().loadCurrent(pipelineId);
         active.run();
         return current.map(value -> versions(value.effective())).orElseGet(List::of);
     }

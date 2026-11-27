@@ -9,6 +9,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import java.util.HashMap;
 import java.util.List;
@@ -143,6 +144,8 @@ class EngineRunHandleTest {
         java.util.function.BiConsumer<String, Long> add = (name, value) ->
                 values.put(name, List.of(Measurement.of(name, value, 0L, Map.of())));
         add.accept("outCountingSince", 1000L);
+        add.accept(JetDeliveryGauge.CDC_COUNT, 0L);
+        add.accept(JetDeliveryGauge.CDC_TOTAL_MILLIS, 0L);
         add.accept("recordsOut.insert.orders", 7L);
         add.accept("outDeliveryCount.orders", 1L);
         add.accept("outDeliverySumMillis.orders", 0L);
@@ -154,6 +157,7 @@ class EngineRunHandleTest {
         assertThat(sample.jobId()).isEqualTo(1L);
         assertThat(sample.manifest()).isEqualTo(manifest);
         assertThat(sample.delivered().countingSince()).isEqualTo(java.time.Instant.ofEpochMilli(1000));
+        assertThat(sample.delivered().cdcDelivery()).isEqualTo(CdcDeliveryTotals.ZERO);
         assertThat(sample.delivered().rowsByTableAndOp()).containsEntry("orders", Map.of("insert", 7L));
         assertThat(sample.delivered().deliveryDurationByTable().get("orders").bucketCounts().getFirst()).isOne();
     }

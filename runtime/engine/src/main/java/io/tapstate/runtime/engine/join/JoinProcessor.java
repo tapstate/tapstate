@@ -5,6 +5,7 @@ import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Watermark;
+import com.hazelcast.jet.datamodel.Tuple2;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.lifecycle.Stage;
@@ -134,9 +135,11 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
                     if (item instanceof SettledPositions) {
                         break;
                     }
-                    Envelope event = (Envelope) item;
-                    changes.add(new SourceChange(source, event));
-                    SettledPositions.fold(takenPositions, event.positions());
+                    SourceChange change = item instanceof Tuple2<?, ?> owned
+                            ? new SourceChange(source, (Envelope) owned.f1(), (String) owned.f0())
+                            : new SourceChange(source, (Envelope) item);
+                    changes.add(change);
+                    SettledPositions.fold(takenPositions, change.event().positions());
                 }
                 driver.absorb(changes);
                 taken = changes.size();

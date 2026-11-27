@@ -203,7 +203,7 @@ def stop_expiring_run(repository, performance, now):
     if now < deadline:
         jobs = api(repository, f"runs/{run_id}/attempts/1/jobs?per_page=100")["jobs"]
         unfinished = any(job["status"] != "completed" and
-                         (job["name"] == "prepare" or job["name"].startswith("measure ("))
+                         (job["name"] in {"prepare", "Prepare Maven dependencies"} or job["name"].startswith("measure ("))
                          for job in jobs)
         if not unfinished:
             return

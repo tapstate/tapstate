@@ -78,6 +78,7 @@ class IdlePipelineObservationIT {
                 var observations = client.getDatabase(storage.cacheDatabase()).getCollection("pipeline_observation");
                 Date first = awaitObservation(observations, new Date(0));
                 Date warm = awaitObservation(observations, first);
+                ((InProcessServer) server).inspectStorageNow();
                 var configuration = client.getDatabase(storage.configurationDatabase());
                 var envelope = new Document("$or", List.of(new Document("command.aggregate", "configuration_version"),
                         new Document("command.find", "serve_definitions")));

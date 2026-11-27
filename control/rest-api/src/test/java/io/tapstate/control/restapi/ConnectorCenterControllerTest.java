@@ -104,6 +104,27 @@ class ConnectorCenterControllerTest {
     }
 
     @Test
+    void uploadKeepsTheCauseWhenTheRequestStreamCannotBeOpened() throws IOException {
+        SecurityContextHolder.getContext().setAuthentication(UsernamePasswordAuthenticationToken.authenticated(
+                new TapstatePrincipal("admin", CredentialType.HUMAN_JWT, Set.of(Scope.ADMIN), Optional.empty()),
+                "", List.of()));
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("connectorCenterService",
+                new ConnectorCenterService(new CapturedCenter(), new AuditGate(record -> { }, Clock.systemUTC())));
+        var controller = new ConnectorCenterController(beans.getBeanProvider(ConnectorCenterService.class),
+                io.tapstate.messages.MessageCatalog.bundled());
+        var request = org.mockito.Mockito.mock(jakarta.servlet.http.HttpServletRequest.class);
+        var original = new IOException("Request stream is unavailable");
+        org.mockito.Mockito.when(request.getInputStream()).thenThrow(original);
+
+        assertThatThrownBy(() -> controller.upload(request, null))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(failure.getCause()).isSameAs(original);
+                });
+    }
+
+    @Test
     void aLegacyAssemblyWithoutTheCenterReportsItsCodedUnavailableState() {
         var services = new DefaultListableBeanFactory().getBeanProvider(ConnectorCenterService.class);
         var controller = new ConnectorCenterController(services, io.tapstate.messages.MessageCatalog.bundled());

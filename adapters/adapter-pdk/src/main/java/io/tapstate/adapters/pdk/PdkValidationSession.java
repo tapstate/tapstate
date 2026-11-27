@@ -307,7 +307,8 @@ final class PdkValidationSession {
                 if(paged)requirePostgresBufferCapability();
                 TapTable model = discover(opened);
                 checkAlive(opened);
-                var codecs = new PdkValidationCodecs(connectorId, codecBinding, opened.codecs());
+                var codecs = new PdkValidationCodecs(connectorId, codecBinding, opened.codecs(),
+                        PdkBsonDecimal.usesBsonModel(artifact.className()));
                 var admittedDecoder = Objects.requireNonNull(admission.prepare(model, codecs), "admitted decoder");
                 decoder = raw -> {
                     ValidationValues.Row decoded = admittedDecoder.decode(raw);

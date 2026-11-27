@@ -16,6 +16,7 @@ import io.tapstate.control.core.PipelineMetricsHistory.Status;
 import io.tapstate.control.core.PipelineMetricsHistory.Unavailable;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.LifecycleError;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.RateHistoryStore.Entry;
@@ -130,7 +131,7 @@ public final class PipelineHistoryQueryService {
 
         Projection projection = rawProjection(page.entries(), predecessor,
                 frozen.afterKey() == null ? StartReason.WINDOW_START : StartReason.CONTINUATION,
-                frozen.from(), frozen.to(), normalized.tables());
+                frozen.from(), frozen.to(), normalized.tables(), missingCdcBaseline(frozen, predecessor));
         String next = null;
         if (page.hasMore() && !page.entries().isEmpty()) {
             Entry last = page.entries().getLast();
@@ -152,7 +153,7 @@ public final class PipelineHistoryQueryService {
                 effective.duration(), sampleInterval, normalized.tables(),
                 frozen.afterKey() == null ? StartReason.WINDOW_START : StartReason.CONTINUATION,
                 binding.limit() + 1);
-        aggregator.begin(predecessor);
+        aggregator.begin(predecessor, missingCdcBaseline(frozen, predecessor));
 
         Key after = frozen.afterKey();
         boolean storeHasMore = true;
@@ -210,6 +211,13 @@ public final class PipelineHistoryQueryService {
                 segments, gaps, unavailable, next);
         cost.peakRawEntriesHeld = Math.max(cost.peakRawEntriesHeld, all.peakRawEntriesHeld());
         return measured(response, cost);
+    }
+
+    private static boolean missingCdcBaseline(Frozen frozen, Entry predecessor) {
+        Key afterKey = frozen.afterKey();
+        // An older fallback can support clipped throughput, but a discrete CDC delta
+        // from that fallback could include deliveries already attributed to the previous page.
+        return afterKey != null && (predecessor == null || !afterKey.equals(predecessor.key()));
     }
 
     private Entry boundaryBefore(Normalized normalized, Frozen frozen, Cost cost) {
@@ -332,42 +340,49 @@ public final class PipelineHistoryQueryService {
     }
 
     private Projection rawProjection(List<Entry> entries, Entry predecessor, StartReason initialReason,
-            Instant from, Instant to, List<String> tables) {
+            Instant from, Instant to, List<String> tables, boolean skipFirstCdc) {
         List<Emitted> points = new ArrayList<>();
         List<EmittedGap> gaps = new ArrayList<>();
         Entry previous = predecessor;
         int segment = 0;
         StartReason reason = initialReason;
         for (Entry current : entries) {
-            Point point;
-            StartReason boundary = previous == null ? null : boundary(previous.sample(), current.sample());
+            RateSample left = previous == null ? null : previous.sample();
+            RateSample right = current.sample();
+            StartReason boundary = left == null ? null : boundary(left, right);
             if (boundary != null) {
                 segment++;
                 reason = boundary;
                 if (boundary == StartReason.GAP) {
-                    Instant gapStart = max(from, previous.sample().observedAt());
-                    Instant gapEnd = min(to, current.sample().observedAt());
+                    Instant gapStart = max(from, left.observedAt());
+                    Instant gapEnd = min(to, right.observedAt());
                     if (gapStart.isBefore(gapEnd)) {
                         gaps.add(new EmittedGap(segment, new Gap(gapStart, gapEnd, GapReason.SAMPLE_GAP)));
                     }
                 }
-                point = new Point(current.sample().observedAt(), current.sample().observedAt(),
-                        null, null, lag(current.sample(), tables));
-            } else if (previous == null) {
-                point = new Point(current.sample().observedAt(), current.sample().observedAt(),
-                        null, null, lag(current.sample(), tables));
-            } else {
-                Rate records = rawRate(previous.sample(), current.sample(), HistoryAggregator.RECORDS_OUT);
-                Rate bytes = rawRate(previous.sample(), current.sample(), HistoryAggregator.BYTES_OUT);
-                Instant start = records == null && bytes == null
-                        ? current.sample().observedAt() : previous.sample().observedAt();
-                point = new Point(start, current.sample().observedAt(), records, bytes,
-                        lag(current.sample(), tables));
             }
-            points.add(new Emitted(point, segment, reason, current.key(), current.sample().observedAt()));
+            Point point = rawPoint(left, right, boundary, from, tables, skipFirstCdc);
+            points.add(new Emitted(point, segment, reason, current.key(), right.observedAt()));
             previous = current;
+            skipFirstCdc = false;
         }
         return new Projection(points, gaps);
+    }
+
+    private static Point rawPoint(RateSample left, RateSample right, StartReason boundary,
+            Instant from, List<String> tables, boolean skipCdc) {
+        var cdc = skipCdc ? CdcDeliveryTotals.ZERO : HistoryAggregator.cdcDelta(left, right, from, boundary);
+        var cdcReading = HistoryAggregator.cdcReading(cdc.count(), cdc.totalMillis());
+        Instant end = right.observedAt();
+        List<Lag> lag = lag(right, tables);
+        if (left == null || boundary != null) {
+            return new Point(end, end, null, null, lag, cdcReading);
+        }
+
+        Rate records = rawRate(left, right, HistoryAggregator.RECORDS_OUT);
+        Rate bytes = rawRate(left, right, HistoryAggregator.BYTES_OUT);
+        Instant start = records == null && bytes == null ? end : left.observedAt();
+        return new Point(start, end, records, bytes, lag, cdcReading);
     }
 
     private StartReason boundary(RateSample left, RateSample right) {

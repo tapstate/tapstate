@@ -10,6 +10,7 @@ import io.tapstate.core.lifecycle.TableSnapshot;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -84,13 +85,23 @@ final class ControlPlane {
     private static final String ERRORS_PREFIX = "errors.";
 
     private final URI baseUrl;
-    private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
+    private final HttpClient http;
 
     private String credential;
     private boolean cloudCookie;
 
     ControlPlane(URI baseUrl) {
+        this(baseUrl, HttpClient.newBuilder().connectTimeout(TIMEOUT).build());
+    }
+
+    static ControlPlane direct(URI baseUrl) {
+        return new ControlPlane(baseUrl,
+                HttpClient.newBuilder().connectTimeout(TIMEOUT).proxy(ProxySelector.of(null)).build());
+    }
+
+    private ControlPlane(URI baseUrl, HttpClient http) {
         this.baseUrl = baseUrl;
+        this.http = http;
     }
 
     /** Actual View projection, read with this scenario's original authenticated session. */
@@ -900,7 +911,11 @@ final class ControlPlane {
 
     /** The merged catalog that backs the Web list. */
     List<String> pipelineCatalogIds() {
-        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=0"));
+        return pipelineCatalogIds(0);
+    }
+
+    List<String> pipelineCatalogIds(int offset) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=" + offset));
         expect(response, 200, "read the Pipeline catalog");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("items") instanceof List<?> items)) {

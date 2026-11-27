@@ -202,10 +202,8 @@ class ConnectorArtifactRegistrarTest {
         // database kinds themselves; each managed variant is accepted by an explicit support decision.
         // Order is the order a refusal message names them in.
         assertThat(OfficialConnectors.IDS).containsExactly(
-                "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
-                "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
-                "tencent-db-postgres",
-                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
+                "mysql", "aws-rds-mysql", "mysql-pxc",
+                "postgres", "mongodb", "mongodb-atlas", "oracle", "sqlserver",
                 "db2", "db2i", "dummy");
     }
 

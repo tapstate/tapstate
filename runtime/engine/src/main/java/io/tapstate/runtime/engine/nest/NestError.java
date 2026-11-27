@@ -56,6 +56,8 @@ public enum NestError implements TapstateErrorCode {
      */
     ROOT_KEY_REQUIRED(NestErrorDefinitions.ROOT_KEY_REQUIRED),
 
+    ROOT_HANDOVER_UNCONFIRMED(NestErrorDefinitions.ROOT_HANDOVER_UNCONFIRMED),
+
     /**
      * Checking the tree: a level declares no key and its stream offers neither a primary key nor a unique
      * index to take one from, leaving its rows with no identity — updates would pile up as duplicates.

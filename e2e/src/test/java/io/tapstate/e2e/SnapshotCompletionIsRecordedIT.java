@@ -116,7 +116,9 @@ class SnapshotCompletionIsRecordedIT {
                             && documents.consumerReadSeq(chain, consumer, TABLE) == 2,
                     () -> "largest=" + documents.largestSequence(chain, TABLE)
                             + " cursor=" + documents.consumerReadSeq(chain, consumer, TABLE));
-            assertThat(control.state(pipeline)).contains(PipelineState.RUNNING);
+            Await.until("the first RUNNING observation after the snapshot", TIMEOUT,
+                    () -> control.state(pipeline).filter(PipelineState.RUNNING::equals).isPresent(),
+                    () -> "pipeline observation=" + control.state(pipeline));
             files.cdc(EndpointAddress.uri(sourceDirectory.toString()), TABLE, CdcOp.INSERT, 1);
             Await.until("the completed snapshot's live tail to consume a later filtered change", TIMEOUT,
                     () -> documents.largestSequence(chain, TABLE) == 3

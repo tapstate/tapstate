@@ -348,6 +348,9 @@ public final class ControlApiSchema {
         pointProperties.put("recordsOut", rate);
         pointProperties.put("bytesOut", rate);
         pointProperties.put("lag", array(lag));
+        pointProperties.put("cdcDelivery", object(List.of("sampleCount", "averageMillis"),
+                Map.of("sampleCount", positiveInteger("Confirmed CDC deliveries in this point"),
+                        "averageMillis", nonNegativeNumber()), false));
         Map<String, Object> point = object(
                 List.of("intervalStart", "intervalEnd", "lag"), pointProperties, false);
         Map<String, Object> segment = object(

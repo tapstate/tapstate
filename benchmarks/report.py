@@ -11,7 +11,7 @@ ARM_CONDITIONS = ("effective_input_rows", "mongo_topology", "target_delay_millis
 OOM_ATTRIBUTIONS = {"observed-java-out-of-memory", "observed-op-oom-kill"}
 
 
-def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
+def reconcile(manifest, summaries, baseline=None, *, baseline_status=None, batch_conditions=None):
     if manifest["manifest_sha256"] != catalog.digest(
         {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     ):
@@ -24,6 +24,8 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
         (entry["case"]["id"], repeat): entry
         for entry in entries for repeat in range(1, entry["repeats"] + 1)
     }
+    case_batches = {entry["case"]["id"]: batch["index"]
+                    for batch in manifest["batches"] for entry in batch["entries"]}
     rows = {}
     errors = []
     for summary in summaries:
@@ -65,14 +67,25 @@ def reconcile(manifest, summaries, baseline=None, *, baseline_status=None):
         fallback = {"case_id": key[0], "case_version": entry["case"]["case_version"],
                     "repeat": key[1], "status": "missing"}
         row = {**fallback, **rows.get(key, {})}
-        failures = memory_failures(row, baseline, manifest["environment"])
+        observed = row if key in rows else None
+        if observed and batch_conditions and baseline and baseline.get("schema_version") == baseline_schema.SOURCE_SCHEMA:
+            observed = {**row, "runner": batch_conditions.get(case_batches[key[0]], {})}
+        outcome = observed or row
+        failures = memory_failures(outcome, baseline, manifest["environment"])
+        checks = source_memory_checks(outcome, baseline, manifest["environment"])
+        if checks:
+            row["memory_budget_checks"] = checks
+            failures.extend({**check, "reason": "memory-budget-exceeded"}
+                            for check in checks if check["status"] == "exceeded")
         if failures:
             row["memory_failures"] = failures
             if row["status"] not in verdict.FAILED_STATUSES:
                 if row.get("reason"):
                     row["reason_before_memory_failure"] = row["reason"]
                 row.update(status="failed", last_stage="memory", reason=failures[0]["reason"])
-        comparison = compare(row if key in rows else None, baseline, manifest["environment"])
+        if observed is not None and observed["status"] != row["status"]:
+            observed["status"] = row["status"]
+        comparison = compare(observed, baseline, manifest["environment"])
         if comparison["status"] == "baseline-not-supplied" and baseline_status:
             reason = baseline_status.get("reason")
             if reason and reason != "baseline-not-supplied":
@@ -121,6 +134,35 @@ def memory_failures(row, baseline, environment):
                     failures.append({"arm": name, "reason": "memory-budget-exceeded", "metric": metric,
                                      "observed": observed, **limit})
     return failures
+
+
+def source_memory_checks(row, baseline, environment):
+    if not baseline or baseline.get("schema_version") != baseline_schema.SOURCE_SCHEMA:
+        return []
+    limits = baseline.get("memory_limits", {}).get(row["case_id"])
+    if not limits:
+        return []
+    reference = baseline["cases"][row["case_id"]]["current"]
+    if row["status"] != "completed":
+        missing = "result-unavailable"
+    elif baseline["environment"] != environment or not matches_reference(row, reference):
+        missing = "incompatible-conditions"
+    else:
+        missing = "evidence-insufficient"
+    arms = arms_for(row) if missing == "evidence-insufficient" else {}
+    checks = []
+    for name, metrics in limits.items():
+        observations = list(source_metrics(arms[name])) if name in arms else []
+        for metric, budgets in metrics.items():
+            for budget in budgets:
+                observed = next((value for key, value, binding in observations
+                                 if key == metric and metric_binding_matches(budget, binding)), None)
+                check = {**budget, "arm": name, "metric": metric, "status": missing}
+                if observed is not None:
+                    check.update(observed=observed,
+                                 status="exceeded" if observed > budget["limit"] else "within-budget")
+                checks.append(check)
+    return checks
 
 
 def summarize_repeats(results):
@@ -247,6 +289,8 @@ def compare(row, baseline, environment):
     reference = baseline["cases"].get(row["case_id"])
     if reference is None or reference.get("status") != "completed":
         return {"status": "baseline-result-unavailable"}
+    if baseline.get("schema_version") == baseline_schema.SOURCE_SCHEMA:
+        return compare_sources(row, reference, baseline)
     if not compatible_case(row, baseline, environment):
         return {"status": "incompatible"}
     arms = arms_for(row)
@@ -276,8 +320,95 @@ def compare(row, baseline, environment):
     return {"status": status, "arms": comparisons}
 
 
-def ratio(output, metric, observed, reference, source, conditions):
-    if valid_metric_value(metric, observed) and valid_metric_value(metric, reference):
+def compare_sources(row, case, baseline):
+    """Evaluate the current and initial references independently."""
+    policy = baseline.get("comparison_rules", {})
+    current = compare_reference(row, case["current"], baseline["kind"], policy)
+    first = case["first"]
+    if first != "current" and first != case["current"]:
+        current["first"] = compare_reference(row, first, baseline["kind"], policy)
+    return current
+
+
+def compare_reference(row, reference, kind, policy):
+    result = {"reference": reference["measurement"], "rules_version": policy.get("version")}
+    rules = policy.get("cases", {}).get(row["case_id"], {})
+    conditions = reference["conditions"]
+    if not matches_reference(row, reference):
+        return {**result, "status": "incompatible"}
+    comparisons = {}
+    unavailable = {}
+    for name, arm in arms_for(row).items():
+        if arm.get("status") != "completed":
+            continue
+        groups_by_metric = reference["arms"][name]["metrics"]
+        arm_results = {}
+        for metric, value, binding in source_metrics(arm):
+            match = [group for group in groups_by_metric.get(metric, ()) if group["availability"] == "measured"
+                     and metric_binding_matches(group, binding)]
+            if len(match) != 1:
+                continue
+            median = match[0]["summary"]["median"]
+            if median == 0 and "zero_reference" not in rules.get(metric, {}):
+                unavailable.setdefault(name, {})[metric] = "zero-reference-no-absolute-rule"
+            else:
+                ratio(arm_results, metric, value, median, binding["source"],
+                      {"case": conditions, **binding}, validator=finite_observation)
+        if arm_results:
+            comparisons[name] = arm_results
+    if unavailable:
+        result["metric_reasons"] = unavailable
+    if comparisons:
+        status = "fixture-comparison" if kind == "fixture" else "compared"
+    elif unavailable:
+        status = "incompatible"
+        result["reason"] = "zero-reference-no-absolute-rule"
+    else:
+        status = "no-eligible-observation"
+    return {**result, "status": status, "arms": comparisons}
+
+
+def matches_reference(row, reference):
+    conditions = reference["conditions"]
+    return (arms_for(row).keys() == reference["arms"].keys()
+            and all(row.get(key) == conditions[key] for key in (*CASE_CONDITIONS, "runner", "environment_profile")))
+
+
+def metric_binding_matches(stored, observed):
+    return all(stored[key] == observed[key] for key in baseline_schema.SOURCE_METRIC_BINDING)
+
+
+def source_metrics(arm):
+    """Convert eligible observations into the units carried by a versioned reference."""
+    facts = {key: arm[key] for key in ARM_CONDITIONS if arm.get(key) is not None}
+    resources = arm.get("resources", {})
+    for metric, value, source in eligible_metrics(arm):
+        if not valid_metric_value(metric, value):
+            continue
+        conditions = {**facts, **metric_conditions(arm, metric)}
+        if metric == "completion_nanos":
+            name, value, unit, scope, window = "completion_ms", value / 1_000_000, "ms", "pipeline", "completion"
+        elif metric == "endpoint_p95_nanos":
+            name, value, unit, scope, window = "endpoint_p95_ms", value / 1_000_000, "ms", "target endpoint", "live"
+        else:
+            window, _, measure = metric.rpartition(".")
+            scope = conditions.pop("scope", None) or resources.get("scope")
+            if measure.endswith("_kib_per_second"):
+                name, value, unit = metric.removesuffix("_kib_per_second") + "_bytes_per_hour", value * 1024 * 3600, "B/h"
+            else:
+                name, value, unit = metric.removesuffix("_kib") + "_bytes", value * 1024, "B"
+        if scope and baseline_schema.finite_number(value):
+            yield name, value, {"conditions": conditions, "scope": scope, "window_ref": window,
+                                "source": source, "unit": unit}
+
+
+def finite_observation(metric, value):
+    return baseline_schema.finite_number(value) and value >= 0
+
+
+def ratio(output, metric, observed, reference, source, conditions, *, validator=None):
+    validator = validator or valid_metric_value
+    if validator(metric, observed) and validator(metric, reference):
         change = observed / reference - 1 if reference else None
         if change is None or baseline_schema.finite_number(change):
             output[metric] = {"observed": observed, "baseline": reference, "change_ratio": change,

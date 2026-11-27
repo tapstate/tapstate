@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.join;
 
 import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.sql.JoinKey;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -11,6 +12,19 @@ import java.util.Map;
 final class JoinKeys {
 
     private JoinKeys() {
+    }
+
+    static String nameOf(Map<String, Object> row, List<String> columns) {
+        JoinKey key = JoinKey.of(valuesOf(row, columns));
+        return key.matchable() ? key.name() : null;
+    }
+
+    static boolean isDifferentRow(Map<String, Object> row, List<String> identityColumns, String expectedIdentity) {
+        if (row == null || expectedIdentity == null) {
+            return false;
+        }
+        String currentIdentity = nameOf(row, identityColumns);
+        return currentIdentity != null && !currentIdentity.equals(expectedIdentity);
     }
 
     /**

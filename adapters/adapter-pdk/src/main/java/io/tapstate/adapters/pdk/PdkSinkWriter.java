@@ -29,6 +29,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.function.Supplier;
 
 /**
@@ -49,6 +50,10 @@ import java.util.function.Supplier;
  * the backpressure that bounds them belong to the runtime, not this writer.
  */
 final class PdkSinkWriter implements SinkWriter {
+
+    // PDK alternatives and target transactions can be keyed by thread name on a shared connector.
+    private static final ThreadFactory WRITER_THREADS =
+            Thread.ofPlatform().daemon().name("tapstate-sink-write-", 1).factory();
 
     private final PdkConnector connector;
     private final WriteRecordFunction write;
@@ -71,8 +76,7 @@ final class PdkSinkWriter implements SinkWriter {
     private volatile Thread writeThread;
     private boolean delivering;
     private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
-        Thread thread = new Thread(task, "tapstate-sink-write");
-        thread.setDaemon(true);
+        Thread thread = WRITER_THREADS.newThread(task);
         writeThread = thread;
         return thread;
     });
@@ -362,7 +366,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
-        long[] accepted = {0};
+        long written = 0;
+        long acknowledgedRows = 0;
         for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
             List<TapRecordEvent> rows = entry.getValue();
             TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
@@ -379,12 +384,22 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
-            try {write.writeRecord(connector.context(), rows, table,
-                    result -> accepted[0] += accepted(result));}
-            catch(Throwable failure){operation(table.getId(),failure);throw failure;}
-            operation(table.getId(),null);
+            int submittedRows = rows.size();
+            var outcome = new BatchOutcome();
+            try {
+                write.writeRecord(connector.context(), rows, table, outcome::accept);
+                if (outcome.failure != null) throw outcome.failure;
+            } catch (Throwable failure) {
+                operation(table.getId(), failure);
+                throw failure;
+            }
+            operation(table.getId(), null);
+            written += outcome.written;
+            // The synchronous writer completed this table's submitted events without errors.
+            // Physical change counts can be lower for no-ops or higher for a key change.
+            if (outcome.reported) acknowledgedRows += submittedRows;
         }
-        return new WriteResult(accepted[0]);
+        return new WriteResult(written, acknowledgedRows);
     }
 
     private TargetTable projectedTarget(String stream, TargetTable original) {
@@ -392,8 +407,20 @@ final class PdkSinkWriter implements SinkWriter {
         return plan == null ? original : plan.target();
     }
 
-    private static long accepted(WriteListResult<TapRecordEvent> result) {
-        return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+    private static final class BatchOutcome {
+        private long written;
+        private boolean reported;
+        private Throwable failure;
+
+        void accept(WriteListResult<TapRecordEvent> result) {
+            var errors = result.getErrorMap();
+            if (failure == null && errors != null && !errors.isEmpty()) {
+                failure = errors.values().iterator().next();
+                if (failure == null) failure = new IllegalStateException("Connector rejected a row without a cause");
+            }
+            written += result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
+            reported = true;
+        }
     }
 
     private TapRecordEvent encode(Envelope env) {

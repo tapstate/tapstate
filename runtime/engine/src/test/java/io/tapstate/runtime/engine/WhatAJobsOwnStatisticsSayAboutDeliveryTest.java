@@ -2,6 +2,8 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
+import com.hazelcast.jet.core.metrics.MetricTags;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import org.junit.jupiter.api.DisplayName;
@@ -36,6 +38,24 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
         valuesByMetric.forEach((metric, values) -> measurements.put(metric,
                 values.stream().map(value -> Measurement.of(metric, value, 0L, Map.of())).toList()));
         return JobMetrics.of(measurements);
+    }
+
+    @Test
+    void cdcTotalsRequireMatchingWriterAndScrape() {
+        String count = JetDeliveryGauge.CDC_COUNT;
+        String millis = JetDeliveryGauge.CDC_TOTAL_MILLIS;
+        Map<String, String> first = Map.of(MetricTags.VERTEX, "sink", MetricTags.PROCESSOR, "0");
+        Map<String, String> second = Map.of(MetricTags.VERTEX, "sink", MetricTags.PROCESSOR, "1");
+        var counts = List.of(Measurement.of(count, 10, 500, first), Measurement.of(count, 5, 600, second));
+        var firstTotal = Measurement.of(millis, 1_000, 500, first);
+        var secondTotal = Measurement.of(millis, 600, 600, second);
+
+        assertThat(Engine.cdcDeliveryIn(JobMetrics.of(Map.of(count, counts, millis,
+                List.of(secondTotal, firstTotal))))).isEqualTo(new CdcDeliveryTotals(15, 1_600));
+        assertThat(Engine.cdcDeliveryIn(JobMetrics.of(Map.of(count, counts, millis,
+                List.of(firstTotal, Measurement.of(millis, 400, 599, second)))))).isNull();
+        assertThat(Engine.cdcDeliveryIn(JobMetrics.of(Map.of(count, counts, millis,
+                List.of(firstTotal, Measurement.of(millis, 600, 600, first)))))).isNull();
     }
 
     @Test

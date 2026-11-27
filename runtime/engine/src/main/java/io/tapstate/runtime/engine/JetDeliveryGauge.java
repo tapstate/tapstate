@@ -1,11 +1,18 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+import com.hazelcast.internal.metrics.ProbeLevel;
+import com.hazelcast.internal.metrics.ProbeUnit;
+import com.hazelcast.jet.core.metrics.MetricTags;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramValue;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Publishes a sink's delivery readings as run statistics of the job it belongs to, one per table and
@@ -57,7 +64,9 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> reachedByTable = new HashMap<>();
     private final Map<String, JobStatistic> durationParts = new HashMap<>();
     private final Map<String, JobStatistic> waitingByName = new HashMap<>();
-    private JobStatistic since;
+    static final String CDC_COUNT = "cdcDeliveryCount";
+    static final String CDC_TOTAL_MILLIS = "cdcDeliveryTotalMillis";
+    private final AtomicReference<CdcSnapshot> cdcDelivery = new AtomicReference<>();
 
     @Override
     public void delivered(Map<String, Map<String, Long>> rowsByTableAndOp) {
@@ -99,6 +108,26 @@ final class JetDeliveryGauge implements DeliveryGauge {
     }
 
     @Override
+    public void cdcDelivered(CdcDeliveryTotals totals) {
+        CdcSnapshot current = cdcDelivery.get();
+        cdcDelivery.set(new CdcSnapshot(current.startMillis(), totals));
+    }
+
+    void collectCdcDelivery(MetricDescriptor descriptor, MetricsCollectionContext context) {
+        // The collector can run on another thread. Read the start and both totals together.
+        CdcSnapshot snapshot = cdcDelivery.get();
+        if (snapshot != null) {
+            descriptor.withTag(MetricTags.USER, "true");
+            context.collect(descriptor, SINCE_METRIC, ProbeLevel.INFO, ProbeUnit.MS, snapshot.startMillis());
+            context.collect(descriptor, CDC_COUNT, ProbeLevel.INFO, ProbeUnit.COUNT, snapshot.totals().count());
+            context.collect(descriptor, CDC_TOTAL_MILLIS, ProbeLevel.INFO, ProbeUnit.MS, snapshot.totals().totalMillis());
+        }
+    }
+
+    private record CdcSnapshot(long startMillis, CdcDeliveryTotals totals) {
+    }
+
+    @Override
     public void took(Map<String, HistogramValue> durationByTable) {
         durationByTable.forEach((table, histogram) -> {
             part(DURATION_COUNT_PREFIX + table).set(histogram.count());
@@ -121,10 +150,10 @@ final class JetDeliveryGauge implements DeliveryGauge {
 
     @Override
     public void countingSince(long epochMillis) {
-        if (since == null) {
-            since = new JobStatistic(SINCE_METRIC);
+        if (cdcDelivery.get() == null) {
+            // Cooperative processors can initialize before Jet binds the thread-local metrics API.
+            cdcDelivery.set(new CdcSnapshot(epochMillis, CdcDeliveryTotals.ZERO));
         }
-        since.set(epochMillis);
     }
 
     /**

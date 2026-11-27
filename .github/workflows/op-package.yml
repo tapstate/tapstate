@@ -39,16 +39,8 @@ on:
         description: "MySQL"
         type: boolean
         default: false
-      connector_aliyun-rds-mysql:
-        description: "ApsaraDB RDS for MySQL"
-        type: boolean
-        default: false
       connector_aws-rds-mysql:
         description: "Amazon RDS for MySQL"
-        type: boolean
-        default: false
-      connector_polar-db-mysql:
-        description: "ApsaraDB PolarDB for MySQL"
         type: boolean
         default: false
       connector_mysql-pxc:
@@ -57,30 +49,6 @@ on:
         default: false
       connector_postgres:
         description: "PostgreSQL"
-        type: boolean
-        default: false
-      connector_aliyun-rds-postgres:
-        description: "ApsaraDB RDS for PostgreSQL"
-        type: boolean
-        default: false
-      connector_aliyun-adb-postgres:
-        description: "ApsaraDB AnalyticDB for PostgreSQL"
-        type: boolean
-        default: false
-      connector_polar-db-postgres:
-        description: "ApsaraDB PolarDB for PostgreSQL"
-        type: boolean
-        default: false
-      connector_tencent-db-postgres:
-        description: "TencentDB for PostgreSQL"
-        type: boolean
-        default: false
-      connector_aliyun-db-mongodb:
-        description: "ApsaraDB for MongoDB"
-        type: boolean
-        default: false
-      connector_tencent-db-mongodb:
-        description: "TencentDB for MongoDB"
         type: boolean
         default: false
       connector_oracle:
@@ -110,6 +78,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
@@ -220,6 +189,9 @@ jobs:
           VERSION: ${{ steps.source.outputs.version }}
           PLATFORM: ${{ inputs.platform }}
           CONNECTOR_MODE: ${{ inputs.selection_mode }}
+          TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS: "1"
+          TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
+          TAPSTATE_OP_SELECTION_TIMEOUT_SECONDS: "600"
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           WEB_SHA: ${{ steps.web.outputs.sha }}
           WORKFLOW_INPUTS: ${{ toJSON(inputs) }}

@@ -9,8 +9,9 @@ public final class PdkSourceModelComparison {
 
     public static SourceModelComparison forVerifiedArtifact(String connectorId, ConnectorRef artifact) {
         Objects.requireNonNull(artifact, "artifact");
-        if ("mongodb".equals(connectorId)
-                && "io.tapdata.mongodb.MongodbConnector".equals(artifact.className())
+        boolean sampled = ("mongodb".equals(connectorId) && PdkBsonDecimal.MONGODB.equals(artifact.className()))
+                || ("mongodb-atlas".equals(connectorId) && PdkBsonDecimal.ATLAS.equals(artifact.className()));
+        if (sampled
                 && artifact.contentHash() != null && artifact.contentHash().matches("[a-f0-9]{64}")) {
             return SourceModelComparison.SAMPLED_DOCUMENT;
         }

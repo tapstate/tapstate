@@ -81,6 +81,6 @@ class RateHistoryQueryTest {
         assertThat(walked.get(0).bytesOut().delta()).isEqualByComparingTo("600");
         assertThat(PipelineMetricsHistory.Point.class.getRecordComponents())
                 .extracting(java.lang.reflect.RecordComponent::getName)
-                .containsExactly("intervalStart", "intervalEnd", "recordsOut", "bytesOut", "lag");
+                .containsExactly("intervalStart", "intervalEnd", "recordsOut", "bytesOut", "lag", "cdcDelivery");
     }
 }

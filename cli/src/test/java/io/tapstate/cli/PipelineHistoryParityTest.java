@@ -25,7 +25,8 @@ class PipelineHistoryParityTest {
             "history-auto-page-1.golden.json",
             "history-aggregate-boundaries.golden.json",
             "history-single-metric-missing.golden.json",
-            "history-empty.golden.json");
+            "history-empty.golden.json",
+            "history-cdc-delivery.golden.json");
 
     @Test
     void everyRestFixtureReachesTheCliWithTheSameTypedFields() throws Exception {
@@ -107,6 +108,11 @@ class PipelineHistoryParityTest {
                 "observedAt", lag.observedAt(),
                 "last", lag.last(),
                 "max", lag.max())).toList());
+        if (point.cdcDelivery() != null) {
+            value.put("cdcDelivery", Map.of(
+                    "sampleCount", point.cdcDelivery().sampleCount(),
+                    "averageMillis", point.cdcDelivery().averageMillis()));
+        }
         return value;
     }
 

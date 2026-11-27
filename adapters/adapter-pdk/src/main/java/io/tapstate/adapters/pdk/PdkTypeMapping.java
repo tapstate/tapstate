@@ -62,6 +62,16 @@ final class PdkTypeMapping {
         }
     }
 
+    static Resolved resolve(TapType type, String nativeType, String connectorClass) {
+        var resolved = resolve(type);
+        // The MongoDB connectors can omit the fixed flag. The BSON type still identifies a decimal.
+        if (resolved.type() == TapstateType.UNKNOWN && type instanceof TapNumber
+                && "DECIMAL128".equals(nativeType) && PdkBsonDecimal.usesBsonModel(connectorClass)) {
+            return Resolved.of(TapstateType.DECIMAL);
+        }
+        return resolved;
+    }
+
     /**
      * The tapstate type for a filled PDK type, and the reason where it is unknown. One switch, so the
      * type and its attribution cannot answer differently.

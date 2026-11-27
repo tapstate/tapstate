@@ -14,6 +14,7 @@ import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
+import io.tapstate.spi.sink.TargetKeyConstraints;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.KeyedStateStore;
 import java.util.Map;
@@ -200,6 +201,28 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
         if(configured!=null){ScopedSinkStateProvider.of(coordinator).open(coordinator,configured,config(),provisioner(coordinator),null,"preparation")
                 .withTargetIdentities(identities).prepare(config(),targets);return;}
         new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose).prepare(config(), targets);
+    }
+
+    @Override
+    public boolean supportsParallelKeyMoves() {
+        return Set.of("mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb").contains(connectorId)
+                && purpose == PipelineNode.Purpose.SYNC && writeMode == WriteMode.UPSERT && ddl != DdlPolicy.APPLY
+                && !targets.isEmpty() && targets.values().stream().allMatch(target -> target.unwindIdentity() == null
+                        && target.fields().stream().anyMatch(io.tapstate.spi.sink.TargetField::primaryKey));
+    }
+
+    @Override
+    public Map<String, TargetKeyConstraints> prepareTargetConstraints(HazelcastInstance coordinator) {
+        if (!supportsParallelKeyMoves()) {
+            throw new IllegalStateException("target equality inspection requires a native keyed MongoDB upsert sink");
+        }
+        prepareTargets(coordinator);
+        PdkSinkPort port = configured == null
+                ? new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose)
+                : ScopedSinkStateProvider.of(coordinator)
+                        .open(coordinator, configured, config(), provisioner(coordinator), null, "key-constraints")
+                        .withTargetIdentities(identities);
+        return port.inspectTargetConstraints(config(), targets);
     }
 
     SinkConfig config() {
