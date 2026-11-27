@@ -29,7 +29,7 @@ final class PipelineConvergencePass {
     private final AtomicReference<WorkloadClaimFence> claim;
     private final PipelineStoreViews views;
     private final Runnable requireActive;
-    private final StateStore state;
+    private final io.tapstate.runtime.scheduler.ScopedPipelineStateStore state;
     private final AtomicReference<PipelineCaptureBindings> captures = new AtomicReference<>();
 
     private final io.tapstate.spi.store.RateHistoryStore rateHistory = rateHistory(null);
@@ -131,13 +131,14 @@ final class PipelineConvergencePass {
         this.claim = new AtomicReference<>(original);
         this.views = Objects.requireNonNull(views, "views");
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
-        this.state = new io.tapstate.runtime.scheduler.ScopedPipelineStateStore(intent.scope(),claim::get,views,requireActive);
+        this.state = new io.tapstate.runtime.scheduler.ScopedPipelineStateStore(intent,claim::get,views,requireActive);
     }
 
     PipelineIntentSnapshot intent() { return intent; }
     PipelineIntentScope scope() { return intent.scope(); }
     WorkloadClaimFence claim() { return claim.get(); }
     StateStore state() { return state; }
+    io.tapstate.runtime.scheduler.ScopedPipelineStateStore metricState() { return state; }
     ObservationStore observations() { return observations; }
     ObservationStore observationSample() {
         return views.pipelineObservations(scope(), claim(), requireActive);

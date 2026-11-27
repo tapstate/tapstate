@@ -66,6 +66,12 @@ public interface WorkloadClaimStore {
     Optional<WorkloadClaim> advanceExecution(
             WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds);
 
+    /** Includes the original resume revision in the existing execution allocation. */
+    default Optional<WorkloadClaim> advanceResumeExecution(WorkloadClaim expected, long topologyRevision,
+            Set<String> executionNodeIds, long intentRevision) {
+        throw new UnsupportedOperationException("resume allocation requires a checkpoint binding");
+    }
+
     /** Records the first observed failure of this execution under the exact live claim. Later observations leave it intact. */
     Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss);
 

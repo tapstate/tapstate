@@ -26,6 +26,15 @@
         "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding."
       ]
     },
+    "pipeline-resume-metric-continuation": {
+      "goal": "Continue the known cumulative native metrics of a rebuilding RESUME while retaining the original counter starts and the existing execution authority.",
+      "entry": "Reopen the same CACHE and reconcile the original prepared Pipeline. Read the optional handoff from the scoped checkpoint and accept it only for the original intent revision and the actual Jet execution verified through its original manifest and the current full claim. No continuation after loss of that CACHE is promised.",
+      "prerequisites": [
+        "The PAUSE state transition freezes the last qualified RUNNING observation selected by original scope, checkpoint epoch and full claim. It records the observed old Jet Job identity, only job-origin cumulative counters and histograms with stable point attributes and explicit starts, and no instantaneous readings. A genuine rebuilding RESUME activates the candidate for that old Job and original intent revision. Ordinary START, stamped START, replacement after a clearing stop, deletion, and superseding intent invalidate inapplicable handoffs.",
+        "Only an execution advance granted by the existing allocator can bind the successor fence. Sampling validates the live native Job and its producer start before applying the fixed baseline to each native cumulative reading. Repeated sampling of the same native values gives the same totals. A missing optional field in an earlier checkpoint carries no qualified baseline. Old binaries must be removed from the CACHE writer set before writing the field. Binary downgrade against CACHE containing the field is unsupported.",
+        "A genuinely absent prior observation remains unknown. An encoded handoff over the bound emits the existing DOCUMENT_TOO_LARGE diagnostic and leaves the affected continuation metrics unavailable. It never publishes an invented total, truncates a known total or blocks command acceptance, Jet admission or row delivery. Store unavailability follows the existing fenced transaction retry policy."
+      ]
+    },
     "authentication": {
       "goal": "Re-enter through the original account or Cloud identity without resurrecting old sessions.",
       "entry": "Original OP login or Cloud exchange after native authentication preparation.",
@@ -1380,15 +1389,18 @@
         "Before the first canonical TS per-pair failure is written, retain and verify a compatible recovery build that reads both code forms from original reports. An unmodified legacy reader rejects canonical codes and is not a supported rollback reader after that write. Recovery preserves current CONFIG records and original publication fences; it never deletes reports or recreates runs to regain readability."
       ]
     },
-    "cache-runtime-diagnostic-projection-v3": {
+    "cache-observation-resume-window-v4": {
       "goal": "Preserve the original latest execution outcome and retained redacted diagnostic facts across restart and compatible recovery; do not reconstruct missing historical causes or use diagnostics as checkpoint authority.",
-      "entry": "Read legacy observations without failure.diagnostic unchanged. New scoped CACHE publications may append failure.diagnostic with formatVersion 2 and the canonical diagnostic projection. Republish current facts only through the existing scoped observation path; preserve a retained failed observation until the original lifecycle replaces it.",
+      "entry": "Read legacy observations without failure.diagnostic unchanged. New scoped CACHE publications may append failure.diagnostic with formatVersion 2 and the canonical diagnostic projection. Republish current facts only through the existing scoped observation path; preserve a retained failed observation until the original lifecycle replaces it. On reopening the same CACHE for continued metrics, read the native window proof together with the retained logical result or establish its absence in the original scoped read.",
       "prerequisites": [
         "All existing CACHE business identity, pipeline scope, state/epoch, initial-load and ownership prerequisites of the current observation contract remain mandatory.",
         "Keep failure.code and failure.params, original metrics and initialLoad fields. A source-aware bounded capture/redactor supplies already-redacted facts before DiagnosticProjection schema validation; logical resource references carry identifiers, never live Java objects. Retain safe text resolved against the actual verified connector artifact at capture time; reading old diagnostics never reinterprets a code against a different current artifact. Final encoding enforces the complete diagnostic BSON budget. Truncate with an explicit marker or omit an unavailable attachment without replacing the original observation outcome; invalid or unknown stored diagnostic formats use the existing unreadable-document path.",
         "Before enabling the first extended write, verify a packaged recovery reader against both old and extended observations on the same admitted CACHE. After extended writes, use only a reader that preserves the complete shape; an unmodified earlier reader may reject it and is not an allowed rollback target.",
         "Do not delete reports, restore an earlier snapshot over newer running facts, change CACHE bindings or claims, clear state or trigger automatic retries to regain compatibility. Preserve the existing cadence, latest replacement and cleanup boundaries.",
-        "No new production writes to LEGACY observation resources and no modification of their stored format or recovery entry. Historical records without a captured diagnostic remain readable without invented causes."
+        "No new production writes to LEGACY observation resources and no modification of their stored format or recovery entry. Historical records without a captured diagnostic remain readable without invented causes.",
+        "For a rebuilding RESUME, recover the public observation and its optional private resumeWindow from the original CACHE, under the complete original observation key. Check the matching intent revision, checkpoint baseline and full allocator fence, and the actual successor Job ID and original manifest. The attachment records formatVersion 1, intentRevision and jobId. The in, out and stage slots each record the native producer start in epoch milliseconds and whether the checkpoint baseline applies. Obtain the captured input, delivered output including delivery durations, and stage durations from one JobMetrics sample. Each slot covers its producer across stable point attributes.",
+        "For a proved first publication of a bound successor with no prior cumulative result for that producer, combine its qualified baseline once with the raw sample. Persist the slot with that result. An unchanged native start reuses its recorded carry mode. A changed start publishes the current native values with the new native start and disables carry for that producer for the remainder of this binding, including after controller restart. Unmeasured producers retain their existing slots without fabricating values. A different Job cannot inherit a slot. Gauges remain current. Use the existing qualified PAUSE transition and allocator for any subsequent rebuilding RESUME.",
+        "A legacy row remains readable. When an existing cumulative result lacks verifiable native provenance, start from the verified raw window, without inferring a native start from the previously published logical start. Distinguish a proved first sample from an unavailable read. Preserve the last accepted result on transient failure and retry through ordinary reconciliation. Unknown or malformed stored proof follows DOCUMENT_UNREADABLE. All CACHE observation writers and recovery readers must be upgraded before the first extended write. Retain the previous diagnostic and checkpoint compatibility requirements."
       ]
     },
     "operation-retry-policy-v1": {
@@ -1705,9 +1717,9 @@
       "atomicDomain": "CONFIG",
       "fencing": "Existing ordinary CONFIG transactions remain. The shared operation start atomically verifies the original immutable plan, complete current dependency/scope revisions, reserves one fixed effective mapping and installs only exact affected old-scope gates and STOPPED intents. CACHE executes independently with an adapter-issued narrow handle and separate transaction, with CONFIG checks outside that transaction. Protected reconfirm requires the exact CACHE CANCELLED arbitration receipt; completion requires the original reservation and exact RETIRED/new-namespace/CAPTURE receipt without reinterpreting later authoring. The winning per-Pipeline explicit full completion removes only its original scope gate. No cross-instance atomicity is promised. The CONFIG publication rechecks the recorded start intent and state generation and atomically publishes all candidate source and sink bindings. The candidate and membership writes in CACHE are separately durable before publication. Cleanup can be retried independently after publication."
     },
-    "cache-runtime-diagnostic-projection-v3": {
+    "cache-observation-resume-window-v4": {
       "atomicDomain": "CACHE",
-      "fencing": "Preserve the exact clusterId/bindingVersion/cacheIncarnation/pipelineId/stateGeneration, epoch, claimGeneration/executionGeneration/topologyRevision and node/boot run key. Writes retain the existing active guard and structure checks followed by a single-document atomic monotonic observedAt update; do not claim live ownership is re-proven in the write transaction. Reads retain their existing CACHE observation transaction and state/claim checks. CONFIG is not a CACHE fence. Read-only views cannot mutate."
+      "fencing": "Preserve the exact clusterId/bindingVersion/cacheIncarnation/pipelineId/stateGeneration, epoch, claimGeneration/executionGeneration/topologyRevision and node/boot run key. Writes retain the existing active guard and structure checks followed by a single-document atomic monotonic observedAt update; do not claim live ownership is re-proven in the write transaction. Reads retain their existing CACHE observation transaction and state/claim checks. CONFIG is not a CACHE fence. Read-only views cannot mutate. Single, fallback and batched writes commit the verified window and its logical result together in the same existing per-key update. Accept a derived result only against the window evidence used to compute it. A stale or equal-time replay cannot replace a newer accepted pair. A conflicting predecessor cannot publish or export a mismatched result. Use the existing checked read or in-pass facts and original write, without an extra Mongo command, transaction, lease, allocation or checkpoint write. Preserve independent pipeline progress and per-entry batch failure handling."
     },
     "operation-retry-policy-v1": {
       "atomicDomain": "CONFIG",
@@ -3500,49 +3512,52 @@
     },
     {
       "id": "mongo.cache.pipeline_state",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "pipeline_state"
       ],
-      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope.",
+      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope, with an optional private resume metric handoff. Freeze the candidate with the existing PAUSE checkpoint compare-and-set; bind the original rebuilding intent at the existing RESUME state transition and update the successor in the existing allocator transaction that also updates the checkpoint write fence. Reuse the full old scope, epoch and claim to read the exact observation within the original CACHE client/session. Jet termination, capture admission and Job submission stay outside those transactions. Ordinary HTTP and steady-state sampling use existing commands. A qualifying PAUSE transaction attempt adds at most one find by complete observation key, without any independent write, transaction, lease or allocation.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore"
+        "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore",
+        "io.tapstate.adapters.mongostore.MongoCacheWorkloadClaimStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineStateStore"
       ],
-      "recovery": "runtime-state",
+      "recovery": "pipeline-resume-metric-continuation",
       "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "At most one optional handoff per existing Pipeline checkpoint, holding one applied baseline and one pause candidate, with a strict one MiB combined encoded BSON limit including metadata, metric names, attributes and values. Existing metric cardinality limits still apply. No new collection, index, per-record growth, attempt history or extra cleanup task.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "app/src/test/java/io/tapstate/app/ScopedResumeMetricsTest.java"
       ]
     },
     {
       "id": "mongo.cache.pipeline_observation",
-      "resourceVersion": 3,
-      "proposalVersion": 3,
+      "resourceVersion": 4,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "pipeline_observation"
       ],
-      "responsibility": "Latest scoped Pipeline observation, optional current-run initial-load projection and an optional already-redacted bounded failure diagnostic captured from the actual runtime exception. Existing failure code and named parameters remain authoritative for the original outcome; missing historical cause facts stay unknown.",
+      "responsibility": "Latest scoped Pipeline observation, optional current-run initial-load projection and an optional already-redacted bounded failure diagnostic captured from the actual runtime exception. Existing failure code and named parameters remain authoritative for the original outcome; missing historical cause facts stay unknown. An optional private producer-window proof travels with the latest resumed result. The existing full key identifies its physical scope, epoch and claim; the private fields do not grant execution authority.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
       ],
-      "recovery": "cache-runtime-diagnostic-projection-v3",
-      "consistency": "cache-runtime-diagnostic-projection-v3",
-      "growth": "Keep one latest document per original composite run key, with prior run keys reaped by the existing cadence and bounded cleanup; no new history, collection or cleanup task. Each optional failure.diagnostic adds at most 256 KiB complete encoded BSON including UTF-8, keys, arrays and envelope overhead, 64 exception nodes, depth 32, 32 parameters or positional arguments per node, 4096 characters per text value, 32 stack frames per node and 128 logical references total. Existing metric and initial-load budgets remain unchanged; total incremental cost is bounded per retained observation, not per processed row.",
+      "recovery": "cache-observation-resume-window-v4",
+      "consistency": "cache-observation-resume-window-v4",
+      "growth": "Keep one latest document per original composite run key, with prior run keys reaped by the existing cadence and bounded cleanup; no new history, collection or cleanup task. Each optional failure.diagnostic adds at most 256 KiB complete encoded BSON including UTF-8, keys, arrays and envelope overhead, 64 exception nodes, depth 32, 32 parameters or positional arguments per node, 4096 characters per text value, 32 stack frames per node and 128 logical references total. Existing metric and initial-load budgets remain unchanged; total incremental cost is bounded per retained observation, not per processed row. The complete resumeWindow BSON wrapper is limited to 256 bytes, including keys and envelope overhead. Store only fixed-width version, revision and Job identifiers and at most three fixed producer slots. An encoding that exceeds the bound reports DOCUMENT_TOO_LARGE and withholds the affected continuation result without stopping the Job. No per-series identifiers, raw metric copies, public API fields or additional indexes are introduced.",
       "evidence": [
+        "app/src/test/java/io/tapstate/app/ResumeSubmissionRecoveryIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCachePipelineStoresIT.java",
         "app/src/test/java/io/tapstate/app/ThreeLayerObservationTest.java",
         "app/src/test/java/io/tapstate/app/PipelineDirectPreparationIT.java",

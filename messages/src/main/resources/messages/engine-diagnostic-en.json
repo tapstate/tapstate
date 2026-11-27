@@ -66,5 +66,9 @@
   "TS0440017": {
     "message": "Parallel target {node} cannot establish key ordering for stream {stream}.",
     "solution": "Check the target unique indexes, collations, and complete scalar key values in both row images. Check that the connector can read the target index definitions."
+  },
+  "TS0440018": {
+    "message": "The sink confirmed {accepted} row events for a batch of {expected}. The pipeline stopped before acknowledging the batch.",
+    "solution": "Check the target and the connector receipt before resuming. Some rows may already have been written and may be replayed."
   }
 }

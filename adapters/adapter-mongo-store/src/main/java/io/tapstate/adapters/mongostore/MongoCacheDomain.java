@@ -996,14 +996,19 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     public record ObservationWrite(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active,
-            Observation observation, long checkpointEpoch) {}
+            Observation observation, long checkpointEpoch, io.tapstate.spi.store.ResumeMetrics.Publication publication) {
+        public ObservationWrite(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active,
+                Observation observation, long checkpointEpoch) {
+            this(scope, original, active, observation, checkpointEpoch, null);
+        }
+    }
 
     /** Writes independent latest observations and returns each original entry's failure, or null on success. */
     public List<RuntimeException> writeObservations(List<ObservationWrite> batch) {
         return MongoCachePipelineObservationStore.writeBatch(batch.stream().map(write ->
                 new MongoCachePipelineObservationStore.BatchWrite(
                         new MongoCachePipelineObservationStore(pipelineAccess(write.scope(), write.original(), write.active())),
-                        write.observation(), write.checkpointEpoch())).toList());
+                        write.observation(), write.checkpointEpoch(), write.publication())).toList());
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */
