@@ -328,7 +328,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
 
     /** The mapping, intent and CACHE incarnation belong to the same CONFIG snapshot. */
     private BindingRows bindingRows(ClientSession session, PipelineIntentScope scope, boolean readIntent) {
-        if (bindings.supportsActuationBatch()) {
+        if (MongoReadBudget.supportsSnapshotReads(client)) {
             var stages = MongoStartConfigRead.root();
             stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
             MongoStorageBindingStore.appendAdmittedPreparation(stages);

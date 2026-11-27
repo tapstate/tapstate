@@ -425,8 +425,15 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 (owner, mode, version, stage) -> MongoStorageRecoveryStore.read(session, database, owner, mode, version, stage).preparation());
     }
 
+    private final MongoStructureProof actuationStructures = new MongoStructureProof();
+
     boolean supportsActuationBatch() {
-        return MongoReadBudget.supportsSnapshotReads(client);
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return false;
+        return actuationStructures.permits(MongoStructureProof.Kind.OBSERVATION, () ->
+                MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.PIPELINE_INTENTS, SystemCollections.OPERATOR_GENERATIONS, SystemCollections.PIPELINES,
+                        SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP, SystemCollections.STORAGE_BINDING,
+                        SystemCollections.STORAGE_RECOVERY, SystemCollections.CONFIGURATION_VERSION)));
     }
 
     AdmittedFacts admittedObservationFacts(Document cluster, Document state, Document stored, Document version, Document recovery) {
