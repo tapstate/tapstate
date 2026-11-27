@@ -290,7 +290,11 @@ final class StorageRoot implements AutoCloseable {
     }
     private void completeInstallationOwned(StorageBindingCommit expected) {
         if (!installationCompletionPending() || !runtime.businessStarted()) return;
-        var original = requirePublishedBusinessOwner(expected); var scope = original.binding().setup();
+        publishInstallationReadiness(requirePublishedBusinessOwner(expected));
+    }
+
+    private void publishInstallationReadiness(StorageRuntime.Bound original) {
+        var scope = original.binding().setup();
         phase = Phase.BUSINESS_READY;
         var completion = installationCompletion.get();
         if (!installationReadinessPublished) {
@@ -311,19 +315,30 @@ final class StorageRoot implements AutoCloseable {
 
     private void completeRetainedInstallation() {
         try {
-            var original = runtime;
-            if (installationCompletionPending() && !original.businessStarted()) {
-                if (original.cleanupRequired()) return;
-                var business = original.businessForLiveness();
-                if (business.isPresent()) {
-                    var bound = original.boundForObservation().orElseThrow(StorageRuntime::unavailable);
-                    observeRetainedInstallation(new RetainedInstallationOwner(original, bound, business.orElseThrow()));
-                }
-                return;
-            }
-            completeInstallationIfReady(null);
+            lifecycle(() -> { completeRetainedInstallationOwned(); return null; });
         } catch (TapstateException unavailable) {
             LOG.warn("Retained installation completion failed [{}]", unavailable.code().code());
+        }
+    }
+
+    private void completeRetainedInstallationOwned() {
+        if (!installationCompletionPending()) return;
+        var original = runtime;
+        if (original.businessStarted()) {
+            var bound = requirePublishedBusinessOwner(null);
+            try {
+                publishInstallationReadiness(bound);
+                return;
+            } catch (TapstateException unavailable) {
+                // The callbacks can observe lost admission after the owner and readiness checks.
+                if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
+            }
+        }
+        if (original.cleanupRequired()) return;
+        var business = original.businessForLiveness();
+        if (business.isPresent()) {
+            var bound = original.boundForObservation().orElseThrow(StorageRuntime::unavailable);
+            observeRetainedInstallation(new RetainedInstallationOwner(original, bound, business.orElseThrow()));
         }
     }
 
@@ -347,7 +362,7 @@ final class StorageRoot implements AutoCloseable {
                 if (runtime == original.runtime()
                         && runtime.boundForObservation().orElse(null) == original.bound()
                         && runtime.businessForLiveness().orElse(null) == original.business())
-                    completeRetainedInstallation();
+                    completeRetainedInstallationOwned();
                 return null;
             });
         } catch (TapstateException unavailable) {

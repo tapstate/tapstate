@@ -532,6 +532,30 @@ class OnPremInstallationCompletionTest {
         }
     }
 
+    @Test void retainedInstallationRetriesWhenAdmissionDropsDuringCompletion() {
+        try (var f = new Fixture(directory.resolve("retained-owner-admission-drop"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var observeAdmission = new AtomicBoolean();
+            var admissionChecks = new AtomicInteger();
+            var stable = new AtomicBoolean();
+            when(f.business.available()).thenAnswer(ignored ->
+                    observeAdmission.get() && (stable.get() || admissionChecks.incrementAndGet() == 1));
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            observeAdmission.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(admissionChecks.get()).isGreaterThanOrEqualTo(2));
+            assertThat(f.completions).hasValue(0);
+
+            stable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
         try (var f = new Fixture(directory.resolve("retained-catalog"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
