@@ -28,8 +28,12 @@ import io.tapstate.spi.store.FirstPipelineCreationResult;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.PipelineIntentStore;
 import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelinePreparationInputs;
+import io.tapstate.spi.store.PipelineRetirementRequest;
+import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -525,6 +529,81 @@ class PipelineFirstStatePreparerIT {
                     .contains(io.tapstate.spi.store.PipelineIntentStore.FirstClearResult.UNPROVEN);
             assertThat(preparation.read(id)).contains(retained);
             assertThat(intents.load(id)).contains(historical);
+        });
+    }
+
+    @Test void contradictoryCacheStateLeavesTheFirstClearUnproven() {
+        withFixture(f -> {
+            var id = f.scope.pipelineId();
+            var intents = f.configuration.intents();
+            var initial = intents.load(id).orElseThrow();
+            var stop = new DesiredState(id, PipelineState.STOPPED, initial.desired().revision(), true);
+            assertThat(intents.compareAndSet(f.scope, initial.intentRevision(), stop)).isTrue();
+            var clearing = intents.load(id).orElseThrow();
+            var states = SystemCollections.CACHE_PIPELINE_STATE.on(f.cacheDatabase);
+            var contradictory = new Document("_id", id);
+            states.insertOne(contradictory);
+            var ports = new ConvergenceDriver.ScopedPorts(intents, f.cache, ACTIVE,
+                    pass -> { throw new AssertionError("Unexpected runtime actuation"); }, pass -> null, ignored -> {});
+            var membership = mock(ClusterMembershipGate.class);
+            when(membership.businessEligible()).thenReturn(true);
+            var ownership = PipelineActuationOwnership.nodeBacked(f.business(), f.node, membership,
+                    new ClusterWorkloadClaims(f.cache.workloadClaims(f.business()), membership),
+                    TTL, Duration.ofSeconds(10), System::nanoTime);
+            try (var driver = ConvergenceDriver.scoped(null, mock(ObservationPublisher.class), null, null,
+                    () -> true, ownership, ports)) {
+                driver.reconcile();
+                driver.reconcile();
+            }
+
+            assertThat(intents.firstClearResult(clearing, Duration.ofSeconds(5)))
+                    .contains(PipelineIntentStore.FirstClearResult.UNPROVEN);
+            assertThat(intents.load(id)).contains(clearing);
+            assertThat(states.find(contradictory).first()).isEqualTo(contradictory);
+            assertThat(f.configuration.preparations().read(id).orElseThrow().phase())
+                    .isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+            assertCode(() -> intents.compareAndSet(f.scope, clearing.intentRevision(), initial.desired()),
+                    IoError.PIPELINE_CLEAR_UNPROVEN);
+            var bound = mock(StorageRuntime.Bound.class);
+            when(bound.cache()).thenReturn(f.cache);
+            when(bound.preparation()).thenReturn(f.configuration.bindings().cachePreparation().orElseThrow());
+            var port = new ThreeLayerStorePort(f.configuration, bound, (scope, revision, inputs) -> {
+                throw new AssertionError("Unexpected synchronous preparation");
+            });
+            var artifacts = new ArtifactQueryService(port.artifacts());
+            var observations = new PipelineObservationQueryService(artifacts, port.observations());
+            var catalog = new PipelineCatalogService(artifacts, new PipelineDraftService(mock(PipelineDraftStore.class)),
+                    observations, port);
+            var status = catalog.find(id).orElseThrow().status();
+            assertThat(status.displayState()).isEqualTo(PipelineCatalogItem.UiState.FAILED);
+            assertThat(status.failure().code()).isEqualTo(IoError.PIPELINE_CLEAR_UNPROVEN.code());
+        });
+    }
+
+    @Test void aFirstClearReceiptOnlyAdmitsDeletionForItsOriginalStop() {
+        withFixture(f -> {
+            var id = f.scope.pipelineId();
+            var intents = f.configuration.intents();
+            var initial = intents.load(id).orElseThrow();
+            var stop = new DesiredState(id, PipelineState.STOPPED, initial.desired().revision(), true);
+            assertThat(intents.compareAndSet(f.scope, initial.intentRevision(), stop)).isTrue();
+            var clearing = intents.load(id).orElseThrow();
+            var request = new PipelineRetirementRequest("delete-after-clear", f.scope, stop.revision(), Optional.empty());
+            f.cache.requireUnpreparedPipelineAbsent(f.scope, ACTIVE);
+            intents.completeFirstClear(clearing, true);
+            var settled = intents.load(id).orElseThrow();
+            assertThat(intents.firstClearResult(clearing, Duration.ofSeconds(5)))
+                    .contains(PipelineIntentStore.FirstClearResult.CLEARED);
+
+            var anotherStop = new PipelineIntentSnapshot(f.scope, initial.intentRevision(), stop);
+            assertCode(() -> f.configuration.retirements().beginAfterFirstClear(request, settled, anotherStop),
+                    IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.configuration.pipelineStates().read(id).orElseThrow().phase())
+                    .isEqualTo(PipelineStateMapping.Phase.ACTIVE);
+            assertThat(f.configuration.retirements().beginAfterFirstClear(request, settled, clearing).request())
+                    .isEqualTo(request);
+            assertThat(f.configuration.pipelineStates().read(id).orElseThrow().phase())
+                    .isEqualTo(PipelineStateMapping.Phase.RETIRING);
         });
     }
 
