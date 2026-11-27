@@ -424,7 +424,9 @@ class ASinkBatchesByCountOrByTimeTest {
         }
 
         void completeAll() {
-            pending.forEach(future -> future.complete(new WriteResult(1)));
+            for (int i = 0; i < pending.size(); i++) {
+                pending.get(i).complete(new WriteResult(batches.get(i).size()));
+            }
         }
 
         @Override

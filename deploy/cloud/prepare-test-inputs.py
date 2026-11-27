@@ -26,7 +26,8 @@ def download(url: str, destination: Path, maximum: int) -> None:
         result = subprocess.run([
             "curl", "--fail", "--silent", "--show-error", "--location",
             "--proto", "=https", "--proto-redir", "=https", "--max-time", "60",
-            "--retry", "2", "--retry-max-time", "120", "--max-filesize", str(maximum),
+            # Retry interrupted TLS handshakes within the existing budget for these file downloads.
+            "--retry", "2", "--retry-all-errors", "--retry-max-time", "120", "--max-filesize", str(maximum),
             "--output", str(destination), url,
         ], capture_output=True, timeout=125, check=False)
     except (OSError, subprocess.TimeoutExpired):
