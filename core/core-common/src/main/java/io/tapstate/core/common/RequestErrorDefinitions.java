@@ -80,6 +80,9 @@ public final class RequestErrorDefinitions {
     public static final ProductErrorDefinition RETRY_SETTINGS_REVISION_CONFLICT =
             DEFINITIONS.define(34, Severity.ERROR, Set.of());
 
+    public static final ProductErrorDefinition CLOUD_SIGN_IN_LINK_INVALID =
+            DEFINITIONS.define(35, Severity.ERROR, Set.of());
+
     private RequestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

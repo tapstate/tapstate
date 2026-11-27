@@ -162,7 +162,14 @@ class RequestDiagnosticDefinitionGatesTest {
                     ? Severity.WARNING : Severity.ERROR);
             Map<String, Object> args = new java.util.HashMap<>();
             owner.placeholders().forEach(name -> args.put(name, "value-" + name));
-            assertThat(catalog.render(owner.code(), args)).isEqualTo(catalog.render(historical, args));
+            var current = catalog.render(owner.code(), args);
+            if (owner == ControlError.CLOUD_AUTH_UNAVAILABLE) {
+                assertThat(current.message()).isEqualTo("Managed Cloud authentication is unavailable.");
+                assertThat(current.solution()).isEqualTo("Try entering the cluster again from the Cloud Console later. "
+                        + "If the problem persists, contact your administrator.");
+            } else {
+                assertThat(current).isEqualTo(catalog.render(historical, args));
+            }
             var messages = new java.util.HashSet<String>();
             for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
                 var resolved = RequestDiagnosticCatalog.bundled().resolve(owner.code(), args, List.of(), locale).orElseThrow();
