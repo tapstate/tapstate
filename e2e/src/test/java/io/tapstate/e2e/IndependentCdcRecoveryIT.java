@@ -113,6 +113,80 @@ class IndependentCdcRecoveryIT {
     }
 
     @Test
+    void anUnconfirmedAppendFailsAndReplaysFromTheLastConfirmedPosition(@TempDir Path temporary) throws Exception {
+        try (var fixture = fixture(temporary, "unconfirmed_append")) {
+            var witness = new WriteWitness(temporary.resolve("writes"));
+            var marker = fixture.signals().resolve("omit-result");
+            var jvm = List.of("-Xmx768m", "-XX:ActiveProcessorCount=2");
+            try (var first = launch(fixture, jvm)) {
+                ControlPlane control = loggedIn(first, fixture);
+                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, fixture.connector());
+                control.apply(Map.of(
+                        "source.tap.yml", source(ROOT_SOURCE, fixture.source()),
+                        "target.tap.yml", Workspaces.targetYaml("support_target", fixture.rootTarget(), Map.of(
+                                "hold_writes", fixture.signals().toString(), "write_witness", witness.directory().toString())),
+                        "pipeline.tap.yml", """
+                                version: tapstate/v1
+                                kind: pipeline
+                                id: support_pipeline
+                                source: [{ id: support_source, srs: false }]
+                                settings: { read_mode: cdc_only }
+                                serve:
+                                  from: support_case
+                                  sync: [{ source: support_target, write_mode: append }]
+                                """));
+                control.discoverSchema(ROOT_SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", fixture.source().toString()));
+                control.lifecycle(ROOT_PIPELINE, LifecycleVerb.START);
+                awaitState(control, ROOT_PIPELINE, PipelineState.RUNNING);
+                Await.until("the direct capture to start", TIMEOUT,
+                        () -> activeStreams(CdcRecoveryFixture.streams(fixture.source())) == 1, () -> streamText(fixture));
+                CdcRecoveryFixture.change(fixture.source(), 1, ROOT, "1", "", "confirmed");
+                awaitReceiptPosition(fixture, 1);
+                Files.createFile(marker);
+                CdcRecoveryFixture.change(fixture.source(), 2, ROOT, "2", "", "unconfirmed");
+                awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "2", "unconfirmed");
+                Await.until("the write to fail or the checkpoint to acknowledge it", TIMEOUT,
+                        () -> control.state(ROOT_PIPELINE).filter(PipelineState.FAILED::equals).isPresent()
+                                || receiptPosition(fixture) >= 2, () -> control.logs(ROOT_PIPELINE));
+                assertThat(control.state(ROOT_PIPELINE)).as("a missing sink receipt must fail the run")
+                        .contains(PipelineState.FAILED);
+                var failure = Await.answered("the published sink receipt diagnostic", TIMEOUT,
+                        () -> control.failure(ROOT_PIPELINE));
+                assertThat(failure.code()).isEqualTo("TS0440018");
+                assertThat(String.valueOf(failure.params().get("expected"))).isEqualTo("1");
+                assertThat(String.valueOf(failure.params().get("accepted"))).isEqualTo("0");
+                assertThat(receiptPosition(fixture)).isEqualTo(1);
+                assertThat(witness.rowsOf(ROOT)).filteredOn(row -> row.id().equals("2")).hasSize(1);
+                control.stop(ROOT_PIPELINE, false);
+                awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
+            }
+
+            Files.delete(marker);
+            Files.deleteIfExists(fixture.source().resolve("end-stream"));
+            try (var replacement = launch(fixture, jvm)) {
+                ControlPlane control = loggedIn(replacement, fixture);
+                // The replacement has an empty local plugin directory. Install the identical fixture artifact.
+                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, fixture.connector());
+                assertThat(receiptPosition(fixture)).isEqualTo(1);
+                control.lifecycle(ROOT_PIPELINE, LifecycleVerb.START);
+                awaitReceiptPosition(fixture, 2);
+                assertThat(witness.rowsOf(ROOT)).filteredOn(row -> row.id().equals("2")).hasSize(2);
+                assertThat(witness.rowsOf(ROOT)).filteredOn(row -> row.id().equals("1")).hasSize(1);
+            }
+        }
+    }
+
+    private static long receiptPosition(Fixture fixture) {
+        return sourceSequence(fixture.srs().directChannel(ROOT_PIPELINE, ROOT_SOURCE));
+    }
+
+    private static void awaitReceiptPosition(Fixture fixture, long expected) {
+        Await.until("the stored direct checkpoint to reach " + expected, TIMEOUT,
+                () -> receiptPosition(fixture) == expected,
+                () -> String.valueOf(fixture.srs().directChannel(ROOT_PIPELINE, ROOT_SOURCE)));
+    }
+
+    @Test
     void stopObservationConvergesWhileAnIndependentTargetHoldsHigh(@TempDir Path temporary) throws Exception {
         independentDirectChannels("snapshot_and_cdc", temporary, true);
     }
