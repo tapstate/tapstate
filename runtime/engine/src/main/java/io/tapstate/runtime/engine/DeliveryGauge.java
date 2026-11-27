@@ -103,6 +103,10 @@ interface DeliveryGauge {
     default void waiting(Map<String, Long> queuedByStream, Map<String, Long> inFlightByTable) {
     }
 
+    /** The oldest timestamp of a CDC row observed waiting at this sink, or zero if none was observed. */
+    default void oldestPendingCdc(long eventMillis) {
+    }
+
     /**
      * A gauge nothing reads, for a sink driven outside a running job. Never a way to opt a real sink out:
      * a delivery no one counts is the state this seam exists to end.

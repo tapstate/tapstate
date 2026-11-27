@@ -13,6 +13,8 @@ import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
+import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.HistogramValue;
@@ -769,6 +771,35 @@ public final class Engine {
         return job == null ? null : cdcDeliveryIn(job.getMetrics());
     }
 
+    /** Projects one scrape of the job's confirmed deliveries and pending writes. */
+    public DeliveryReading deliveryReading(String pipelineId, Instant now) {
+        Job job = liveJob(pipelineId);
+        if (job == null) return DeliveryReading.NONE;
+        JobMetrics metrics = job.getMetrics();
+        var since = countingSinceIn(metrics);
+        if (since.isEmpty()) return DeliveryReading.NONE;
+        return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics),
+                highestIn(metrics, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(since.getAsLong()),
+                settledDurationsIn(metrics), cdcDeliveryIn(metrics), pendingCdcWriteIn(metrics, now));
+    }
+
+    /** An empty sink supplies no evidence about source capture progress. */
+    static PendingCdcWrite pendingCdcWriteIn(JobMetrics metrics, Instant now) {
+        PendingCdcWrite oldest = null;
+        for (Measurement measurement : metrics.get(JetDeliveryGauge.OLDEST_PENDING_CDC)) {
+            long eventMillis = measurement.value();
+            long sampleMillis = measurement.timestamp();
+            Instant at = Instant.ofEpochMilli(sampleMillis);
+            if (eventMillis <= 0 || eventMillis > sampleMillis || !PendingCdcWrite.isCurrent(at, now)) continue;
+            long age = sampleMillis - eventMillis;
+            if (oldest == null || age > oldest.ageMillis()
+                    || (age == oldest.ageMillis() && at.isAfter(oldest.observedAt()))) {
+                oldest = new PendingCdcWrite(age, at);
+            }
+        }
+        return oldest;
+    }
+
     static CdcDeliveryTotals cdcDeliveryIn(JobMetrics metrics) {
         var counts = metrics.get(JetDeliveryGauge.CDC_COUNT);
         var totals = metrics.get(JetDeliveryGauge.CDC_TOTAL_MILLIS);
@@ -951,7 +982,10 @@ public final class Engine {
         if (job == null) {
             return OptionalLong.empty();
         }
-        JobMetrics collected = job.getMetrics();
+        return countingSinceIn(job.getMetrics());
+    }
+
+    private static OptionalLong countingSinceIn(JobMetrics collected) {
         OptionalLong latest = OptionalLong.empty();
         for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
             latest = latest.isPresent()
