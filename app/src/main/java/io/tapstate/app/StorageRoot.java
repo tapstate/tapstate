@@ -329,9 +329,9 @@ final class StorageRoot implements AutoCloseable {
                 publishInstallationReadiness(requirePublishedBusinessOwner(null));
                 return;
             } catch (TapstateException unavailable) {
-                // Recheck the original owner after temporary store or installation-lock unavailability.
-                var code = unavailable.code();
-                if (code != ControlError.STORAGE_UNAVAILABLE && code != IoError.STORE_UNAVAILABLE
+                // Retry only the original owner's temporary admission, store or mutation-lock failures.
+                if (unavailable.code() != IoError.STORE_UNAVAILABLE
+                        && !(unavailable instanceof OnPremInstallation.BusinessAdmissionUnavailable)
                         && !(unavailable instanceof InstallationFiles.MutationLockTimeout)) throw unavailable;
             }
         }

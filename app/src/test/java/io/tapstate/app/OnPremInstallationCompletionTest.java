@@ -634,6 +634,45 @@ class OnPremInstallationCompletionTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"binding", "setup-phase"})
+    void retainedInstallationStopsObservationWhenItsStoredOwnerIsRefused(String reason) {
+        try (var f = new Fixture(directory.resolve("retained-owner-refused-" + reason))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var reject = new AtomicBoolean();
+            var refusedChecks = new AtomicInteger();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            if (reason.equals("binding")) {
+                when(f.bindings.load()).thenAnswer(ignored -> {
+                    if (!reject.get()) return Optional.of(f.binding);
+                    refusedChecks.incrementAndGet();
+                    return Optional.empty();
+                });
+            } else {
+                when(f.states.load()).thenAnswer(ignored -> {
+                    var setupPhase = f.phase.get();
+                    if (reject.get()) {
+                        refusedChecks.incrementAndGet();
+                        setupPhase = StorageSetupStateStore.Phase.STORAGE_BOUND;
+                    }
+                    return new StorageSetupStateStore.Status(f.currentScope.get(), setupPhase, 1);
+                });
+            }
+
+            f.root.loadExisting(ignored -> f.business);
+            reject.set(true);
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(refusedChecks).hasValue(1));
+            org.awaitility.Awaitility.await().during(java.time.Duration.ofSeconds(1))
+                    .atMost(java.time.Duration.ofSeconds(2))
+                    .untilAsserted(() -> assertThat(refusedChecks).hasValue(1));
+            assertThat(f.completions).hasValue(0);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
         try (var f = new Fixture(directory.resolve("retained-catalog"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
