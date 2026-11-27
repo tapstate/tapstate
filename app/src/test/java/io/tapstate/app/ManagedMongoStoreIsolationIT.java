@@ -3149,7 +3149,7 @@ class ManagedMongoStoreIsolationIT {
     }
     private static void assertComposedConfiguration(MongoDatabase configuration, MongoDatabase cache, String operation) {
         var schema = configuration.getCollection("schema_migrations").find(new Document("_id", "config")).first();
-        assertThat(schema.getInteger("installedVersion")).isEqualTo(3);
+        assertThat(schema).containsEntry("installedVersion", 4).containsEntry("componentVersion", 3);
         var marker = schema.get("validation", Document.class);
         assertThat(marker).containsEntry("phase", "READY").containsEntry("initializedPipelines", 0L);
         assertThat(UUID.fromString(marker.getString("operationId")).toString()).isEqualTo(marker.getString("operationId"));

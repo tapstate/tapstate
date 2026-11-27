@@ -17,6 +17,7 @@ import io.tapstate.spi.store.ConnectorBindingStore;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelineIntentStore;
+import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelinePreparationInputs;
 import io.tapstate.spi.store.PipelineStateMapping;
 import org.bson.Document;
@@ -41,6 +42,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     private static final String PREPARATION = "startPreparation";
     private static final String FAILURE = "startFailure";
     private static final String FAILURE_PARAMS = "startFailureParams";
+    private static final String FIRST_CLEAR = "firstClearingStopResult";
     private static final String DOCUMENT_ID_PARAM = "id";
     private static final String DOCUMENT_FIELD_PARAM = "field";
     private static final Pattern DOCUMENT_FIELD = Pattern.compile("[\\p{L}\\p{Nd}._\\[\\]-]++");
@@ -611,6 +613,123 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         });
     }
 
+    @Override public Optional<PendingFirstClear> pendingFirstClear(String pipelineId) {
+        requireId(pipelineId);
+        return readSnapshot(session -> {
+            var row = intents.find(session, new Document("_id", pipelineId)).first();
+            if (row == null) return Optional.empty();
+            var intent = decode(row);
+            if (!clearingStop(intent) || intent.scope().stateGeneration() != 1) return Optional.empty();
+            var mapping = readScopedMapping(session, intent.scope(), false);
+            if (!firstClearingCandidate(intent.scope(), mapping)
+                    || firstClear(mapping, intent).isPresent()
+                    || !MongoFirstClearingStopSchema.enabled(session, database, clusterId)) return Optional.empty();
+            return Optional.of(new PendingFirstClear(intent,
+                    preparationPhase(intent.scope(), mapping) == PipelinePreparation.Phase.ISSUED));
+        });
+    }
+
+    @Override public void completeFirstClear(PipelineIntentSnapshot original, boolean cacheAbsent) {
+        Objects.requireNonNull(original);
+        if (!clearingStop(original)) throw fenced();
+        var scope = original.scope();
+        transaction(session -> {
+            var current = intents.find(session, new Document("_id", scope.pipelineId())).first();
+            if (current == null) return null;
+            var live = decode(current);
+            if (!original.equals(live)) return null;
+            var mapping = readScopedMapping(session, scope, false);
+            if (!firstClearingCandidate(scope, mapping) || firstClear(mapping, live).isPresent()
+                    || !MongoFirstClearingStopSchema.enabled(session, database, clusterId)) return null;
+
+            boolean cleared = cacheAbsent && preparationPhase(scope, mapping) == PipelinePreparation.Phase.UNASSIGNED;
+            long revision = cleared ? Math.addExact(live.intentRevision(), 1) : live.intentRevision();
+            long fence = mapping.getLong("noteWriteFence");
+            if (fence >= Long.MAX_VALUE - 1 || revision == Long.MAX_VALUE) throw fenced();
+            var receipt = new Document("formatVersion", 1).append("scope", MongoPipelinePreparationFacts.scope(scope))
+                    .append("stopRevision", live.intentRevision()).append("intentRevision", revision)
+                    .append("result", (cleared ? FirstClearResult.CLEARED : FirstClearResult.UNPROVEN).name());
+            ConfigurationVersion.advance(session, versions, client);
+            if (mappings.updateOne(session, mapping, new Document("$set", new Document(FIRST_CLEAR, receipt))
+                    .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw fenced();
+            if (cleared && intents.replaceOne(session, current, new Document(current)
+                    .append("purgeState", false).append("intentRevision", revision)).getMatchedCount() != 1) throw fenced();
+            return null;
+        });
+    }
+
+    @Override public Optional<FirstClearResult> firstClearResult(PipelineIntentSnapshot original, java.time.Duration timeout) {
+        if (!clearingStop(original) || original.scope().stateGeneration() != 1) return Optional.empty();
+        var budget = new MongoReadBudget(timeout);
+        return budget.transaction(client, session -> {
+            requireActive.run();
+            // The transaction carries the deadline uniformly for both intent and binding reads.
+            var result = firstClearResult(session, original);
+            requireActive.run();
+            return result;
+        });
+    }
+
+    private Optional<FirstClearResult> firstClearResult(ClientSession session, PipelineIntentSnapshot original) {
+        var scope = original.scope();
+        var filter = new Document("_id", scope.pipelineId());
+        var current = intents.find(session, filter).first();
+        if (current == null) return Optional.empty();
+        var live = decodeCurrent(session, current);
+        if (!scope.equals(live.scope())) return Optional.empty();
+        var mapping = mappings.find(session, filter).first();
+        if (!firstClearingCandidate(scope, mapping) || !mapping.containsKey(FIRST_CLEAR)
+                || !MongoFirstClearingStopSchema.enabled(session, database, clusterId)) return Optional.empty();
+        return firstClear(mapping, live, original.intentRevision());
+    }
+
+    static Optional<FirstClearResult> firstClear(Document mapping, PipelineIntentSnapshot live) {
+        long stopRevision = live.deleted() || live.desired().purgeState() ? live.intentRevision() : live.intentRevision() - 1;
+        return firstClear(mapping, live, stopRevision);
+    }
+
+    static Optional<FirstClearResult> firstClear(Document mapping, PipelineIntentSnapshot live, long stopRevision) {
+        if (mapping == null || !mapping.containsKey(FIRST_CLEAR) || live.deleted()
+                || live.desired().targetState() != PipelineState.STOPPED) return Optional.empty();
+        if (!(mapping.get(FIRST_CLEAR) instanceof Document recorded)
+                || !recorded.keySet().equals(Set.of("formatVersion", "scope", "stopRevision", "intentRevision", "result"))
+                || !Integer.valueOf(1).equals(recorded.get("formatVersion"))) throw unreadable();
+        if (!Long.valueOf(live.intentRevision()).equals(recorded.get("intentRevision"))
+                || !Long.valueOf(stopRevision).equals(recorded.get("stopRevision"))
+                || !MongoPipelinePreparationFacts.scope(live.scope()).equals(recorded.get("scope"))) return Optional.empty();
+        if (!live.desired().purgeState() && live.intentRevision() == stopRevision + 1
+                && "CLEARED".equals(recorded.get("result"))) return Optional.of(FirstClearResult.CLEARED);
+        if (clearingStop(live) && live.intentRevision() == stopRevision
+                && "UNPROVEN".equals(recorded.get("result"))) return Optional.of(FirstClearResult.UNPROVEN);
+        throw unreadable();
+    }
+
+    static TapstateException clearUnproven(String pipelineId) {
+        return new TapstateException(IoError.PIPELINE_CLEAR_UNPROVEN, Map.of("pipeline", pipelineId), null);
+    }
+
+    static boolean clearingStop(PipelineIntentSnapshot intent) {
+        return intent != null && !intent.deleted() && intent.desired().targetState() == PipelineState.STOPPED
+                && intent.desired().purgeState();
+    }
+
+    private PipelinePreparation.Phase preparationPhase(PipelineIntentScope scope, Document mapping) {
+        return MongoPipelinePreparationFacts.decode(scope.pipelineId(), mapping, clusterId).phase();
+    }
+
+    private boolean firstClearingCandidate(PipelineIntentScope scope, Document mapping) {
+        if (mapping == null || scope.stateGeneration() != 1) return false;
+        var identity = MongoPipelineStateMappings.decode(scope.pipelineId(), mapping);
+        if (identity.phase() != PipelineStateMapping.Phase.ACTIVE || identity.stateGeneration() != 1
+                || identity.operationId() != null || mapping.containsKey("stateRebuild") || mapping.containsKey("retirement")
+                || mapping.containsKey("cacheRecovery") || mapping.containsKey("sharedRecovery")
+                || preparationPhase(scope, mapping) == PipelinePreparation.Phase.COMPLETE) return false;
+        return MongoPipelineStateMappings.connectorBindings(mapping).map(binding -> scope.equals(binding.scope())
+                && binding.effective().isEmpty() && (binding.handoff() == null
+                        || binding.handoff().phase() == ConnectorRunBindings.Phase.REQUESTED
+                        && binding.handoff().previous().isEmpty() && binding.handoff().candidates().isEmpty())).orElse(true);
+    }
+
     static void requirePending(ClientSession session, MongoDatabase database, PendingStart pending) {
         var row = SystemCollections.PIPELINE_INTENTS.on(database).find(session, pendingFilter(pending)).first();
         if (row == null) throw fenced();
@@ -733,6 +852,15 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
                     throw new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",scope.pipelineId()),null);
             }
             if (held != null && !held.scope().equals(scope)) throw fenced();
+            if (desired != null && (clearingStop(held) && desired.targetState() == PipelineState.RUNNING
+                    || desired.targetState() == PipelineState.STOPPED && desired.purgeState())
+                    && firstClearingCandidate(scope, generation)
+                    && MongoFirstClearingStopSchema.enabled(session, database, clusterId)) {
+                if (preparationPhase(scope, generation) == PipelinePreparation.Phase.ISSUED
+                        || clearingStop(held) && firstClear(generation, held).orElse(null) == FirstClearResult.UNPROVEN)
+                    throw clearUnproven(scope.pipelineId());
+                if (desired.targetState() == PipelineState.RUNNING) throw fenced();
+            }
             if (pending == null) {
                 Document artifact = pipelines.find(session, new Document("_id", scope.pipelineId())).first();
                 if (artifact == null) throw fenced();

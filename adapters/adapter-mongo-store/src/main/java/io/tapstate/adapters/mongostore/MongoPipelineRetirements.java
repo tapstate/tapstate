@@ -33,6 +33,18 @@ final class MongoPipelineRetirements implements PipelineRetirements {
         return begin(original, null);
     }
     @Override public PipelineRetirementPreparation begin(PipelineRetirementRequest original, PipelineIntentSnapshot expectedIntent) {
+        return begin(original, expectedIntent, null);
+    }
+
+    @Override public PipelineRetirementPreparation beginAfterFirstClear(PipelineRetirementRequest original,
+            PipelineIntentSnapshot expectedIntent, PipelineIntentSnapshot clearingStop) {
+        Objects.requireNonNull(expectedIntent);
+        if (!MongoPipelineIntentStore.clearingStop(clearingStop) || !original.scope().equals(clearingStop.scope())) throw fenced();
+        return begin(original, expectedIntent, clearingStop);
+    }
+
+    private PipelineRetirementPreparation begin(PipelineRetirementRequest original, PipelineIntentSnapshot expectedIntent,
+            PipelineIntentSnapshot clearingStop) {
         Objects.requireNonNull(original);
         if (expectedIntent != null && (!original.scope().equals(expectedIntent.scope()) || expectedIntent.deleted()
                 || expectedIntent.desired().purgeState()
@@ -48,6 +60,10 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             if (expectedIntent != null && new MongoPipelineIntentStore(client,database,cluster,bindings)
                     .loadInTransaction(session,original.scope().pipelineId()).filter(expectedIntent::equals).isEmpty()) throw fenced();
             requireDefinition(session,original);var preparation=MongoPipelinePreparationFacts.decode(state.pipelineId(),row,cluster);
+            if (clearingStop != null && (preparation.phase() != PipelinePreparation.Phase.UNASSIGNED
+                    || !MongoFirstClearingStopSchema.enabled(session, database, cluster)
+                    || MongoPipelineIntentStore.firstClear(row, expectedIntent, clearingStop.intentRevision()).orElse(null)
+                            != io.tapstate.spi.store.PipelineIntentStore.FirstClearResult.CLEARED)) throw fenced();
             Optional<PipelineRetiredState> predecessor=Optional.empty();
             if(preparation.phase()==PipelinePreparation.Phase.COMPLETE) {
                 if(!original.scope().equals(preparation.scope()) || original.cache().isEmpty())throw fenced();

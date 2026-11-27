@@ -448,7 +448,13 @@ class PipelineFirstStatePreparerIT {
                         .isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
                 assertThat(f.state()).isNull();
 
+                var prior = intents.load(id).orElseThrow();
                 assertThat(lifecycle.stop("operator", id, true).targetState()).isEqualTo(PipelineState.STOPPED);
+                var clearing = intents.load(id).orElseThrow();
+                assertCode(() -> f.configuration.preparations().issueFirstCreate(f.scope, f.node, captured.inputs(),
+                        prior.intentRevision()), IoError.PIPELINE_INTENT_FENCED);
+                assertCode(() -> f.configuration.preparations().issueFirstCreate(f.scope, f.node, captured.inputs(),
+                        clearing.intentRevision()), IoError.PIPELINE_INTENT_FENCED);
                 driver.reconcile();
                 driver.reconcile();
 
@@ -465,7 +471,60 @@ class PipelineFirstStatePreparerIT {
                         .matches(status -> status.displayState() != PipelineCatalogItem.UiState.STOPPING
                                         && status.stopState() != PipelineCatalogItem.StopState.CLEARING,
                                 "the clearing Stop has settled");
+                assertThat(detail.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.STOPPED);
+                assertThat(detail.status().stopState()).isEqualTo(PipelineCatalogItem.StopState.CLEARED);
+                assertThat(detail.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+                assertThat(detail.status().failure()).isNull();
+                assertThat(intent.intentRevision()).isEqualTo(clearing.intentRevision() + 1);
+                assertThat(intent.desired().purgeState()).isFalse();
+                assertThat(mapping.stateGeneration()).isEqualTo(clearing.scope().stateGeneration());
+                assertThat(preparation.phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                assertThat(f.state()).isNull();
+                assertThat(f.claim()).isNull();
+                try (var reopened = MongoConfigurationDomain.open(f.settings, f.scope.clusterId())) {
+                    assertThat(reopened.intents().firstClearResult(clearing, Duration.ofSeconds(5)))
+                            .contains(io.tapstate.spi.store.PipelineIntentStore.FirstClearResult.CLEARED);
+                    assertThat(reopened.preparations().issueFirstCreate(f.scope, f.node, captured.inputs(), intent.intentRevision()))
+                            .isInstanceOf(FirstPipelineCreationResult.Issued.class);
+                }
             }
+        });
+    }
+
+    @Test void anIssuedFirstStartCannotBeClearedAsNeverPrepared() {
+        withFixture(false, f -> {
+            var id = f.scope.pipelineId();
+            var intents = f.configuration.intents();
+            String hash = CanonicalHash.of(f.configuration.artifacts().get(id).orElseThrow());
+            var start = new DesiredState(id, PipelineState.RUNNING, hash);
+            var inputs = new PipelinePreparationInputs(hash, Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, 0, start, inputs)).isTrue();
+            var pending = intents.pendingStart(id).orElseThrow();
+            var preparation = f.configuration.preparations();
+            assertThat(preparation.issueDeferred(pending, f.node)).isInstanceOf(FirstPipelineCreationResult.Issued.class);
+            var retained = preparation.read(id).orElseThrow();
+            var stop = new DesiredState(id, PipelineState.STOPPED, hash, true);
+            assertCode(() -> intents.compareAndSet(f.scope, pending.intent().intentRevision(), stop),
+                    IoError.PIPELINE_CLEAR_UNPROVEN);
+            assertThat(preparation.read(id)).contains(retained);
+            assertThat(intents.load(id)).contains(pending.intent());
+            assertThat(f.state()).isNull();
+
+            // Model an accepted Stop left by a writer from before the feature was enabled.
+            var schemas = f.configDatabase.getCollection("schema_migrations");
+            var schema = schemas.find(new Document("_id", "config")).first();
+            schemas.updateOne(new Document("_id", "config"), new Document("$set", new Document("installedVersion", 2))
+                    .append("$unset", new Document("firstClearingStop", "").append("componentVersion", "")));
+            assertThat(intents.compareAndSet(f.scope, pending.intent().intentRevision(), stop)).isTrue();
+            var historical = intents.load(id).orElseThrow();
+            assertThat(intents.pendingFirstClear(id)).isEmpty();
+            schemas.replaceOne(new Document("_id", "config"), schema);
+            assertThat(intents.pendingFirstClear(id).orElseThrow().issued()).isTrue();
+            intents.completeFirstClear(historical, true);
+            assertThat(intents.firstClearResult(historical, Duration.ofSeconds(5)))
+                    .contains(io.tapstate.spi.store.PipelineIntentStore.FirstClearResult.UNPROVEN);
+            assertThat(preparation.read(id)).contains(retained);
+            assertThat(intents.load(id)).contains(historical);
         });
     }
 

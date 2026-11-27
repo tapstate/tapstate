@@ -178,5 +178,9 @@
   "TS0480044": {
     "message": "Pipeline '{pipeline}' stopped before dispatch because its installation does not support key moves.",
     "solution": "Keep source keys stable on this installation or run the pipeline on a new installation with key-move support."
+  },
+  "TS0480045": {
+    "message": "The clearing Stop for pipeline '{pipeline}' could not be confirmed.",
+    "solution": "Keep the original pipeline state. Save its status and available logs, and ask your deployment administrator to inspect the original preparation and cache evidence."
   }
 }

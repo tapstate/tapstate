@@ -48,7 +48,7 @@ import java.util.concurrent.TimeUnit;
 public final class MongoConfigurationDomain implements AutoCloseable {
     private static final String CLUSTER_ROW_ID = "cluster";
     static final String LAYOUT = "three-layer-v1";
-    static final int SCHEMA_VERSION = 3;
+    static final int SCHEMA_VERSION = MongoFirstClearingStopSchema.VERSION;
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
     private final MongoConfigurationCatalogStore catalog;
@@ -91,6 +91,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         this.installedSchemaVersion = installed;
+        MongoFirstClearingStopSchema.enabled(schema, clusterId);
         this.openedWithAiOnlySchema = MongoValidationSchema.isAiOnlyVersion(schema);
         if (openedWithAiOnlySchema) MongoValidationSchema.requireAiOnlyIdentity(schema);
         if (MongoValidationSchema.configurationDeclaresValidation(schema))
@@ -144,6 +145,39 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         try (var connection = MongoConnection.forConfiguration(settings)) {
             connection.verifyConnectivity();
             return prepareConfigComponentIdentity(connection, expectedClusterId, new MongoReadBudget(settings.serverSelectionTimeout()));
+        }
+    }
+
+    /**
+     * Offline activation after the operator has isolated every old writer and taken a coordinated backup.
+     * The CACHE lease check is additional evidence and cannot establish process isolation.
+     */
+    public static boolean enableFirstClearingStop(MongoConnectionSettings settings, String expectedClusterId) {
+        try (var configuration = expectedClusterId == null ? openExisting(settings) : open(settings, expectedClusterId)) {
+            var connection = configuration.connection;
+            var database = connection.database();
+            var original = openingFacts(connection.client(), database);
+            var cluster = configuration.clusterId;
+            if (MongoFirstClearingStopSchema.enabled(original.schema(), cluster)) return false;
+            var preparation = configuration.bindings.cachePreparation()
+                    .orElseThrow(() -> startIntentFenced());
+            var binding = configuration.bindings.load().orElseThrow(() -> startIntentFenced());
+            try (var cache = MongoCacheDomain.connect(binding.cache(), settings.serverSelectionTimeout(), "first-clear-maintenance")) {
+                cache.requireRecoveryTarget(binding);
+                cache.verifyStoppedBusiness(preparation);
+            }
+            var budget = new MongoReadBudget(settings.serverSelectionTimeout());
+            return budget.transaction(connection.client(), session -> {
+                var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+                var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+                if (!original.identity().equals(identity) || !configuration.bindings.cachePreparationForTransaction(session)
+                        .filter(preparation::equals).isPresent()) throw startIntentFenced();
+                var update = MongoFirstClearingStopSchema.enablement(cluster,
+                        MongoFirstClearingStopSchema.componentVersion(original.schema()));
+                if (schemas.updateOne(session, original.schema(), new Document("$set", update)).getMatchedCount() != 1)
+                    throw startIntentFenced();
+                return true;
+            });
         }
     }
 
@@ -227,7 +261,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 .find(new Document("_id", "config")).first());
         var skipped = java.util.EnumSet.noneOf(SystemCollections.class);
         if (schema != null) {
-            var installed = schema.get("installedVersion");
+            var installed = MongoFirstClearingStopSchema.componentVersion(schema);
             if (Integer.valueOf(2).equals(installed) && !schema.containsKey("validation")
                     || Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(installed))
                 required.add(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS);
@@ -521,7 +555,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
                     var marker = MongoValidationSchema.configurationMarker(operation.toString(), "PREPARING", 0, scope);
-                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row))
+                    if (schemas.updateOne(session, row, new Document("$set", MongoFirstClearingStopSchema.validationVersionUpdate(row)
                             .append("validation", marker)).append("$unset", new Document(MongoValidationSchema.AI_ONLY, ""))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     return marker;
@@ -604,7 +638,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
                     var marker = MongoValidationSchema.configurationMarker(operation.toString(), "READY", 0, scope);
-                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row)).append("validation", marker)).append("$unset", new Document(MongoValidationSchema.AI_ONLY, ""))).getMatchedCount() != 1)
+                    if (schemas.updateOne(session, row, new Document("$set", MongoFirstClearingStopSchema.validationVersionUpdate(row).append("validation", marker)).append("$unset", new Document(MongoValidationSchema.AI_ONLY, ""))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     return status(marker);
                 }
@@ -856,9 +890,17 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
             Optional<io.tapstate.core.lifecycle.DesiredState> desired,
             Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure,
-            long intentRevision, Map<String, String> startFailureParams, boolean completedStopClear) {
+            long intentRevision, Map<String, String> startFailureParams, boolean completedStopClear, boolean unprovenStopClear) {
         public PipelineDisplayHeader {
             startFailureParams = Map.copyOf(startFailureParams);
+        }
+
+        public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
+                Optional<io.tapstate.core.lifecycle.DesiredState> desired, Optional<TapstateException> intentFailure,
+                boolean recovering, Optional<IoError> startFailure, long intentRevision,
+                Map<String, String> startFailureParams, boolean completedStopClear) {
+            this(mapping, preparation, desired, intentFailure, recovering, startFailure, intentRevision,
+                    startFailureParams, completedStopClear, false);
         }
 
         public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
@@ -992,7 +1034,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
     }
 
-    private static PipelineDisplayHeader readDisplayHeader(Document row, PipelineStateMapping mapping, PipelinePreparation preparation,
+    private PipelineDisplayHeader readDisplayHeader(Document row, PipelineStateMapping mapping, PipelinePreparation preparation,
             boolean recovering, Document intent, DisplayIntentScope scope, MongoPipelineIntentStore reader) {
         if (intent == null) return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.empty(), recovering);
         try {
@@ -1006,9 +1048,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             var code = sameGeneration
                     ? MongoPipelineIntentStore.startFailure(intent) : Optional.<IoError>empty();
             var params = code.map(value -> MongoPipelineIntentStore.startFailureParams(intent, value)).orElseGet(Map::of);
+            var firstClear = installedSchemaVersion == MongoFirstClearingStopSchema.VERSION && sameGeneration
+                    && preparation.phase() != PipelinePreparation.Phase.COMPLETE
+                    ? MongoPipelineIntentStore.firstClear(row, snapshot).orElse(null) : null;
             return new PipelineDisplayHeader(mapping, preparation, Optional.of(snapshot.desired()), Optional.empty(), recovering,
                     code, snapshot.intentRevision(), params,
-                    row != null && MongoPipelinePreparationFacts.completedStopClear(row, preparation, snapshot));
+                    firstClear == io.tapstate.spi.store.PipelineIntentStore.FirstClearResult.CLEARED
+                            || row != null && MongoPipelinePreparationFacts.completedStopClear(row, preparation, snapshot),
+                    firstClear == io.tapstate.spi.store.PipelineIntentStore.FirstClearResult.UNPROVEN);
         } catch (TapstateException malformed) {
             if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
             return new PipelineDisplayHeader(mapping, preparation, Optional.empty(), Optional.of(malformed), recovering);

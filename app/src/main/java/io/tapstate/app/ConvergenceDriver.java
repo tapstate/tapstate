@@ -507,6 +507,8 @@ final class ConvergenceDriver implements AutoCloseable {
                     observationOrigin = reading.orElse(null);
                     snapshot = reading.map(PipelineIntentStore.ActuationReading::intent);
                 }
+                if (snapshot.isEmpty() && (stopOperation || pipelineConvergences == null)
+                        && reconcileFirstClear(pipelineId)) return;
                 if (stopOperation && snapshot.filter(intent -> intent.desired() != null
                         && intent.desired().targetState() == PipelineState.STOPPED).isEmpty()) return;
                 if (snapshot.isEmpty()) {
@@ -920,6 +922,29 @@ final class ConvergenceDriver implements AutoCloseable {
             scoped.intents().failStart(pending, error, failure.args());
             return false;
         }
+    }
+
+    private boolean reconcileFirstClear(String pipelineId) {
+        var pending = scoped.intents().pendingFirstClear(pipelineId);
+        if (pending.isEmpty()) return false;
+        var clear = pending.orElseThrow();
+        var original = clear.intent();
+        try (var local = actuation.enterPass(original.scope())) {
+            if (clear.issued()) {
+                scoped.intents().guardedBy(scoped.requireActive()).completeFirstClear(original, false);
+                return true;
+            }
+            boolean cacheAbsent = true;
+            try {
+                scoped.stores().requireUnpreparedPipelineAbsent(original.scope(), scoped.requireActive());
+            } catch (TapstateException unavailable) {
+                if (unavailable.code() != IoError.PIPELINE_STATE_REBUILD_REQUIRED
+                        && unavailable.code() != IoError.DOCUMENT_UNREADABLE) throw unavailable;
+                cacheAbsent = false;
+            }
+            scoped.intents().guardedBy(scoped.requireActive()).completeFirstClear(original, cacheAbsent);
+        }
+        return true;
     }
 
     private void alert(Runnable action) {

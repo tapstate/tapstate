@@ -915,6 +915,10 @@ final class ControlPlane {
     }
 
     List<String> pipelineCatalogIds(int offset) {
+        return pipelineCatalogItems(offset).stream().map(item -> (String) item.get("id")).toList();
+    }
+
+    List<Map<String, Object>> pipelineCatalogItems(int offset) {
         HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=" + offset));
         expect(response, 200, "read the Pipeline catalog");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
@@ -922,10 +926,10 @@ final class ControlPlane {
             throw new AssertionError("the pipeline catalog was not a list: " + response.body());
         }
         return items.stream().map(item -> {
-            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String id)) {
+            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String)) {
                 throw new AssertionError("the pipeline catalog contained an invalid entry: " + item);
             }
-            return id;
+            return asObject(entry);
         }).toList();
     }
 

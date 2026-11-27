@@ -1055,10 +1055,11 @@ class MongoValidationSchemaIT {
         }
         Fixture(int pipelines, StorageBinding.Mode mode, boolean nativeAi) {
             try (var prepared = MongoConfigurationBootstrap.prepare(settings, "cluster", "installation", "setup", 1)) {
+                // Retain the legacy inputs to the existing composition and recovery tests.
+                SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"),
+                        new Document("$set", new Document("installedVersion", nativeAi ? 2 : 1))
+                                .append("$unset", new Document("firstClearingStop", "").append("componentVersion", "")));
                 if (!nativeAi) {
-                    // Preserve the original pre-AI layout as the input to the existing upgrade regressions.
-                    SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"),
-                            new Document("$set", new Document("installedVersion", 1)));
                     SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(configDb).drop();
                 }
             }

@@ -15,6 +15,12 @@ public interface PipelineStatePreparations {
     /** A source snapshot and resolved selection are mandatory when first preparing a private direct tail. */
     FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode, PipelinePreparationInputs inputs);
 
+    /** A synchronous Start must still own its original intent revision at first issuance. */
+    default FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode,
+            PipelinePreparationInputs inputs, long expectedIntentRevision) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, java.util.Map.of(), null);
+    }
+
     /** The original explicit full confirmation is required after a lost-cache scope replacement. */
     default FirstPipelineCreationResult issueRecoveredFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode,
             PipelinePreparationInputs inputs, CacheRecoveryStore.FullPreparation confirmation, Runnable verifyPredecessor) {
