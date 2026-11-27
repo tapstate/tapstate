@@ -19,6 +19,7 @@ import org.slf4j.LoggerFactory;
 /** CONFIG-first production ownership. Reads cannot turn an unavailable existing installation into a new one. */
 final class StorageRoot implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(StorageRoot.class);
+    private static final long RETAINED_CONFIGURATION_CHECK_NANOS = TimeUnit.SECONDS.toNanos(5);
     enum Phase { CONFIGURATION_REQUIRED, CONFIGURATION_UNAVAILABLE, SETUP_REQUIRED, CACHE_UNAVAILABLE, AUTH_READY, BUSINESS_READY }
     private final CloudRuntimeSettings cloud;
     // Publishes an owner identity; the runtime synchronizes its own mutable lifecycle.
@@ -324,47 +325,61 @@ final class StorageRoot implements AutoCloseable {
     private void completeRetainedInstallationOwned() {
         if (!installationCompletionPending()) return;
         var original = runtime;
-        if (original.businessStarted()) {
-            try {
-                publishInstallationReadiness(requirePublishedBusinessOwner(null));
-                return;
-            } catch (TapstateException unavailable) {
-                // Retry only the original owner's temporary admission, store or mutation-lock failures.
-                if (unavailable.code() != IoError.STORE_UNAVAILABLE
-                        && !(unavailable instanceof StorageAuthentication.AuthenticationStoreUnavailable)
-                        && !(unavailable instanceof OnPremInstallation.BusinessAdmissionUnavailable)
-                        && !(unavailable instanceof InstallationFiles.MutationLockTimeout)) throw unavailable;
-            }
-        }
+        if (original.businessStarted() && tryCompleteRetainedInstallation()) return;
         if (original.cleanupRequired()) return;
         var business = original.businessForLiveness();
         if (business.isPresent()) {
             var bound = original.boundForObservation().orElseThrow(StorageRuntime::unavailable);
-            observeRetainedInstallation(new RetainedInstallationOwner(original, bound, business.orElseThrow()));
+            observeRetainedInstallation(new RetainedInstallationOwner(original, bound, business.orElseThrow()),
+                    System.nanoTime() + RETAINED_CONFIGURATION_CHECK_NANOS);
+        }
+    }
+
+    private boolean tryCompleteRetainedInstallation() {
+        try {
+            publishInstallationReadiness(requirePublishedBusinessOwner(null));
+            return true;
+        } catch (TapstateException unavailable) {
+            // Retry only the original owner's temporary admission, store or mutation-lock failures.
+            if (unavailable.code() != IoError.STORE_UNAVAILABLE
+                    && !(unavailable instanceof StorageAuthentication.AuthenticationStoreUnavailable)
+                    && !(unavailable instanceof OnPremInstallation.BusinessAdmissionUnavailable)
+                    && !(unavailable instanceof InstallationFiles.MutationLockTimeout)) throw unavailable;
+            return false;
         }
     }
 
     // Keep the published member alive while it waits for admission. Only the same owner may resume the handoff.
-    private void observeRetainedInstallation(RetainedInstallationOwner original) {
+    private void observeRetainedInstallation(RetainedInstallationOwner original, long nextConfigurationCheck) {
         synchronized (activationLock) {
             requireOpen();
             if (original.equals(retainedInstallationOwner)) return;
             retainedInstallationOwner = original;
-            activationWorker().schedule(() -> continueRetainedInstallation(original), 250, TimeUnit.MILLISECONDS);
+            activationWorker().schedule(() -> continueRetainedInstallation(original, nextConfigurationCheck),
+                    250, TimeUnit.MILLISECONDS);
         }
     }
 
-    private void continueRetainedInstallation(RetainedInstallationOwner original) {
+    private void continueRetainedInstallation(RetainedInstallationOwner original, long nextConfigurationCheck) {
         try {
             lifecycle(() -> {
                 synchronized (activationLock) {
                     if (retainedInstallationOwner != original) return null;
                     retainedInstallationOwner = null;
                 }
-                if (runtime == original.runtime()
+                if (runtime == original.runtime() && !runtime.cleanupRequired()
                         && runtime.boundForObservation().orElse(null) == original.bound()
-                        && runtime.businessForLiveness().orElse(null) == original.business())
-                    completeRetainedInstallationOwned();
+                        && runtime.businessForLiveness().orElse(null) == original.business()
+                        && installationCompletionPending()) {
+                    long configurationCheck = nextConfigurationCheck;
+                    if (runtime.businessStarted()) {
+                        if (tryCompleteRetainedInstallation()) return null;
+                    } else if (System.nanoTime() - configurationCheck >= 0) {
+                        checkRetainedInstallationConfiguration(original);
+                        configurationCheck = System.nanoTime() + RETAINED_CONFIGURATION_CHECK_NANOS;
+                    }
+                    observeRetainedInstallation(original, configurationCheck);
+                }
                 return null;
             });
         } catch (TapstateException unavailable) {
@@ -372,6 +387,20 @@ final class StorageRoot implements AutoCloseable {
         } catch (RuntimeException | Error failure) {
             LOG.error("Retained installation continuation failed [{}]", failure.getClass().getName());
             throw failure;
+        }
+    }
+
+    private void checkRetainedInstallationConfiguration(RetainedInstallationOwner original) {
+        // Read the binding, CACHE preparation and setup phase from the same CONFIG snapshot.
+        try {
+            var view = original.runtime().requireConfiguration().storageSetupView(
+                    new MongoReadBudget(java.time.Duration.ofSeconds(1)));
+            if (view.status().phase() != StorageSetupStateStore.Phase.COMPLETE
+                    || view.binding().filter(original.bound().binding()::equals).isEmpty()
+                    || view.cachePreparation().filter(original.bound().preparation()::equals).isEmpty())
+                throw StorageRuntime.unavailable();
+        } catch (TapstateException unavailable) {
+            if (unavailable.code() != IoError.STORE_UNAVAILABLE) throw unavailable;
         }
     }
 

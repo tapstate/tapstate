@@ -103,6 +103,10 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     private void verifyIndex() {
+        verifyIndex(sources);
+    }
+
+    private static void verifyIndex(MongoCollection<Document> sources) {
         var declared = SystemCollections.SOURCES.indexes().getFirst();
         Document index = IndexEnsure.existing(sources, declared);
         if (index == null || !Boolean.TRUE.equals(index.get("unique"))
@@ -507,6 +511,11 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     TransactionFacts readForStorageLifecycle(ClientSession session) {
         verifyIndex();
+        return read(session);
+    }
+
+    TransactionFacts readForStorageLifecycle(ClientSession session, MongoReadBudget budget) {
+        verifyIndex(sources.withTimeout(budget.operationMillis(), java.util.concurrent.TimeUnit.MILLISECONDS));
         return read(session);
     }
 

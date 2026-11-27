@@ -712,6 +712,45 @@ class OnPremInstallationCompletionTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"binding", "setup-phase"})
+    void retainedInstallationStopsWatchingARefusedOwnerBeforeAdmission(String reason) {
+        try (var f = new Fixture(directory.resolve("retained-owner-unadmitted-" + reason))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var reject = new AtomicBoolean();
+            var durableChecks = new AtomicInteger();
+            var admissionChecks = new AtomicInteger();
+            when(f.business.available()).thenAnswer(ignored -> {
+                admissionChecks.incrementAndGet();
+                return false;
+            });
+            when(f.configuration.storageSetupView(any(MongoReadBudget.class))).thenAnswer(ignored -> {
+                var phase = f.phase.get();
+                var binding = Optional.of(f.binding);
+                if (reject.get()) {
+                    durableChecks.incrementAndGet();
+                    if (reason.equals("binding")) binding = Optional.empty();
+                    else phase = StorageSetupStateStore.Phase.STORAGE_BOUND;
+                }
+                var current = new StorageSetupStateStore.Status(f.currentScope.get(), phase, 1);
+                return new StorageSetupStateStore.View(current, binding, Optional.of(f.preparation));
+            });
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            reject.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(10))
+                    .untilAsserted(() -> assertThat(durableChecks).hasValue(1));
+
+            int finalAdmissionChecks = admissionChecks.get();
+            org.awaitility.Awaitility.await().during(java.time.Duration.ofSeconds(1))
+                    .atMost(java.time.Duration.ofSeconds(2))
+                    .untilAsserted(() -> assertThat(admissionChecks).hasValue(finalAdmissionChecks));
+            assertThat(f.completions).hasValue(0);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
         try (var f = new Fixture(directory.resolve("retained-catalog"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
