@@ -695,7 +695,9 @@ final class ConvergenceDriver implements AutoCloseable {
             var published = reading.observation();
             if (pass != null) runProgress.observation(pass.intent(), pass.claim(), published);
             PipelineDiagnostics.event("observation_" + published.state().name());
-            if (canSettleStopped(pass, result, published)) {
+            if (pass == null) {
+                if (reading.measured()) sample(published, null);
+            } else if (canSettleStopped(pass, result, published)) {
                 evidence = recordStoppedEvidence(pipelineId, pass, result, reading);
             } else {
                 notifyObservation(pass, result, reading);

@@ -38,6 +38,42 @@ class PipelineRunProgressTest {
         assertThat(failure.failedStage()).isEqualTo(stage);
     }
 
+    @Test
+    void fullLoadAndCdcOnlyRunsAwaitOnlyTheirOwnMilestones() {
+        var snapshot = PipelineRunProgress.empty("snapshot").beginExecution(PipelineRunProgress.Mode.SNAPSHOT_ONLY)
+                .reach(PipelineRunStage.ENGINE_RUNNING, START);
+        assertThat(snapshot.awaitingMilestones()).isTrue();
+        var landed = snapshot.observeInitialLoad(new PipelineRunProgress.LoadProgress(2, 2), START.plusSeconds(1));
+        assertThat(landed.awaitingMilestones()).isFalse();
+        assertThat(landed.milestones()).extracting(PipelineRunProgress.Milestone::stage)
+                .containsExactly(PipelineRunStage.ENGINE_RUNNING, PipelineRunStage.INITIAL_LOAD_COMPLETED);
+
+        var cdc = PipelineRunProgress.empty("cdc").beginExecution(PipelineRunProgress.Mode.CDC_ONLY)
+                .reach(PipelineRunStage.ENGINE_RUNNING, START);
+        assertThat(cdc.awaitingMilestones()).isTrue();
+        var ready = cdc.reach(PipelineRunStage.CDC_READY, START.plusSeconds(1));
+        assertThat(ready.awaitingMilestones()).isFalse();
+        assertThat(ready.milestones()).extracting(PipelineRunProgress.Milestone::stage)
+                .containsExactly(PipelineRunStage.ENGINE_RUNNING, PipelineRunStage.CDC_READY);
+    }
+
+    @Test
+    void aConfirmedFailureStopsWaitingAndARecoveredExecutionCanResumeTheSameRun() {
+        var active = PipelineRunProgress.empty("run").enter(PipelineRunStage.EXECUTION_PLAN_PREPARING, START);
+        var failed = active.leave(PipelineRunStage.EXECUTION_PLAN_PREPARING, START, true).markRunFailed();
+        assertThat(failed.awaitingMilestones()).isFalse();
+        assertThat(failed.failedStage()).isEqualTo(PipelineRunStage.EXECUTION_PLAN_PREPARING);
+        assertThat(failed.milestones()).isEmpty();
+        assertThat(failed.enter(PipelineRunStage.WAITING_FOR_CAPTURE, START.plusSeconds(1))).isSameAs(failed);
+        assertThat(failed.markRunFailed()).isSameAs(failed);
+
+        var recovered = failed.beginExecution(PipelineRunProgress.Mode.SNAPSHOT_AND_CDC);
+        assertThat(recovered.runId()).isEqualTo(failed.runId());
+        assertThat(recovered.failedStage()).isNull();
+        assertThat(recovered.runFailed()).isFalse();
+        assertThat(recovered.awaitingMilestones()).isTrue();
+    }
+
     private static InitialLoad load(Instant at, InitialLoad.Stage items) {
         return new InitialLoad("execution", at, "snapshot_and_cdc", Map.of(
                 "orders", new InitialLoad.Table(InitialLoad.Stage.LANDED, 2L, 2L),

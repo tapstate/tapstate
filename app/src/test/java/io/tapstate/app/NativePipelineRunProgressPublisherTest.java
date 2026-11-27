@@ -14,6 +14,8 @@ import io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore;
 import io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.InitialLoad;
+import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineRunProgress;
 import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -40,9 +42,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class NativePipelineRunProgressPublisherTest {
@@ -139,6 +143,55 @@ class NativePipelineRunProgressPublisherTest {
                     new PipelineRunProgress.Milestone(PipelineRunStage.EXECUTION_PLAN_PREPARED, prepared),
                     new PipelineRunProgress.Milestone(PipelineRunStage.CONNECTORS_READY, ready),
                     new PipelineRunProgress.Milestone(PipelineRunStage.ENGINE_RUNNING, running));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = PipelineState.class, names = {"COMPLETED", "FAILED"})
+    void observationsKeepCompletionAndFailureDistinct(PipelineState state) throws Exception {
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var intent = new PipelineIntentSnapshot(scope, 4, new DesiredState("orders", PipelineState.RUNNING, "a".repeat(64)));
+        var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
+                new WorkloadOwner("node", "boot"), 1, 2, 3);
+        var cache = mock(MongoCacheDomain.class);
+        var store = mock(MongoCachePipelineRunProgressStore.class);
+        when(cache.pipelineRunProgress(eq(scope), eq(claim), any())).thenReturn(store);
+        var intents = mock(PipelineIntentStore.class);
+        when(intents.executionBindings(scope)).thenReturn(Optional.of(new PipelineIntentStore.ExecutionBindings(
+                new ConnectorRunBindings(scope, 4, List.of(), null), intent.intentRevision())));
+        var member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
+        var started = NativePipelineRunProgressQuery.accepted(scope, 4, null, 3)
+                .beginExecution(PipelineRunProgress.Mode.SNAPSHOT_ONLY);
+        var current = new AtomicReference<>(started);
+        var terminal = new CompletableFuture<PipelineRunProgress>();
+        var execution = state == PipelineState.FAILED ? Execution.KEEP : Execution.REQUIRE_BOUND;
+        when(store.update(eq(4L), any(), eq(execution), any())).thenAnswer(call -> {
+            UnaryOperator<PipelineRunProgress> change = call.getArgument(3);
+            var updated = current.updateAndGet(change);
+            if (updated.runFailed() || updated.milestones().stream().anyMatch(m -> m.stage() == PipelineRunStage.RUN_COMPLETED)) {
+                terminal.complete(updated);
+            }
+            return true;
+        });
+        Instant at = Instant.parse("2026-11-26T10:00:00Z");
+        var load = state == PipelineState.COMPLETED ? new InitialLoad("execution", at, "snapshot_only",
+                Map.of("orders", new InitialLoad.Table(InitialLoad.Stage.LANDED, 2L, 2L))) : null;
+        var observed = new Observation("orders", state, Map.of(), Map.of(), Map.of(), null, at, List.of(), load);
+        try (var publisher = new NativePipelineRunProgressPublisher(cache, new CacheBusinessScope("cluster", 1, "cache"),
+                intents, () -> {}, member, mock(Engine.class))) {
+            publisher.observation(intent, claim, observed);
+            var progress = terminal.get(5, TimeUnit.SECONDS);
+            assertThat(progress.awaitingMilestones()).isFalse();
+            if (state == PipelineState.COMPLETED) {
+                assertThat(progress.runFailed()).isFalse();
+                assertThat(progress.milestones()).containsExactly(started.milestones().getFirst(),
+                        new PipelineRunProgress.Milestone(PipelineRunStage.INITIAL_LOAD_COMPLETED, at),
+                        new PipelineRunProgress.Milestone(PipelineRunStage.RUN_COMPLETED, at));
+            } else {
+                assertThat(progress.runFailed()).isTrue();
+                assertThat(progress.milestones()).isEqualTo(started.milestones());
+            }
         }
     }
 }

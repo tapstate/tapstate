@@ -1,7 +1,7 @@
 package io.tapstate.app;
 
-import io.tapstate.control.core.PipelineRunProgressQuery;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.control.core.PipelineRunProgressQuery;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineRunProgress;
@@ -11,8 +11,8 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelineIntentStore;
-import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelineStatePreparations;
 import java.util.List;
 import java.util.Optional;
@@ -44,42 +44,47 @@ final class NativePipelineRunProgressQuery implements PipelineRunProgressQuery {
     public Optional<Read> find(String pipelineId) {
         if (!active.getAsBoolean()) return Optional.empty();
         try {
-            // The common branch uses one actuation read and one admitted bindings read. The second
-            // rechecks the first read's intent revision before any previously published stage is used.
             var intent = intents.loadForActuation(pipelineId).orElse(null);
-            if (intent == null) return firstStart(pipelineId);
-            if (intent.deleted() || !inScope(intent.scope())) return Optional.empty();
-            var current = intents.executionBindings(intent.scope()).orElse(null);
-            if (current == null || current.intentRevision() != intent.intentRevision() || !active.getAsBoolean()) {
-                return Optional.empty();
-            }
-            long start = startRevision(current);
-            if (start > current.intentRevision()) return Optional.empty();
-            boolean stopping = intent.desired().targetState() == PipelineState.STOPPED;
-            if (cache != null) {
-                // CONFIG and CACHE are independent. The second CONFIG read must still name the
-                // same committed Start (and valid state generation) before exposing the CACHE row.
-                var saved = cache.pipelineRunProgress(intent.scope(), null, () -> {}).latest().orElse(null);
-                if (saved != null) {
-                    var verified = intents.executionBindings(intent.scope()).orElse(null);
-                    if (!current.equals(verified) || !active.getAsBoolean()) return Optional.empty();
-                    boolean acceptedStart = current.bindings().handoff() != null ? saved.startRevision() == start
-                            : saved.startRevision() >= start && saved.startRevision() <= current.intentRevision();
-                    if (acceptedStart) {
-                        var progress = saved.progress();
-                        if (!stopping) return Optional.of(new Read(progress, progress.awaitingMilestones()));
-                        return Optional.of(new Read(new PipelineRunProgress(progress.runId(), progress.version(),
-                                List.of(), progress.milestones(), progress.initialLoad(), progress.failedStage(),
-                                progress.readMode(), progress.runFailed()), false));
-                    }
-                }
-            }
-            return start < 1 ? Optional.empty() : Optional.of(new Read(accepted(intent.scope(), start, null, 3), !stopping));
+            return intent == null ? firstStart(pipelineId) : admittedStart(intent);
         } catch (TapstateException unavailable) {
             if (unavailable.code() == IoError.PIPELINE_INTENT_FENCED
                     || unavailable.code() == IoError.STORE_UNAVAILABLE) return Optional.empty();
             throw unavailable;
         }
+    }
+
+    private Optional<Read> admittedStart(PipelineIntentSnapshot intent) {
+        if (intent.deleted() || !inScope(intent.scope())) return Optional.empty();
+        var current = intents.executionBindings(intent.scope()).orElse(null);
+        if (current == null || current.intentRevision() != intent.intentRevision() || !active.getAsBoolean()) {
+            return Optional.empty();
+        }
+        long start = startRevision(current);
+        if (start > current.intentRevision()) return Optional.empty();
+        boolean stopping = intent.desired().targetState() == PipelineState.STOPPED;
+        var saved = cache == null ? null : cache.pipelineRunProgress(intent.scope(), null, () -> {}).latest().orElse(null);
+        if (saved != null) {
+            // CONFIG and CACHE are independent. The second CONFIG read must still name the
+            // same committed Start and state generation before exposing the CACHE row.
+            var verified = intents.executionBindings(intent.scope()).orElse(null);
+            if (!current.equals(verified) || !active.getAsBoolean()) return Optional.empty();
+            if (matchesStart(current, start, saved.startRevision())) {
+                return Optional.of(projectedRead(saved.progress(), stopping));
+            }
+        }
+        return start < 1 ? Optional.empty() : Optional.of(new Read(accepted(intent.scope(), start, null, 3), !stopping));
+    }
+
+    private static boolean matchesStart(PipelineIntentStore.ExecutionBindings current, long start, long savedStart) {
+        if (current.bindings().handoff() != null) return savedStart == start;
+        return savedStart >= start && savedStart <= current.intentRevision();
+    }
+
+    private static Read projectedRead(PipelineRunProgress progress, boolean stopping) {
+        if (!stopping) return new Read(progress, progress.awaitingMilestones());
+        return new Read(new PipelineRunProgress(progress.runId(), progress.version(), List.of(),
+                progress.milestones(), progress.initialLoad(), progress.failedStage(), progress.readMode(), progress.runFailed()),
+                false);
     }
 
     private Optional<Read> firstStart(String pipelineId) {
