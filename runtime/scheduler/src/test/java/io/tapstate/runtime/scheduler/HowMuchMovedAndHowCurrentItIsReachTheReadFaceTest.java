@@ -2,6 +2,7 @@ package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -483,6 +484,20 @@ class HowMuchMovedAndHowCurrentItIsReachTheReadFaceTest {
         // And distinct, which the assertions inside the loop cannot see one at a time. Two kinds sharing
         // a name would be two series added together, and the sum reads exactly like a healthy single one.
         assertThat(names).hasSize(checked);
+    }
+
+    @Test
+    void carries_cdc_only_totals_into_the_history_sample_without_changing_records_out() {
+        state.create("orders", PipelineState.RUNNING.name(), AT);
+        DeliveryReading delivery = new DeliveryReading(Map.of("orders", Map.of("r", 20L, "i", 3L)),
+                Map.of(), Map.of(), STARTED, Map.of(), new CdcDeliveryTotals(3, 750));
+        var observation = publisherAt(delivery, AT).publish("orders").orElseThrow();
+        var sample = RateSampler.sampleOf(observation);
+        assertThat(sample.countingSince()).isEqualTo(STARTED);
+        assertThat(sample.counters())
+                .containsEntry("records.out", 23L)
+                .containsEntry(CdcDeliveryTotals.COUNT_METRIC, 3L)
+                .containsEntry(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 750L);
     }
 
     private List<MetricFact> facts(DeliveryReading reading, Instant at) {

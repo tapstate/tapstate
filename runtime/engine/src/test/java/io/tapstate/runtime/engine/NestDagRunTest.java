@@ -8,6 +8,8 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.Traverser;
+import com.hazelcast.jet.Traversers;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
@@ -263,6 +265,35 @@ class NestDagRunTest {
     }
 
     @Test
+    void aReferencedCustomerMoveVacatesTheOldKeyAndPublishesTheNewOne() {
+        ProcessorMetaSupplier customers = ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of(MovingCustomer::new));
+        DAG dag = ordersWithCustomers(List.of(row("order_id", 1, "cust_ref", 100),
+                row("order_id", 2, "cust_ref", 200)), customers, "moved_customer");
+
+        member.getJet().newJob(dag).join();
+
+        var documents = latestPerRoot();
+        assertThat(documents).containsKeys(1, 2);
+        assertThat(documents.get(1).get("customer")).as("lookup at the vacated key").isNull();
+        assertThat(customer(documents.get(2))).containsEntry("name", "Ada");
+    }
+
+    private static final class MovingCustomer extends AbstractProcessor {
+        private final Traverser<Envelope> changes = Traversers.traverseIterable(
+                List.of(Envelope.insert(1, "customers", row("customer_id", 100, "name", "Ada"), null)
+                                .withOrder(new SourceOrder(1, 1)),
+                        Envelope.update(2, "customers", row("customer_id", 100, "name", "Ada"),
+                                row("customer_id", 200, "name", "Ada"), null)
+                                .withOrder(new SourceOrder(1, 2))));
+
+        @Override
+        public boolean complete() {
+            return emitFromTraverser(changes);
+        }
+    }
+
+    @Test
     void aRootBringsInTheRowItPointsAtRatherThanTheRowsThatPointAtIt() {
         // The other direction: an order names a customer, so the customer is one row shared by many
         // documents rather than a child grouped under one. Three orders across two customers, and the
@@ -383,6 +414,11 @@ class NestDagRunTest {
 
     private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
             List<Map<String, Object>> customers, String pipelineId) {
+        return ordersWithCustomers(orders, rowsSource("customers", customers, false, Duration.ZERO), pipelineId);
+    }
+
+    private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
+            ProcessorMetaSupplier customers, String pipelineId) {
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
@@ -405,7 +441,7 @@ class NestDagRunTest {
         // arrives after it is a different mechanism from the one under test here - this case is about the
         // read finding the row, and holding the orders back is what keeps the two apart.
         sources.put("orders", rowsSource("orders", orders, false, LATE_ROOT));
-        sources.put("customers", rowsSource("customers", customers, false, Duration.ZERO));
+        sources.put("customers", customers);
 
         Map<String, NestTable> tables = new LinkedHashMap<>();
         tables.put("order", new NestTable("orders", List.of("order_id")));

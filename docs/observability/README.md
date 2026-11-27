@@ -168,6 +168,7 @@ The history projection deliberately exposes only:
 
 - pipeline-level `records.out`, the number of records acknowledged by the target;
 - pipeline-level `bytes.out`, the payload bytes acknowledged by the target;
+- pipeline-level `cdcDelivery`, with `sampleCount` and `averageMillis` for confirmed CDC output records;
 - target-acknowledged lag for explicitly selected tables, in seconds.
 
 Rates are calculated at query time from adjacent samples and their real `observedAt` values. Each
@@ -185,6 +186,20 @@ remain preview surface and may change.
 
 Lag is the age of the last event that the target acknowledged for that table. It is not source backlog,
 and it cannot say whether the source has more changes waiting.
+
+CDC delivery time measures the time from the source event timestamp to target acknowledgement.
+It counts only writes with one incremental source position and uses the time the writer confirms
+the batch. Full loads, outputs with multiple or unknown source positions, and missing or future
+timestamps are excluded. Confirmed no-op writes count as
+deliveries. A batch contributes latency samples only when the writer confirms every row event.
+Schema changes do not count as row events. If a change produces multiple confirmed outputs, each
+output is one delivery. History differences the cumulative count and elapsed-time total for each
+usable observation pair. The right observation determines the bucket, and the mean is weighted by
+delivered records. An explicit zero reported within the window supplies a baseline for an
+adjacent sample. Unavailable counters do not establish a baseline. Deltas do not span gaps or restarts. If retention removes the
+cursor sample, CDC calculations resume once the continuation has its own observation pair.
+Points without confirmed CDC samples omit `cdcDelivery`. Old retained samples remain readable.
+A measured average of zero is present with a positive `sampleCount`.
 
 ## Window and resolution
 
@@ -327,7 +342,8 @@ tapstate(admin@127.0.0.1:8080)> explain order_pipeline
 
 `metrics <id>` without `--from` and `--to` keeps its current-snapshot behavior. A history query requires
 both range options. The CLI prints the effective range, segments, rates, lag, gaps, unavailable series,
-retention cutoff, consistency, and continuation cursor.
+retention cutoff, consistency, and continuation cursor. When a point has CDC delivery samples,
+the CLI prints `cdc.delivery.avg` in milliseconds and `samples` as the number of confirmed deliveries.
 
 In a connected session, or when `-c` selects a server explicitly, `explain <id>` is the runtime
 explanation. Without a server target, the existing offline `explain` command remains the DSL field

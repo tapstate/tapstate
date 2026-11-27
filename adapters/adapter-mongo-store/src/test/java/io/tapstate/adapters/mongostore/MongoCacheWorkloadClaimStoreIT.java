@@ -1665,7 +1665,8 @@ class MongoCacheWorkloadClaimStoreIT {
             } finally {
                 MongoCommandObservation.COLLECTIONS.remove();
             }
-            assertThat(commands).containsExactly("aggregate:cache_identity", "find:pipeline_state", "find:workload_claims", "commitTransaction:");
+            assertThat(commands).containsExactly("aggregate:cache_identity", "aggregate:cache_identity",
+                    "find:pipeline_state", "find:workload_claims", "commitTransaction:");
         });
     }
 

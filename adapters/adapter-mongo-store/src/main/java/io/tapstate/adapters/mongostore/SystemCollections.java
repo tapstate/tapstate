@@ -220,6 +220,7 @@ public enum SystemCollections {
             new IndexSpec(List.of("secretHash", "issuer"), false)),
     CLOUD_REVOCATIONS("cloud_revocations", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1),
     PIPELINE_INTENTS("pipeline_intents", Database.CONFIG, MongoPipelineIntentStore.class, Strategy.MIGRATED, 1),
+    PIPELINE_KEY_MOVE_WINDOWS("pipeline_key_move_windows", Database.CONFIG, MongoKeyMoveWindowStore.class, Strategy.MIGRATED, 1),
     SRS_EVENTS("srs_events", Database.CACHE, MongoSrsLogStore.class, Strategy.MIGRATED, 1),
     SRS_LOG_BOUNDS("srs_log_bounds", Database.CACHE, MongoSrsLogStore.class, Strategy.MIGRATED, 1),
     CACHE_WORKLOAD_CLAIMS("workload_claims", Database.CACHE, MongoWorkloadClaimStore.class, Strategy.OWNED_ELSEWHERE, 1),

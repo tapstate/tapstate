@@ -233,6 +233,7 @@ class ApiExceptionHandler {
             Map.entry(ControlError.AUTH_FAILED.code(), HttpStatus.UNAUTHORIZED),
             Map.entry(ControlError.UNAUTHENTICATED.code(), HttpStatus.UNAUTHORIZED),
             Map.entry(ControlError.CLOUD_AUTH_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry(ControlError.CLOUD_SIGN_IN_LINK_INVALID.code(), HttpStatus.UNAUTHORIZED),
             Map.entry(ControlError.AUTH_MODE_UNAVAILABLE.code(), HttpStatus.FORBIDDEN),
             Map.entry(ControlError.FORBIDDEN.code(), HttpStatus.FORBIDDEN),
             Map.entry(ControlError.BOOTSTRAP_FORBIDDEN.code(), HttpStatus.FORBIDDEN),

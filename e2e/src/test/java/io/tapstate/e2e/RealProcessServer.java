@@ -1,5 +1,8 @@
 package io.tapstate.e2e;
 
+import com.sun.jdi.Bootstrap;
+import com.sun.jdi.VirtualMachine;
+
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
@@ -10,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.regex.Pattern;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -381,8 +385,14 @@ final class RealProcessServer implements ServerHandle {
 
     static PreparedLaunch preparePrepared(String configurationUri, String listenAddress, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
-        return prepare(configurationUri, null, bootJar(), listenAddress,
-                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments, null);
+        return preparePrepared(configurationUri, listenAddress, stagingDirectory, extraArguments, List.of());
+    }
+
+    static PreparedLaunch preparePrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments, List<String> extraJvmOptions) {
+        var jvmOptions = new ArrayList<>(List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"));
+        jvmOptions.addAll(extraJvmOptions);
+        return prepare(configurationUri, null, bootJar(), listenAddress, jvmOptions, stagingDirectory, extraArguments, null);
     }
 
     private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
@@ -603,6 +613,19 @@ final class RealProcessServer implements ServerHandle {
      * two members did a piece of one-time work, and how often - and the store records how far that work
      * got rather than who did it, so the account the server gave of itself is the only place to look.
      */
+    VirtualMachine attachDebugger() throws Exception {
+        Path log = output();
+        var port = Pattern.compile("Listening for transport dt_socket at address: (\\d+)").matcher(Files.readString(log));
+        if (!port.find()) throw new AssertionError("No owned JDWP startup in " + log);
+        var connector = Bootstrap.virtualMachineManager().attachingConnectors().stream()
+                .filter(c -> c.name().equals("com.sun.jdi.SocketAttach")).findFirst().orElseThrow();
+        var args = connector.defaultArguments();
+        args.get("hostname").setValue("127.0.0.1");
+        args.get("port").setValue(port.group(1));
+        args.get("timeout").setValue("5000");
+        return connector.attach(args);
+    }
+
     Path output() {
         return output;
     }

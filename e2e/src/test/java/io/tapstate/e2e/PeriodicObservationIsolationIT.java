@@ -21,7 +21,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
-import java.util.regex.Pattern;
 
 @RequiresDocker
 class PeriodicObservationIsolationIT {
@@ -134,7 +133,7 @@ class PeriodicObservationIsolationIT {
             MongoDatabase dbA = ca.getDatabase(new ConnectionString(ta).getDatabase());
             MongoDatabase dbB = cb.getDatabase(new ConnectionString(tb).getDatabase());
             var observations = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(cache.getDatabase(storage.cacheDatabase()));
-            var vm = attach(server.output());
+            var vm = server.attachDebugger();
             try {
                 try (var held = hold(vm, Mode.EXECUTION_ADVANCE, () -> control.lifecycle(A, LifecycleVerb.START))) {
                     control.lifecycle(B, LifecycleVerb.START);
@@ -207,18 +206,6 @@ class PeriodicObservationIsolationIT {
         return new Reading(amount(database), recordsOut.longValue(), observedAt.toInstant());
     }
 
-    private static VirtualMachine attach(Path log) throws Exception {
-        var port = Pattern.compile("Listening for transport dt_socket at address: (\\d+)").matcher(Files.readString(log));
-        if (!port.find()) throw new AssertionError("No owned JDWP startup in " + log);
-        var connector = Bootstrap.virtualMachineManager().attachingConnectors().stream()
-                .filter(c -> c.name().equals("com.sun.jdi.SocketAttach")).findFirst().orElseThrow();
-        var args = connector.defaultArguments();
-        args.get("hostname").setValue("127.0.0.1");
-        args.get("port").setValue(port.group(1));
-        args.get("timeout").setValue("5000");
-        return connector.attach(args);
-    }
-
     private static Held hold(VirtualMachine vm, Mode mode, Runnable trigger) throws Exception {
         String name = switch (mode) {
             case EXECUTION_ADVANCE -> CLAIMS;
@@ -280,7 +267,7 @@ class PeriodicObservationIsolationIT {
                             batchDetail = " batch=" + pipelines;
                         } else {
                             if (frames.stream().noneMatch(f -> frameIs(f, DRIVER, "reconcile")
-                                    || frameIs(f, DRIVER, "reconcilePipeline")
+                                    || frameIs(f, DRIVER, "reconcileCurrentPipeline")
                                     || frameIs(f, DRIVER, "publishPeriodicObservation"))) continue;
                             var scope = frames.stream().filter(f -> mode == Mode.EXECUTION_ADVANCE
                                     ? frameIs(f, CLAIMS, "advanceExecution") : frameIs(f, ENGINE, "nestStateReadings"))

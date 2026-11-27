@@ -29,7 +29,8 @@ record PipelineHistoryResponse(
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    record Point(String intervalStart, String intervalEnd, Rate recordsOut, Rate bytesOut, List<Lag> lag) {
+    record Point(String intervalStart, String intervalEnd, Rate recordsOut, Rate bytesOut, List<Lag> lag,
+            CdcDelivery cdcDelivery) {
     }
 
     record Rate(
@@ -39,6 +40,9 @@ record PipelineHistoryResponse(
         Rate(BigDecimal delta, BigDecimal averageRate, BigDecimal maxRate) {
             this(delta.toPlainString(), averageRate.toPlainString(), maxRate.toPlainString());
         }
+    }
+
+    record CdcDelivery(long sampleCount, @JsonRawValue String averageMillis) {
     }
 
     record Lag(String table, String observedAt, long last, long max) {
@@ -76,7 +80,12 @@ record PipelineHistoryResponse(
     private static Point point(PipelineMetricsHistory.Point point) {
         return new Point(point.intervalStart().toString(), point.intervalEnd().toString(),
                 rate(point.recordsOut()), rate(point.bytesOut()),
-                point.lag().stream().map(PipelineHistoryResponse::lag).toList());
+                point.lag().stream().map(PipelineHistoryResponse::lag).toList(),
+                cdcDelivery(point.cdcDelivery()));
+    }
+
+    private static CdcDelivery cdcDelivery(PipelineMetricsHistory.CdcDelivery delivery) {
+        return delivery == null ? null : new CdcDelivery(delivery.sampleCount(), delivery.averageMillis().toPlainString());
     }
 
     private static Rate rate(PipelineMetricsHistory.Rate rate) {

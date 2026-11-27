@@ -659,8 +659,7 @@ final class ConvergenceDriver implements AutoCloseable {
             writeObservationNow(pipelineId, () -> publisher.publishScoped(pass.scope(),
                     pass.state(), pass.observationSample(), null));
         };
-        BooleanSupplier currentIntent = () -> scoped.intents().loadForActuation(pipelineId)
-                .filter(pass.intent()::equals).isPresent();
+        BooleanSupplier currentIntent = () -> currentIntent(pass);
         if (stopOperation) return converger.convergeScoped(pass.intent(), state, actuator, rebuilds,
                 beforeCompletion, currentIntent, true);
         return converger.convergeScoped(pass.intent(), state, actuator, rebuilds, beforeCompletion, currentIntent);
@@ -681,20 +680,7 @@ final class ConvergenceDriver implements AutoCloseable {
             LifecycleActuator actuator, RebuildAdmission rebuilds, boolean refreshTerminal) {
         Optional<ObservationPublisher.Publication> publication;
         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PUBLISH)) {
-            boolean terminal = result.checkpoint().map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                    .filter(state -> state == PipelineState.STOPPED || state == PipelineState.FAILED).isPresent();
-            if (scoped != null && terminal && scoped.observations() != null) scoped.observations().forget(pipelineId);
-            boolean finalStopSample = terminal && scoped != null && scoped.stoppedRecheck() != null && pass != null
-                    && pass.intent().desired().targetState() == PipelineState.STOPPED && !pass.intent().desired().purgeState()
-                    && !pass.intent().desired().reassemble()
-                    && result.checkpoint().filter(checkpoint -> StateJson.parse(checkpoint.stateJson()) == PipelineState.STOPPED).isPresent();
-            publication = scoped == null ? publisher.publish(pipelineId, failure)
-                    .map(value -> new ObservationPublisher.Publication(value, true))
-                    : scoped.observations() == null || terminal
-                            ? publisher.publishScopedReading(pass.scope(), pass.state(), pass.observationSample(), failure,
-                                    !finalStopSample && !refreshTerminal && !scoped.alerts().needsFreshTerminalMetrics(pass.scope()))
-                            : scoped.observations().publish(publisher, pass, result, config, failure)
-                                    .map(value -> new ObservationPublisher.Publication(value, true));
+            publication = publishObservationReading(pipelineId, pass, result, config, failure, refreshTerminal);
         }
         StoppedEvidence evidence = null;
         if (publication.isPresent()) {
@@ -702,30 +688,9 @@ final class ConvergenceDriver implements AutoCloseable {
             var published = reading.observation();
             PipelineDiagnostics.event("observation_" + published.state().name());
             if (canSettleStopped(pass, result, published)) {
-                var checkpoint = result.checkpoint().orElseThrow();
-                var terminal = TerminalPublication.from(pass, checkpoint.epoch(), published);
-                scoped.observations().terminal(terminal);
-                var alertReceipt = TerminalPublication.failed();
-                try {
-                    alertReceipt = scoped.alerts().terminalPublished(pass, terminal, published, result.failure().orElse(null), reading.measured());
-                } catch (RuntimeException unavailable) {
-                    LOG.warn("Could not submit the final alert sample for pipeline {}", pipelineId);
-                }
-                var sample = reading.measured() && sampler != null ? RateSampler.sampleOf(published) : null;
-                var history = sample == null ? null : new ProcessObservationWriter.History(sample,
-                        remaining -> pass.rateHistory(remaining).append(sample));
-                var historyReceipt = scoped.writes().terminalHistory(terminal,
-                        history == null ? null : history.guardedBy(pass.guardOriginal(pass.claim())));
-                evidence = new StoppedEvidence(pass.intent(), checkpoint, pass.claim(), historyReceipt, alertReceipt);
+                evidence = recordStoppedEvidence(pipelineId, pass, result, reading);
             } else {
-                if (scoped != null) alert(() -> scoped.alerts().published(pass, published, result.failure().orElse(null), reading.measured()));
-                if (reading.measured()) {
-                    if (scoped == null || scoped.writes() == null) sample(published, pass);
-                    else {
-                        var history = history(published, pass);
-                        if (history != null) scoped.writes().offerHistory(history.guardedBy(pass.guardOriginal(pass.claim())));
-                    }
-                }
+                notifyObservation(pass, result, reading);
             }
             if (reading.measured()) export(published);
         }
@@ -733,14 +698,89 @@ final class ConvergenceDriver implements AutoCloseable {
                 actuator, rebuilds, evidence);
     }
 
-    private boolean canSettleStopped(PipelineConvergencePass pass, ConvergeResult result, Observation observation) {
-        if (pass == null || scoped.stoppedRecheck() == null || scoped.writes() == null || scoped.observations() == null
-                || result.status() != ConvergeStatus.CONVERGED || result.checkpoint().isEmpty()
-                || observation.state() != PipelineState.STOPPED) return false;
+    private Optional<ObservationPublisher.Publication> publishObservationReading(String pipelineId, PipelineConvergencePass pass,
+            ConvergeResult result, PipelineIntentStore.ActuationReading config, ObservationFailure failure, boolean refreshTerminal) {
+        var actual = result.checkpoint().map(checkpoint -> StateJson.parse(checkpoint.stateJson())).orElse(null);
+        if (scoped == null) return publisher.publish(pipelineId, failure)
+                .map(value -> new ObservationPublisher.Publication(value, true));
+        boolean terminal = actual == PipelineState.STOPPED || actual == PipelineState.FAILED;
+        if (scoped.observations() != null) {
+            if (!terminal) return scoped.observations().publish(publisher, pass, result, config, failure)
+                    .map(value -> new ObservationPublisher.Publication(value, true));
+            scoped.observations().forget(pipelineId);
+        }
+        boolean allowTerminalReuse = !finalStopSample(pass, actual) && !refreshTerminal
+                && !scoped.alerts().needsFreshTerminalMetrics(pass.scope());
+        return publishScopedObservation(pass, result, failure, allowTerminalReuse);
+    }
+
+    private boolean finalStopSample(PipelineConvergencePass pass, PipelineState actual) {
+        if (actual != PipelineState.STOPPED || scoped.stoppedRecheck() == null || pass == null) return false;
+        var desired = pass.intent().desired();
+        return desired.targetState() == PipelineState.STOPPED && !desired.purgeState() && !desired.reassemble();
+    }
+
+    private StoppedEvidence recordStoppedEvidence(String pipelineId, PipelineConvergencePass pass, ConvergeResult result,
+            ObservationPublisher.Publication reading) {
+        var published = reading.observation();
+        var checkpoint = result.checkpoint().orElseThrow();
+        var terminal = TerminalPublication.from(pass, checkpoint.epoch(), published);
+        scoped.observations().terminal(terminal);
+        var alertReceipt = TerminalPublication.failed();
+        try {
+            alertReceipt = scoped.alerts().terminalPublished(pass, terminal, published, result.failure().orElse(null), reading.measured());
+        } catch (RuntimeException unavailable) {
+            LOG.warn("Could not submit the final alert sample for pipeline {}", pipelineId);
+        }
+        var sample = reading.measured() && sampler != null ? RateSampler.sampleOf(published) : null;
+        var history = sample == null ? null : new ProcessObservationWriter.History(sample,
+                remaining -> pass.rateHistory(remaining).append(sample));
+        var historyReceipt = scoped.writes().terminalHistory(terminal,
+                history == null ? null : history.guardedBy(pass.guardOriginal(pass.claim())));
+        return new StoppedEvidence(pass.intent(), checkpoint, pass.claim(), historyReceipt, alertReceipt);
+    }
+
+    private void notifyObservation(PipelineConvergencePass pass, ConvergeResult result, ObservationPublisher.Publication reading) {
+        var published = reading.observation();
+        if (scoped != null) alert(() -> scoped.alerts().published(pass, published, result.failure().orElse(null), reading.measured()));
+        if (!reading.measured()) return;
+        if (scoped == null || scoped.writes() == null) {
+            sample(published, pass);
+        } else {
+            var history = history(published, pass);
+            if (history != null) scoped.writes().offerHistory(history.guardedBy(pass.guardOriginal(pass.claim())));
+        }
+    }
+
+    private Optional<ObservationPublisher.Publication> publishScopedObservation(PipelineConvergencePass pass,
+            ConvergeResult result, ObservationFailure failure, boolean allowTerminalReuse) {
+        var observations = pass.observationSample();
+        try {
+            return publisher.publishScopedReading(pass.scope(), pass.state(), observations, failure, allowTerminalReuse);
+        } catch (TapstateException unavailable) {
+            if (unavailable.code() != IoError.WORKLOAD_CLAIM_FENCED || failure != null
+                    || !settledStop(pass, result) || !currentIntent(pass)) throw unavailable;
+            // A stopped reader's old capture can be retired while its checkpoint and execution are still current.
+            var stopped = observations.republishStopped(result.checkpoint().orElseThrow()).orElseThrow(() -> unavailable);
+            return currentIntent(pass) ? Optional.of(new ObservationPublisher.Publication(stopped, false)) : Optional.empty();
+        }
+    }
+
+    private boolean currentIntent(PipelineConvergencePass pass) {
+        return scoped.intents().loadForActuation(pass.scope().pipelineId()).filter(pass.intent()::equals).isPresent();
+    }
+
+    private static boolean settledStop(PipelineConvergencePass pass, ConvergeResult result) {
+        if (result.status() != ConvergeStatus.CONVERGED || result.checkpoint().isEmpty()) return false;
         var desired = pass.intent().desired();
         var checkpoint = result.checkpoint().orElseThrow();
         return StateJson.parse(checkpoint.stateJson()) == PipelineState.STOPPED && desired.targetState() == PipelineState.STOPPED
-                && !desired.purgeState() && !desired.reassemble() && !desired.rebuildOwedAt(checkpoint)
+                && !desired.purgeState() && !desired.reassemble() && !desired.rebuildOwedAt(checkpoint);
+    }
+
+    private boolean canSettleStopped(PipelineConvergencePass pass, ConvergeResult result, Observation observation) {
+        return pass != null && scoped.stoppedRecheck() != null && scoped.writes() != null && scoped.observations() != null
+                && observation.state() == PipelineState.STOPPED && settledStop(pass, result)
                 && !scoped.alerts().needsFrequentTerminalSamples(pass.scope(), observation.state())
                 && (periodicObservations == null || periodicObservations.idle(pass.scope().pipelineId()))
                 && (sampler == null || sampler.idle(pass.scope()));

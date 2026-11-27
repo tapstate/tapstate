@@ -115,6 +115,12 @@ final class TwoMemberCluster implements AutoCloseable {
         return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, false, false, Map.of());
     }
 
+    static TwoMemberCluster startPreparedWithClaimBreakpoints(PreparedNativeStore storage) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage,
+                List.of(), List.of(),
+                List.of("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:0"));
+    }
+
     /** Starts both JVMs before waiting, so first-boot coordination executes concurrently. */
     static TwoMemberCluster startConcurrently(String storeUri, String name, Duration nodeSessionTtl) {
         return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, true, false, Map.of());
@@ -160,6 +166,14 @@ final class TwoMemberCluster implements AutoCloseable {
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode,
             PreparedNativeStore preparedStore, List<String> firstMemberArguments, List<String> secondMemberArguments) {
+        return start(storeUri, clusterId, nodeSessionTtl, concurrent, existingAdministrator, stagingByNode,
+                preparedStore, firstMemberArguments, secondMemberArguments, List.of());
+    }
+
+    private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
+            boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode,
+            PreparedNativeStore preparedStore, List<String> firstMemberArguments, List<String> secondMemberArguments,
+            List<String> jvmOptions) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, RealProcessServer.PreparedLaunch> preparedLaunches = new LinkedHashMap<>();
@@ -187,12 +201,12 @@ final class TwoMemberCluster implements AutoCloseable {
             };
             preparedLaunches.put(NODE_A, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
-                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
+                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments, jvmOptions));
             first = preparedLaunches.get(NODE_A).launch();
             if (!concurrent) first.awaitHealthy();
             preparedLaunches.put(NODE_B, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments)
-                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
+                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments, jvmOptions));
             second = preparedLaunches.get(NODE_B).launch();
             if (!concurrent) second.awaitHealthy();
         } catch (RuntimeException | Error failure) {

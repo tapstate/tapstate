@@ -10,6 +10,7 @@ import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.spi.sink.SinkWriter;
@@ -63,6 +64,94 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         assertThat(delivery.latestRows()).isEqualTo(Map.of("orders", Map.of("i", 2L)));
         // Two rows of {id: <number>} at ten bytes each: two for the field's name, eight for the number.
         assertThat(delivery.latestBytes()).isEqualTo(Map.of("orders", 20L));
+    }
+
+    @Test
+    void measures_cdc_output_at_confirmation_without_counting_snapshot_or_synthetic_rows() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(writer, delivery, () -> now);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        ChainPosition snapshot = new ChainPosition(SourceOrder.snapshotRow(1), null);
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(
+                row("orders", now - 300).withPosition(change),
+                update("orders", now - 600).withPosition(change),
+                row("orders", now - 800).withPosition(snapshot),
+                row("orders", now - 1_200).withPositions(Map.of("orders", change, "customers", snapshot)),
+                row("orders", now - 1_600),
+                row("orders", now - 1_700).withPositions(Map.of("orders", change,
+                        "customers", new ChainPosition(new SourceOrder(1, 22), "other-change"))),
+                delete("orders", now + 10).withPosition(change)));
+        processor.process(0, inbox);
+        assertThat(delivery.cdc).isEmpty();
+
+        writer.completeAll();
+        drain(processor);
+
+        assertThat(delivery.cdc.getLast()).isEqualTo(new CdcDeliveryTotals(2, 900));
+        assertThat(delivery.latestDurations().get("orders").count()).isEqualTo(7);
+    }
+
+    @Test
+    void cdc_duration_stops_when_the_writer_acknowledges_the_batch() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long[] now = {1_700_000_000_000L};
+        SinkProcessor processor = init(writer, delivery, () -> now[0]);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        TestInbox inbox = new TestInbox();
+        inbox.add(row("orders", now[0] - 100).withPosition(change));
+        processor.process(0, inbox);
+
+        now[0] += 2_000;
+        writer.completeAll();
+        now[0] += 5_000;
+        drain(processor);
+
+        assertThat(delivery.cdc).containsExactly(new CdcDeliveryTotals(1, 2_100));
+    }
+
+    @Test
+    void measures_acknowledged_no_op_rows_in_a_batch_with_ignored_ddl() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(writer, delivery, () -> now);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(
+                update("orders", now - 300).withPosition(change),
+                Envelope.ddl(now - 500, "orders", Map.of()).withPosition(change),
+                delete("orders", now - 600).withPosition(change)));
+        processor.process(0, inbox);
+        writer.completeNext(new WriteResult(0, 2));
+        drain(processor);
+
+        assertThat(delivery.cdc).containsExactly(new CdcDeliveryTotals(2, 900));
+    }
+
+    @Test
+    void omits_partial_acknowledgements_from_cdc_and_resumes_with_the_next_complete_batch() throws Exception {
+        RecordingDelivery delivery = new RecordingDelivery();
+        ManualWriter writer = new ManualWriter();
+        long now = 1_700_000_000_000L;
+        SinkProcessor processor = init(writer, delivery, () -> now);
+        ChainPosition change = new ChainPosition(new SourceOrder(1, 13), "change");
+        TestInbox inbox = new TestInbox();
+        inbox.addAll(List.of(row("orders", now - 300).withPosition(change),
+                update("orders", now - 600).withPosition(change)));
+        processor.process(0, inbox);
+        writer.completeNext(new WriteResult(2, 1));
+        processor.tryProcess();
+        assertThat(delivery.cdc).containsExactly(CdcDeliveryTotals.ZERO);
+
+        inbox.add(row("orders", now - 200).withPosition(change));
+        processor.process(0, inbox);
+        writer.completeAll();
+        drain(processor);
+        assertThat(delivery.cdc.getLast()).isEqualTo(new CdcDeliveryTotals(1, 200));
     }
 
     /**
@@ -411,6 +500,13 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
         private final List<Map<String, Long>> bytes = new ArrayList<>();
         private final List<Map<String, Long>> eventTimes = new ArrayList<>();
         private final List<Map<String, HistogramValue>> durations = new ArrayList<>();
+        private final List<CdcDeliveryTotals> cdc = new ArrayList<>();
+
+        @Override
+        public void cdcDelivered(CdcDeliveryTotals totals) {
+            cdc.add(totals);
+        }
+
         private final List<Long> starts = new ArrayList<>();
         private final List<Map<String, Long>> queued = new ArrayList<>();
         private final List<Map<String, Long>> inFlight = new ArrayList<>();
@@ -495,21 +591,22 @@ class WhatReachedTheTargetIsCountedWhereItLandedTest {
 
     /** Hands out futures the test settles by hand. */
     private static final class ManualWriter implements SinkWriter {
-        private final List<CompletableFuture<WriteResult>> pending = new ArrayList<>();
+        private final Map<CompletableFuture<WriteResult>, Integer> pending = new LinkedHashMap<>();
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             CompletableFuture<WriteResult> future = new CompletableFuture<>();
-            pending.add(future);
+            pending.put(future, records.size());
             return future;
         }
 
+        void completeNext(WriteResult result) {
+            pending.keySet().stream().filter(future -> !future.isDone()).findFirst().orElseThrow()
+                    .complete(result);
+        }
+
         void completeAll() {
-            for (CompletableFuture<WriteResult> future : pending) {
-                if (!future.isDone()) {
-                    future.complete(new WriteResult(1));
-                }
-            }
+            pending.forEach((future, size) -> future.complete(new WriteResult(size)));
         }
 
         @Override

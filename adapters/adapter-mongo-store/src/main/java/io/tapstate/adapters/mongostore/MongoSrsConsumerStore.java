@@ -1332,10 +1332,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 MongoCaptureStartupRows.lookup(SystemCollections.CACHE_SCHEMA_MIGRATIONS, "schema", "business")));
         Document root = captured == null ? null : captured.get("root", Document.class);
         if (root == null || !chain.equals(root.get("_id"))
-                || MongoCaptureStartupRows.get(captured, "cache") == null
-                || MongoCaptureStartupRows.get(captured, "schema") == null
                 || MongoCaptureStartupRows.ambiguous(captured, "cache", "cluster")
-                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")) return StartupCapture.FALLBACK;
+                || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
+                || MongoCaptureStartupRows.get(captured, "cache") == null
+                || MongoCaptureStartupRows.get(captured, "schema") == null) return StartupCapture.FALLBACK;
         MongoCacheBusinessIdentity.requireObservedReady(MongoCaptureStartupRows.get(captured, "cache"),
                 MongoCaptureStartupRows.get(captured, "schema"), scope);
         var members = captured.getList("members", Document.class);
@@ -2462,10 +2462,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 MongoCaptureStartupRows.lookup(SystemCollections.CACHE_WORKLOAD_CLAIMS, "claim", claimId)));
         Document root = captured == null ? null : captured.get("root", Document.class);
         if (root == null || !chain.equals(root.get("_id"))
-                || MongoCaptureStartupRows.get(captured, "cache") == null
-                || MongoCaptureStartupRows.get(captured, "schema") == null
                 || MongoCaptureStartupRows.ambiguous(captured, "cache", "cluster")
                 || MongoCaptureStartupRows.ambiguous(captured, "schema", "business")
+                || MongoCaptureStartupRows.get(captured, "cache") == null
+                || MongoCaptureStartupRows.get(captured, "schema") == null
                 || MongoCaptureStartupRows.ambiguous(captured, "pipeline", pipeline)
                 || MongoCaptureStartupRows.ambiguous(captured, "claim", claimId)) return startupAttachFallback(session, chain);
         MongoCacheBusinessIdentity.requireObservedReady(MongoCaptureStartupRows.get(captured, "cache"),

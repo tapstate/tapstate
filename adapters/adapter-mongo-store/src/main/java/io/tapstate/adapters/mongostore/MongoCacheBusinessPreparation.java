@@ -20,6 +20,11 @@ import java.util.Set;
 
 /** Initial business DDL and readiness publish together; existing readiness permits verification only. */
 final class MongoCacheBusinessPreparation {
+    private static final String BUSINESS_PHASE = "businessPhase";
+    private static final String BUSINESS_RETIREMENT_ID = "businessRetirementId";
+    private static final String EXISTS = "$exists";
+    private static final String BUSINESS_PREPARATION_ID = "businessPreparationId";
+    private static final String CLAIM_ADMISSION_FENCE = "claimAdmissionFence";
     // This value exists only inside an uncommitted DDL transaction; only READY is published.
     static final String CREATING = "CREATING";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.LOCAL)
@@ -48,32 +53,36 @@ final class MongoCacheBusinessPreparation {
                                 || !Long.valueOf(original.authScope().bindingVersion()).equals(row.get("bindingVersion"))
                                 || !original.authScope().cacheIncarnation().equals(row.get("cacheIncarnation"))
                                 || !MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId"))) throw refused();
-                        if ("READY".equals(row.get("businessPhase"))) {
-                            if (!original.operationId().equals(row.get("businessPreparationId"))) throw refused();
+                        if ("READY".equals(row.get(BUSINESS_PHASE))) {
+                            if (!original.operationId().equals(row.get(BUSINESS_PREPARATION_ID))) throw refused();
                             new MongoCacheBusinessIdentity(database, original.businessScope()).requireAdmissionState(session);
                             active.run();
                             return null;
                         }
-                        if (!"PREPARING".equals(row.get("businessPhase")) || !original.operationId().equals(row.get("businessPreparationId"))
-                                || row.containsKey("claimAdmissionFence") || row.containsKey("businessRetirementId")
+                        if (!"PREPARING".equals(row.get(BUSINESS_PHASE)) || !original.operationId().equals(row.get(BUSINESS_PREPARATION_ID))
+                                || row.containsKey(CLAIM_ADMISSION_FENCE) || row.containsKey(BUSINESS_RETIREMENT_ID)
                                 || SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first() != null) throw refused();
                         Document pending = new Document("_id", "cluster").append("clusterId", original.authScope().clusterId())
                                 .append("bindingVersion", original.authScope().bindingVersion()).append("cacheIncarnation", original.authScope().cacheIncarnation())
-                                .append("businessPhase", "PREPARING").append("businessPreparationId", original.operationId())
-                                .append("claimAdmissionFence", new Document("$exists", false)).append("businessRetirementId", new Document("$exists", false));
+                                .append(BUSINESS_PHASE, "PREPARING").append(BUSINESS_PREPARATION_ID, original.operationId())
+                                .append(CLAIM_ADMISSION_FENCE, new Document(EXISTS, false)).append(BUSINESS_RETIREMENT_ID, new Document(EXISTS, false));
                         // Serialize with another preparation before observing structures outside this snapshot.
                         if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, pending,
-                                new Document("$set", new Document("businessPhase", CREATING))).getMatchedCount() != 1) throw refused();
+                                new Document("$set", new Document(BUSINESS_PHASE, CREATING))).getMatchedCount() != 1) throw refused();
                         requireOnlyAuthCollections();
                         structure.prepareBusinessInTransaction(session, active);
                         MongoCacheClusterMembershipStore.prepareInitial(session, database, original.businessScope(), original.operationId());
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).insertOne(session,
+                                MongoCacheBusinessIdentity.claimNamespaceRecord(original.businessScope(), original.operationId()));
                         Document filter = new Document("_id", "cluster").append("clusterId", original.authScope().clusterId())
                                 .append("bindingVersion", original.authScope().bindingVersion()).append("cacheIncarnation", original.authScope().cacheIncarnation())
-                                .append("businessPhase", CREATING).append("businessPreparationId", original.operationId())
-                                .append("claimAdmissionFence", new Document("$exists", false))
-                                .append("businessRetirementId", new Document("$exists", false));
-                        if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, filter, new Document("$set", new Document("businessPhase", "READY")
-                                .append("businessPreparationId", original.operationId()).append("claimAdmissionFence", 0L))).getMatchedCount() != 1) throw refused();
+                                .append(BUSINESS_PHASE, CREATING).append(BUSINESS_PREPARATION_ID, original.operationId())
+                                .append(CLAIM_ADMISSION_FENCE, new Document(EXISTS, false))
+                                .append(BUSINESS_RETIREMENT_ID, new Document(EXISTS, false));
+                        if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, filter, new Document("$set", new Document(BUSINESS_PHASE, "READY")
+                                .append(BUSINESS_PREPARATION_ID, original.operationId()).append(CLAIM_ADMISSION_FENCE, 0L)
+                                .append(MongoCacheBusinessIdentity.CLAIM_NAMESPACE_PROOF_VERSION,
+                                        MongoCacheBusinessIdentity.CLAIM_NAMESPACE_PROOF_V1))).getMatchedCount() != 1) throw refused();
                         SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", 1)
                                 .append("epoch", 1L).append("operationId", original.operationId()).append("phase", "READY"));
                         active.run();
