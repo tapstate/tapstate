@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
 import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.ResumeMetrics;
 import io.tapstate.spi.store.ResumeMetrics.Producer;
@@ -1690,6 +1691,11 @@ public final class ObservationPublisher {
                     MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.count())));
             facts.add(MetricFact.single(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, MetricType.COUNTER, "ms",
                     MetricPoint.accumulated(scope, delivered.countingSince(), at, cdc.totalMillis())));
+        }
+        var pending = delivered.pendingCdcWrite();
+        if (pending != null && PendingCdcWrite.isCurrent(pending.observedAt(), at)) {
+            facts.add(MetricFact.single(PendingCdcWrite.METRIC, MetricType.GAUGE, "ms",
+                    MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId), pending.observedAt(), pending.ageMillis())));
         }
         // The distribution accumulates from the same start as the counts: it is over the same rows.
         delivered.start().ifPresent(start -> {

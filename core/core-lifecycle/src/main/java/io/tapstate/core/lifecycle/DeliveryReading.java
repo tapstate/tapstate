@@ -35,7 +35,7 @@ import java.util.Optional;
 public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
         Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
         Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable,
-        CdcDeliveryTotals cdcDelivery, RateSample.StartupEvidence startupEvidence) {
+        CdcDeliveryTotals cdcDelivery, PendingCdcWrite pendingCdcWrite, RateSample.StartupEvidence startupEvidence) {
 
     /** A reading from a run reporting nothing — no live job, or one that has settled nothing yet. */
     public static final DeliveryReading NONE =
@@ -66,8 +66,16 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
             Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
             Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable,
             CdcDeliveryTotals cdcDelivery) {
-        this(rowsByTableAndOp, bytesByTable, newestEventTimeByTable, countingSince, deliveryDurationByTable,
-                cdcDelivery, null);
+        this(rowsByTableAndOp, bytesByTable, newestEventTimeByTable, countingSince,
+                deliveryDurationByTable, cdcDelivery, null, null);
+    }
+
+    public DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
+            Map<String, Long> bytesByTable, Map<String, Long> newestEventTimeByTable,
+            Instant countingSince, Map<String, HistogramValue> deliveryDurationByTable,
+            CdcDeliveryTotals cdcDelivery, PendingCdcWrite pendingCdcWrite) {
+        this(rowsByTableAndOp, bytesByTable, newestEventTimeByTable, countingSince,
+                deliveryDurationByTable, cdcDelivery, pendingCdcWrite, null);
     }
 
     /** A reading carrying the original delivery distribution. */
@@ -92,6 +100,6 @@ public record DeliveryReading(Map<String, Map<String, Long>> rowsByTableAndOp,
     /** Whether this run reported nothing at all, as opposed to reporting nothing delivered. */
     public boolean isEmpty() {
         return rowsByTableAndOp.isEmpty() && bytesByTable.isEmpty()
-                && newestEventTimeByTable.isEmpty() && deliveryDurationByTable.isEmpty() && cdcDelivery == null;
+                && newestEventTimeByTable.isEmpty() && deliveryDurationByTable.isEmpty() && cdcDelivery == null && pendingCdcWrite == null;
     }
 }

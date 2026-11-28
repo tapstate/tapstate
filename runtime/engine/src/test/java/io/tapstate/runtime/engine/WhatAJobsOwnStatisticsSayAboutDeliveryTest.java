@@ -4,11 +4,13 @@ import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.lifecycle.CdcDeliveryTotals;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.time.Instant;
 import java.util.List;
@@ -40,6 +42,22 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
         valuesByMetric.forEach((metric, values) -> measurements.put(metric,
                 values.stream().map(value -> Measurement.of(metric, value, 0L, Map.of())).toList()));
         return JobMetrics.of(measurements);
+    }
+
+    @Test
+    void pendingCdcUsesTheLargestAgeFromFreshSinkSamples() {
+        String name = JetDeliveryGauge.OLDEST_PENDING_CDC;
+        var samples = List.of(Measurement.of(name, 97_000, 99_000, Map.of()),
+                Measurement.of(name, 96_000, 100_000, Map.of()),
+                Measurement.of(name, 500, 39_000, Map.of()),
+                Measurement.of(name, 0, 100_000, Map.of()),
+                Measurement.of(name, 100_001, 100_000, Map.of()));
+        var now = Instant.ofEpochMilli(100_000);
+
+        assertThat(Engine.pendingCdcWriteIn(JobMetrics.of(Map.of(name, samples)), now))
+                .isEqualTo(new PendingCdcWrite(4_000, now));
+        assertThat(Engine.pendingCdcWriteIn(JobMetrics.of(Map.of(name, samples.subList(2, 5))), now))
+                .isNull();
     }
 
     @Test

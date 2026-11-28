@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
@@ -784,6 +785,23 @@ public final class Engine {
         return job == null ? null : cdcDeliveryIn(job.getMetrics());
     }
 
+    /** An empty sink supplies no evidence about source capture progress. */
+    static PendingCdcWrite pendingCdcWriteIn(JobMetrics metrics, Instant now) {
+        PendingCdcWrite oldest = null;
+        for (Measurement measurement : metrics.get(JetDeliveryGauge.OLDEST_PENDING_CDC)) {
+            long eventMillis = measurement.value();
+            long sampleMillis = measurement.timestamp();
+            Instant at = Instant.ofEpochMilli(sampleMillis);
+            if (eventMillis <= 0 || eventMillis > sampleMillis || !PendingCdcWrite.isCurrent(at, now)) continue;
+            long age = sampleMillis - eventMillis;
+            if (oldest == null || age > oldest.ageMillis()
+                    || (age == oldest.ageMillis() && at.isAfter(oldest.observedAt()))) {
+                oldest = new PendingCdcWrite(age, at);
+            }
+        }
+        return oldest;
+    }
+
     static CdcDeliveryTotals cdcDeliveryIn(JobMetrics metrics) {
         var counts = metrics.get(JetDeliveryGauge.CDC_COUNT);
         var totals = metrics.get(JetDeliveryGauge.CDC_TOTAL_MILLIS);
@@ -993,11 +1011,12 @@ public final class Engine {
         OptionalLong since = deliveryStart(metrics);
         if (since.isEmpty()) {
             return evidence == null ? DeliveryReading.NONE
-                    : new DeliveryReading(Map.of(), Map.of(), Map.of(), null, Map.of(), null, evidence);
+                    : new DeliveryReading(Map.of(), Map.of(), Map.of(), null, Map.of(), null, null, evidence);
         }
         return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics),
                 highestIn(metrics, JetDeliveryGauge::reachedTableOf),
-                Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics), evidence);
+                Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics),
+                pendingCdcWriteIn(metrics, Instant.now()), evidence);
     }
 
     static Instant outboundZeroAt(JobMetrics metrics, String execution, Set<String> participants) {
