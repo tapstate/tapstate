@@ -23,6 +23,10 @@ final class MongoPipelineRebuildFacts {
 
     private MongoPipelineRebuildFacts() { }
 
+    static Document rebuildingMappingFilter(String pipelineId) {
+        return new Document("_id", pipelineId).append("phase", PipelineStateMapping.Phase.REBUILDING.name());
+    }
+
     static void requireObservablePending(Document mapping, PipelineStateMapping state, PipelineIntentSnapshot intent) {
         try {
             var annex = mapping.get("stateRebuild", Document.class);

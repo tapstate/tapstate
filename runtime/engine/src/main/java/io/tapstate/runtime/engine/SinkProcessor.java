@@ -176,6 +176,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
     private final Map<String, ArrayDeque<Queued>> queued = new LinkedHashMap<>();
     // When each queued stream's oldest row was taken in, by the clock the wait is measured against.
     private final Map<String, Long> waitingSince = new LinkedHashMap<>();
+    private final Map<String, Long> oldestQueuedCdcByStream = new LinkedHashMap<>();
     private int queuedRows;
     private Map<String, SinkTarget> nativeTargets = Map.of();
     private QueuedMove queuedMove;
@@ -567,6 +568,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             waitingSince.put(row.src(), nanoClock.getAsLong());
         }
         queue.add(new Queued(nextOrder++, row));
+        if (DeliveredRows.hasCdcTimestamp(row)) {
+            oldestQueuedCdcByStream.merge(row.src(), row.ts(), Math::min);
+        }
         queuedRows++;
     }
 
@@ -611,7 +615,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
                 if (!inFlight.isEmpty()) return wrote;
                 var batch = List.of(queuedMove.row());
                 inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
-                        queuedMove.order(), queuedMove.reply(), batch.size()));
+                        queuedMove.order(), queuedMove.reply(), EngineError.KEY_MOVE_WRITE_UNCONFIRMED));
                 queuedMove = null;
                 return true;
             }
@@ -622,12 +626,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             wrote = true;
             ArrayDeque<Queued> queue = queued.remove(stream);
             waitingSince.remove(stream);
+            oldestQueuedCdcByStream.remove(stream);
             List<Envelope> batch = new ArrayList<>(queue.size());
             long firstOrder = queue.peek().order();
-            int dataEvents = 0;
             for (Queued row : queue) {
                 batch.add(row.row());
-                if (laneCoordination && row.row().op() != io.tapstate.core.event.Op.DDL) dataEvents++;
             }
             queuedRows -= batch.size();
             // Tallied while the rows are still here and counted only once the write settles. Holding the
@@ -635,7 +638,8 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             // write; this keeps one number per table and operation in it instead.
             var positions = positionsOf(batch);
             var delivered = DeliveredRows.of(batch);
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder, null, dataEvents));
+            inFlight.add(new InFlightBatch(settlementOf(batch), positions, delivered, firstOrder, null,
+                    laneCoordination ? EngineError.KEY_MOVE_WRITE_UNCONFIRMED : EngineError.SINK_WRITE_UNCONFIRMED));
         }
         // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
         // backpressures upstream until reapSettled frees a slot on a later call.
@@ -699,12 +703,24 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
         Map<String, Long> queuedByStream = new LinkedHashMap<>();
         queued.forEach((stream, rows) -> queuedByStream.put(stream, (long) rows.size()));
         Map<String, Long> inFlightByTable = new LinkedHashMap<>();
+        long oldestCdc = Long.MAX_VALUE;
+        for (long eventMillis : oldestQueuedCdcByStream.values()) {
+            oldestCdc = Math.min(oldestCdc, eventMillis);
+        }
         for (InFlightBatch batch : inFlight) {
+            if (!batch.future().isDone()) {
+                oldestCdc = Math.min(oldestCdc, batch.delivered().oldestCdcTimestamp());
+            }
             batch.delivered().rows().forEach((table, byOp) -> inFlightByTable.merge(
                     table, byOp.values().stream().mapToLong(Long::longValue).sum(), Long::sum));
         }
-        if (queuedMove != null) queuedByStream.merge(queuedMove.row().src(), 1L, Long::sum);
+        if (queuedMove != null) {
+            Envelope move = queuedMove.row();
+            queuedByStream.merge(move.src(), 1L, Long::sum);
+            if (DeliveredRows.hasCdcTimestamp(move)) oldestCdc = Math.min(oldestCdc, move.ts());
+        }
         delivery.waiting(queuedByStream, inFlightByTable);
+        delivery.oldestPendingCdc(oldestCdc == Long.MAX_VALUE ? 0 : oldestCdc);
     }
 
     /**
@@ -865,6 +881,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             return;
         }
         closed = true;
+        delivery.oldestPendingCdc(0);
         try {
             if (ack != null) closeStep("SinkAck.flushOnClose", ack::flushOnClose);
         } finally {
@@ -885,11 +902,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             SettledWrite settled;
             try {
                 settled = settle(batch.future());
-                WriteResult result = settled.result();
-                if (batch.expectedWrites() > 0 && (result == null || result.acknowledgedRows() != batch.expectedWrites())) {
-                    throw new TapstateException(EngineError.KEY_MOVE_WRITE_UNCONFIRMED,
-                            Map.of("expected", batch.expectedWrites(), "accepted", result == null ? 0L : result.acknowledgedRows()), null);
-                }
+                batch.requireConfirmation(settled.result());
                 if (batch.reply() != null) laneAcknowledgments.accept(batch.reply());
             } catch (RuntimeException | Error failure) {
                 // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
@@ -912,11 +925,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             // this processor's queue and in flight at the target is part of that, not noise around it.
             long settledAt = clock.getAsLong();
             batch.delivered().foldDurationsInto(settledDurations, settledAt);
-            // A partial receipt only identifies a count. It cannot tell us which event times to sample.
-            WriteResult result = settled.result();
-            if (result != null && result.acknowledgedRows() == batch.delivered().rowCount()) {
-                cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settled.acknowledgedAtMillis());
-            }
+            cdcDelivery = batch.delivered().addCdcDurations(cdcDelivery, settled.acknowledgedAtMillis());
             reportDelivered(batch.delivered().tables());
             return true;
         });
@@ -1033,7 +1042,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      * first row - the lowest in it, since a stream's rows go in the order they were taken in.
      */
     private record InFlightBatch(CompletableFuture<SettledWrite> future, List<ChainEntry> positions,
-            DeliveredRows delivered, long firstOrder, SinkLaneAcks.Ticket reply, int expectedWrites) {
+            DeliveredRows delivered, long firstOrder, SinkLaneAcks.Ticket reply, EngineError receiptError) {
+        void requireConfirmation(WriteResult receipt) {
+            int expected = delivered.rowCount();
+            long accepted = receipt == null ? 0L : receipt.acknowledgedRows();
+            if (expected > 0 && accepted != expected) {
+                throw new TapstateException(receiptError, Map.of("expected", expected, "accepted", accepted), null);
+            }
+        }
     }
 
     /** A row taken in and not yet handed to the writer, with the number it was taken in under. */
@@ -1051,7 +1067,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
      */
     private record DeliveredRows(Map<String, Map<String, Long>> rows, Map<String, Long> bytes,
             Map<String, Long> newestEventTime, Map<String, List<Long>> eventTimes, List<Long> cdcTimes,
-            int rowCount) {
+            int rowCount, long oldestCdcTimestamp) {
 
         /** The tables this batch settled rows of, which are the ones whose readings have moved. */
         Set<String> tables() {
@@ -1065,6 +1081,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
             Map<String, List<Long>> stamps = new LinkedHashMap<>();
             List<Long> cdcTimes = new ArrayList<>();
             int rowCount = 0;
+            long oldestCdcTimestamp = Long.MAX_VALUE;
             for (Envelope event : batch) {
                 if (event.op() != Op.DDL) {
                     rowCount++;
@@ -1082,9 +1099,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged, Dy
                 stamps.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(event.ts());
                 if (hasCdcTimestamp(event)) {
                     cdcTimes.add(event.ts());
+                    oldestCdcTimestamp = Math.min(oldestCdcTimestamp, event.ts());
                 }
             }
-            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount);
+            return new DeliveredRows(rows, bytes, newest, stamps, cdcTimes, rowCount, oldestCdcTimestamp);
         }
 
         private static boolean hasCdcTimestamp(Envelope event) {

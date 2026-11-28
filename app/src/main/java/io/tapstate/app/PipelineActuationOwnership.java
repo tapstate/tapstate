@@ -823,6 +823,10 @@ final class PipelineActuationOwnership {
     }
 
     Execution beginExecution(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        return beginExecution(scope, expected, 0L);
+    }
+
+    Execution beginExecution(PipelineIntentScope scope, WorkloadClaimFence expected, long resumeRevision) {
         Objects.requireNonNull(scope, "scope");
         Objects.requireNonNull(expected, "expected");
         if (!admission.enter()) return Execution.refused();
@@ -830,7 +834,7 @@ final class PipelineActuationOwnership {
             var reserved = reserveAdvance(scope, expected);
             if (reserved == null) return Execution.refused();
             try {
-                return advanceScopedExecution(scope, reserved);
+                return advanceScopedExecution(scope, reserved, resumeRevision);
             } finally {
                 synchronized (this) {
                     reserved.state().executionAdvancing = false;
@@ -864,14 +868,14 @@ final class PipelineActuationOwnership {
         return new ScopedAdvance(state, state.claim, planned, runMembers);
     }
 
-    private Execution advanceScopedExecution(PipelineIntentScope scope, ScopedAdvance reserved) {
+    private Execution advanceScopedExecution(PipelineIntentScope scope, ScopedAdvance reserved, long resumeRevision) {
         var original = reserved.original();
         if (original.topologyRevision() != reserved.planned().revision()) {
             original = rebaseForAdvance(scope, reserved);
             if (original == null) return Execution.refused();
         }
         // The durable CAS still uses the exact claim and original topology of this submission.
-        var next = advanceClaim(original, reserved.runMembers());
+        var next = advanceClaim(original, reserved.runMembers(), resumeRevision);
         synchronized (this) {
             var state = reserved.state();
             if (!holdsAdvance(scope, state, original)) return Execution.refused();
@@ -932,7 +936,12 @@ final class PipelineActuationOwnership {
     }
 
     private Optional<WorkloadClaim> advanceClaim(WorkloadClaim original, Set<String> runMembers) {
+        return advanceClaim(original, runMembers, 0L);
+    }
+
+    private Optional<WorkloadClaim> advanceClaim(WorkloadClaim original, Set<String> runMembers, long resumeRevision) {
         try {
+            if (resumeRevision > 0) return claims.advanceResumeExecution(original, runMembers, resumeRevision);
             return claims.advanceExecution(original, original.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
             return Optional.empty();

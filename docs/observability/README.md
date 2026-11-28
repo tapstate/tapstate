@@ -24,6 +24,7 @@ pipeline. The history and explanation responses, including coded errors, carry
 |---|---|---|---|
 | What runtime state was last observed? | `GET /api/pipelines/{id}/status` | `status <id>` | `pipeline_status` |
 | What lifecycle target was requested? | `desiredState` in `GET /api/pipelines/{id}/status` | — | `desiredState` in `pipeline_status` |
+| What is the current or latest run doing, and what milestones has it reached? | `GET /api/pipelines/{id}/run-progress` (`pipeline.run-progress`, read scope) | — | — |
 | How can I follow runtime state changes? | WebSocket `/api/pipelines/{id}/status/watch` | `status <id> --watch` | — |
 | What are the current counters and positions? | `GET /api/pipelines/{id}/metrics` | `metrics <id>` | `pipeline_metrics` |
 | How far has the initial snapshot loaded? | `GET /api/pipelines/{id}/snapshot` | `snapshot <id>` | `pipeline_snapshot` |
@@ -146,6 +147,14 @@ are target-confirmed tables out of that run's complete initial-load table set, n
 
 The optional projection is unavailable for old observations, unverified execution bindings, or stale
 observations. A mismatched replacement execution never inherits the preceding run's partial counts.
+The Pipeline catalog (`GET /api/pipelines`) exposes `syncLag` for running pipelines.
+`BEHIND` carries `lowerBoundMillis` and `observedAt`. The duration measures the oldest
+timestamped CDC row observed waiting for its target write at that sample. A pipeline can
+have additional, older work upstream. `UNKNOWN` means that a current pending-write
+sample is unavailable. An empty sink queue alone cannot establish that capture has
+reached the source. The sample expires after 60 seconds and the duration stays fixed
+at its recorded observation time.
+
 Normal cleanup of a completed bounded execution can retain its target-confirmed final facts without an
 active plan; those facts describe the completed run. The projection is for display, not pipeline recovery,
 and it does not make separate status, metrics, and snapshot requests a transactional snapshot.
