@@ -34,6 +34,19 @@ class SnapshotBufferTest {
     private static final String PIPELINE = "orders_pipeline";
 
     @Test
+    void aLatePrivateStreamCannotMarkTheReplacementHandoffReady() {
+        var buffer = new SnapshotBuffer();
+        String ring = "srs.chain.replaced-ready";
+        var original = buffer.handoff(PIPELINE, ring);
+        buffer.release(PIPELINE);
+        var current = buffer.handoff(PIPELINE, ring);
+        original.changesReady();
+        assertThat(buffer.changesReady(PIPELINE, ring)).isFalse();
+        current.changesReady();
+        assertThat(buffer.changesReady(PIPELINE, ring)).isTrue();
+    }
+
+    @Test
     void rejectsInvalidKeysBeforeDirectOrBoundSnapshotAdmission() {
         SnapshotBuffer buffer = new SnapshotBuffer();
         String ring = "srs.chain.invalidkeys";
