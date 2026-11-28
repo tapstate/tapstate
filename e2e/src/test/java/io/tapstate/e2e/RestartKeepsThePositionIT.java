@@ -90,7 +90,7 @@ class RestartKeepsThePositionIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void thePlainRestartCarriesOnWithoutReadingTheCollectionAgain(Tiers tier) throws Exception {
-        Fixture fixture = Fixture.forCase("restart_keep", tier);
+        Fixture fixture = Fixture.forCase("restart_keep", tier, false);
 
         try (PreparedNativeStore storage = PreparedNativeStore.create();
                 MongoClient source = fixture.openSource();
@@ -145,7 +145,7 @@ class RestartKeepsThePositionIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void aRerunReadsTheWholeCollectionAgain(Tiers tier) throws Exception {
-        Fixture fixture = Fixture.forCase("restart_rerun", tier);
+        Fixture fixture = Fixture.forCase("restart_rerun", tier, true);
 
         try (PreparedNativeStore storage = PreparedNativeStore.create();
                 MongoClient source = fixture.openSource();
@@ -195,14 +195,15 @@ class RestartKeepsThePositionIT {
      * reason -- which is the failure this file would be least able to see, both readings being what the
      * case expects.
      */
-    private record Fixture(String pipelineId, String sourceUri, String targetUri) {
+    private record Fixture(String pipelineId, String sourceUri, String targetUri, boolean preImage) {
 
-        static Fixture forCase(String name, Tiers tier) {
+        static Fixture forCase(String name, Tiers tier, boolean preImage) {
             String suffix = name + "_" + tier.name().toLowerCase(Locale.ROOT);
             return new Fixture(
                     suffix,
                     SharedMongo.replicaSetUrl(suffix + "_src"),
-                    SharedMongo.replicaSetUrl(suffix + "_tgt"));
+                    SharedMongo.replicaSetUrl(suffix + "_tgt"),
+                    preImage);
         }
 
         String sourceDatabase() {
@@ -219,7 +220,12 @@ class RestartKeepsThePositionIT {
 
         /** Written by a driver of the database rather than through any face of the product. */
         void seed(MongoClient client) {
-            client.getDatabase(sourceDatabase()).getCollection(COLLECTION).drop();
+            var database = client.getDatabase(sourceDatabase());
+            database.getCollection(COLLECTION).drop();
+            if (preImage) {
+                database.runCommand(new Document("create", COLLECTION)
+                        .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+            }
             for (int id = 1; id <= SEEDED_ROWS; id++) {
                 add(client, id, "order-" + id);
             }
@@ -249,7 +255,11 @@ class RestartKeepsThePositionIT {
             // The source model is discovered because the key it reports is what the sink writes under.
             // Without it the sink has no key, and the change below would land as a second document
             // rather than as a change to the one already there.
-            control.discoverSchema(SOURCE_ID, "mongodb", Map.of("uri", sourceUri, "database", sourceDatabase()));
+            Map<String, Object> sourceConfig = new LinkedHashMap<>(Map.of("uri", sourceUri, "database", sourceDatabase()));
+            if (preImage) {
+                sourceConfig.put("preImage", true);
+            }
+            control.discoverSchema(SOURCE_ID, "mongodb", sourceConfig);
             control.lifecycle(pipelineId, LifecycleVerb.START);
             return control;
         }
@@ -260,11 +270,11 @@ class RestartKeepsThePositionIT {
                     kind: source
                     id: %s
                     connector: mongodb
-                    config: { uri: "%s", database: %s }
+                    config: { uri: "%s", database: %s%s }
                     mode: cdc
                     tables: [ %s ]
                     """
-                    .formatted(SOURCE_ID, sourceUri, sourceDatabase(), COLLECTION);
+                    .formatted(SOURCE_ID, sourceUri, sourceDatabase(), preImage ? ", preImage: true" : "", COLLECTION);
         }
 
         String targetYaml() {

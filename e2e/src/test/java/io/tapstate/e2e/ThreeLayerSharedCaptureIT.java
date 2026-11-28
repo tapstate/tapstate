@@ -43,15 +43,16 @@ class ThreeLayerSharedCaptureIT {
 
     @Test @Timeout(300)
     void everyMemberEndsTheOriginalSharedTenuresWithoutResettingTheUnrelatedReaderOrLosingAQuietTable() throws Exception {
-        multiMemberSharedRecovery(false);
+        // Exercise owner replacement with complete old keys in the shared capture.
+        multiMemberSharedRecovery(false, true);
     }
 
     @Test @Timeout(300)
     void completedMultiMemberSharedRecoveryStillExposesTheStoppedReaders() throws Exception {
-        multiMemberSharedRecovery(true);
+        multiMemberSharedRecovery(true, false);
     }
 
-    private void multiMemberSharedRecovery(boolean stopAfterRecovery) throws Exception {
+    private void multiMemberSharedRecovery(boolean stopAfterRecovery, boolean preImage) throws Exception {
         String suffix=UUID.randomUUID().toString().replace("-","");String clusterId="shared-members-"+suffix;
         String configDb="members_cfg_"+suffix,cacheDb="members_cache_"+suffix,configUri=CONFIG.getReplicaSetUrl(configDb);
         String sourceUri=DATA.getReplicaSetUrl("members_source_"+suffix),secondUri=DATA.getReplicaSetUrl("members_second_"+suffix);
@@ -77,13 +78,13 @@ class ThreeLayerSharedCaptureIT {
             mongo.seed(source,"orders",SeedRows.generated(8));mongo.seed(source,"quiet",SeedRows.generated(1));mongo.seed(second,"items",SeedRows.generated(5));
             var control=cluster.member(nodes.getFirst());control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
             var resources=new LinkedHashMap<String,String>();resources.put("views.tap.yml",control.artifact("views").orElseThrow().canonicalForm());
-            resources.put("input.tap.yml",source("input",sourceUri,"orders, quiet"));resources.put("second.tap.yml",source("second",secondUri,"items"));
+            resources.put("input.tap.yml",source("input",sourceUri,"orders, quiet",preImage));resources.put("second.tap.yml",source("second",secondUri,"items",preImage));
             resources.put("target_b.tap.yml",target("target_b",bUri));resources.put("target_c.tap.yml",target("target_c",cUri));
             resources.put("reader_a.tap.yml",pipeline("reader_a",List.of("input","second"),"views",List.of("orders","quiet","items")));
             resources.put("reader_b.tap.yml",pipeline("reader_b",List.of("input"),"target_b",List.of("orders","quiet")));
             resources.put("reader_c.tap.yml",pipeline("reader_c",List.of("second"),"target_c",List.of("items")));
-            control.apply(resources);control.discoverSchema("input","mongodb",Map.of("isUri",true,"uri",sourceUri));
-            control.discoverSchema("second","mongodb",Map.of("isUri",true,"uri",secondUri));
+            control.apply(resources);control.discoverSchema("input","mongodb",sourceSettings(sourceUri, preImage));
+            control.discoverSchema("second","mongodb",sourceSettings(secondUri, preImage));
             control.lifecycle("reader_c",LifecycleVerb.START);awaitRows(mongo,second,c,"items",BOUND);
             control.lifecycle("reader_a",LifecycleVerb.START);awaitRows(mongo,source,a,BOUND);awaitRows(mongo,source,a,"quiet",BOUND);awaitRows(mongo,second,a,"items",BOUND);
             control.lifecycle("reader_b",LifecycleVerb.START);awaitRows(mongo,source,b,BOUND);awaitRows(mongo,source,b,"quiet",BOUND);
@@ -643,9 +644,27 @@ class ThreeLayerSharedCaptureIT {
                     .isGreaterThanOrEqualTo(new io.tapstate.core.event.SourceOrder(ack.getLong("epoch"),ack.getLong("sequence")));
         }
     }
-    private static String source(String id,String uri,String table) {
-        return "version: tapstate/v1\nkind: source\nid: "+id+"\nconnector: mongodb\nconfig: { isUri: true, uri: \""+uri+"\" }\nmode: cdc\ntables: [ "+table+" ]\n";
+    private static String source(String id, String uri, String table) {
+        return source(id, uri, table, false);
     }
+
+    private static String source(String id, String uri, String table, boolean preImage) {
+        return """
+                version: tapstate/v1
+                kind: source
+                id: %s
+                connector: mongodb
+                config: { isUri: true, uri: "%s"%s }
+                mode: cdc
+                tables: [ %s ]
+                """.formatted(id, uri, preImage ? ", preImage: true" : "", table);
+    }
+
+    private static Map<String, Object> sourceSettings(String uri, boolean preImage) {
+        return preImage ? Map.of("isUri", true, "uri", uri, "preImage", true)
+                : Map.of("isUri", true, "uri", uri);
+    }
+
     private static String target(String id,String uri) {
         return "version: tapstate/v1\nkind: source\nid: "+id+"\nconnector: mongodb\nconfig: { isUri: true, uri: \""+uri+"\" }\n";
     }
@@ -683,7 +702,7 @@ class ThreeLayerSharedCaptureIT {
                         kind: source
                         id: input
                         connector: mongodb
-                        config: { isUri: true, uri: "%s" }
+                        config: { isUri: true, uri: "%s", preImage: true }
                         mode: cdc
                         tables: [ orders ]
                         """.formatted(taggedSource));
@@ -696,7 +715,7 @@ class ThreeLayerSharedCaptureIT {
                         """.formatted(targetBUri));
                 resources.put("reader_a.tap.yml", pipeline("reader_a", "views"));
                 resources.put("reader_b.tap.yml", pipeline("reader_b", "target_b"));
-                control.apply(resources); control.discoverSchema("input", "mongodb", Map.of("isUri", true, "uri", taggedSource));
+                control.apply(resources); control.discoverSchema("input", "mongodb", sourceSettings(taggedSource, true));
                 control.lifecycle("reader_a", LifecycleVerb.START); awaitRows(mongo, source, targetA, BOUND);
                 control.lifecycle("reader_b", LifecycleVerb.START); awaitRows(mongo, source, targetB, BOUND);
                 String beforeAck = Await.answered("the second consumer's initial target confirmation", BOUND,
