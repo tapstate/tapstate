@@ -74,7 +74,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context.getDefaultListableBeanFactory();
         beans.setConversionService(org.springframework.boot.convert.ApplicationConversionService.getSharedInstance());
         beans.registerSingleton("nativeBusinessContext", this);
-        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::prepareStartIntent, true);
+        port = new ThreeLayerStorePort(configuration, original, this::prepareStartIntent);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         var diagnosticCandidate = parent.getBeanProvider(IsolatedConnectionDiagnostics.class).getIfAvailable();
@@ -219,8 +219,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 && ownership.hasLocalWriterLease(original);
     }
 
-    private void preparePipeline(PipelineIntentScope scope) {
+    private void prepareStartIntent(PipelineIntentScope scope, long intentRevision, PipelinePreparationInputs captured) {
         original.requireBusiness();
+        var preparer = context.getBean(PipelineFirstStatePreparer.class);
+        if (captured != null) {
+            preparer.prepareForStartIntent(scope, captured, intentRevision);
+            return;
+        }
         var snapshot = ReadOnlyArtifactSnapshot.capture(context.getBean(ArtifactStore.class));
         var authored = StoredArtifacts.requirePipeline(snapshot, scope.pipelineId());
         var expanded = PipelineInlining.inline(authored, snapshot);
@@ -228,16 +233,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         expanded.sourceIds().forEach(id -> sources.put(id, StoredArtifacts.requireSource(snapshot, id)));
         var models = SourceModelSnapshot.capture(scope.pipelineId(), sources.values(), port.schemas());
         var inputs = models.preparationInputs(scope, authored, expanded, sources);
-        preparePipeline(scope, inputs);
-    }
-
-    private void preparePipeline(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
-        original.requireBusiness();
-        context.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
-    }
-    private void prepareStartIntent(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
-        original.requireBusiness();
-        context.getBean(PipelineFirstStatePreparer.class).prepareForStartIntent(scope, inputs);
+        preparer.prepareForStartIntent(scope, inputs, intentRevision);
+        preparer.verifyRetainedSources(scope, inputs);
     }
     private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership) {
         return modelCommand(pipeline, ownership, false);

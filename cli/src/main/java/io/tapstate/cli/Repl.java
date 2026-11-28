@@ -2762,11 +2762,7 @@ final class Repl {
         // A server with no start checks: the rerun is the stop and the start it always was.
         int started = lifecycleOnline("start", id, null);
         if (started != Cli.EXIT_OK) {
-            PrintWriter err = commandLine.getErr();
-            err.println("restart: " + id + " was stopped and its state cleared, but starting it did not "
-                    + "go through; it is stopped with no position to resume from, so the next run reads "
-                    + "the whole source");
-            err.flush();
+            flow.reportRerunStartFailure(id, null);
         }
         return started;
     }
@@ -2857,6 +2853,11 @@ final class Repl {
                 return withFailover(() -> controlPlane.startChecks(
                                 session.landingNode(), session.credential(), pipelineId, intent),
                         outcome -> outcome instanceof StartChecksOutcome.Unreachable);
+            }
+
+            @Override
+            public StatusOutcome status(String pipelineId) {
+                return readStatus(pipelineId);
             }
         };
         StartFlow.Reporting reporting = new StartFlow.Reporting() {

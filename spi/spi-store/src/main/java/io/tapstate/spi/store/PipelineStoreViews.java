@@ -5,6 +5,8 @@ package io.tapstate.spi.store;
  * view retains one immutable claim through all transaction retries and never resolves a newer claim.
  */
 public interface PipelineStoreViews {
+    default void requireUnpreparedPipelineAbsent(PipelineIntentScope scope, Runnable requireActive) { throw unsupported(); }
+
     default SnapshotStateStore snapshotStates(PipelineIntentScope scope,WorkloadClaimFence original,Runnable requireActive) { throw unsupported(); }
 
     default SinkPreparationStore sinkPreparations(PipelineIntentScope scope,WorkloadClaimFence original,Runnable requireActive) { throw unsupported(); }

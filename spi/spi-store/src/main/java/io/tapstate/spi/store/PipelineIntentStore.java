@@ -62,6 +62,22 @@ public interface PipelineIntentStore {
 
     default Optional<PendingStart> pendingStart(String pipelineId) { return Optional.empty(); }
 
+    enum FirstClearResult { CLEARED, UNPROVEN }
+
+    record PendingFirstClear(PipelineIntentSnapshot intent, boolean issued) {}
+
+    /** An accepted clearing Stop without admitted runtime state. */
+    default Optional<PendingFirstClear> pendingFirstClear(String pipelineId) { return Optional.empty(); }
+
+    /** Publishes the result only against the original Stop intent and preparation fence. */
+    default void completeFirstClear(PipelineIntentSnapshot original, boolean cacheAbsent) {
+        throw new UnsupportedOperationException("first clearing Stop is not supported");
+    }
+
+    default Optional<FirstClearResult> firstClearResult(PipelineIntentSnapshot original, java.time.Duration budget) {
+        return Optional.empty();
+    }
+
     default void failStart(PendingStart pending, IoError error) {
         throw new UnsupportedOperationException("deferred first start is not supported");
     }

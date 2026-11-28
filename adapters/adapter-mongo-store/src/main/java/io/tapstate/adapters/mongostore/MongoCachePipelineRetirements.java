@@ -11,6 +11,7 @@ import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.*;
 import org.bson.Document;
+import java.time.Duration;
 import java.util.*;
 import java.util.function.Function;
 
@@ -118,6 +119,28 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                 Map.entry(SystemCollections.CACHE_SNAPSHOT_ORDERS,"_id.pipelineId"),Map.entry(SystemCollections.CACHE_SNAPSHOT_COUNTS,"_id.scope.pipelineId"),
                 Map.entry(SystemCollections.CACHE_PIPELINE_RATE_HISTORY,"scope.pipelineId")))
             if(entry.getKey().on(database).find(session,new Document(entry.getValue(),scope.pipelineId())).first()!=null)throw rebuild(scope);
+
+        var observations = SystemCollections.CACHE_PIPELINE_OBSERVATION;
+        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(observations);
+        if (observations.on(database).find(session, MongoCachePipelineObservationStore.scopeFilter(scope))
+                .projection(new Document("_id", 1)).first() != null) throw rebuild(scope);
+    }
+
+    void requireUnpreparedAbsent(PipelineIntentScope scope, Duration rateRetention) {
+        requireScope(scope);
+        StoreIo.run(() -> {
+            active.run();
+            verifyStructures(rateRetention);
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    active.run();
+                    new MongoCacheBusinessIdentity(database, business).requireReady(session);
+                    requireAbsent(session, scope);
+                    active.run();
+                    return null;
+                }, TRANSACTION);
+            }
+        });
     }
     private MongoCacheDerivedSchemaStore models(PipelineIntentScope scope) {
         return new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(client, database, scope, null, active));
@@ -145,12 +168,18 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
         return StoreIo.call(() -> {check(original);try(var session=client.startSession()) {
             return session.withTransaction(() -> {
                 check(original);new MongoCacheBusinessIdentity(database,business).admitMetadataWrite(session);
-                var structure=new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION);structure.verifyDirect();structure.verifySrs();
-                for(var table:List.of(SystemCollections.CACHE_OPERATOR_CLEANUP,SystemCollections.CACHE_PIPELINE_STATE,
-                        SystemCollections.CACHE_DERIVED_SCHEMAS))structure.verifyFacet(table);
+                verifyStructures(MongoRateHistoryStore.DEFAULT_RETENTION);
                 T result=action.apply(session);check(original);return result;
             },TRANSACTION);
         }});
+    }
+
+    private void verifyStructures(Duration retention) {
+        var structure = new MongoCacheMetadataStructure(database, retention);
+        structure.verifyDirect();
+        structure.verifySrs();
+        for (var table : List.of(SystemCollections.CACHE_OPERATOR_CLEANUP, SystemCollections.CACHE_PIPELINE_STATE,
+                SystemCollections.CACHE_DERIVED_SCHEMAS)) structure.verifyFacet(table);
     }
     private void check(PipelineRetirementPreparation original){active.run();MongoPipelineRetirements.requireOriginalActive(original);}
     private void requireScope(PipelineIntentScope scope){if(!business.equals(new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation())))throw MongoCacheBusinessIdentity.businessFenced();}

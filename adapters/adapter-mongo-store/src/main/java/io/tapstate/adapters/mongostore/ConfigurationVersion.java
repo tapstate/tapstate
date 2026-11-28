@@ -78,7 +78,8 @@ final class ConfigurationVersion {
         var row = versions.aggregate(session, java.util.List.of(new Document("$match", new Document("_id", ID)),
                 new Document("$lookup", new Document("from", SystemCollections.SCHEMA_MIGRATIONS.collectionName())
                         .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "config")),
-                                new Document("$project", new Document("installedVersion", 1).append("validation", 1))))
+                                new Document("$project", new Document("installedVersion", 1).append("componentVersion", 1)
+                                        .append("firstClearingStop", 1).append("validation", 1))))
                         .append("as", "schema")),
                 new Document("$lookup", new Document("from", SystemCollections.CONFIG_CLUSTER_IDENTITY.collectionName())
                         .append("pipeline", java.util.List.of(new Document("$match", new Document("_id", "cluster")),

@@ -21,6 +21,17 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * placeholders from the exception's arguments and falling back to the bare canonical code.
  */
 class MessageCatalogTest {
+    @Test
+    void firstClearRefusalHasItsOwnDiagnosticAndPreservesTheRebuildMessage() {
+        var catalog = MessageCatalog.bundled();
+        var params = Map.<String, Object>of("pipeline", "flow");
+        var rebuild = catalog.render(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_STATE_REBUILD_REQUIRED.code(), params);
+        assertThat(rebuild.message()).isEqualTo("Pipeline flow cannot prove its original checkpoint preparation and claim history.");
+        assertThat(rebuild.solution()).isEqualTo("Inspect the original operation or explicitly confirm a full rebuild. Do not recreate missing claims, epochs or preparation authority.");
+        var clearing = catalog.render(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_CLEAR_UNPROVEN.code(), params);
+        assertThat(clearing.message()).isEqualTo("The clearing Stop for pipeline 'flow' could not be confirmed.");
+        assertThat(clearing.solution()).contains("deployment administrator").doesNotContain("rebuild");
+    }
 
     private static final MessageCatalog EN = MessageCatalog.bundled();
 

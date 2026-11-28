@@ -1899,49 +1899,38 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * when that field is absent. A malformed failure block is a contract error, not a healthy pipeline.
      */
     private static StatusOutcome statusFound(String body) {
-        Object parsed = JsonReader.parse(body);
-        if (parsed instanceof Map<?, ?> pending && pending.get("pipelineId") instanceof String
-                && pending.get("state") == null && pending.get("observedState") == null
-                && (pending.containsKey("displayState") || pending.containsKey("desiredState"))) {
-            return new StatusOutcome.NoObservation();
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> m) || !(m.get("pipelineId") instanceof String id)) {
+            return null;
         }
-        if (parsed instanceof Map<?, ?> m
-                && m.get("pipelineId") instanceof String id
-                && m.get("state") instanceof String state) {
-            boolean aggregate = m.containsKey("observedState")
-                    || m.containsKey("desiredState") || m.containsKey("displayState");
-            if (aggregate) {
-                Object observed = m.get("observedState");
-                if (observed == null) {
-                    return new StatusOutcome.NoObservation();
-                }
-                if (!(observed instanceof String observedState)) {
-                    return null;
-                }
-                state = observedState;
-            }
-            // How old the reading is, as the server measured it. Absent on a server that does not report
-            // it and on an observation stored before the time was recorded; both read back null, which
-            // means "nobody can say" and is never replaced by a subtraction against this machine's clock.
-            Long ageMillis = m.get("observedAgeMillis") instanceof Number age ? age.longValue() : null;
-            Object rawFailure = m.get("failure");
-            if (rawFailure == null) {
-                return new StatusOutcome.Found(id, state, null, null, ageMillis);
-            }
+        String stopState = stringOrNull(m.get("stopState"));
+        String failureCode = null;
+        String failureMessage = null;
+        var params = new LinkedHashMap<String, Object>();
+        Map<String, Object> diagnostic = Map.of();
+        Object rawFailure = m.get("failure");
+        if (rawFailure != null) {
             if (!(rawFailure instanceof Map<?, ?> failure) || !(failure.get("code") instanceof String code)) {
                 return null;
             }
-            // The message is the server's rendering of that code; when it is absent the code still names
-            // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
-            String message = failure.get("message") instanceof String rendered ? rendered : code;
-            var params = new LinkedHashMap<String, Object>();
+            failureCode = code;
+            failureMessage = failure.get("message") instanceof String rendered ? rendered : code;
             if (failure.get("params") instanceof Map<?, ?> supplied) {
                 supplied.forEach((key, value) -> { if (key instanceof String name) params.put(name, value); });
             }
-            return new StatusOutcome.Found(id, state, code, message, ageMillis, params,
-                    io.tapstate.core.common.RuntimeDiagnosticProjection.read(failure.get("diagnostic")));
+            diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.read(failure.get("diagnostic"));
         }
-        return null;
+        boolean aggregate = m.containsKey("observedState") || m.containsKey("desiredState") || m.containsKey("displayState");
+        Object state = m.get("state");
+        if (aggregate && (state instanceof String || state == null && (m.containsKey("displayState") || m.containsKey("desiredState")))) {
+            Object observed = m.get("observedState");
+            if (observed == null) {
+                return new StatusOutcome.NoObservation(new StatusOutcome.StopDetails(stopState, failureCode, failureMessage, params));
+            }
+            if (state instanceof String) state = observed;
+        }
+        if (!(state instanceof String observedState)) return null;
+        Long ageMillis = m.get("observedAgeMillis") instanceof Number age ? age.longValue() : null;
+        return new StatusOutcome.Found(id, observedState, failureCode, failureMessage, ageMillis, params, diagnostic, stopState);
     }
 
     /**

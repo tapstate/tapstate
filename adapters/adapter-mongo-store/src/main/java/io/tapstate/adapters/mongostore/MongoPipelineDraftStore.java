@@ -2,6 +2,9 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.TransactionOptions;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -17,6 +20,7 @@ import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.PipelineDraftSummary;
 import org.bson.Document;
+import org.bson.types.Decimal128;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -33,7 +37,12 @@ import java.util.logging.Logger;
 /** Mongo persistence for Pipeline drafts and the cross-collection publish transaction. */
 public final class MongoPipelineDraftStore implements PipelineDraftStore {
 
+    private static final String DELETED = "deleted";
+    private static final String PIPELINE_ID = "pipelineId";
+    private static final String FIELD = "field";
     private static final String REVISION = "revision";
+    private static final TransactionOptions OCCUPANCY_SNAPSHOT = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT).readPreference(ReadPreference.primary()).build();
     private static final int MAX_COMMIT_ATTEMPTS = 3;
     private static final Logger LOG = Logger.getLogger(MongoPipelineDraftStore.class.getName());
     private final MongoClient client;
@@ -54,6 +63,56 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Document document = StoreIo.call(() -> drafts.find(activeDraft(pipelineId)).first());
         return document == null ? Optional.empty() : Optional.of(readDraft(document));
+    }
+
+    @Override
+    public Optional<Boolean> idOccupied(String pipelineId) {
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        return Optional.of(StoreIo.call(() -> {
+            try (ClientSession session = client.startSession()) {
+                // Publication can overlap deletion, so both headers must be read in one snapshot.
+                session.startTransaction(OCCUPANCY_SNAPSHOT);
+                boolean occupied;
+                try {
+                    occupied = occupiedInSnapshot(session, pipelineId);
+                } catch (RuntimeException error) {
+                    abortAfterFailure(session, error);
+                    throw error;
+                }
+                session.abortTransaction(); // The observation writes nothing.
+                return occupied;
+            }
+        }));
+    }
+
+    private boolean occupiedInSnapshot(ClientSession session, String pipelineId) {
+        var key = new Document("_id", pipelineId);
+        if (artifacts.withReadPreference(ReadPreference.primary()).find(session, key)
+                .projection(new Document("_id", 1)).first() != null) return true;
+        var row = drafts.withReadPreference(ReadPreference.primary()).find(session, key)
+                .projection(new Document("_id", 1).append(DELETED, 1).append(REVISION, 1)).first();
+        if (row == null) return false;
+        if (!Boolean.TRUE.equals(row.getBoolean(DELETED))) return true;
+        tombstoneRevision(row, pipelineId);
+        return false;
+    }
+
+    private static long tombstoneRevision(Document row, String id) {
+        Object value = row.get(REVISION);
+        try {
+            long revision = switch (value) {
+                case Integer integer -> integer.longValue();
+                case Long integral -> integral;
+                case Double decimal when decimal > 0 && decimal < 0x1.0p63
+                        && Math.rint(decimal) == decimal -> decimal.longValue();
+                case Decimal128 decimal -> decimal.bigDecimalValue().longValueExact();
+                case null, default -> throw new ArithmeticException();
+            };
+            if (revision > 0 && revision < Long.MAX_VALUE) return revision;
+        } catch (ArithmeticException ignored) {
+            // A non-integral, non-finite or overflowing revision cannot be revived.
+        }
+        throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, FIELD, REVISION), null);
     }
 
     @Override
@@ -154,7 +213,7 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                 if (!Boolean.TRUE.equals(current.getBoolean("deleted"))) {
                     return PipelineDraftMutation.ALREADY_EXISTS;
                 }
-                long previousRevision = ((Number) current.get(REVISION)).longValue();
+                long previousRevision = tombstoneRevision(current, draft.pipelineId());
                 PipelineDraft revived = withRevision(draft, previousRevision + 1);
                 Document filter = new Document("_id", draft.pipelineId())
                         .append(REVISION, previousRevision).append("deleted", true);

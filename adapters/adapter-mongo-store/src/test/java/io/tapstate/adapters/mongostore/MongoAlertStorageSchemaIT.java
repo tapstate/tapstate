@@ -314,10 +314,12 @@ class MongoAlertStorageSchemaIT {
 
     @Test void firstInstallationPublishesTheWholeFeatureWithoutChangingTheGlobalConfigVersion() {
         withConfiguration(false, fixture -> {
-            assertThat(fixture.domain().schemaVersion()).isEqualTo(2);
+            assertThat(fixture.domain().schemaVersion()).isEqualTo(4);
             assertThat(fixture.domain().alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
-            assertThat(schema(fixture).getInteger("installedVersion")).isEqualTo(2);
-            assertThat(schema(fixture).get(MongoAlertStorageSchema.FIELD, Document.class).getString("operationId"))
+            var configSchema = schema(fixture);
+            assertThat(configSchema.getInteger("installedVersion")).isEqualTo(4);
+            assertThat(configSchema.getInteger("componentVersion")).isEqualTo(2);
+            assertThat(configSchema.get(MongoAlertStorageSchema.FIELD, Document.class).getString("operationId"))
                     .isEqualTo("setup-a");
             assertAllTables(fixture);
         });
