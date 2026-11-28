@@ -180,10 +180,16 @@ class SinkAckMetaSupplierTest {
         }
     }
     @Test void independentOpensRemainBoundedAndReturnedProcessorsKeepTheirOriginalSlots() throws Exception {
+        var firstEntered = new CountDownLatch(1);
         var secondReturned = new CountDownLatch(1); var releaseFirst = new CountDownLatch(1);
         var recorder = new OpeningRecorder(4) {
             @Override protected SinkWriter openOwned(int member, int index) throws Exception {
-                if (index == 1) assertThat(releaseFirst.await(2, TimeUnit.SECONDS)).isTrue();
+                if (index == 1) {
+                    firstEntered.countDown();
+                    assertThat(releaseFirst.await(2, TimeUnit.SECONDS)).isTrue();
+                } else if (index == 2) {
+                    assertThat(firstEntered.await(2, TimeUnit.SECONDS)).isTrue();
+                }
                 var opened = super.openOwned(member, index);
                 if (index == 2) secondReturned.countDown();
                 return opened;
