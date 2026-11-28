@@ -233,9 +233,11 @@ retain the request and summary from each command. Check the keys and values prod
 Check live warm-up and window counts and final readback,
 and backlog source history, zero snapshot rows on resume, confirmed writes and
 final readback. Review `measurement_status` independently from execution `status`.
-Copy, Map, JS and Filter live cases can collect source and target callbacks
+Copy, Map, JS, Filter and Union live cases can collect source and target callbacks
 with `--endpoint-latency-probe`. Filter records intentionally excluded source
 events separately. Confirmation coverage uses all retained events.
+Union verifies event history and confirmation coverage separately for both
+source inputs before combining their latency samples.
 For the Copy handoff, retain the snapshot overlap witness together with the
 latency trace for events in the scored CDC window.
 Cases without complete correlation report

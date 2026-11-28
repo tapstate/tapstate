@@ -95,13 +95,7 @@ class BenchmarkLatencyProbeTest {
         Path witness = directory.resolve("copy");
         Files.writeString(witness, "0\t1\t1000\n0\t2\t1000\n0\t3\t3000\n");
         Files.writeString(witness.resolveSibling("copy.ack"), "0\t1\t1000\t1960\n0\t2\t1000\t2200\n0\t3\t3000\t3100\n");
-        var mongo = (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
-                new Class<?>[]{MongoDatabase.class}, (proxy, method, args) -> switch (method.getName()) {
-                    case "withTimeout" -> proxy;
-                    case "runCommand" -> new Document("localTime", new Date());
-                    default -> throw new UnsupportedOperationException(method.getName());
-                });
-        try (var probe = new BenchmarkLatencyProbe(witness, mongo, false)) {
+        try (var probe = new BenchmarkLatencyProbe(witness, fixtureClock(), false)) {
             probe.start();
             var result = probe.finish(live, "records", 2, 100, 1, Duration.ofSeconds(2));
             assertNull(result.reason());
@@ -109,6 +103,55 @@ class BenchmarkLatencyProbeTest {
             assertEquals(4_000L, result.endExclusiveEpochMillis());
             assertEquals(1_200_000_000L, result.reading().p95Nanos());
         }
+    }
+
+    @Test
+    void requiresCoverageForEachInputEvenWhenAggregateCoverageWouldPass(@TempDir Path directory) throws Exception {
+        var leftWarm = phase(1000, 1999, new Event(0, 10, 1_000));
+        var rightWarm = phase(1000, 1999, new Event(0, 20, 1_000));
+        var left = phase(2000, 4000, new Event(0, 11, 2_000), new Event(0, 12, 2_000), new Event(0, 13, 2_000));
+        var right = phase(2000, 4000, new Event(0, 21, 3_000));
+        var live = new Live(null, null, null, null, byInput(leftWarm, rightWarm), byInput(left, right));
+        Path witness = directory.resolve("union");
+        Path acknowledgements = directory.resolve("union.ack");
+        Files.writeString(witness, """
+                0\t10\t1000\tleft\t{}\t0
+                0\t20\t1000\tright\t{}\t0
+                0\t21\t3000\tright\t{}\t0
+                0\t11\t2000\tleft\t{}\t0
+                0\t12\t2000\tleft\t{}\t0
+                0\t13\t2000\tleft\t{}\t0
+                """);
+        String leftAcks = "0\t11\t2000\t2120\n0\t12\t2000\t2140\n0\t13\t2000\t2160\n";
+        try (var probe = new BenchmarkLatencyProbe(witness, fixtureClock(), false)) {
+            Files.writeString(acknowledgements, leftAcks);
+            probe.start();
+            var incomplete = probe.finish(live, "records", 1, 10, 0.70, Duration.ofSeconds(2));
+            assertEquals("Confirmation coverage below threshold for input right", incomplete.reason());
+            Files.writeString(acknowledgements, leftAcks + "0\t21\t3000\t3200\n");
+            probe.start();
+            var complete = probe.finish(live, "records", 1, 10, 0.70, Duration.ofSeconds(2));
+            assertNull(complete.reason());
+            assertEquals(4, complete.reading().valid());
+            assertEquals(3, complete.inputs().get("left").confirmedEvents());
+            assertEquals(1, complete.inputs().get("right").confirmedEvents());
+            assertEquals(200_000_000L, complete.reading().p95Nanos());
+        }
+    }
+
+    private static MongoDatabase fixtureClock() {
+        return (MongoDatabase) Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
+                new Class<?>[]{MongoDatabase.class}, (proxy, method, args) -> switch (method.getName()) {
+                    case "withTimeout" -> proxy;
+                    case "runCommand" -> new Document("localTime", new Date());
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private static PhaseReport byInput(PhaseReport left, PhaseReport right) {
+        return new PhaseReport("fixture", left.startedAt(), left.writesFinishedAt(), 0, 0,
+                null, null, null, false, 0, 0, null,
+                Map.of("left", left.streams().get("records"), "right", right.streams().get("records")), true);
     }
 
     private static PhaseReport phase(long start, long end, Event... events) {

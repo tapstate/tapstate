@@ -49,13 +49,14 @@ public final class ObservedMongoConnector implements TapConnector {
             functions.supportWriteRecord(LatencyWitness.snapshotTarget(snapshot, functions.getWriteRecordFunction()));
             return;
         }
-        Path latency = witnessPath("mongo-latency-witness-path.txt");
+        Path unionLatency = witnessPath("mongo-union-latency-witness-path.txt");
+        Path latency = unionLatency == null ? witnessPath("mongo-latency-witness-path.txt") : unionLatency;
         Path backlog = witnessPath("mongo-backlog-witness-path.txt");
         Path measurement = latency == null ? backlog : latency;
         if (measurement != null) {
             functions.supportWriteRecord(LatencyWitness.target(measurement, functions.getWriteRecordFunction()));
             functions.supportStreamRead(LatencyWitness.source(measurement, functions.getStreamReadFunction(),
-                    backlog != null));
+                    backlog != null || unionLatency != null));
             return;
         }
         Path witness = witnessPath("mongo-write-witness-path.txt");

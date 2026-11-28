@@ -284,11 +284,12 @@ class BenchmarkRunIT {
         boolean mapLatency = caseId.equals("map.live.basic.standard");
         boolean jsLatency = caseId.equals("js.live.basic.standard");
         boolean filteredLatency = caseId.equals("filter.live.basic.standard");
+        boolean unionLatency = caseId.equals("union.live.basic.standard");
         boolean copyLatency = operators == null
                 && (caseId.equals(HANDOFF) || text(definition, "spec").equals("specs/copy-basic.json"));
         boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && text(definition, "mode").equals("live-latency")
-                && (mapLatency || jsLatency || filteredLatency || copyLatency);
+                && (mapLatency || jsLatency || filteredLatency || copyLatency || unionLatency);
         boolean filteredBacklog = caseId.equals("filter.backlog.basic.standard");
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
@@ -330,12 +331,13 @@ class BenchmarkRunIT {
             Files.createDirectory(delegate.getParent());
             byte[] original = Files.readAllBytes(artifact);
             Files.write(connector, backlogProbe ? ObservedMongoConnectorJar.buildBacklogProbe(original, witness, delegate)
-                    : ObservedMongoConnectorJar.buildLatencyProbe(original, witness, delegate));
+                    : ObservedMongoConnectorJar.buildLatencyProbe(original, witness, delegate, unionLatency));
             String latencyProtocol = switch (caseId) {
                 case "map.live.basic.standard" -> BenchmarkLatencyProbe.MAP_PROTOCOL;
                 case "js.live.basic.standard" -> BenchmarkLatencyProbe.JS_PROTOCOL;
                 case "filter.live.basic.standard" -> BenchmarkLatencyProbe.FILTER_PROTOCOL;
                 case HANDOFF -> BenchmarkLatencyProbe.HANDOFF_PROTOCOL;
+                case "union.live.basic.standard" -> BenchmarkLatencyProbe.UNION_PROTOCOL;
                 default -> BenchmarkLatencyProbe.PROTOCOL;
             };
             evidence.result.put(backlogProbe ? "backlog_probe" : "latency_probe",
@@ -771,6 +773,9 @@ class BenchmarkRunIT {
         }
         if (measured.excludedEvents() != null) {
             evidence.result.put("latency_filtered_source_events", measured.excludedEvents());
+        }
+        if (!measured.inputs().isEmpty()) {
+            evidence.result.put("latency_input_windows", measured.inputs());
         }
         evidence.result.remove("latency_probe_error");
         if (measured.reason() != null) evidence.result.put("latency_probe_error", measured.reason());

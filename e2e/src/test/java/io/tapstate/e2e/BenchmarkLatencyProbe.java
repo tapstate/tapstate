@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +30,7 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
     static final String JS_PROTOCOL = "mongo-js-pdk-ack-v1";
     static final String FILTER_PROTOCOL = "mongo-filter-pdk-ack-v1";
     static final String HANDOFF_PROTOCOL = "mongo-copy-handoff-pdk-ack-v1";
+    static final String UNION_PROTOCOL = "mongo-union-pdk-ack-v1";
     private static final long CLOCK_ALLOWANCE_MILLIS = 100;
     private final Path source;
     private final MongoDatabase mongo;
@@ -71,16 +73,22 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
     }
 
     record Result(LiveLatencyEligibility.Reading reading, String reason, Long startEpochMillis,
-                  Long endExclusiveEpochMillis, Integer excludedEvents) {}
+                  Long endExclusiveEpochMillis, Integer excludedEvents, Map<String, InputWindow> inputs) {}
+
+    record InputWindow(long startEpochMillis, long endExclusiveEpochMillis, int sourceEvents, int confirmedEvents) {}
 
     Result finish(Live live, String stream, int minimumP95, int minimumP99, double coverage, Duration drain) {
-        var measured = live.measured().streams().get(stream);
-        int expected = measured.observed().total();
+        int expected = live.measured().streams().values().stream()
+                .mapToInt(report -> report.observed().total()).sum();
         try {
             Files.deleteIfExists(path(".active"));
             if (!initialClock || !clockMatches()) {
                 return insufficient(expected, minimumP95, coverage, "MongoDB and fixture clocks did not agree");
             }
+            if (live.measured().streams().size() > 1) {
+                return finishByInput(live, expected, minimumP95, minimumP99, coverage, drain);
+            }
+            var measured = live.measured().streams().get(stream);
             var warmup = live.warmup().streams().get(stream);
             if (measured.first() == null || measured.last() == null) {
                 return insufficient(expected, minimumP95, coverage, "The measured source history has no event timestamps");
@@ -94,10 +102,64 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
                     event -> !filtered || BenchmarkOperatorOracle.evenKey(event.key()));
             var reading = LiveLatencyEligibility.assess(correlation.expected(), correlation.samples(),
                     true, minimumP95, minimumP99, coverage);
-            return new Result(reading, null, start, finish, filtered ? expected - correlation.expected() : null);
+            return new Result(reading, null, start, finish, filtered ? expected - correlation.expected() : null, Map.of());
         } catch (IOException | IllegalArgumentException unavailable) {
             return insufficient(expected, minimumP95, coverage, unavailable.getMessage());
         }
+    }
+
+    private Result finishByInput(Live live, int expected, int minimumP95, int minimumP99,
+            double coverage, Duration drain) throws IOException {
+        var inputByEvent = new HashMap<Event, String>();
+        var sourceByInput = new HashMap<String, List<Confirmation>>();
+        for (String line : Files.readAllLines(source)) {
+            String[] fields = line.split("\t", -1);
+            if (fields.length != 6 || !live.measured().streams().containsKey(fields[3])) {
+                throw new IllegalArgumentException("Unrecognized live source input in probe evidence");
+            }
+            Event event = event(fields);
+            if (inputByEvent.putIfAbsent(event, fields[3]) != null) {
+                throw new IllegalArgumentException("A source identity is ambiguous or replayed across inputs");
+            }
+            sourceByInput.computeIfAbsent(fields[3], ignored -> new ArrayList<>()).add(new Confirmation(event, 0));
+        }
+        if (!sourceByInput.keySet().equals(live.measured().streams().keySet())
+                || !sourceByInput.keySet().equals(live.warmup().streams().keySet())) {
+            throw new IllegalArgumentException("The witness is missing a declared source input");
+        }
+        var targetByInput = new HashMap<String, List<Confirmation>>();
+        for (Confirmation ack : read(path(".ack"), true)) {
+            String input = inputByEvent.get(ack.event());
+            if (input == null) {
+                throw new IllegalArgumentException("A target acknowledgement has no observed source input");
+            }
+            targetByInput.computeIfAbsent(input, ignored -> new ArrayList<>()).add(ack);
+        }
+        long drainEnd = live.measured().writesFinishedAt().plus(drain).toEpochMilli();
+        var samples = new ArrayList<LiveLatencyEligibility.Sample>();
+        var windows = new LinkedHashMap<String, InputWindow>();
+        for (var entry : live.measured().streams().entrySet()) {
+            String input = entry.getKey();
+            StreamReport measured = entry.getValue();
+            if (measured.first() == null || measured.last() == null) {
+                throw new IllegalArgumentException("Source input lacks measured event bounds: " + input);
+            }
+            long start = measured.first().clusterTime().getTime() * 1000L;
+            long end = (measured.last().clusterTime().getTime() + 1L) * 1000;
+            var correlation = correlate(sourceByInput.get(input), targetByInput.getOrDefault(input, List.of()),
+                    live.warmup().streams().get(input), measured, start, end, drainEnd, event -> true);
+            if ((double) correlation.samples().size() / correlation.expected() < coverage) {
+                throw new IllegalArgumentException("Confirmation coverage below threshold for input " + input);
+            }
+            windows.put(input, new InputWindow(start, end, correlation.expected(), correlation.samples().size()));
+            for (var sample : correlation.samples()) {
+                samples.add(new LiveLatencyEligibility.Sample(input + "/" + sample.sourceEvent(), sample.latencyNanos()));
+            }
+        }
+        long start = windows.values().stream().mapToLong(InputWindow::startEpochMillis).min().orElseThrow();
+        long end = windows.values().stream().mapToLong(InputWindow::endExclusiveEpochMillis).max().orElseThrow();
+        var reading = LiveLatencyEligibility.assess(expected, samples, true, minimumP95, minimumP99, coverage);
+        return new Result(reading, null, start, end, null, windows);
     }
 
     private boolean clockMatches() {
@@ -113,7 +175,7 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
     }
 
     private static Result insufficient(int expected, int minimum, double coverage, String reason) {
-        return new Result(LiveLatencyEligibility.assess(expected, List.of(), false, minimum, coverage), reason, null, null, null);
+        return new Result(LiveLatencyEligibility.assess(expected, List.of(), false, minimum, coverage), reason, null, null, null, Map.of());
     }
 
     record Event(int operation, long key, long epochMillis) {}

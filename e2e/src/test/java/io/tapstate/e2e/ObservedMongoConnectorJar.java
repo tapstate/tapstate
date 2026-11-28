@@ -28,8 +28,10 @@ final class ObservedMongoConnectorJar {
         return build(original, witness, delegate, "mongo-write-witness-path.txt", wrapperVersion);
     }
 
-    static byte[] buildLatencyProbe(byte[] original, Path witness, Path delegate) throws IOException, URISyntaxException {
-        return build(original, witness, delegate, "mongo-latency-witness-path.txt", null);
+    static byte[] buildLatencyProbe(byte[] original, Path witness, Path delegate, boolean multipleInputs)
+            throws IOException, URISyntaxException {
+        String resource = multipleInputs ? "mongo-union-latency-witness-path.txt" : "mongo-latency-witness-path.txt";
+        return build(original, witness, delegate, resource, null);
     }
 
     static byte[] buildBacklogProbe(byte[] original, Path witness, Path delegate) throws IOException, URISyntaxException {
