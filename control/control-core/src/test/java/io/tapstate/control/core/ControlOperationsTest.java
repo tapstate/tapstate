@@ -79,6 +79,7 @@ class ControlOperationsTest {
                         "pipeline.pause",
                         "pipeline.resume",
                         "pipeline.status",
+                        "pipeline.run-progress",
                         "pipeline.metrics",
                         "pipeline.snapshot",
                         "pipeline.logs",
@@ -174,7 +175,7 @@ class ControlOperationsTest {
         // read faces; read-scoped, unaudited.
         for (String id : List.of(
                 "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
-                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
+                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain", "pipeline.run-progress",
                 "pipeline.start-checks")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
@@ -260,6 +261,7 @@ class ControlOperationsTest {
                 && !"state-store.connection-uri".equals(op.id())
                 && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
+                && !"pipeline.run-progress".equals(op.id())
                 && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
                 && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")
                 && !op.id().startsWith("connector-center.")).allSatisfy(op ->
@@ -335,7 +337,7 @@ class ControlOperationsTest {
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
                         "pipeline.preview",
-                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog", "pipeline.delete");
+                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog", "pipeline.delete", "pipeline.run-progress");
     }
 
     /**

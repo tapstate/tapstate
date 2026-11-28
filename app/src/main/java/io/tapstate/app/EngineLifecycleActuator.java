@@ -126,8 +126,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     /** Reuses this assembly without registering a second global capture ownership predicate. */
     LifecycleActuator forPass(PipelineConvergencePass pass, ScopedEngineLifecycleActuator.Ports ports) {
+        return forPass(pass, ports, PipelineRunProgressEvents.NONE);
+    }
+
+    LifecycleActuator forPass(PipelineConvergencePass pass, ScopedEngineLifecycleActuator.Ports ports,
+            PipelineRunProgressEvents progress) {
         return new ScopedEngineLifecycleActuator(pass, engine, dagSource, captureCoordinator, actuation,
-                defaultDatabase, connectors, clock, ports, scopedSubmissions);
+                defaultDatabase, connectors, clock, ports, scopedSubmissions, progress);
     }
     boolean hasPendingSubmission(String pipeline) { return scopedSubmissions.hasPending(pipeline); }
 

@@ -87,6 +87,12 @@ final class ConvergenceDriver implements AutoCloseable {
 
     private final PeriodicObservations periodicObservations;
     private final PipelineConvergences pipelineConvergences;
+    private PipelineRunProgressEvents runProgress = PipelineRunProgressEvents.NONE;
+
+    ConvergenceDriver withRunProgress(PipelineRunProgressEvents events) {
+        runProgress = Objects.requireNonNull(events);
+        return this;
+    }
     private final Map<String, PipelineIntentScope> unavailableObservations = new ConcurrentHashMap<>();
 
     /** The fixed store root and per-pass bindings; no current-scope or current-claim lookup is supplied. */
@@ -657,7 +663,8 @@ final class ConvergenceDriver implements AutoCloseable {
         Consumer<String> beforeCompletion = ignored -> {
             discardPeriodic(pipelineId);
             writeObservationNow(pipelineId, () -> publisher.publishScoped(pass.scope(),
-                    pass.state(), pass.observationSample(), null));
+                    pass.state(), pass.observationSample(), null)
+                    .ifPresent(observed -> runProgress.observation(pass.intent(), pass.claim(), observed)));
         };
         BooleanSupplier currentIntent = () -> currentIntent(pass);
         if (stopOperation) return converger.convergeScoped(pass.intent(), state, actuator, rebuilds,
@@ -686,8 +693,11 @@ final class ConvergenceDriver implements AutoCloseable {
         if (publication.isPresent()) {
             var reading = publication.orElseThrow();
             var published = reading.observation();
+            if (pass != null) runProgress.observation(pass.intent(), pass.claim(), published);
             PipelineDiagnostics.event("observation_" + published.state().name());
-            if (canSettleStopped(pass, result, published)) {
+            if (pass == null) {
+                if (reading.measured()) sample(reading, null);
+            } else if (canSettleStopped(pass, result, published)) {
                 evidence = recordStoppedEvidence(pipelineId, pass, result, reading);
             } else {
                 notifyObservation(pass, result, reading);
@@ -859,11 +869,11 @@ final class ConvergenceDriver implements AutoCloseable {
             });
             projection.ifPresent(reading -> {
                 if (stage == null) {
-                    periodicCommitted(pass, checkpoint, reading, admitted, current);
+                    periodicCommitted(pass, original, checkpoint, reading, admitted, current);
                 } else {
                     scoped.writes().submit(stage, () -> {
                         if (scoped.observations() != null) scoped.observations().recordPublishedRunning(pass, checkpoint);
-                        periodicCommitted(pass, checkpoint, reading, admitted, current);
+                        periodicCommitted(pass, original, checkpoint, reading, admitted, current);
                     }, history(reading, pass), () -> alert(() -> scoped.alerts().unavailableIfExpected(pass)));
                 }
             });
@@ -880,9 +890,11 @@ final class ConvergenceDriver implements AutoCloseable {
         }
     }
 
-    private void periodicCommitted(PipelineConvergencePass pass, CheckpointDoc checkpoint, ObservationPublisher.Publication reading,
+    private void periodicCommitted(PipelineConvergencePass pass, WorkloadClaimFence original, CheckpointDoc checkpoint,
+            ObservationPublisher.Publication reading,
             BooleanSupplier admitted, BooleanSupplier current) {
         var published = reading.observation();
+        runProgress.observation(pass.intent(), original, published);
         String pipelineId = pass.scope().pipelineId();
         if (unavailableObservations.remove(pipelineId, pass.scope())) {
             LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);

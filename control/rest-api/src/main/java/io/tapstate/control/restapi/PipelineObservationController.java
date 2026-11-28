@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.control.core.PipelineRunProgressQuery;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.control.core.ConnectorUsageQuery;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,9 +26,13 @@ class PipelineObservationController {
     private final PipelineCatalogService pipelines;
     private final MessageCatalog catalog;
     private ConnectorUsageQuery usage;
+    private PipelineRunProgressQuery runProgress;
 
     @Autowired(required = false)
     void connectorUsage(ConnectorUsageQuery usage) { this.usage = usage; }
+
+    @Autowired(required = false)
+    void runProgressQuery(PipelineRunProgressQuery runProgress) { this.runProgress = runProgress; }
 
     PipelineObservationController(PipelineObservationQueryService observations,
             PipelineCatalogService pipelines, MessageCatalog catalog) {
@@ -53,6 +58,14 @@ class PipelineObservationController {
 
     private PipelineStatusResponse connectorVersions(PipelineStatusResponse response, String id) {
         return response.withConnectorVersions(usage == null ? java.util.List.of() : usage.forPipeline(id));
+    }
+
+    @Verb("pipeline.run-progress")
+    @GetMapping("/pipelines/{id}/run-progress")
+    PipelineRunProgressResponse runProgress(@PathVariable("id") String id) {
+        return runProgress == null ? PipelineRunProgressResponse.unavailable()
+                : runProgress.find(id).map(PipelineRunProgressResponse::from)
+                        .orElseGet(PipelineRunProgressResponse::unavailable);
     }
 
     @Verb("pipeline.metrics")

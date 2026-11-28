@@ -61,7 +61,17 @@ final class MongoCacheMetadataStructure {
     }
 
     void prepareBusinessInTransaction(ClientSession session, Runnable requireActive) {
-        prepareInTransaction(session, requireActive, BUSINESS_TABLES);
+        var tables = new java.util.ArrayList<>(BUSINESS_TABLES);
+        tables.add(SystemCollections.CACHE_PIPELINE_RUN_PROGRESS);
+        prepareInTransaction(session, requireActive, tables);
+    }
+
+    boolean hasPipelineRunProgress() {
+        return !collections(Set.of(SystemCollections.CACHE_PIPELINE_RUN_PROGRESS.collectionName())).isEmpty();
+    }
+
+    void preparePipelineRunProgressInTransaction(ClientSession session, Runnable requireActive) {
+        prepareInTransaction(session, requireActive, List.of(SystemCollections.CACHE_PIPELINE_RUN_PROGRESS));
     }
 
     private void prepareInTransaction(ClientSession session, Runnable requireActive, List<SystemCollections> tables) {
