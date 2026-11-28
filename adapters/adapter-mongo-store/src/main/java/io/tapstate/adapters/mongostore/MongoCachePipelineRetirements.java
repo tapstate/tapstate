@@ -72,6 +72,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
             var checkpoint = new Document("stateJson", StateJson.of(PipelineState.STOPPED))
                     .append("epoch", epoch).append("runtimeWriteFence", write);
             if (!MongoCachePipelineStateStore.update(database, session, state, new Document("$set", checkpoint))) throw fenced();
+            MongoCachePipelineRunProgressStore.deleteOriginal(database, session, scope);
             models(scope).retireInTransaction(session, false);
             return new Receipt(this,original,Optional.of(retired));
         });

@@ -330,13 +330,8 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
 
     /** The mapping, intent and CACHE incarnation belong to the same CONFIG snapshot. */
     private BindingRows bindingRows(ClientSession session, PipelineIntentScope scope, boolean readIntent) {
-        if (bindings.supportsActuationBatch()) {
-            var stages = MongoStartConfigRead.root();
-            stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
-            MongoStorageBindingStore.appendAdmittedPreparation(stages);
-            stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", scope.pipelineId()));
-            if (readIntent) stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINE_INTENTS, "intent", scope.pipelineId()));
-            var row = identity.aggregate(session, stages).first();
+        if (MongoReadBudget.supportsSnapshotReads(client)) {
+            var row = identity.aggregate(session, bindingReadStages(scope.pipelineId(), readIntent)).first();
             var mapping = MongoStartConfigRead.boundedRow(row, "mapping", scope.pipelineId());
             var intent = MongoStartConfigRead.boundedRow(row, "intent", scope.pipelineId());
             var cluster = row == null ? null : row.get("root", Document.class);
@@ -353,6 +348,15 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         }
         var mapping = requireAdmittedScope(session, scope);
         return new BindingRows(mapping, readIntent ? loadRetainedInTransaction(session, scope.pipelineId()).orElse(null) : null);
+    }
+
+    private static List<Document> bindingReadStages(String pipelineId, boolean readIntent) {
+        var stages = MongoStartConfigRead.root();
+        stages.add(new Document("$project", new Document("root", MongoStartConfigRead.boundedValue())));
+        MongoStorageBindingStore.appendAdmittedPreparation(stages);
+        stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.OPERATOR_GENERATIONS, "mapping", pipelineId));
+        if (readIntent) stages.add(MongoStartConfigRead.boundedLookup(SystemCollections.PIPELINE_INTENTS, "intent", pipelineId));
+        return stages;
     }
 
     @Override public Optional<ExecutionBindings> executionBindings(PipelineIntentScope scope) {

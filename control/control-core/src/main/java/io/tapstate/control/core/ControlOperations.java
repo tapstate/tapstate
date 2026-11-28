@@ -387,6 +387,9 @@ public final class ControlOperations {
     public static final Operation PIPELINE_STATUS = mcp(
             "pipeline.status", Scope.READ, false,
             "Read a Pipeline's current lifecycle status.");
+    public static final Operation PIPELINE_RUN_PROGRESS = new Operation(
+            "pipeline.run-progress", Scope.READ, false, ControlApiSchema.ref("pipeline.run-progress"),
+            "Read the current or latest Pipeline run's observed milestones for Builder and Monitoring.", REST_ONLY);
     public static final Operation PIPELINE_METRICS = mcp(
             "pipeline.metrics", Scope.READ, false,
             "Read the bounded metrics snapshot most recently published for a Pipeline.");
@@ -551,6 +554,7 @@ public final class ControlOperations {
             PIPELINE_PAUSE,
             PIPELINE_RESUME,
             PIPELINE_STATUS,
+            PIPELINE_RUN_PROGRESS,
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
