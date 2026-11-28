@@ -309,9 +309,7 @@ final class StorageAuthentication implements AutoCloseable {
             }
             catch (TapstateException unavailable) {
                 LOG.warn("Storage authentication check failed [stage=cache-authentication-scope, error_code={}]", unavailable.code().code());
-                if (unavailable.code() == IoError.STORE_QUOTA_EXCEEDED)
-                    throw new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
-                throw StorageRuntime.unavailable();
+                throw authenticationStoreFailure(unavailable);
             }
             requireLocallyActive();
         }
@@ -326,9 +324,7 @@ final class StorageAuthentication implements AutoCloseable {
             }
             catch (TapstateException unavailable) {
                 LOG.warn("Storage authentication check failed [stage=configuration-publication, error_code={}]", unavailable.code().code());
-                if (unavailable.code() == IoError.STORE_QUOTA_EXCEEDED)
-                    throw new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
-                throw StorageRuntime.unavailable();
+                throw authenticationStoreFailure(unavailable);
             }
             requireLocallyActive();
         }
@@ -344,5 +340,17 @@ final class StorageAuthentication implements AutoCloseable {
         if (bootstrap != null) bootstrap.sessions.close();
         java.util.Arrays.fill(signingKey, (byte)0);
     }
+
+    private static TapstateException authenticationStoreFailure(TapstateException failure) {
+        if (failure.code() == IoError.STORE_QUOTA_EXCEEDED)
+            return new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
+        if (failure.code() == IoError.STORE_UNAVAILABLE) return new AuthenticationStoreUnavailable();
+        return StorageRuntime.unavailable();
+    }
+
+    static final class AuthenticationStoreUnavailable extends TapstateException {
+        private AuthenticationStoreUnavailable() { super(ControlError.STORAGE_UNAVAILABLE, Map.of(), null); }
+    }
+
     private static TapstateException unauthenticated() { return new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null); }
 }
