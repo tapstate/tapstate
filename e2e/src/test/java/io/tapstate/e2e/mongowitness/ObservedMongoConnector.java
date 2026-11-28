@@ -40,8 +40,12 @@ public final class ObservedMongoConnector implements TapConnector {
     @Override
     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         delegate.registerCapabilities(functions, codecs);
-        Path snapshot = witnessPath("mongo-snapshot-witness-path.txt");
+        Path filteredSnapshot = witnessPath("mongo-filter-snapshot-witness-path.txt");
+        Path snapshot = filteredSnapshot == null ? witnessPath("mongo-snapshot-witness-path.txt") : filteredSnapshot;
         if (snapshot != null) {
+            if (filteredSnapshot != null) {
+                functions.supportBatchRead(LatencyWitness.snapshotSource(snapshot, functions.getBatchReadFunction()));
+            }
             functions.supportWriteRecord(LatencyWitness.snapshotTarget(snapshot, functions.getWriteRecordFunction()));
             return;
         }

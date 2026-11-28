@@ -6,6 +6,7 @@ import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
+import io.tapdata.pdk.apis.functions.connector.source.BatchReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.StreamReadFunction;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 import java.io.IOException;
@@ -68,6 +69,23 @@ public final class LatencyWitness {
                     public boolean isAsyncMethodAndNoRetry() {
                         return downstream.isAsyncMethodAndNoRetry();
                     }
+                });
+    }
+
+    static BatchReadFunction snapshotSource(Path file, BatchReadFunction delegate) {
+        return (context, table, offset, size, downstream) -> delegate.batchRead(context, table, offset, size,
+                (events, next) -> {
+                    if (active(file)) {
+                        long read = System.currentTimeMillis();
+                        var lines = new StringBuilder();
+                        for (var event : events) {
+                            if (event instanceof TapRecordEvent record) {
+                                lines.append(snapshotKey(record)).append('\t').append(read).append('\n');
+                            }
+                        }
+                        append(file, lines);
+                    }
+                    downstream.accept(events, next);
                 });
     }
 

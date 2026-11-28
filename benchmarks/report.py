@@ -208,6 +208,8 @@ def eligible_metrics(arm):
         duration = completion.get("completion_ms")
         if (completion.get("status") == "eligible" and type(duration) is int and duration > 0
                 and identified_source(arm.get(identity_key, {}).get("protocol"))):
+            if "final_source_read_epoch_ms" in completion:
+                source = "snapshot source reads and target writer acknowledgements"
             yield "completion_nanos", duration * 1_000_000, source
     elif arm.get("measurement_status") == "eligible":
         yield "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"), "completion observation"

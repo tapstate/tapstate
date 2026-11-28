@@ -29,4 +29,25 @@ class BenchmarkSnapshotProbeTest {
         assertThrows(IllegalArgumentException.class, () -> BenchmarkSnapshotProbe.verify(
                 SOURCE_KEYS, List.of("10\t999", "11\t1020"), 1000, 1100));
     }
+
+    @Test
+    void filteredTailCanFinishAfterTheFinalWrite() {
+        var reading = BenchmarkSnapshotProbe.verifyFiltered(
+                SOURCE_KEYS, List.of("10\t1010", "11\t1050"), List.of("10\t1030"), 1000, 1100);
+        assertEquals(50, reading.durationMillis());
+        assertEquals(1050, reading.finalReadEpochMillis());
+        assertEquals(1030, reading.finalAckEpochMillis());
+        assertEquals(1, reading.confirmed());
+    }
+
+    @Test
+    void rejectsFilteredSnapshotWithMissingInputOrInvalidOutput() {
+        var reads = List.of("10\t1010", "11\t1050");
+        assertThrows(IllegalArgumentException.class, () -> BenchmarkSnapshotProbe.verifyFiltered(
+                SOURCE_KEYS, List.of("10\t1010"), List.of("10\t1030"), 1000, 1100));
+        assertThrows(IllegalArgumentException.class, () -> BenchmarkSnapshotProbe.verifyFiltered(
+                SOURCE_KEYS, reads, List.of("10\t1030", "11\t1060"), 1000, 1100));
+        assertThrows(IllegalArgumentException.class, () -> BenchmarkSnapshotProbe.verifyFiltered(
+                SOURCE_KEYS, reads, List.of("10\t1005"), 1000, 1100));
+    }
 }

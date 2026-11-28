@@ -289,7 +289,8 @@ class BenchmarkRunIT {
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
                         "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
-        boolean operatorSnapshot = caseId.equals("map.snapshot.basic.standard")
+        boolean filteredSnapshot = caseId.equals("filter.snapshot.basic.standard");
+        boolean operatorSnapshot = filteredSnapshot || caseId.equals("map.snapshot.basic.standard")
                 || caseId.equals("js.snapshot.basic.standard");
         boolean copySnapshot = operators == null && text(definition, "mode").equals("snapshot")
                 && text(definition, "spec").equals("specs/copy-basic.json");
@@ -301,11 +302,17 @@ class BenchmarkRunIT {
         if (snapshotProbe) {
             Path delegate = folder.resolve("verified-snapshot-delegate").resolve("mongodb.jar");
             Files.createDirectory(delegate.getParent());
-            Files.write(connector, ObservedMongoConnectorJar.buildSnapshotProbe(Files.readAllBytes(artifact), witness, delegate));
+            Files.write(connector, ObservedMongoConnectorJar.buildSnapshotProbe(
+                    Files.readAllBytes(artifact), witness, delegate, filteredSnapshot));
             String protocol = operatorSnapshot ? BenchmarkSnapshotProbe.KEY_PRESERVING_PROTOCOL : BenchmarkSnapshotProbe.PROTOCOL;
-            evidence.result.put("snapshot_probe", Map.of("protocol", protocol,
-                    "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
-                    "ack_file", witness.getFileName() + ".ack"));
+            var snapshotIdentity = new LinkedHashMap<>(Map.of(
+                    "protocol", protocol, "original_connector_sha256", digest(artifact),
+                    "probe_connector_sha256", digest(connector), "ack_file", witness.getFileName() + ".ack"));
+            if (filteredSnapshot) {
+                snapshotIdentity.put("protocol", BenchmarkSnapshotProbe.FILTER_PROTOCOL);
+                snapshotIdentity.put("source_file", witness.getFileName().toString());
+            }
+            evidence.result.put("snapshot_probe", snapshotIdentity);
         } else if (latencyProbe || backlogProbe) {
             String delegateFolder = backlogProbe ? "verified-backlog-delegate" : "verified-latency-delegate";
             Path delegate = folder.resolve(delegateFolder).resolve("mongodb.jar");
@@ -335,7 +342,7 @@ class BenchmarkRunIT {
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
                 try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null;
                         var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness, filteredBacklog) : null;
-                        var snapshot = snapshotProbe ? new BenchmarkSnapshotProbe(witness) : null) {
+                        var snapshot = snapshotProbe ? new BenchmarkSnapshotProbe(witness, filteredSnapshot) : null) {
                     runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
                             sourceDb, targetDb, client.getDatabase("admin"), limited, latency, backlog, snapshot);
                 }
@@ -529,9 +536,14 @@ class BenchmarkRunIT {
             long startEpochMillis, long startNanos, Evidence evidence) {
         try {
             var reading = probe.finish(source, startEpochMillis, startNanos);
-            evidence.result.put("snapshot_completion", Map.of("status", "eligible", "started_epoch_ms", startEpochMillis,
+            var completion = new LinkedHashMap<String, Object>(Map.of(
+                    "status", "eligible", "started_epoch_ms", startEpochMillis,
                     "final_target_ack_epoch_ms", reading.finalAckEpochMillis(), "confirmed_target_writes", reading.confirmed(),
                     "completion_ms", reading.durationMillis(), "clock_resolution_ms", 1));
+            if (reading.finalReadEpochMillis() != null) {
+                completion.put("final_source_read_epoch_ms", reading.finalReadEpochMillis());
+            }
+            evidence.result.put("snapshot_completion", completion);
             evidence.result.put("measurement_status", "eligible");
         } catch (IOException | IllegalArgumentException unavailable) {
             evidence.result.put("snapshot_completion", Map.of("status", "insufficient", "reason", unavailable.toString()));

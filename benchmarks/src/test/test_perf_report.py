@@ -72,6 +72,13 @@ class PerfReportTest(unittest.TestCase):
         self.assertEqual(1, len(completion))
         self.assertEqual(23, completion[0][0])
         self.assertEqual("mongo-copy-snapshot-pdk-ack-v1", completion[0][1]["conditions"]["protocol"])
+        self.row.update(snapshot_probe={"protocol": "mongo-filter-snapshot-pdk-read-ack-v1"},
+                        snapshot_completion={"status": "eligible", "completion_ms": 47, "clock_resolution_ms": 1,
+                                             "final_source_read_epoch_ms": 5047, "final_target_ack_epoch_ms": 5023})
+        [(filtered, binding)] = [(value, binding) for metric, value, binding in report.source_metrics(self.row)
+                                 if metric == "completion_ms"]
+        self.assertEqual(47, filtered)
+        self.assertEqual("snapshot source reads and target writer acknowledgements", binding["source"])
         self.row["snapshot_completion"] = {"status": "insufficient"}
         self.assertNotIn("completion_ms", {metric for metric, _, _ in report.source_metrics(self.row)})
 
