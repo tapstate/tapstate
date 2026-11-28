@@ -11,9 +11,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 SPEC = importlib.util.spec_from_file_location("connector_stage", Path(__file__).with_name("stage-connectors.py"))
 assert SPEC is not None and SPEC.loader is not None
@@ -58,7 +59,29 @@ def download(url: str, destination: Path) -> None:
             "dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s "
             "first_byte=%{time_starttransfer}s redirect=%{time_redirect}s total=%{time_total}s bytes=%{size_download}",
         ]
-    process = subprocess.run([*command, url], capture_output=True, timeout=download_timeout + 5, check=False)
+    command.append(url)
+    attempts = 5 if os.environ.get("TAPSTATE_OP_DOWNLOAD_RETRY") == "1" else 1
+    for attempt in range(1, attempts + 1):
+        started_at = time.monotonic()
+        failure = download_attempt(command, download_timeout, destination, parsed, diagnostics)
+        if failure is None:
+            return
+        destination.unlink(missing_ok=True)
+        if attempt == attempts:
+            raise STAGE.StageError(f"{destination.name}: Maven artifact download failed ({failure})")
+        delay = max(0.0, started_at + 30 - time.monotonic())
+        print(f"Connector download {destination.name}: {failure}; retrying in {delay:.3f}s "
+              f"(attempt {attempt + 1}/{attempts})", file=sys.stderr, flush=True)
+        if delay > 0:
+            time.sleep(delay)
+
+
+def download_attempt(command: list[str], timeout: int, destination: Path,
+                     parsed: SplitResult, diagnostics: bool) -> str | None:
+    try:
+        process = subprocess.run(command, capture_output=True, timeout=timeout + 5, check=False)
+    except subprocess.TimeoutExpired:
+        return "curl process timed out"
     if diagnostics:
         artifact = parsed.path.rsplit("/", 1)[-1]
         metrics = process.stdout.decode(errors="replace")
@@ -68,8 +91,7 @@ def download(url: str, destination: Path) -> None:
             message = " ".join(process.stderr.decode(errors="replace").splitlines())
             message = re.sub(r"https?://\S+", "[URL]", message)
             print(f"Connector download {destination.name}: {message}", file=sys.stderr, flush=True)
-    if process.returncode != 0:
-        raise STAGE.StageError(f"{destination.name}: Maven artifact download failed (curl exit={process.returncode})")
+    return f"curl exit={process.returncode}" if process.returncode != 0 else None
 
 
 def inspect(path: Path, selected: dict) -> tuple[dict, str]:

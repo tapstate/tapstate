@@ -135,6 +135,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
           TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS: "1"
+          TAPSTATE_OP_DOWNLOAD_RETRY: "1"
         shell: bash
         run: |
           set -euo pipefail
@@ -353,6 +354,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
           TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS: "1"
+          TAPSTATE_OP_DOWNLOAD_RETRY: "1"
         shell: bash
         run: |
           set -euo pipefail
