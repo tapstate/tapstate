@@ -642,7 +642,7 @@ class MongoSharedSrsRecoveryReservationsIT {
                 if(entry.getKey().equals(SystemCollections.SRS_CHAINS.collectionName()) || entry.getKey().equals(SystemCollections.CACHE_IDENTITY.collectionName()))continue;
                 if(entry.getKey().equals(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())) {
                     for(var before:entry.getValue()) {
-                        if(before.getString("resourceType").equals(WorkloadClaimType.NODE_SESSION.name()))continue;
+                        if(WorkloadClaimType.NODE_SESSION.name().equals(before.getString("resourceType")))continue;
                         assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).find(new Document("_id",before.get("_id"))).first()).isEqualTo(before);
                     }
                 } else assertThat(after.get(entry.getKey())).isEqualTo(entry.getValue());
