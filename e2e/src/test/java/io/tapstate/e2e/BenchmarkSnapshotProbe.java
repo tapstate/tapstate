@@ -11,9 +11,10 @@ import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
 
-/** Measures Copy snapshot completion from confirmation of all independently read source keys. */
+/** Measures snapshot completion from confirmation of all independently read source keys. */
 final class BenchmarkSnapshotProbe implements AutoCloseable {
     static final String PROTOCOL = "mongo-copy-snapshot-pdk-ack-v1";
+    static final String KEY_PRESERVING_PROTOCOL = "mongo-key-preserving-snapshot-pdk-ack-v1";
     private final Path active;
     private final Path acknowledgements;
     private boolean started;

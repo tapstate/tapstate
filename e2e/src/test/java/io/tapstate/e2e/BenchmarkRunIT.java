@@ -289,9 +289,12 @@ class BenchmarkRunIT {
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
                         "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
-        boolean snapshotProbe = evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
-                && operators == null && text(definition, "mode").equals("snapshot")
+        boolean operatorSnapshot = caseId.equals("map.snapshot.basic.standard")
+                || caseId.equals("js.snapshot.basic.standard");
+        boolean copySnapshot = operators == null && text(definition, "mode").equals("snapshot")
                 && text(definition, "spec").equals("specs/copy-basic.json");
+        boolean snapshotProbe = evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
+                && (copySnapshot || operatorSnapshot);
         Path connector = seeds.resolve("mongodb-connector.jar");
         Path witness = folder.resolve(snapshotProbe ? "snapshot-writes.tsv"
                 : backlogProbe ? "source-backlog.tsv" : "source-latency.tsv");
@@ -299,7 +302,8 @@ class BenchmarkRunIT {
             Path delegate = folder.resolve("verified-snapshot-delegate").resolve("mongodb.jar");
             Files.createDirectory(delegate.getParent());
             Files.write(connector, ObservedMongoConnectorJar.buildSnapshotProbe(Files.readAllBytes(artifact), witness, delegate));
-            evidence.result.put("snapshot_probe", Map.of("protocol", BenchmarkSnapshotProbe.PROTOCOL,
+            String protocol = operatorSnapshot ? BenchmarkSnapshotProbe.KEY_PRESERVING_PROTOCOL : BenchmarkSnapshotProbe.PROTOCOL;
+            evidence.result.put("snapshot_probe", Map.of("protocol", protocol,
                     "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
                     "ack_file", witness.getFileName() + ".ack"));
         } else if (latencyProbe || backlogProbe) {
@@ -412,7 +416,7 @@ class BenchmarkRunIT {
                         try {
                             if (operators != null) {
                                 operatorRun(entry, prepared, control, sourceDb, targetDb, operators, evidence, hot,
-                                        backlogProbe, latencyProbe);
+                                        backlogProbe, latencyProbe, snapshotProbe);
                             } else {
                                 if (snapshot) {
                                     mongoSnapshot(entry, control, source, evidence, snapshotProbe);
@@ -517,15 +521,20 @@ class BenchmarkRunIT {
         evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
         evidence.window("readback");
         if (probe != null) {
-            try {
-                var reading = probe.finish(source, startEpochMillis, start);
-                evidence.result.put("snapshot_completion", Map.of("status", "eligible", "started_epoch_ms", startEpochMillis,
-                        "final_target_ack_epoch_ms", reading.finalAckEpochMillis(), "confirmed_target_writes", reading.confirmed(),
-                        "completion_ms", reading.durationMillis(), "clock_resolution_ms", 1));
-                evidence.result.put("measurement_status", "eligible");
-            } catch (IOException | IllegalArgumentException unavailable) {
-                evidence.result.put("snapshot_completion", Map.of("status", "insufficient", "reason", unavailable.toString()));
-            }
+            recordSnapshotCompletion(probe, source, startEpochMillis, start, evidence);
+        }
+    }
+
+    private static void recordSnapshotCompletion(BenchmarkSnapshotProbe probe, MongoCollection<BsonDocument> source,
+            long startEpochMillis, long startNanos, Evidence evidence) {
+        try {
+            var reading = probe.finish(source, startEpochMillis, startNanos);
+            evidence.result.put("snapshot_completion", Map.of("status", "eligible", "started_epoch_ms", startEpochMillis,
+                    "final_target_ack_epoch_ms", reading.finalAckEpochMillis(), "confirmed_target_writes", reading.confirmed(),
+                    "completion_ms", reading.durationMillis(), "clock_resolution_ms", 1));
+            evidence.result.put("measurement_status", "eligible");
+        } catch (IOException | IllegalArgumentException unavailable) {
+            evidence.result.put("snapshot_completion", Map.of("status", "insufficient", "reason", unavailable.toString()));
         }
     }
 
@@ -802,19 +811,26 @@ class BenchmarkRunIT {
 
     private static void operatorRun(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
-            MongoWorkloadGenerator.HotKeys hot, BenchmarkBacklogProbe backlogProbe, BenchmarkLatencyProbe latencyProbe) {
+            MongoWorkloadGenerator.HotKeys hot, BenchmarkBacklogProbe backlogProbe, BenchmarkLatencyProbe latencyProbe,
+            BenchmarkSnapshotProbe snapshotProbe) {
         boolean lifecycle = operators.scenario.equals("join-lifecycle-release");
         String mode = lifecycle ? "live-latency" : text(entry.getDocument("case"), "mode");
         evidence.stage = "initial-state";
         evidence.window(mode.equals("snapshot") ? "snapshot" : "load");
         var initial = operators.expected(source);
+        if (snapshotProbe != null) snapshotProbe.start();
         long initialStart = System.nanoTime();
+        long initialStartEpochMillis = System.currentTimeMillis();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
         waitFor(entry, "operator snapshot input and landing", () -> operatorInitialLanded(control, operators, mode));
         if (mode.equals("snapshot")) {
             long input = operators.rows.values().stream().mapToLong(Integer::longValue).sum();
             evidence.measure(initialStart, input, initial.size());
             evidence.window("readback");
+            if (snapshotProbe != null) {
+                recordSnapshotCompletion(snapshotProbe, source.getCollection(RECORDS, BsonDocument.class),
+                        initialStartEpochMillis, initialStart, evidence);
+            }
             verifyOperator(operators, target, initial, evidence);
             return;
         }
