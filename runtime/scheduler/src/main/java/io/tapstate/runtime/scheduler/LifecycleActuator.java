@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.DeliveryReading;
 import java.util.Optional;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
@@ -49,6 +50,9 @@ public interface LifecycleActuator {
      * on a pipeline whose owner asked for it to be left alone.
      */
     void stop(String pipelineId, boolean purgeState);
+
+    /** Confirmed delivery read from the original live execution before this pass stopped it. */
+    default Optional<DeliveryReading> stoppedDelivery() { return Optional.empty(); }
 
     /** Clears an original execution whose physical stop has already been confirmed. */
     default void clearStopped(String pipelineId) { stop(pipelineId, true); }
