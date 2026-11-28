@@ -206,6 +206,7 @@ class ApiExceptionHandler {
             Map.entry(io.tapstate.core.common.IoErrorDefinitions.CONFIGURATION_IMPORT_REFUSED.code(), HttpStatus.CONFLICT),
             Map.entry("io.pipeline-state-rebuild-required", HttpStatus.CONFLICT),
             Map.entry(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_STATE_REBUILD_REQUIRED.code(), HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_CLEAR_UNPROVEN.code(), HttpStatus.CONFLICT),
             Map.entry("io.pipeline-table-selection-rebuild-required", HttpStatus.CONFLICT),
             Map.entry(io.tapstate.core.common.IoErrorDefinitions.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED.code(), HttpStatus.CONFLICT),
             Map.entry("store.initialization-refused", HttpStatus.CONFLICT),
