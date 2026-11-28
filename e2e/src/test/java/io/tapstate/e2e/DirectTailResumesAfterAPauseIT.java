@@ -55,8 +55,8 @@ class DirectTailResumesAfterAPauseIT {
                 MongoClient source = MongoClients.create(sourceUri);
                 MongoEndpoints mongo = new MongoEndpoints();
                 ServerHandle server = tier.launch(storage)) {
-            seed(source, database);
-            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri, connector);
+            seed(source, database, false);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri, connector, false);
             awaitCount(mongo, target, "the seeded load");
             rename(source, database, CHANGED_BEFORE, BEFORE_PAUSE);
             awaitName(mongo, target, CHANGED_BEFORE, BEFORE_PAUSE, "the running tail");
@@ -131,8 +131,9 @@ class DirectTailResumesAfterAPauseIT {
                 MongoEndpoints mongo = new MongoEndpoints();
                 ServerHandle server = tier.launch(storage)) {
 
-            seed(source, database);
-            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri);
+            seed(source, database, true);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri,
+                    ConnectorJars.bytesFor("mongodb"), true);
 
             awaitCount(mongo, target, "the full load of the seeded documents");
             // A change while it is running, so the run ends holding a position it confirmed rather than
@@ -156,23 +157,22 @@ class DirectTailResumesAfterAPauseIT {
 
     /** Everything up to and including the start. */
     private static ControlPlane start(
-            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri) {
-        return start(server, storage, pipelineId, sourceUri, targetUri, ConnectorJars.bytesFor("mongodb"));
-    }
-
-    private static ControlPlane start(
-            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri, byte[] connector) {
+            ServerHandle server, PreparedNativeStore storage, String pipelineId,
+            String sourceUri, String targetUri, byte[] connector, boolean preImage) {
         ControlPlane control = new ControlPlane(server.baseUrl());
         storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", connector);
 
         Map<String, String> resources = new LinkedHashMap<>();
-        resources.put(SOURCE_ID + ".tap.yml", sourceYaml(sourceUri, pipelineId + "_src"));
+        resources.put(SOURCE_ID + ".tap.yml", sourceYaml(sourceUri, pipelineId + "_src", preImage));
         resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri, pipelineId + "_tgt"));
         resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
         control.apply(resources);
-        control.discoverSchema(SOURCE_ID, "mongodb",
-                Map.of("uri", sourceUri, "database", pipelineId + "_src"));
+        Map<String, Object> sourceConfig = new LinkedHashMap<>(Map.of("uri", sourceUri, "database", pipelineId + "_src"));
+        if (preImage) {
+            sourceConfig.put("preImage", true);
+        }
+        control.discoverSchema(SOURCE_ID, "mongodb", sourceConfig);
         control.lifecycle(pipelineId, LifecycleVerb.START);
         return control;
     }
@@ -196,17 +196,17 @@ class DirectTailResumesAfterAPauseIT {
                 .formatted(pipelineId, SOURCE_ID, COLLECTION, TARGET_ID);
     }
 
-    private static String sourceYaml(String uri, String database) {
+    private static String sourceYaml(String uri, String database, boolean preImage) {
         return """
                 version: tapstate/v1
                 kind: source
                 id: %s
                 connector: mongodb
-                config: { uri: "%s", database: %s }
+                config: { uri: "%s", database: %s%s }
                 mode: cdc
                 tables: [ %s ]
                 """
-                .formatted(SOURCE_ID, uri, database, COLLECTION);
+                .formatted(SOURCE_ID, uri, database, preImage ? ", preImage: true" : "", COLLECTION);
     }
 
     private static String targetYaml(String uri, String database) {
@@ -221,10 +221,15 @@ class DirectTailResumesAfterAPauseIT {
     }
 
     /** Written by a driver of the database rather than through any face of the product. */
-    private static void seed(MongoClient client, String database) {
-        client.getDatabase(database).getCollection(COLLECTION).drop();
+    private static void seed(MongoClient client, String database, boolean preImage) {
+        var source = client.getDatabase(database);
+        source.getCollection(COLLECTION).drop();
+        if (preImage) {
+            source.runCommand(new Document("create", COLLECTION)
+                    .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+        }
         for (int id = 1; id <= SEEDED_ROWS; id++) {
-            client.getDatabase(database).getCollection(COLLECTION)
+            source.getCollection(COLLECTION)
                     .insertOne(new Document("_id", id).append("oid", id).append("name", "order-" + id));
         }
     }

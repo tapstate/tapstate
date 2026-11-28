@@ -27,17 +27,23 @@ class AlertSourceFailureIT {
             try(var sourceClient=MongoClients.create(source.uriForThisHost(sourceDb));var targetClient=MongoClients.create(targetUri);
                     var storage=PreparedNativeStore.withBorrowedMaster("alert-source-"+suffix,"e2e","e2e-password",target);
                     var server=InProcessServer.startPrepared(storage,List.of("--logging.level.io.tapstate.app.NativeBusinessContext=DEBUG","--logging.level.io.tapstate.app.BuiltinResourceSignals=DEBUG"))) {
-                var collection=sourceClient.getDatabase(sourceDb).getCollection("orders");collection.insertOne(new Document("_id",1).append("name","before"));
+                var sourceDatabase = sourceClient.getDatabase(sourceDb);
+                if (masterFailure) {
+                    sourceDatabase.runCommand(new Document("create", "orders")
+                            .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+                }
+                var collection = sourceDatabase.getCollection("orders");
+                collection.insertOne(new Document("_id", 1).append("name", "before"));
                 var control=new ControlPlane(server.baseUrl());storage.loginAndAwaitBusiness(control);control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
                 control.apply(Map.of("source.tap.yml","""
                         version: tapstate/v1
                         kind: source
                         id: src_alarm
                         connector: mongodb
-                        config: { uri: "%s", database: "%s" }
+                        config: { uri: "%s", database: "%s"%s }
                         mode: cdc
                         tables: [orders]
-                        """.formatted(uri,sourceDb),"pipeline.tap.yml","""
+                        """.formatted(uri, sourceDb, masterFailure ? ", preImage: true" : ""), "pipeline.tap.yml", """
                         version: tapstate/v1
                         kind: pipeline
                         id: source_alarm
@@ -45,7 +51,11 @@ class AlertSourceFailureIT {
                         settings: { read_mode: snapshot_and_cdc }
                         view: { id: source_result, from: orders, primary_key: _id }
                         """));
-                control.discoverSchema("src_alarm","mongodb",Map.of("uri",uri,"database",sourceDb));
+                Map<String, Object> sourceConfig = new LinkedHashMap<>(Map.of("uri", uri, "database", sourceDb));
+                if (masterFailure) {
+                    sourceConfig.put("preImage", true);
+                }
+                control.discoverSchema("src_alarm", "mongodb", sourceConfig);
                 for(var pair:Map.of("source-failure","source.connection-failed","pipeline-failure","pipeline.failed").entrySet())
                     control.alert("configuration/save",Map.of("kind","RULE","id",pair.getKey(),"etag","0","form",Map.of("name",pair.getValue(),"typeId",pair.getValue(),
                             "resourceKinds",List.of(pair.getKey().equals("source-failure")?"source":"pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true)));
