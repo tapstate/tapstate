@@ -2,6 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import io.tapstate.spi.store.CacheBusinessScope;
 
+import com.mongodb.MongoCommandException;
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
@@ -429,8 +430,21 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 (owner, mode, version, stage) -> MongoStorageRecoveryStore.read(session, database, owner, mode, version, stage).preparation());
     }
 
+    private final MongoStructureProof actuationStructures = new MongoStructureProof();
+
     boolean supportsActuationBatch() {
-        return MongoReadBudget.supportsSnapshotReads(client);
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return false;
+        try {
+            return actuationStructures.permits(MongoStructureProof.Kind.OBSERVATION, () ->
+                    MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                            SystemCollections.PIPELINE_INTENTS, SystemCollections.OPERATOR_GENERATIONS, SystemCollections.PIPELINES,
+                            SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP, SystemCollections.STORAGE_BINDING,
+                            SystemCollections.STORAGE_RECOVERY, SystemCollections.CONFIGURATION_VERSION)));
+        } catch (MongoCommandException failure) {
+            if (failure.getErrorCode() != 13) throw failure;
+            // Reading CONFIG collections can still succeed when the collation audit is unauthorized.
+            return false;
+        }
     }
 
     AdmittedFacts admittedObservationFacts(Document cluster, Document state, Document stored, Document version, Document recovery) {
