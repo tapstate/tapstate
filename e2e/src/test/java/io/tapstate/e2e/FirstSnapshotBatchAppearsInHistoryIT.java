@@ -47,7 +47,8 @@ class FirstSnapshotBatchAppearsInHistoryIT {
         Path hold = Files.createDirectory(directory.resolve("hold")).resolve("read-" + TABLE);
         Files.createFile(hold);
         var existingMembers = Hazelcast.getAllHazelcastInstances();
-        var interval = Duration.ofSeconds(30);
+        // Two intervals cover acknowledgement, Stop and the final write without crossing a history gap.
+        var interval = Duration.ofMinutes(2);
 
         try (var endpoints = new FileEndpoints(); var storage = PreparedNativeStore.create("e2e", "e2e-password");
                 var mongo = MongoClients.create(storage.cacheUri());
@@ -63,7 +64,8 @@ class FirstSnapshotBatchAppearsInHistoryIT {
             var filter = new Document("pipelineId", PIPELINE);
             var zeroFilter = new Document(filter).append("startupEvidence.zeroAt", new Document("$exists", true))
                     .append("countingSince", new Document("$exists", false));
-            Await.answered("the retained zero before the held snapshot", WAIT,
+            // A pre-execution observation can consume the first sampling slot.
+            Await.answered("the retained zero before the held snapshot", interval.plus(WAIT),
                     () -> Optional.ofNullable(history.find(zeroFilter).first()));
             assertThat(server.stopPublishingObservations()).isEqualTo(1);
             server.awaitObservationWorkersIdle();
@@ -117,12 +119,13 @@ class FirstSnapshotBatchAppearsInHistoryIT {
                 assertThat(history.updateOne(previousId, update).getModifiedCount()).isEqualTo(1);
                 for (String resolution : List.of("raw", "PT5M")) {
                     var response = history(client, server.baseUrl(), control.credential(), from, end.plusMillis(1), resolution);
-                    assertThat(points(response)).isNotEmpty().allSatisfy(point -> {
-                        for (String key : List.of("recordsOut", "bytesOut")) {
-                            if (point.get(key) instanceof Map<?, ?> rate) {
-                                assertThat(number(rate.get("delta"))).isZero();
-                            }
-                        }
+                    assertThat((List<?>) response.get("gaps")).isEmpty();
+                    // RAW can also return the measured idle interval that ends at the selected baseline.
+                    var startupPoints = points(response).stream()
+                            .filter(point -> Instant.parse(point.get("intervalEnd").toString()).isAfter(from)).toList();
+                    assertThat(startupPoints).isNotEmpty().allSatisfy(point -> {
+                        assertThat(point.get("recordsOut")).as("%s records rate without matching proof", resolution).isNull();
+                        assertThat(point.get("bytesOut")).as("%s bytes rate without matching proof", resolution).isNull();
                     });
                 }
             }
