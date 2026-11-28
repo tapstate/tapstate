@@ -70,7 +70,7 @@ class ThreeLayerRestartContinuationIT {
                 var control = login(first);
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 var defaultTarget = control.artifact("views").orElseThrow();
-                var workspace = resources(sourceUri);
+                var workspace = resources(sourceUri, false, "views", true);
                 workspace.put("views.tap.yml", defaultTarget.canonicalForm());
                 control.apply(workspace);
                 assertThat(control.artifact("views").orElseThrow().contentHash()).isEqualTo(defaultTarget.contentHash());
@@ -137,7 +137,7 @@ class ThreeLayerRestartContinuationIT {
             var first=start(configUri,cluster);
             try(first) {
                 var control=login(first); control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
-                var resources=resources(sourceUri,true);
+                var resources=resources(sourceUri, true, "views", false);
                 resources.put("views.tap.yml",control.artifact("views").orElseThrow().canonicalForm());
                 control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
                 control.lifecycle(PIPELINE,LifecycleVerb.START);
@@ -223,7 +223,7 @@ class ThreeLayerRestartContinuationIT {
                 var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds,work.resolve("cloud-plugins"));
                 try(first) {
                     var control=cloudLogin(first);
-                    var resources=resources(sourceUri,false,targetId);
+                    var resources=resources(sourceUri, false, targetId, true);
                     resources.put(targetId+".tap.yml",control.artifact(targetId).orElseThrow().canonicalForm());
                     resources.put(stoppedTargetId+".tap.yml","""
                             version: tapstate/v1
@@ -232,7 +232,7 @@ class ThreeLayerRestartContinuationIT {
                             connector: mongodb
                             config: { isUri: true, uri: "%s" }
                             """.formatted(stoppedTargetUri));
-                    resources.put(stoppedPipeline+".tap.yml",resources(sourceUri,false,stoppedTargetId).get("pipeline.tap.yml")
+                    resources.put(stoppedPipeline+".tap.yml",resources(sourceUri, false, stoppedTargetId, true).get("pipeline.tap.yml")
                             .replace("id: native_resume","id: "+stoppedPipeline));
                     control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
                     control.lifecycle(PIPELINE,LifecycleVerb.START);awaitRows(mongo,source,target,"the Cloud snapshot before its customer instance outage");
@@ -372,7 +372,7 @@ class ThreeLayerRestartContinuationIT {
                 try (first) {
                     var control = login(first);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-                    var resources = resources(sourceUri);
+                    var resources = resources(sourceUri, false, "views", together);
                     resources.put("views.tap.yml", control.artifact("views").orElseThrow().canonicalForm());
                     control.apply(resources); control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
                     control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -586,24 +586,17 @@ class ThreeLayerRestartContinuationIT {
         return rows;
     }
 
-    private static Map<String, String> resources(String sourceUri) {
-        return resources(sourceUri,false);
-    }
-
-    private static Map<String, String> resources(String sourceUri,boolean bounded) {
-        return resources(sourceUri,bounded,"views");
-    }
-    private static Map<String,String> resources(String sourceUri,boolean bounded,String targetId) {
+    private static Map<String, String> resources(String sourceUri, boolean bounded, String targetId, boolean preImage) {
         var resources = new LinkedHashMap<String, String>();
         resources.put("input.tap.yml", """
                 version: tapstate/v1
                 kind: source
                 id: input
                 connector: mongodb
-                config: { isUri: true, uri: "%s" }
+                config: { isUri: true, uri: "%s"%s }
                 mode: %s
                 tables: [ orders ]
-                """.formatted(sourceUri,bounded?"snapshot":"cdc"));
+                """.formatted(sourceUri, preImage ? ", preImage: true" : "", bounded ? "snapshot" : "cdc"));
         resources.put("pipeline.tap.yml", """
                 version: tapstate/v1
                 kind: pipeline

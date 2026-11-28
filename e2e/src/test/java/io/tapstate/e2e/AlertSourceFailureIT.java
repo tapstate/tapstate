@@ -30,16 +30,20 @@ class AlertSourceFailureIT {
                     var server=InProcessServer.startPrepared(storage,List.of("--logging.level.io.tapstate.app.NativeBusinessContext=DEBUG","--logging.level.io.tapstate.app.BuiltinResourceSignals=DEBUG"))) {
                 var collection=sourceClient.getDatabase(sourceDb).getCollection("orders");collection.insertOne(new Document("_id",1).append("name","before"));
                 var control=new ControlPlane(server.baseUrl());storage.loginAndAwaitBusiness(control);control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
-                if (!masterFailure) disableStreamReadRetry(control);
+                if (!masterFailure) {
+                    sourceClient.getDatabase(sourceDb).runCommand(new Document("collMod", "orders")
+                            .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+                    disableStreamReadRetry(control);
+                }
                 control.apply(Map.of("source.tap.yml","""
                         version: tapstate/v1
                         kind: source
                         id: src_alarm
                         connector: mongodb
-                        config: { uri: "%s", database: "%s" }
+                        config: { uri: "%s", database: "%s"%s }
                         mode: cdc
                         tables: [orders]
-                        """.formatted(uri,sourceDb),"pipeline.tap.yml","""
+                        """.formatted(uri, sourceDb, masterFailure ? "" : ", preImage: true"),"pipeline.tap.yml","""
                         version: tapstate/v1
                         kind: pipeline
                         id: source_alarm
