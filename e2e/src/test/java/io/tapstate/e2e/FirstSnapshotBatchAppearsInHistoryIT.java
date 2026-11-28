@@ -4,6 +4,7 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -20,8 +21,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -59,17 +62,39 @@ class FirstSnapshotBatchAppearsInHistoryIT {
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             var history = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(mongo.getDatabase(storage.cacheDatabase()));
             var filter = new Document("pipelineId", PIPELINE);
-            Await.until("a retained zero baseline while the snapshot is held", WAIT, () -> {
-                var sample = history.find(new Document(filter).append("startupEvidence.zeroAt", new Document("$exists", true))
-                        .append("countingSince", new Document("$exists", false))).first();
-                if (sample == null) return false;
-                var counters = sample.get("counters", Document.class);
-                return Long.valueOf(0).equals(counters.getLong("records.out"))
-                        && Long.valueOf(0).equals(counters.getLong("bytes.out"));
-            },
-                    () -> history.find(filter).sort(new Document("observedAt", -1)).limit(3)
-                            .into(new java.util.ArrayList<>()) + control.logs(PIPELINE));
+            var baseline = Await.answered("two retained zero observations while the snapshot is held", WAIT, () -> {
+                var samples = history.find(new Document(filter).append("startupEvidence.zeroAt", new Document("$exists", true))
+                        .append("countingSince", new Document("$exists", false)))
+                        .sort(new Document("observedAt", 1)).limit(2).into(new ArrayList<>());
+                return samples.size() == 2 && samples.stream().allMatch(sample -> {
+                    var counters = sample.get("counters", Document.class);
+                    return Long.valueOf(0).equals(counters.getLong("records.out"))
+                            && Long.valueOf(0).equals(counters.getLong("bytes.out"));
+                }) ? Optional.of(samples) : Optional.empty();
+            });
             assertThat(endpoints.count(EndpointAddress.uri(target.toString()), TABLE)).isZero();
+            Instant idleFrom = baseline.getFirst().getDate("observedAt").toInstant();
+            Instant idleTo = baseline.getLast().getDate("observedAt").toInstant().plusMillis(1);
+            try (var client = HttpClient.newHttpClient()) {
+                for (String resolution : List.of("raw", "PT5M")) {
+                    var idle = history(client, server.baseUrl(), control.credential(), idleFrom, idleTo, resolution);
+                    assertThat((List<?>) idle.get("gaps")).isEmpty();
+                    var idlePoints = points(idle);
+                    assertThat(idlePoints).noneMatch(point -> point.containsKey("cdcDelivery"));
+                    for (String key : List.of("recordsOut", "bytesOut")) {
+                        var zeroRates = idlePoints.stream().map(point -> point.get(key)).filter(Map.class::isInstance)
+                                .map(rate -> (Map<?, ?>) rate).toList();
+                        assertThat(zeroRates).as("%s held snapshot %s", resolution, key).isNotEmpty().allSatisfy(rate -> {
+                            assertThat(number(rate.get("delta"))).isZero();
+                            assertThat(number(rate.get("averageRate"))).isZero();
+                        });
+                    }
+                    var empty = history(client, server.baseUrl(), control.credential(), idleFrom.minusSeconds(3600),
+                            idleFrom.minusSeconds(1800), resolution);
+                    assertThat(empty.get("status")).isEqualTo("NO_RETAINED_SAMPLES");
+                    assertThat(points(empty)).isEmpty();
+                }
+            }
             Files.delete(hold);
 
             var first = new AtomicReference<Document>();
@@ -101,12 +126,17 @@ class FirstSnapshotBatchAppearsInHistoryIT {
                     var response = history(client, server.baseUrl(), control.credential(), from,
                             observedAt.plusMillis(1), resolution);
                     assertThat((List<?>) response.get("gaps")).isEmpty();
-                    var points = ((List<?>) response.get("segments")).stream()
-                            .map(item -> (List<?>) ((Map<?, ?>) item).get("points"))
-                            .flatMap(List::stream).map(item -> (Map<?, ?>) item).toList();
+                    var points = points(response);
                     assertThat(points).noneMatch(point -> point.containsKey("cdcDelivery"));
                     assertRates(points, resolution, "recordsOut", records);
                     assertRates(points, resolution, "bytesOut", bytes);
+                }
+                assertThat(history.updateOne(new Document("_id", baseline.getFirst().get("_id")),
+                        new Document("$set", new Document("startupEvidence", "unreadable"))).getModifiedCount()).isEqualTo(1);
+                for (String resolution : List.of("raw", "PT5M")) {
+                    var failure = getResponse(client, server.baseUrl(), control.credential(), historyPath(idleFrom, idleTo, resolution));
+                    assertThat(failure.statusCode()).isEqualTo(500);
+                    assertThat(failure.body()).contains(IoError.DOCUMENT_UNREADABLE.code());
                 }
             }
         }
@@ -114,18 +144,31 @@ class FirstSnapshotBatchAppearsInHistoryIT {
 
     private static Map<?, ?> history(HttpClient client, URI base, String token, Instant from, Instant to,
             String resolution) throws Exception {
-        String path = "/api/pipelines/" + PIPELINE + "/metrics/history?resolution=" + resolution
+        return get(client, base, token, historyPath(from, to, resolution));
+    }
+
+    private static String historyPath(Instant from, Instant to, String resolution) {
+        return "/api/pipelines/" + PIPELINE + "/metrics/history?resolution=" + resolution
                 + "&from=" + URLEncoder.encode(from.toString(), StandardCharsets.UTF_8)
                 + "&to=" + URLEncoder.encode(to.toString(), StandardCharsets.UTF_8);
-        return get(client, base, token, path);
     }
 
     private static Map<?, ?> get(HttpClient client, URI base, String token, String path) throws Exception {
-        var request = HttpRequest.newBuilder(base.resolve(path)).header("Authorization", "Bearer " + token)
-                .timeout(Duration.ofSeconds(20)).GET().build();
-        var response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        var response = getResponse(client, base, token, path);
         assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
         return (Map<?, ?>) JsonReader.parse(response.body());
+    }
+
+    private static HttpResponse<String> getResponse(HttpClient client, URI base, String token, String path) throws Exception {
+        var request = HttpRequest.newBuilder(base.resolve(path)).header("Authorization", "Bearer " + token)
+                .timeout(Duration.ofSeconds(20)).GET().build();
+        return client.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static List<? extends Map<?, ?>> points(Map<?, ?> response) {
+        return ((List<?>) response.get("segments")).stream()
+                .map(item -> (List<?>) ((Map<?, ?>) item).get("points"))
+                .flatMap(List::stream).map(item -> (Map<?, ?>) item).toList();
     }
 
     private static void assertRates(List<? extends Map<?, ?>> points, String resolution, String key, BigDecimal expected) {

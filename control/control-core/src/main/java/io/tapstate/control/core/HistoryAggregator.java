@@ -256,15 +256,15 @@ public final class HistoryAggregator {
      * How much {@code name} grew from {@code left} to {@code right}, or {@code null} when the pair gives no
      * rate: a total missing on one side, totals counted from different starts, or a total that fell.
      *
-     * <p>Two samples taken before the run counted anything at all — no counting start and no total on
-     * either side — moved nothing between them, and that is a measurement of zero, not the absence of one.
-     * The engine publishes a total only once the first row crosses, so without this a running pipeline
-     * with nothing to deliver would read as unmeasured for as long as it stayed idle.
+     * <p>Before the run has a counting start, both the legacy absent total and an explicitly observed
+     * zero describe no confirmed output. Once counting has started, a missing total leaves the
+     * interval unmeasured.
      */
     static Long growth(RateSample left, RateSample right, String name) {
         Long before = left.counters().get(name);
         Long after = right.counters().get(name);
-        if (before == null && after == null && left.countingSince() == null && right.countingSince() == null) {
+        if (left.countingSince() == null && right.countingSince() == null
+                && (before == null || before == 0) && (after == null || after == 0)) {
             return 0L;
         }
         if (before == null || after == null
