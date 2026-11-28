@@ -22,4 +22,4 @@ steps:
   - await: { count: { tgt_file.orders: 2 } }
   - cdc: { src_file.orders: insert 3 }
   - await: { count: { tgt_file.orders: 5 } }
-  - assert: { state: RUNNING }
+  - await: { state: RUNNING }
