@@ -22,6 +22,9 @@ STAGE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(STAGE)
 ROOT = Path(__file__).resolve().parents[2]
 OP_DEFAULT_CONNECTORS = ("mongodb", "mongodb-atlas")
+# DNS, connect, partial transfer, timeout, TLS handshake, and send/receive failures.
+RETRYABLE_CURL_EXITS = frozenset({5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 92})
+RETRYABLE_HTTP_STATUSES = frozenset({b"408", b"429", b"500", b"502", b"503", b"504"})
 
 
 def select(boot_jar: Path, profile: str, java: str, extra: tuple[str, ...] = ()) -> list[dict]:
@@ -52,6 +55,7 @@ def download(url: str, destination: Path) -> None:
         "--max-time", str(download_timeout), "--max-filesize", str(STAGE.MAX_JAR_BYTES), "--output", str(destination),
     ]
     diagnostics = os.environ.get("TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS") == "1"
+    attempts = 5 if os.environ.get("TAPSTATE_OP_DOWNLOAD_RETRY") == "1" else 1
     if diagnostics:
         command += [
             "--write-out",
@@ -59,15 +63,16 @@ def download(url: str, destination: Path) -> None:
             "dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s "
             "first_byte=%{time_starttransfer}s redirect=%{time_redirect}s total=%{time_total}s bytes=%{size_download}",
         ]
+    elif attempts > 1:
+        command += ["--write-out", "http=%{http_code}"]
     command.append(url)
-    attempts = 5 if os.environ.get("TAPSTATE_OP_DOWNLOAD_RETRY") == "1" else 1
     for attempt in range(1, attempts + 1):
         started_at = time.monotonic()
-        failure = download_attempt(command, download_timeout, destination, parsed, diagnostics)
+        failure, retryable = download_attempt(command, download_timeout, destination, parsed, diagnostics)
         if failure is None:
             return
         destination.unlink(missing_ok=True)
-        if attempt == attempts:
+        if not retryable or attempt == attempts:
             raise STAGE.StageError(f"{destination.name}: Maven artifact download failed ({failure})")
         delay = max(0.0, started_at + 30 - time.monotonic())
         print(f"Connector download {destination.name}: {failure}; retrying in {delay:.3f}s "
@@ -77,11 +82,11 @@ def download(url: str, destination: Path) -> None:
 
 
 def download_attempt(command: list[str], timeout: int, destination: Path,
-                     parsed: SplitResult, diagnostics: bool) -> str | None:
+                     parsed: SplitResult, diagnostics: bool) -> tuple[str | None, bool]:
     try:
         process = subprocess.run(command, capture_output=True, timeout=timeout + 5, check=False)
     except subprocess.TimeoutExpired:
-        return "curl process timed out"
+        return "curl process timed out", True
     if diagnostics:
         artifact = parsed.path.rsplit("/", 1)[-1]
         metrics = process.stdout.decode(errors="replace")
@@ -91,7 +96,13 @@ def download_attempt(command: list[str], timeout: int, destination: Path,
             message = " ".join(process.stderr.decode(errors="replace").splitlines())
             message = re.sub(r"https?://\S+", "[URL]", message)
             print(f"Connector download {destination.name}: {message}", file=sys.stderr, flush=True)
-    return f"curl exit={process.returncode}" if process.returncode != 0 else None
+    if process.returncode == 0:
+        return None, False
+    if process.returncode == 22:
+        status = process.stdout.partition(b" ")[0].removeprefix(b"http=")
+        failure = f"curl exit=22 http={status.decode()}" if status.isdigit() else "curl exit=22"
+        return failure, status in RETRYABLE_HTTP_STATUSES
+    return f"curl exit={process.returncode}", process.returncode in RETRYABLE_CURL_EXITS
 
 
 def inspect(path: Path, selected: dict) -> tuple[dict, str]:

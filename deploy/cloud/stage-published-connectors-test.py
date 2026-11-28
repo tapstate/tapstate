@@ -117,6 +117,38 @@ class PublishedConnectorsTest(unittest.TestCase):
         self.assertEqual(curl.call_count, 5)
         self.assertEqual(sleep.call_args_list, [call(30)] * 4)
 
+    def test_retry_policy_distinguishes_transfer_and_http_failures(self):
+        settings = {"TAPSTATE_OP_DOWNLOAD_RETRY": "1", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "0"}
+        cases = (
+            (22, b"http=404", False),
+            (22, b"http=401", False),
+            (63, b"http=200", False),
+            (60, b"http=000", False),
+            (22, b"http=429", True),
+            (22, b"http=503", True),
+            (18, b"http=200", True),
+        )
+        for exit_code, metrics, retryable in cases:
+            with self.subTest(exit_code=exit_code, metrics=metrics):
+                destination = self.fixture.jars.parent / "policy.jar"
+                failure = SimpleNamespace(returncode=exit_code, stdout=metrics)
+                success = SimpleNamespace(returncode=0, stdout=b"http=200")
+                destination.write_bytes(b"partial")
+                with patch.dict(os.environ, settings), \
+                        patch.object(PUBLISHED.subprocess, "run", side_effect=[failure, success]) as curl, \
+                        patch.object(time, "monotonic", return_value=0), \
+                        patch.object(time, "sleep") as sleep, contextlib.redirect_stderr(io.StringIO()):
+                    if retryable:
+                        PUBLISHED.download("https://maven.example.test/mysql-connector.jar", destination)
+                    else:
+                        with self.assertRaisesRegex(PUBLISHED.STAGE.StageError, f"curl exit={exit_code}"):
+                            PUBLISHED.download("https://maven.example.test/mysql-connector.jar", destination)
+                self.assertFalse(destination.exists())
+                self.assertEqual(curl.call_count, 2 if retryable else 1)
+                self.assertEqual(sleep.call_args_list, [call(30)] if retryable else [])
+                command = curl.call_args.args[0]
+                self.assertEqual(command[command.index("--write-out") + 1], "http=%{http_code}")
+
     def test_op_keeps_its_licenses_when_the_selection_matches_cloud(self):
         selected = [entry for entry in self.selection if entry["id"] in PUBLISHED.STAGE.CLOUD_IDS]
         with patch.object(PUBLISHED, "download", side_effect=self.download):

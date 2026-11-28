@@ -129,6 +129,7 @@ jobs:
           if-no-files-found: error
       # Older release sources retain their own image format.
       - name: stage the exact on-prem connector and license bytes
+        timeout-minutes: 120
         if: hashFiles('deploy/docker/connectors.lock.json') != ''
         id: onprem-seed
         env:
@@ -350,6 +351,7 @@ jobs:
           distribution: temurin
           java-version: "21.0.13+9.0.LTS"
       - name: stage the exact published connector and license bytes
+        timeout-minutes: 120
         env:
           GH_TOKEN: ${{ github.token }}
           TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS: "600"
