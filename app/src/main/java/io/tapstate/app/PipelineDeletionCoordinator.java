@@ -38,10 +38,22 @@ final class PipelineDeletionCoordinator {
     }
     PipelineRetirementResult delete(PipelineRetirementRequest original,Optional<OperatorRunManifest> manifest,
             PipelineIntentSnapshot expectedIntent) {
+        return delete(original, manifest, expectedIntent, null);
+    }
+
+    PipelineRetirementResult deleteAfterFirstClear(PipelineRetirementRequest original, Optional<OperatorRunManifest> manifest,
+            PipelineIntentSnapshot expectedIntent, PipelineIntentSnapshot clearingStop) {
+        return delete(original, manifest, Objects.requireNonNull(expectedIntent), Objects.requireNonNull(clearingStop));
+    }
+
+    private PipelineRetirementResult delete(PipelineRetirementRequest original, Optional<OperatorRunManifest> manifest,
+            PipelineIntentSnapshot expectedIntent, PipelineIntentSnapshot clearingStop) {
         activeNode.run();var completed=configuration.completed(original.scope().pipelineId(),original.operationId());
         if(completed.isPresent())return same(original,completed.orElseThrow());
         var retired=isolation.isolate(original,manifest);retired.requireRetired().run();activeNode.run();
-        return execute(expectedIntent == null ? configuration.begin(original) : configuration.begin(original,expectedIntent),retired);
+        var preparation = clearingStop != null ? configuration.beginAfterFirstClear(original, expectedIntent, clearingStop)
+                : expectedIntent == null ? configuration.begin(original) : configuration.begin(original, expectedIntent);
+        return execute(preparation, retired);
     }
     Optional<PipelineRetirementResult> resume(PipelineIntentScope scope,String operationId,Optional<OperatorRunManifest> manifest) {
         activeNode.run();var completed=configuration.completed(scope.pipelineId(),operationId);
