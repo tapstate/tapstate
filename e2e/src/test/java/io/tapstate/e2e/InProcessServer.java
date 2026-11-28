@@ -39,14 +39,16 @@ final class InProcessServer implements ServerHandle {
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
     private final Path stagingDirectory;
+    private final boolean ownsStagingDirectory;
     private final List<ConfigurableApplicationContext> refreshedContexts;
 
-    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory,
+    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory, boolean ownsStagingDirectory,
             List<ConfigurableApplicationContext> refreshedContexts) {
         this.context = context;
         this.refreshedContexts = refreshedContexts;
         this.baseUrl = baseUrl;
         this.stagingDirectory = stagingDirectory;
+        this.ownsStagingDirectory = ownsStagingDirectory;
     }
 
     void inspectStorageNow() throws ReflectiveOperationException {
@@ -96,7 +98,7 @@ final class InProcessServer implements ServerHandle {
             if (additionalArguments.stream().noneMatch(argument -> argument.startsWith(key))) arguments.add(value);
         }
         arguments.addAll(additionalArguments);
-        return start(storage.configurationUri(), null, arguments, provider, diagnostics);
+        return start(storage.configurationUri(), null, arguments, provider, diagnostics, storage.connectorDirectory());
     }
 
     /** Boots the assembly with an explicit operator-state database. */
@@ -111,12 +113,13 @@ final class InProcessServer implements ServerHandle {
 
     static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
             io.tapstate.control.core.AiProviderClient provider) {
-        return start(storeUri, operatorStateDatabase, additionalArguments, provider, null);
+        return start(storeUri, operatorStateDatabase, additionalArguments, provider, null, null);
     }
 
     private static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
-            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
-        Path stagingDirectory = ServerHandle.privateStagingDirectory();
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics, Path retainedDirectory) {
+        boolean ownsStagingDirectory = retainedDirectory == null;
+        Path stagingDirectory = ownsStagingDirectory ? ServerHandle.privateStagingDirectory() : retainedDirectory;
         ConfigurableApplicationContext context;
         var refreshed = new java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext>();
         try {
@@ -125,7 +128,7 @@ final class InProcessServer implements ServerHandle {
             // Nothing is handed back to close, so nothing else will ever clear this up. Attached rather
             // than thrown: why the assembly did not boot is the thing a reader needs.
             try {
-                ServerHandle.discardStagingDirectory(stagingDirectory);
+                if (ownsStagingDirectory) ServerHandle.discardStagingDirectory(stagingDirectory);
             } catch (RuntimeException cleanup) {
                 e.addSuppressed(cleanup);
             }
@@ -134,7 +137,7 @@ final class InProcessServer implements ServerHandle {
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
         String address = context.getEnvironment().getProperty("server.address", "127.0.0.1");
         URI endpoint = UriComponentsBuilder.newInstance().scheme("http").host(address).port(port).build().toUri();
-        return new InProcessServer(context, endpoint, stagingDirectory, refreshed);
+        return new InProcessServer(context, endpoint, stagingDirectory, ownsStagingDirectory, refreshed);
     }
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
@@ -379,7 +382,7 @@ final class InProcessServer implements ServerHandle {
         try { context.close(); }
         finally {
             refreshedContexts.clear();
-            ServerHandle.discardStagingDirectory(stagingDirectory);
+            if (ownsStagingDirectory) ServerHandle.discardStagingDirectory(stagingDirectory);
         }
     }
 }

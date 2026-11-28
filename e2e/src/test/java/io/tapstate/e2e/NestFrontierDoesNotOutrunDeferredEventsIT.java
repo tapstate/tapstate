@@ -127,7 +127,7 @@ class NestFrontierDoesNotOutrunDeferredEventsIT {
             String targetUri = SharedMongo.replicaSetUrl("deferred_target_" + suffix);
             Map<String, Object> mysqlConfig = mysqlConfig(mysql);
 
-            try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
                 // Both readings outlive the run that took them: the failure message after the restart is
                 // only legible beside the two positions that made the restart meaningful.
                 String heldAt;

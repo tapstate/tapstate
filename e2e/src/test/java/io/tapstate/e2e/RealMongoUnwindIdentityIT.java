@@ -40,7 +40,7 @@ class RealMongoUnwindIdentityIT {
         String pipeline = "unwind_" + suffix;
         String preserved = tier == Tiers.IN_PROCESS ? "_unwind_source_id" : "original_order_id";
         boolean objectIds = tier == Tiers.REAL_PROCESS;
-        try (PreparedNativeStore storage = PreparedNativeStore.create();
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory();
                 var source = MongoClients.create(sourceUri); var target = MongoClients.create(targetUri)) {
             var sourceDatabase = source.getDatabase(sourceDb);
             var targetDatabase = target.getDatabase(targetDb);

@@ -169,8 +169,13 @@ final class RealProcessServer implements ServerHandle {
 
     /** Real Cloud Bootstrap in a separate JVM; only its external SDK boundary is a fixture. */
     static RealProcessServer startCloudFixture(String configurationUri,String cluster,Path seeds) {
+        return startCloudFixture(configurationUri, cluster, seeds, null);
+    }
+
+    /** Keeps a Cloud installation's local connector artifacts across its process replacements. */
+    static RealProcessServer startCloudFixture(String configurationUri, String cluster, Path seeds, Path stagingDirectory) {
         var server=launching(configurationUri,null,bootJar(),LOOPBACK,
-                List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),null,port -> List.of(
+                List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),stagingDirectory,port -> List.of(
                         "--tapstate.cloud.cluster-id="+cluster,"--tapstate.cluster.node-id=restart-node",
                         "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                         "--tapstate.connectors.seed-dir="+seeds,"--logging.level.root=ERROR",
@@ -314,12 +319,22 @@ final class RealProcessServer implements ServerHandle {
     /** Retains native storage admission while the scenario selects the child JVM's original runtime shape. */
     static RealProcessServer startPreparedInJvm(String configurationUri, List<String> jvmOptions,
             IntFunction<List<String>> extraArguments) {
-        return healthy(launchingPreparedInJvm(configurationUri, jvmOptions, extraArguments));
+        return startPreparedInJvm(configurationUri, jvmOptions, null, extraArguments);
+    }
+
+    static RealProcessServer startPreparedInJvm(String configurationUri, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launchingPreparedInJvm(configurationUri, jvmOptions, stagingDirectory, extraArguments));
     }
 
     static RealProcessServer launchingPreparedInJvm(String configurationUri, List<String> jvmOptions,
             IntFunction<List<String>> extraArguments) {
-        return launching(configurationUri, null, bootJar(), LOOPBACK, jvmOptions, null, extraArguments);
+        return launchingPreparedInJvm(configurationUri, jvmOptions, null, extraArguments);
+    }
+
+    static RealProcessServer launchingPreparedInJvm(String configurationUri, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), LOOPBACK, jvmOptions, stagingDirectory, extraArguments);
     }
 
     /**

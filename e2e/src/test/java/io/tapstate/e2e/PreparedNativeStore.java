@@ -7,6 +7,7 @@ import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.spi.store.StorageBinding;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -24,6 +25,8 @@ final class PreparedNativeStore implements AutoCloseable {
     private final String password;
     private final SourceResource borrowedMaster;
     private final Function<String, String> uriForDatabase;
+    private boolean retainConnectors;
+    private Path connectorDirectory;
 
     private PreparedNativeStore(String cluster, String username, String password, SourceResource borrowedMaster,
             Function<String, String> uriForDatabase) {
@@ -34,6 +37,20 @@ final class PreparedNativeStore implements AutoCloseable {
         this.cluster = cluster; this.username = username; this.password = password;
         this.borrowedMaster = borrowedMaster;
         this.uriForDatabase = uriForDatabase;
+    }
+
+    PreparedNativeStore retainingConnectorDirectory() {
+        retainConnectors = true;
+        return this;
+    }
+
+    synchronized Path connectorDirectory() {
+        if (retainConnectors && connectorDirectory == null) connectorDirectory = ServerHandle.privateStagingDirectory();
+        return connectorDirectory;
+    }
+
+    private void discardConnectorDirectory() {
+        if (connectorDirectory != null) ServerHandle.discardStagingDirectory(connectorDirectory);
     }
 
     static PreparedNativeStore createCloud() {
@@ -148,6 +165,8 @@ final class PreparedNativeStore implements AutoCloseable {
             var owned = borrowedMaster == null ? List.of(configurationDatabase, cacheDatabase, masterDatabase)
                     : List.of(configurationDatabase, cacheDatabase);
             for (String database : owned) client.getDatabase(database).drop();
+        } finally {
+            discardConnectorDirectory();
         }
     }
 
@@ -161,6 +180,8 @@ final class PreparedNativeStore implements AutoCloseable {
                 if(remaining<=0)throw new AssertionError("the owned database disposal deadline expired");
                 client.getDatabase(database).withTimeout(remaining,java.util.concurrent.TimeUnit.NANOSECONDS).drop();
             }
+        } finally {
+            discardConnectorDirectory();
         }
     }
 }

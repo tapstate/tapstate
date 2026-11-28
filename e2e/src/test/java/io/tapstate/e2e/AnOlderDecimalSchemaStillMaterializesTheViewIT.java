@@ -42,7 +42,7 @@ class AnOlderDecimalSchemaStillMaterializesTheViewIT {
         Path jar = E2eConnectorJar.buildInto(directory);
         Files.writeString(source.resolve("orders.csv"), "id,amount\n7,70.00\n");
         Path view = target.resolve("orders.csv");
-        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory()) {
             try (ServerHandle first = InProcessServer.startPrepared(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);

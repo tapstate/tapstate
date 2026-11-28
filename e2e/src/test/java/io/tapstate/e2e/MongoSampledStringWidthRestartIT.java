@@ -29,7 +29,7 @@ class MongoSampledStringWidthRestartIT {
         try (var mongo = mongo()) {
             String sourceUri = mongo.getReplicaSetUrl("sampled_width_source");
             String targetUri = mongo.getReplicaSetUrl("sampled_width_target");
-            try (var storage = PreparedNativeStore.createOn(mongo);
+            try (var storage = PreparedNativeStore.createOn(mongo).retainingConnectorDirectory();
                     var sourceClient = MongoClients.create(sourceUri);
                     var targetClient = MongoClients.create(targetUri);
                     var cacheClient = MongoClients.create(storage.cacheUri())) {

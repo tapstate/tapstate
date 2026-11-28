@@ -55,6 +55,7 @@ class IndependentCdcRecoveryIT {
     void mailConfirmedAfterAPendingHighCannotMakeAProcessRestartSkipThatHigh(
             String readMode, @TempDir Path temporary) throws Exception {
         Fixture fixture = fixture(temporary, "shared_restart_" + readMode);
+        fixture.storage().retainingConnectorDirectory();
         try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri())) {
             MongoDatabase database = database(reader, fixture.storage().cacheUri());
             Document high;
@@ -485,6 +486,7 @@ class IndependentCdcRecoveryIT {
     void aRestartRefusesMissingOrUnprovenRecoveryHistory(LostHistory loss, @TempDir Path temporary)
             throws Exception {
         Fixture fixture = fixture(temporary, "lost_history_" + loss.name().toLowerCase(java.util.Locale.ROOT));
+        fixture.storage().retainingConnectorDirectory();
         try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri())) {
             MongoDatabase database = database(reader, fixture.storage().cacheUri());
             Document high;
@@ -843,6 +845,7 @@ class IndependentCdcRecoveryIT {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
         while (true) {
             var server = RealProcessServer.launchingPreparedInJvm(fixture.storage().configurationUri(), jvmOptions,
+                    fixture.storage().connectorDirectory(),
                     port -> List.of("--tapstate.cluster.id=" + fixture.storage().clusterId(), "--tapstate.hz.member-port=0"));
             var refused = new java.util.concurrent.atomic.AtomicBoolean();
             try {

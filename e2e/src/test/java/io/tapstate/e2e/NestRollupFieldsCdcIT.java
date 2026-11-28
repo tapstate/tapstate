@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -61,7 +62,7 @@ class NestRollupFieldsCdcIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String pipeline = "rollup_cdc_" + suffix;
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = start(server, storage, mysql, WALLET_TABLES, targetUri, pipeline,
                         walletPipeline(pipeline));
@@ -100,6 +101,14 @@ class NestRollupFieldsCdcIT {
                 sql(mysql, "DELETE FROM ratings WHERE id = 8");
                 converge(mongo, target, mysql, "after the winner was deleted");
                 assertThat(document(mongo, target, 2)).containsEntry("latest_score", 520L);
+                // The rollup can be visible before the durable source and writer positions cover the move.
+                try (var config = MongoClients.create(storage.configurationUri())) {
+                    var windows = config.getDatabase(storage.configurationDatabase()).getCollection("pipeline_key_move_windows");
+                    var filter = new Document("_id", pipeline);
+                    Await.until("durable confirmation of the rollup key moves",
+                            () -> windows.find(filter).first() == null,
+                            () -> String.valueOf(windows.find(filter).first()));
+                }
             }
 
             // A running value would be counted twice on replay; a recomputation cannot be.
@@ -270,7 +279,7 @@ class NestRollupFieldsCdcIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String pipeline = "rollup_ref_" + suffix;
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = start(server, storage, mysql, WALLET_TABLES, targetUri, pipeline,
                         walletPipeline(pipeline));

@@ -17,12 +17,6 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
 import io.tapstate.testsupport.RequiresDocker;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -65,12 +59,12 @@ class ThreeLayerRestartContinuationIT {
             mongo.seed(source, TABLE, SeedRows.generated(8));
             String acknowledged;
             Map<Long, Long> beforeShutdown;
-            var first = start(configUri, cluster);
+            var first = start(configUri, cluster, work.resolve("plugins"));
             try (first) {
                 var control = login(first);
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 var defaultTarget = control.artifact("views").orElseThrow();
-                var workspace = resources(sourceUri);
+                var workspace = resources(sourceUri, false, "views", true);
                 workspace.put("views.tap.yml", defaultTarget.canonicalForm());
                 control.apply(workspace);
                 assertThat(control.artifact("views").orElseThrow().contentHash()).isEqualTo(defaultTarget.contentHash());
@@ -93,7 +87,7 @@ class ThreeLayerRestartContinuationIT {
             mongo.delete(source, TABLE, Map.of("id", 3L));
             mongo.insert(source, TABLE, List.of(Map.of("id", 9L, "seq", 90L)));
             assertThat(rows(mongo, target)).as("the old process has exited before downtime changes").isEqualTo(beforeShutdown);
-            try (var replacement = start(configUri, cluster)) {
+            try (var replacement = start(configUri, cluster, work.resolve("plugins"))) {
                 var control = login(replacement);
                 Await.until("the retained running intent to resume", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
@@ -137,7 +131,7 @@ class ThreeLayerRestartContinuationIT {
             var first=start(configUri,cluster);
             try(first) {
                 var control=login(first); control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
-                var resources=resources(sourceUri,true);
+                var resources=resources(sourceUri, true, "views", false);
                 resources.put("views.tap.yml",control.artifact("views").orElseThrow().canonicalForm());
                 control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
                 control.lifecycle(PIPELINE,LifecycleVerb.START);
@@ -220,10 +214,10 @@ class ThreeLayerRestartContinuationIT {
             Map<Long,Long> stoppedRows;long stoppedExecution;
             boolean paused=false,configurationPaused=false;
             try {
-                var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds);
+                var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds,work.resolve("cloud-plugins"));
                 try(first) {
                     var control=cloudLogin(first);
-                    var resources=resources(sourceUri,false,targetId);
+                    var resources=resources(sourceUri, false, targetId, true);
                     resources.put(targetId+".tap.yml",control.artifact(targetId).orElseThrow().canonicalForm());
                     resources.put(stoppedTargetId+".tap.yml","""
                             version: tapstate/v1
@@ -232,7 +226,7 @@ class ThreeLayerRestartContinuationIT {
                             connector: mongodb
                             config: { isUri: true, uri: "%s" }
                             """.formatted(stoppedTargetUri));
-                    resources.put(stoppedPipeline+".tap.yml",resources(sourceUri,false,stoppedTargetId).get("pipeline.tap.yml")
+                    resources.put(stoppedPipeline+".tap.yml",resources(sourceUri, false, stoppedTargetId, true).get("pipeline.tap.yml")
                             .replace("id: native_resume","id: "+stoppedPipeline));
                     control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
                     control.lifecycle(PIPELINE,LifecycleVerb.START);awaitRows(mongo,source,target,"the Cloud snapshot before its customer instance outage");
@@ -258,7 +252,7 @@ class ThreeLayerRestartContinuationIT {
                 }
                 assertThat(first.isAlive()).isFalse();
                 var replacementBoundary=java.time.Instant.now();
-                try(var blocked=RealProcessServer.startCloudFixture(configUri,cluster,seeds)) {
+                try(var blocked=RealProcessServer.startCloudFixture(configUri,cluster,seeds,work.resolve("cloud-plugins"))) {
                     var entry=http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
                             .timeout(Duration.ofSeconds(30)).GET().build(),java.net.http.HttpResponse.BodyHandlers.ofString());
                     assertThat(entry.statusCode()).isEqualTo(200);assertThat(Document.parse(entry.body())).containsEntry("entry","UNAVAILABLE");
@@ -347,7 +341,7 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private void storageOutage(boolean together) throws Exception {
-        Path connectorDirectory = together ? null : work.resolve("connectors");
+        Path connectorDirectory = work.resolve(together ? "plugins" : "connectors");
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String cluster = "outage-" + suffix, configDb = "outage_cfg_" + suffix, cacheDb = "outage_cache_" + suffix;
         String configUri = (together ? CACHE : CONFIG).getReplicaSetUrl(configDb);
@@ -373,7 +367,7 @@ class ThreeLayerRestartContinuationIT {
                 try (first) {
                     var control = login(first);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-                    var resources = resources(sourceUri, false, "views", !together);
+                    var resources = resources(sourceUri, false, "views", true);
                     resources.put("views.tap.yml", control.artifact("views").orElseThrow().canonicalForm());
                     control.apply(resources); control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
                     control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -389,13 +383,15 @@ class ThreeLayerRestartContinuationIT {
                     originalConfiguration = installationFacts(configuration);
                     assertThat(chains.countDocuments()).isOne(); originalChain = chains.find().first();
                     assertThat(originalChain.get("checkpoint", Document.class)).isNotEmpty();
-                    long outageLogOffset = Files.size(first.output());
                     CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec(); paused = true;
                     mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
                     mongo.delete(source, TABLE, Map.of("id", 3L));
                     if (together) {
-                        Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
-                                () -> recordedNodeSessionLoss(first.output(), outageLogOffset), first::tail);
+                        var entry = http.send(java.net.http.HttpRequest.newBuilder(first.baseUrl().resolve("/auth/storage-entry"))
+                                .timeout(Duration.ofSeconds(30)).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                        assertThat(entry.statusCode()).isEqualTo(200);
+                        assertThat(Document.parse(entry.body()))
+                                .containsEntry("entry", "UNAVAILABLE").containsEntry("businessReady", false);
                     } else {
                         // The single-node OP session belongs to the process even while CACHE is unavailable.
                         Await.until("the original process to refuse a CACHE-backed cluster read", Duration.ofSeconds(45),
@@ -448,7 +444,7 @@ class ThreeLayerRestartContinuationIT {
                     if (!together) verifyResume.accept(blocked);
                 }
                 // A process that could not load CONFIG has no authenticated local context to retry.
-                if (together) try (var restored = start(configUri, cluster)) { verifyResume.accept(restored); }
+                if (together) try (var restored = start(configUri, cluster, connectorDirectory)) { verifyResume.accept(restored); }
             } finally {
                 if (paused) CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();
             }
@@ -549,16 +545,6 @@ class ThreeLayerRestartContinuationIT {
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));
     }
 
-    private static boolean recordedNodeSessionLoss(Path output, long outageLogOffset) {
-        try (var input = Files.newInputStream(output);
-             var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
-            input.skipNBytes(outageLogOffset);
-            return reader.lines().anyMatch(line -> line.contains("Node session lost:"));
-        } catch (IOException e) {
-            throw new UncheckedIOException("could not read server output at " + output, e);
-        }
-    }
-
     private static ControlPlane login(RealProcessServer server) {
         var control = new ControlPlane(server.baseUrl());
         control.login(NativeMongoStorageFixture.USER, NativeMongoStorageFixture.PASSWORD);
@@ -593,17 +579,6 @@ class ThreeLayerRestartContinuationIT {
         return rows;
     }
 
-    private static Map<String, String> resources(String sourceUri) {
-        return resources(sourceUri,false);
-    }
-
-    private static Map<String, String> resources(String sourceUri,boolean bounded) {
-        return resources(sourceUri,bounded,"views");
-    }
-    private static Map<String,String> resources(String sourceUri,boolean bounded,String targetId) {
-        return resources(sourceUri, bounded, targetId, false);
-    }
-
     private static Map<String, String> resources(String sourceUri, boolean bounded, String targetId, boolean preImage) {
         var resources = new LinkedHashMap<String, String>();
         resources.put("input.tap.yml", """
@@ -614,7 +589,7 @@ class ThreeLayerRestartContinuationIT {
                 config: { isUri: true, uri: "%s"%s }
                 mode: %s
                 tables: [ orders ]
-                """.formatted(sourceUri, preImage ? ", preImage: true" : "", bounded?"snapshot":"cdc"));
+                """.formatted(sourceUri, preImage ? ", preImage: true" : "", bounded ? "snapshot" : "cdc"));
         resources.put("pipeline.tap.yml", """
                 version: tapstate/v1
                 kind: pipeline

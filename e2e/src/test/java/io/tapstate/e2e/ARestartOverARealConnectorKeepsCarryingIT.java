@@ -68,7 +68,7 @@ class ARestartOverARealConnectorKeepsCarryingIT {
         String targetUri = SharedMongo.replicaSetUrl("restart_real_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create().retainingConnectorDirectory(); MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle first = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 storage.loginAndAwaitBusiness(control);
@@ -95,9 +95,9 @@ class ARestartOverARealConnectorKeepsCarryingIT {
                 ControlPlane control = new ControlPlane(second.baseUrl());
                 storage.loginAndAwaitBusiness(control);
 
-                assertThat(control.state(PIPELINE_ID))
-                        .as("the pipeline the restarted server adopted from the store it read")
-                        .contains(PipelineState.RUNNING);
+                Await.until("the restarted server to adopt its retained Pipeline",
+                        () -> control.state(PIPELINE_ID).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> String.valueOf(control.state(PIPELINE_ID)));
                 assertThat(customer(mongo, target))
                         .as("the target before the last change is made - the wait below has to be earned")
                         .isEqualTo(BEFORE_THE_RESTART);

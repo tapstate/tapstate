@@ -39,7 +39,8 @@ class AFullJoinSurvivesItsRetiredPayloadCleanupFailureIT {
         Path target = Files.createDirectory(directory.resolve("target"));
         FileEndpoints.replaceTable(source.resolve("orders.csv"), "id,seq\n10,1\n11,1\n");
         FileEndpoints.replaceTable(source.resolve("customers.csv"), "id,seq\n1,7\n");
-        try (var storage = PreparedNativeStore.createOn(MONGO); var client = MongoClients.create(MONGO.getReplicaSetUrl());
+        try (var storage = PreparedNativeStore.createOn(MONGO).retainingConnectorDirectory();
+                var client = MongoClients.create(MONGO.getReplicaSetUrl());
              var files = new FileEndpoints()) {
             var cache = client.getDatabase(storage.cacheDatabase()); var config = client.getDatabase(storage.configurationDatabase());
             var admin = client.getDatabase("admin"); var generations = config.getCollection("operator_generations");
@@ -147,7 +148,7 @@ class AFullJoinSurvivesItsRetiredPayloadCleanupFailureIT {
     }
 
     private RealProcessServer start(PreparedNativeStore storage) {
-        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", port -> List.of(
+        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", storage.connectorDirectory(), port -> List.of(
                 "--tapstate.cluster.id=" + storage.clusterId(), "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--tapstate.connectors.seed-dir=" + directory.resolve("no-seeds"), "--SDK_STATUS_SENDER_ENABLED=false",
                 "--logging.level.io.tapstate.app.RetiredPipelinePayloadCleanup=WARN"));

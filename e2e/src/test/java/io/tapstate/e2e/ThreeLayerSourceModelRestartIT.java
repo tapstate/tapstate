@@ -143,7 +143,7 @@ class ThreeLayerSourceModelRestartIT {
     }
 
     private RealProcessServer start(String configUri, String cluster) {
-        return RealProcessServer.startPrepared(configUri, "127.0.0.1", port -> List.of(
+        return RealProcessServer.startPrepared(configUri, "127.0.0.1", work.resolve("plugins"), port -> List.of(
                 "--tapstate.cluster.id=" + cluster, "--tapstate.cluster.node-id=model-node", "--tapstate.hz.member-port=0",
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));

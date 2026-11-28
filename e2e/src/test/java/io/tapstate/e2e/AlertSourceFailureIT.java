@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClients;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.model.SourceResource;
@@ -29,15 +30,20 @@ class AlertSourceFailureIT {
                     var server=InProcessServer.startPrepared(storage,List.of("--logging.level.io.tapstate.app.NativeBusinessContext=DEBUG","--logging.level.io.tapstate.app.BuiltinResourceSignals=DEBUG"))) {
                 var collection=sourceClient.getDatabase(sourceDb).getCollection("orders");collection.insertOne(new Document("_id",1).append("name","before"));
                 var control=new ControlPlane(server.baseUrl());storage.loginAndAwaitBusiness(control);control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
+                if (!masterFailure) {
+                    sourceClient.getDatabase(sourceDb).runCommand(new Document("collMod", "orders")
+                            .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+                    disableStreamReadRetry(control);
+                }
                 control.apply(Map.of("source.tap.yml","""
                         version: tapstate/v1
                         kind: source
                         id: src_alarm
                         connector: mongodb
-                        config: { uri: "%s", database: "%s" }
+                        config: { uri: "%s", database: "%s"%s }
                         mode: cdc
                         tables: [orders]
-                        """.formatted(uri,sourceDb),"pipeline.tap.yml","""
+                        """.formatted(uri, sourceDb, masterFailure ? "" : ", preImage: true"),"pipeline.tap.yml","""
                         version: tapstate/v1
                         kind: pipeline
                         id: source_alarm
@@ -105,6 +111,22 @@ class AlertSourceFailureIT {
                 Files.writeString(Path.of(System.getProperty("tapstate.t8.source-receipt",masterFailure?"/tmp/w4-t8-master-receipt.json":"/tmp/w4-t8-source-receipt.json")),JsonWriter.write(evidence));
             }finally{try(var cleanup=MongoClients.create(targetUri)){cleanup.getDatabase(targetDb).drop();}}
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void disableStreamReadRetry(ControlPlane control) {
+        var settings = (Map<String, Object>) JsonReader.parse(control.retrySettings().body());
+        var defaults = (Map<String, Object>) settings.get("defaults");
+        var operations = new LinkedHashMap<>((Map<String, Map<String, Object>>) settings.get("operations"));
+        var streamRead = new LinkedHashMap<>(operations.getOrDefault("stream-read", Map.of()));
+        streamRead.put("enabled", false);
+        operations.put("stream-read", streamRead);
+        var response = control.replaceRetrySettings(((Number) settings.get("revision")).longValue(), defaults, operations);
+        assertThat(response.statusCode()).isEqualTo(200);
+        var saved = (Map<String, Object>) JsonReader.parse(control.retrySettings().body());
+        assertThat(saved.get("defaults")).isEqualTo(defaults);
+        var savedOperations = (Map<String, Map<String, Object>>) saved.get("operations");
+        assertThat(savedOperations.get("stream-read")).containsEntry("enabled", false);
     }
 
     private static Optional<Map<?, ?>> activeAlert(Map<String, Object> center, String type, String kind, String id) {
