@@ -17,25 +17,78 @@ import java.util.TreeMap;
 /** Complete, detached settings with stable values and runtime types, without secrets in diagnostics. */
 public final class ConnectorNoteOrigin {
     private static final String FORMAT = "connector-settings-v1";
+    private static final String PIPELINE_FORMAT = "pipeline-source-settings-v2";
     private ConnectorNoteOrigin() {}
 
     public static RequiredNoteOrigin capture(String connectorId, String artifactHash, Map<String, Object> settings) {
+        return capture(connectorId, artifactHash, FORMAT, settings);
+    }
+
+    /** Records the exact non-materialized settings supplied to a new Pipeline source drive. */
+    public static RequiredNoteOrigin capturePipeline(String connectorId, ConnectorRef ref,
+            Map<String, Object> settings, Map<String, Object> nodeConfig) {
+        var effective = PdkConnector.pipelineSettings(connectorId, ref.spec(), settings, nodeConfig);
+        return capture(connectorId, ref.contentHash(), PIPELINE_FORMAT,
+                settings, nodeConfig, effective.connection(), effective.node());
+    }
+
+    @SafeVarargs
+    private static RequiredNoteOrigin capture(String connectorId, String artifactHash, String format,
+            Map<String, Object>... settings) {
         try {
-            String json = JsonWriter.write(List.of(FORMAT, encode(settings)));
+            List<Object> fields = new ArrayList<>();
+            fields.add(format);
+            for (var field : settings) fields.add(encode(field));
+            String json = JsonWriter.write(fields);
             return new RequiredNoteOrigin(connectorId, artifactHash, json.getBytes(StandardCharsets.UTF_8));
         } catch (IllegalArgumentException | NullPointerException invalid) {
             throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
         }
     }
     /** Validates retained settings without exposing their decoded credentials to the caller. */
-    public static void requireReadable(RequiredNoteOrigin origin) { settings(origin); }
+    public static void requireReadable(RequiredNoteOrigin origin) { payload(origin); }
+
+    /** Compares authored settings; a legacy origin has no separately recorded node map. */
+    public static boolean matches(RequiredNoteOrigin origin, String connectorId, String artifactHash,
+            Map<String, Object> settings, Map<String, Object> nodeConfig) {
+        if (origin == null || !origin.connectorId().equals(connectorId)
+                || !origin.artifactHash().equals(artifactHash)) return false;
+        var payload = payload(origin);
+        if (payload.nodeConfig() == null) return origin.equals(capture(connectorId, artifactHash, settings));
+        return sameValues(payload.authored(), settings)
+                && (nodeConfig == null || sameValues(payload.nodeConfig(), nodeConfig));
+    }
+
+    private static boolean sameValues(Map<String, Object> left, Map<String, Object> right) {
+        // Encoding preserves numeric types and compares byte arrays by value.
+        return encode(left).equals(encode(right));
+    }
+
+    private record Payload(Map<String, Object> authored, Map<String, Object> nodeConfig,
+            PdkConnector.PipelineSettings effective) {}
+
+    static Map<String, Object> settings(RequiredNoteOrigin origin) { return payload(origin).authored(); }
+
+    static PdkConnector.PipelineSettings pipelineSettings(RequiredNoteOrigin origin) { return payload(origin).effective(); }
 
     @SuppressWarnings("unchecked")
-    static Map<String, Object> settings(RequiredNoteOrigin origin) {
+    private static Map<String, Object> decodedMap(Object encoded) {
+        if (decode(encoded) instanceof Map<?, ?> map) return (Map<String, Object>) map;
+        throw invalid();
+    }
+
+    private static Payload payload(RequiredNoteOrigin origin) {
         try {
             Object parsed = JsonReader.parse(new String(origin.settings(), StandardCharsets.UTF_8));
-            if (parsed instanceof List<?> root && root.size() == 2 && FORMAT.equals(root.getFirst())
-                    && decode(root.get(1)) instanceof Map<?, ?> object) return (Map<String, Object>) object;
+            if (parsed instanceof List<?> root) {
+                if (root.size() == 2 && FORMAT.equals(root.getFirst())) {
+                    return new Payload(decodedMap(root.get(1)), null, null);
+                }
+                if (root.size() == 5 && PIPELINE_FORMAT.equals(root.getFirst())) {
+                    return new Payload(decodedMap(root.get(1)), decodedMap(root.get(2)),
+                            new PdkConnector.PipelineSettings(decodedMap(root.get(3)), decodedMap(root.get(4))));
+                }
+            }
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) {
             // Parser and numeric diagnostics may include secret input; retain neither message nor cause.
         }

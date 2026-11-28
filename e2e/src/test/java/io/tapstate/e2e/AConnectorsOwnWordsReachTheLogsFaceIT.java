@@ -154,7 +154,7 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                 kind: source
                 id: src_tail
                 connector: %s
-                config: { uri: "%s", fail_cdc: true }
+                config: { uri: "%s" }
                 mode: cdc
                 tables: [ orders ]
                 """.formatted(E2eConnectorJar.CONNECTOR_ID, directory);
@@ -194,7 +194,8 @@ class AConnectorsOwnWordsReachTheLogsFaceIT {
                   from: orders
                   sync:
                     - source: tgt_file
-                """.formatted(pipelineId, sourceId);
+                """.formatted(pipelineId, sourceId.equals("src_tail")
+                        ? "{ id: src_tail, nodeConfig: { fail_cdc: true } }" : sourceId);
     }
 
     private static byte[] read(Path file) {

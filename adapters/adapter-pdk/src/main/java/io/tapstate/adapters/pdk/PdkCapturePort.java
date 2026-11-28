@@ -883,7 +883,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     public boolean automaticallyClearsPrivatePostgres(io.tapstate.spi.store.RequiredNoteOrigin origin) {
         if(!origin.connectorId().equals("postgres"))throw new IllegalArgumentException("private PostgreSQL origin required");
         var ref=provisioner.resolve(origin.connectorId(),origin.artifactHash());
-        var settings=ConfigTypeCoercion.coerce(origin.connectorId(),ref.spec(),ConnectorNoteOrigin.settings(origin));
+        var retained = ConnectorNoteOrigin.pipelineSettings(origin);
+        var settings = retained == null
+                ? ConfigTypeCoercion.coerce(origin.connectorId(), ref.spec(), ConnectorNoteOrigin.settings(origin))
+                : retained.connection();
         Object policy=settings.get("autoClearSlot");
         if(policy==null)return true;
         if(policy instanceof Boolean flag)return flag;
@@ -1144,8 +1147,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
         retryFailedOpenCleanup();
+        if (node != null || notes != null) {
+            return PdkConnector.openPipelineSource(config.connectorId(), provisioner.resolve(config.connectorId()),
+                    config.settings(), config.nodeConfig(), node, stateStore, notes, noteScopes);
+        }
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                node, stateStore, notes, node == null && notes == null ? null : noteScopes);
+                null, stateStore, null, null);
     }
 
     /**

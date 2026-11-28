@@ -201,6 +201,35 @@ class ConfiguredCaptureNotesTest {
         }
     }
 
+    @Test void newPrivateCaptureUsesTheNativeSlotDefaultAndLegacyNotesKeepTheirPolicy() {
+        String spec = """
+                {"configOptions":{"node":{"properties":{
+                  "autoClearSlot":{"type":"boolean","default":false},
+                  "maximumQueueSize":{"type":"string","x-component":"InputNumber","default":8000},
+                  "autoIncCacheValue":{"type":"string","x-component":"InputNumber","default":100}
+                }}}}
+                """;
+        var ref = new ConnectorRef(List.of(), "unused", "2.0.8", null, spec, "a".repeat(64), false);
+        var port = new PdkCapturePort(id -> ref);
+        var oldAuthored = Map.<String,Object>of("autoClearSlot", false);
+        var retained = ConnectorNoteOrigin.capture("postgres", ref.contentHash(), oldAuthored);
+        var omitted = ConnectorNoteOrigin.capturePipeline("postgres", ref, oldAuthored, Map.of());
+        var authored = Map.<String,Object>of("autoClearSlot", false, "maximumQueueSize", 8000L, "autoIncCacheValue", 100L);
+        var explicit = ConnectorNoteOrigin.capturePipeline("postgres", ref, authored, authored);
+        assertThat(ConnectorNoteOrigin.pipelineSettings(omitted).node()).isEmpty();
+        assertThat(ConnectorNoteOrigin.pipelineSettings(omitted).connection()).isEmpty();
+
+        assertThat(ConnectorNoteOrigin.pipelineSettings(explicit).node())
+                .containsEntry("maximumQueueSize", 8000).containsEntry("autoIncCacheValue", 100L);
+        assertThat(ConnectorNoteOrigin.pipelineSettings(explicit).connection())
+                .containsEntry("maximumQueueSize", 8000).containsEntry("autoIncCacheValue", 100L);
+        assertThat(port.automaticallyClearsPrivatePostgres(retained)).isFalse();
+        assertThat(port.automaticallyClearsPrivatePostgres(omitted)).isTrue();
+        assertThat(port.automaticallyClearsPrivatePostgres(explicit)).isFalse();
+        assertThat(ConnectorNoteOrigin.matches(omitted, "postgres", ref.contentHash(), oldAuthored, Map.of())).isTrue();
+        assertThat(ConnectorNoteOrigin.matches(omitted, "postgres", ref.contentHash(), oldAuthored, oldAuthored)).isFalse();
+    }
+
     private static CaptureConfig config() {
         return new CaptureConfig("postgres", Map.of(), List.of("t1")).at(NODE);
     }

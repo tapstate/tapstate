@@ -38,13 +38,18 @@ import java.util.Objects;
  */
 public record CaptureConfig(
         String connectorId, Map<String, Object> settings, List<String> streams, PipelineNode node,
-        SharedNotes sharedNotes, Map<String, Object> nodeConfig) {
+        SharedNotes sharedNotes, Map<String, Object> nodeConfig, String directCoordinate) {
 
     public CaptureConfig {
         Objects.requireNonNull(connectorId, "connectorId");
         settings = settings == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(settings));
         streams = streams == null ? List.of() : List.copyOf(streams);
         nodeConfig = nodeConfig == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(nodeConfig));
+    }
+
+    public CaptureConfig(String connectorId, Map<String, Object> settings, List<String> streams,
+            PipelineNode node, SharedNotes sharedNotes, Map<String, Object> nodeConfig) {
+        this(connectorId, settings, streams, node, sharedNotes, nodeConfig, null);
     }
 
     public CaptureConfig(String connectorId, Map<String, Object> settings, List<String> streams,
@@ -64,11 +69,16 @@ public record CaptureConfig(
 
     /** The same config, read on behalf of {@code node}. */
     public CaptureConfig at(PipelineNode node) {
-        return new CaptureConfig(connectorId, settings, streams, node, sharedNotes, nodeConfig);
+        return new CaptureConfig(connectorId, settings, streams, node, sharedNotes, nodeConfig, directCoordinate);
     }
 
     /** The same owner and source configuration, with native notes belonging to one physical capture. */
     public CaptureConfig sharing(SharedNotes notes) {
-        return new CaptureConfig(connectorId, settings, streams, node, notes, nodeConfig);
+        return new CaptureConfig(connectorId, settings, streams, node, notes, nodeConfig, directCoordinate);
+    }
+
+    /** Reads a subset from the same capture configuration. */
+    public CaptureConfig forStreams(List<String> selected) {
+        return new CaptureConfig(connectorId, settings, selected, node, sharedNotes, nodeConfig, directCoordinate);
     }
 }

@@ -50,8 +50,9 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         this.clock = Objects.requireNonNull(clock, "clock");
         ConnectorInstancePool.Limits limits = new ConnectorInstancePool.Limits(
                 2, 8, Duration.ofSeconds(2), Duration.ofSeconds(42), Duration.ofMinutes(5));
-        this.pool = new ConnectorInstancePool<>(config -> new PreviewConnector(PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings())), instance -> {
+        this.pool = new ConnectorInstancePool<>(config -> new PreviewConnector(PdkConnector.openPipelineSource(
+                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(), config.nodeConfig(),
+                null, null, null, null)), instance -> {
             instance.connector.stopQuietly();
             instance.connector.close();
         }, limits, clock);
@@ -87,7 +88,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         cancellation.throwIfCancelled();
         ensureBeforeDeadline(request);
         ConnectionConfig config = new ConnectionConfig(
-                request.sourceId(), request.connectorId(), request.settings());
+                request.sourceId(), request.connectorId(), request.settings(), request.nodeConfig());
         return pool.call(config, instance -> queryWith(instance, request, cancellation), PreviewConnector::reusable);
     }
 

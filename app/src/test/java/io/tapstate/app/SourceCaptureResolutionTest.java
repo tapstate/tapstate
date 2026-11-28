@@ -285,8 +285,10 @@ class SourceCaptureResolutionTest {
         assertThat(inputs.sourceHashes().values()).containsOnly(io.tapstate.core.model.canonical.CanonicalHash.of(source));
         if (!shared) assertThat(inputs.directChannels()).extracting(channel -> channel.context().channelId())
                 .containsExactlyInAnyOrder(root.chainId().value(), child.chainId().value());
-        var inherited = new SourceRef.Spec("crm", shared, Map.of(), "items_input");
-        assertThat(io.tapstate.core.model.PipelineSourceConfig.settings(inherited, source)).containsEntry("preImage", true);
+        var unconfigured = new SourceRef.Spec("crm", shared, Map.of(), "items_input");
+        assertThat(io.tapstate.core.model.PipelineSourceConfig.overrides(unconfigured, source)).isEmpty();
+        assertThat(root.config().nodeConfig()).containsEntry("preImage", true);
+        assertThat(child.config().nodeConfig()).containsEntry("preImage", false);
         assertThat(source.config()).containsEntry("preImage", true);
     }
 

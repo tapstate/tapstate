@@ -25,6 +25,7 @@ import io.tapdata.pdk.apis.spec.TapNodeSpecification;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * An opened, constructed connector plus its registered functions and a driving context — the shared
@@ -148,16 +149,24 @@ final class PdkConnector implements AutoCloseable {
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
                              ConnectorNoteScopes noteScopes, PipelineNode.Purpose purpose) {
-        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false);
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false, null);
+    }
+
+    /** Opens a Pipeline read with an independent set of node values, even when that set is empty. */
+    static PdkConnector openPipelineSource(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+            Map<String, Object> nodeSettings, PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
+            ConnectorNoteScopes noteScopes) {
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, PipelineNode.Purpose.CAPTURE,
+                false, java.util.Objects.requireNonNull(nodeSettings, "nodeSettings"));
     }
 
     static PdkConnector openDefaultTest(String connectorId, ConnectorRef ref, Map<String,Object> settings) {
-        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true);
+        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true, null);
     }
 
     private static PdkConnector open(String connectorId, ConnectorRef ref, Map<String,Object> settings,
             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes, ConnectorNoteScopes noteScopes,
-            PipelineNode.Purpose purpose, boolean strictDefaultTest) {
+            PipelineNode.Purpose purpose, boolean strictDefaultTest, Map<String, Object> nodeSettings) {
         java.util.Objects.requireNonNull(purpose, "purpose");
         if (notes != null && purpose != PipelineNode.Purpose.CAPTURE) {
             throw new IllegalArgumentException("shared notes require capture purpose");
@@ -180,6 +189,7 @@ final class PdkConnector implements AutoCloseable {
             noteScopes.requireActive();
         };
         Map<String, Object> effectiveSettings = settings;
+        Map<String, Object> pipelineNodeValues = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredState = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredGlobal = null;
         long logGeneration = noteScopes == null ? 0 : noteScopes.logStateGeneration();
@@ -212,11 +222,12 @@ final class PdkConnector implements AutoCloseable {
                     : prepared.stream().map(RequiredNoteCarry::source).toList();
             // Opening a connector must revalidate the fixed scope even after sink preflight.
             var origin = startup != null ? startup.origin() : captured.store().origin(primary);
-            var requestedOrigin = ConnectorNoteOrigin.capture(connectorId, ref.contentHash(), settings);
-            if (!origin.equals(requestedOrigin)) {
+            if (!ConnectorNoteOrigin.matches(origin, connectorId, ref.contentHash(), settings, nodeSettings)) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
             }
-            effectiveSettings = ConnectorNoteOrigin.settings(requestedOrigin);
+            var retained = ConnectorNoteOrigin.pipelineSettings(origin);
+            effectiveSettings = retained == null ? ConnectorNoteOrigin.settings(origin) : retained.connection();
+            pipelineNodeValues = retained == null ? null : retained.node();
             var global = captured.open(ConnectorStateNamespace.GLOBAL);
             configuredState = new ScopedDurableStateMap(captured.store(), primary, earlier, notes != null, captured::requireActive);
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
@@ -236,6 +247,11 @@ final class PdkConnector implements AutoCloseable {
         boolean opened = false;
         ConnectorTrustMaterial material = null;
         try {
+            if (noteScopes == null && nodeSettings != null) {
+                var resolved = pipelineSettings(connectorId, ref.spec(), effectiveSettings, nodeSettings);
+                pipelineNodeValues = resolved.node();
+                effectiveSettings = resolved.connection();
+            }
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
             effectiveSettings = material.settings();
             driveGuard.run();
@@ -277,7 +293,8 @@ final class PdkConnector implements AutoCloseable {
             specification.setDataTypesMap(dataTypesFrom(ref.spec()));
             Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), effectiveSettings);
             TapConnectorContext context = new TapConnectorContext(
-                    specification, DataMap.create(config), nodeConfigFrom(ref.spec(), config),
+                    specification, DataMap.create(config), pipelineNodeValues == null
+                            ? nodeConfigFrom(ref.spec(), config) : DataMap.create(pipelineNodeValues),
                     new ConnectorLog(connectorId, pipelineId, logGeneration));
             // A connector reaches what it keeps for itself through the context's state maps during init,
             // discovery and the drive; the context leaves them null, so give it live ones or the first
@@ -484,6 +501,51 @@ final class PdkConnector implements AutoCloseable {
             }
         });
         return nodeConfig;
+    }
+
+    // These connector beans require Integer for explicit node values stored as JSON numbers.
+    private static final Map<String, Set<String>> INTEGER_PIPELINE_SETTINGS = Map.of(
+            "postgres", Set.of("maxSplit", "batchReadThreadSize", "maximumQueueSize", "keepWalHours",
+                    "walPageCacheCapacity", "walSpillThreshold", "walLookbackSegments"),
+            "oracle", Set.of("maxSplit", "batchReadThreadSize", "fetchSize", "pollingInterval",
+                    "transactionAliveMinutes", "fzsSocketTimeout", "fzsFileAliveMinutes"),
+            "mysql", Set.of("maxSplit", "batchReadThreadSize", "maximumQueueSize"));
+
+    record PipelineSettings(Map<String, Object> connection, Map<String, Object> node) {}
+
+    static PipelineSettings pipelineSettings(String connectorId, String spec, Map<String, Object> settings,
+            Map<String, Object> nodeSettings) {
+        var forms = spec != null && JsonReader.parse(spec) instanceof Map<?, ?> root ? root : Map.of();
+        var declaredNodes = ConnectorForm.NODE.itemsIn(forms);
+        var declaredConnection = ConnectorForm.CONNECTION.itemsIn(forms);
+        var connection = new LinkedHashMap<>(settings);
+        var selected = new LinkedHashMap<String, Object>();
+        for (String name : declaredNodes.keySet()) {
+            if (!declaredConnection.containsKey(name)) connection.remove(name);
+            if (nodeSettings.containsKey(name)) selected.put(name, nodeSettings.get(name));
+        }
+        var effectiveNode = pipelineValueTypes(connectorId, spec, selected);
+        // Some PDK connectors load their node parameters from the connection bean as well.
+        connection.putAll(effectiveNode);
+        return new PipelineSettings(ConfigTypeCoercion.coerce(connectorId, spec, connection), effectiveNode);
+    }
+
+    private static Map<String, Object> pipelineValueTypes(String connectorId, String spec, Map<String, Object> settings) {
+        var coerced = ConfigTypeCoercion.coerce(connectorId, spec, settings);
+        var integerFields = INTEGER_PIPELINE_SETTINGS.get(connectorId);
+        if (integerFields == null) return coerced;
+        var typed = new LinkedHashMap<>(coerced);
+        for (String field : integerFields) {
+            if (typed.get(field) instanceof Number number && !(number instanceof Integer)) {
+                try {
+                    typed.put(field, new java.math.BigDecimal(number.toString()).intValueExact());
+                } catch (NumberFormatException | ArithmeticException invalid) {
+                    throw new TapstateException(ConnectorError.CONFIG_TYPE_MISMATCH,
+                            Map.of("connector", connectorId, "field", field, "expected", "integer", "value", number), null);
+                }
+            }
+        }
+        return typed;
     }
 
     /**

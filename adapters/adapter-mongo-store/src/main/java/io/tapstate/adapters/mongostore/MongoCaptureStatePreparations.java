@@ -152,11 +152,10 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             if(!(reference instanceof SourceRef.Spec spec))throw new IllegalStateException("a capture requires a materialized source switch");
             var readMode=pipeline.settings()==null || pipeline.settings().readMode()==null?ReadMode.SNAPSHOT_AND_CDC:pipeline.settings().readMode();
             var mode=readMode==ReadMode.SNAPSHOT_ONLY?CapturePreparation.Mode.SNAPSHOT_ONLY:spec.srs()?CapturePreparation.Mode.SHARED_SRS:CapturePreparation.Mode.DIRECT;
-            String key=source.srs()==null?null:source.srs().key();
             var settings = PipelineSourceConfig.settings(reference, source);
-            var overrides = PipelineSourceConfig.overrides(reference, source);
+            var direct = mode == CapturePreparation.Mode.DIRECT ? PipelineSourceConfig.directCoordinate(reference, source) : null;
             String canonical = mode==CapturePreparation.Mode.DIRECT
-                    ? SourceCaptureIdentity.directChannel(source.connector(),settings,key,pipeline.id(),reference.binding(),overrides)
+                    ? SourceCaptureIdentity.directChannel(direct,pipeline.id(),reference.binding())
                     : PipelineSourceConfig.chain(reference, source);
             var sharedArtifact = request.sharedArtifact();
             if (sharedArtifact != null && mode != CapturePreparation.Mode.SHARED_SRS) throw fenced();
@@ -174,7 +173,7 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             String capture=switch(mode){
                 case SHARED_SRS -> SourceCaptureIdentity.sharedCapture(chain);
                 case SNAPSHOT_ONLY -> SourceCaptureIdentity.snapshotCapture(chain,tables);
-                case DIRECT -> SourceCaptureIdentity.directCapture(source.connector(),settings,key,pipeline.id(),reference.binding(),pipeline.settings()==null?null:pipeline.settings().startFrom(),tables,overrides);
+                case DIRECT -> SourceCaptureIdentity.directCapture(direct,pipeline.id(),reference.binding(),pipeline.settings()==null?null:pipeline.settings().startFrom(),tables);
             };
             var preparation=new CapturePreparation(scope,mode,chain,capture,SourceCaptureIdentity.physical(source.connector(),settings),operation);
             var table=SystemCollections.CAPTURE_PREPARATIONS.on(database);var existing=table.find(session,new Document("_id",MongoCapturePreparationFacts.id(scope,capture))).first();

@@ -1,5 +1,7 @@
 package io.tapstate.core.model;
 
+import io.tapstate.core.model.canonical.SourceCaptureIdentity;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -15,13 +17,22 @@ public final class PipelineSourceConfig {
     }
 
     public static String chain(SourceRef reference, SourceResource source) {
-        return io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(),
+        return SourceCaptureIdentity.resolve(source.connector(),
                 settings(reference, source), source.srs() == null ? null : source.srs().key(), overrides(reference, source));
+    }
+
+    /** Independent captures retain their persisted coordinates for unchanged Pipeline definitions. */
+    public static String directCoordinate(SourceRef reference, SourceResource source) {
+        boolean qualified = overrides(reference, source).entrySet().stream().anyMatch(entry ->
+                !source.config().containsKey(entry.getKey())
+                        || !Objects.equals(source.config().get(entry.getKey()), entry.getValue()));
+        return SourceCaptureIdentity.directCoordinate(source.connector(), settings(reference, source),
+                source.srs() == null ? null : source.srs().key(), qualified);
     }
 
     /** The connector/configuration fingerprint used by preparation guards. */
     public static String physical(PipelineResource pipeline, SourceResource source) {
-        return io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(), settings(pipeline, source));
+        return SourceCaptureIdentity.physical(source.connector(), settings(pipeline, source));
     }
 
     /** A detached runtime view used by connector operations that accept a Source value. */
@@ -35,21 +46,14 @@ public final class PipelineSourceConfig {
                 settings, source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
     }
 
-    /** Local values that change the connector's effective configuration. */
+    /** Authored node values, including values that happen to equal a connection setting. */
     public static Map<String, Object> overrides(PipelineResource pipeline, SourceResource source) {
         return overrides(pipeline.sourceReference(source.id()), source);
     }
 
     public static Map<String, Object> overrides(SourceRef reference, SourceResource source) {
         if (!reference.id().equals(source.id())) throw new IllegalArgumentException("Source binding mismatch");
-        if (reference.nodeConfig().isEmpty()) return Map.of();
-        var result = new LinkedHashMap<String, Object>();
-        reference.nodeConfig().forEach((name, value) -> {
-            if (!source.config().containsKey(name) || !Objects.equals(source.config().get(name), value)) {
-                result.put(name, value);
-            }
-        });
-        return Collections.unmodifiableMap(result);
+        return reference.nodeConfig();
     }
 
     /** Explicit local false and null values take precedence just as any other authored value does. */

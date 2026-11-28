@@ -30,7 +30,7 @@ final class ConnectionFingerprint {
 
     /** The key for {@code config}: {@code <connector-id>:<lower-hex sha-256 of the settings>}. */
     static String of(ConnectionConfig config) {
-        return config.connectorId() + ":" + sha256(canonical(config.settings()));
+        return config.connectorId() + ":" + sha256(canonical(List.of(config.settings(), config.nodeConfig())));
     }
 
     /**

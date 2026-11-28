@@ -112,7 +112,8 @@ final class BenchmarkOperators {
             default -> throw new AssertionError(scenario);
         };
         var sink = Map.of("id", "output", "source", "tgt_perf", "write_mode", "upsert", "on_full_load", "clear");
-        return Map.of("version", "tapstate/v1", "kind", "pipeline", "id", id, "source", "src_perf",
+        return Map.of("version", "tapstate/v1", "kind", "pipeline", "id", id,
+                "source", Map.of("id", "src_perf", "nodeConfig", Map.of("preImage", true)),
                 "settings", Map.of("read_mode", snapshot ? "snapshot_only" : "snapshot_and_cdc"),
                 "transforms", graph, "serve", Map.of("from", nodes.getLast(), "sync", List.of(sink)));
     }

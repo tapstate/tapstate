@@ -573,7 +573,8 @@ class RealDummyPipelineIT {
                 control.apply(Map.of("mongo.tap.yml", source, "target.tap.yml", target));
                 control.discoverSchema("src_mongo", "mongodb", Map.of("uri", uri, "preImage", true));
                 discoverDummyTarget(control);
-                var pipeline = pipeline(id, "cdc_only").replace("source: src_dummy", "source: src_mongo")
+                var pipeline = pipeline(id, "cdc_only").replace("source: src_dummy",
+                        "source: { id: src_mongo, nodeConfig: { preImage: true } }")
                         .replace("read_mode: cdc_only}", "read_mode: cdc_only, start_from: '" + cutoff + "'}");
                 control.apply(Map.of("mongo.tap.yml", source, "target.tap.yml", target, "pipeline.tap.yml", pipeline));
                 long startMillis = System.currentTimeMillis();

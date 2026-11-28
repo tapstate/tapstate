@@ -17,6 +17,7 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelineIntentStore;
 import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteOrigin;
 import io.tapstate.spi.store.RequiredNoteScope;
 import io.tapstate.spi.store.RequiredNoteStore;
 import io.tapstate.spi.store.SrsConsumerContext;
@@ -32,7 +33,12 @@ import java.util.Map;
 /** Reserves one exact artifact selection for an explicit start, and publishes it before submitting the run. */
 final class PipelineConnectorExecutions {
     record Node(String id, PipelineNode.Purpose purpose, String connectorId, Map<String, Object> settings,
+                String canonicalSharedChain, Map<String, Object> nodeConfig) {
+        Node(String id, PipelineNode.Purpose purpose, String connectorId, Map<String, Object> settings,
                 String canonicalSharedChain) {
+            this(id, purpose, connectorId, settings, canonicalSharedChain, null);
+        }
+
         RequiredNoteOwner privateOwner(PipelineIntentScope scope) {
             return RequiredNoteOwner.forNode(scope.bindingVersion(), new PipelineNode(scope.pipelineId(), id),
                     purpose, scope.stateGeneration());
@@ -304,7 +310,9 @@ final class PipelineConnectorExecutions {
     }
 
     private void stagePrivate(Binding candidate, Binding old, Node node, RequiredNoteStore fixed) {
-        var origin = ConnectorNoteOrigin.capture(candidate.connectorId(), candidate.sha256(), node.settings());
+        var origin = node.nodeConfig() == null
+                ? ConnectorNoteOrigin.capture(candidate.connectorId(), candidate.sha256(), node.settings())
+                : privateCaptureOrigin(candidate, old, node, fixed);
         if (old == null || old.notes().equals(candidate.notes())) {
             if (!fixed.prepareOrigin(candidate.notes(), origin).equals(origin)) throw fenced();
             connectors.markBound(fixed, candidate.notes(), origin);
@@ -312,6 +320,18 @@ final class PipelineConnectorExecutions {
             var token = fixed.prepareArtifactBinding(candidate.notes().owner(), origin, old.notes());
             if (!token.equals(candidate.notes())) throw fenced();
         }
+    }
+
+    private RequiredNoteOrigin privateCaptureOrigin(Binding candidate, Binding old, Node node, RequiredNoteStore fixed) {
+        var retained = old == null || old.notes().equals(candidate.notes())
+                ? fixed.originIfPresent(candidate.notes()).orElse(null) : fixed.origin(old.notes());
+        if (retained == null) {
+            return ConnectorNoteOrigin.capturePipeline(candidate.connectorId(),
+                    connectors.resolve(candidate.connectorId(), candidate.sha256()), node.settings(), node.nodeConfig());
+        }
+        if (!ConnectorNoteOrigin.matches(retained, candidate.connectorId(),
+                old == null ? candidate.sha256() : old.sha256(), node.settings(), node.nodeConfig())) throw fenced();
+        return new RequiredNoteOrigin(retained.connectorId(), candidate.sha256(), retained.settings());
     }
 
     private Binding binding(Node node, String sha256, RequiredNoteScope token, String capture, String chain) {

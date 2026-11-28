@@ -63,8 +63,7 @@ public interface SnapshotSession extends AutoCloseable {
         if (port instanceof Provider provider) {
             return provider.snapshotSession(config);
         }
-        return table -> port.snapshot(new CaptureConfig(
-                config.connectorId(), config.settings(), List.of(table), config.node(), config.sharedNotes(), config.nodeConfig()));
+        return table -> port.snapshot(config.forStreams(List.of(table)));
     }
 
     /** Opens the next selected table's bounded read. The caller closes the batch after draining it. */

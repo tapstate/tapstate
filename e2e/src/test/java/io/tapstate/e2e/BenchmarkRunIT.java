@@ -371,6 +371,7 @@ class BenchmarkRunIT {
                         discover(control, "src_perf", "mongodb", src);
                         boolean snapshot = text(definition, "mode").equals("snapshot") && !lifecycle;
                         String yaml = operators == null ? pipeline(snapshot ? "snapshot_only" : "snapshot_and_cdc", "clear")
+                                .replace("source: src_perf", "source: { id: src_perf, nodeConfig: { preImage: true } }")
                                 : JSON.writerWithDefaultPrettyPrinter().writeValueAsString(operators.pipeline(PIPELINE, snapshot, sourceDb));
                         Files.writeString(folder.resolve("pipeline.tap.yml"), yaml);
                         workspace.put("pipeline.tap.yml", yaml);

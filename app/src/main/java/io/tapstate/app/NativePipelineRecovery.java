@@ -121,8 +121,12 @@ final class NativePipelineRecovery {
         if (!retireCovered(pass)) throw PipelineKeyMoveWindows.unresolved(id);
         if(!summary.orElseThrow().targetScope().equals(scope))throw fenced();
         var contexts=new LinkedHashMap<String,SourceResource>();
-        for(var ref:pipeline.sources())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),
-                io.tapstate.core.model.PipelineSourceConfig.effective(ref,sources.get(ref.id())));
+        var nodeConfigs=new LinkedHashMap<String,Map<String,Object>>();
+        for(var ref:pipeline.sources()) {
+            var namespace = RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE);
+            contexts.put(namespace, io.tapstate.core.model.PipelineSourceConfig.effective(ref,sources.get(ref.id())));
+            nodeConfigs.put(namespace, ref.nodeConfig());
+        }
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())
             contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         if(pipeline.view() instanceof ViewBlock.Inline view) {
@@ -133,7 +137,7 @@ final class NativePipelineRecovery {
         for(var entry:contexts.entrySet()) {
             var token=notes.open(new RequiredNoteOwner(auth.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,pass.scope().stateGeneration()));
             var origin=notes.origin(token);var source=entry.getValue();
-            if(!origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),source.config())))throw fenced();
+            if(!ConnectorNoteOrigin.matches(origin,source.connector(),origin.artifactHash(),source.config(),nodeConfigs.get(entry.getKey())))throw fenced();
             connectors.resolveRetained(notes, token, origin);
             String prior=hashes.putIfAbsent(source.connector(),origin.artifactHash());if(prior!=null && !prior.equals(origin.artifactHash()))throw fenced();
         }
@@ -188,7 +192,7 @@ final class NativePipelineRecovery {
         preparer.prepareRecovered(permission,inspected.inputs(),() -> {
             requireAvailable();
             if(engine.captureRun(id).filter(Engine.Run::isCarryingAJob).isPresent())throw fenced();
-            notes.reconcileRecovered(permission,inspected.privateContexts(),predecessor,this::requireAvailable);
+            notes.reconcileRecovered(permission,inspected.privateContexts(),inspected.nodeConfigs(),predecessor,this::requireAvailable);
         });
         requireAvailable();permission.requireActive();
         if(!inspected.operatorDatabases().isEmpty()) {
@@ -203,9 +207,19 @@ final class NativePipelineRecovery {
                 var token=configuredNotes.open(new RequiredNoteOwner(target.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,target.stateGeneration()));
                 var source=entry.getValue();
                 var ref = fixed.resolve(source.connector());
-                var expected=ConnectorNoteOrigin.capture(source.connector(),ref.contentHash(),source.config());
+                var nodeConfig = inspected.nodeConfigs().get(entry.getKey());
+                var retained = configuredNotes.originIfPresent(token);
+                RequiredNoteOrigin expected;
+                if (retained.isPresent()) {
+                    expected = retained.orElseThrow();
+                    if (!ConnectorNoteOrigin.matches(expected, source.connector(), ref.contentHash(), source.config(), nodeConfig)) throw fenced();
+                } else {
+                    expected = nodeConfig == null
+                            ? ConnectorNoteOrigin.capture(source.connector(),ref.contentHash(),source.config())
+                            : ConnectorNoteOrigin.capturePipeline(source.connector(),ref,source.config(),nodeConfig);
+                }
                 connectors.retain(ref);
-                configuredNotes.prepareOrigin(token,expected);
+                if (!expected.equals(configuredNotes.prepareOrigin(token,expected))) throw fenced();
                 connectors.markBound(configuredNotes, token, expected);
             }
             return null;

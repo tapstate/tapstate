@@ -71,11 +71,16 @@ final class PipelineRebuildCoordinator {
         var authored=StoredArtifacts.requirePipeline(snapshot,request.originalScope().pipelineId());
         var pipeline=PipelineInlining.inline(authored,snapshot);
         var desired=new HashMap<String,SourceResource>();
-        for(var ref:pipeline.sources())desired.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.binding()),PipelineNode.Purpose.CAPTURE),PipelineSourceConfig.effective(ref,StoredArtifacts.requireSource(snapshot,ref.id())));
+        var nodeConfigs=new HashMap<String,Map<String,Object>>();
+        for(var ref:pipeline.sources()) {
+            var namespace = RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.binding()),PipelineNode.Purpose.CAPTURE);
+            desired.put(namespace,PipelineSourceConfig.effective(ref,StoredArtifacts.requireSource(snapshot,ref.id())));
+            nodeConfigs.put(namespace,ref.nodeConfig());
+        }
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())desired.put(
                 RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         // View identity is retained here; its deployment-owned target is reconciled by the binding operation.
-        notes.reconcile(original,Map.copyOf(desired),guard);guard.run();stores.configuration().requirePending(original);
+        notes.reconcile(original,Map.copyOf(desired),nodeConfigs,guard);guard.run();stores.configuration().requirePending(original);
         var direct=clearingDirectPostgres(request,snapshot,authored,pipeline);
         if(!direct.isEmpty()) {
             var originalSources=stores.cache().originalDirectSources(original,currentNode);guard.run();
@@ -84,7 +89,7 @@ final class PipelineRebuildCoordinator {
                 String namespace = RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.binding()),PipelineNode.Purpose.CAPTURE);
                 if (originalSources.contains(ref.binding()) && direct.containsKey(namespace)) retained.put(namespace,direct.get(namespace));
             }
-            if(!retained.isEmpty())notes.retireDirectPostgres(original,Map.copyOf(retained),guard);
+            if(!retained.isEmpty())notes.retireDirectPostgres(original,Map.copyOf(retained),nodeConfigs,guard);
         }
         var receipt=stores.cache().prepare(original,currentNode,ttl,clock.instant());guard.run();
         guard.run();return stores.configuration().complete(receipt);

@@ -84,9 +84,18 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
     /** Explicit recovery preflight reads structure without starting potentially expensive row counts. */
     public SourceModel discoverStructure(ConnectionConfig config) { return discover(config,false); }
 
-    private SourceModel discover(ConnectionConfig config,boolean countRows) {
-        PdkConnector connector = PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+    public SourceModel discoverPipelineStructure(ConnectionConfig config) {
+        return discover(PdkConnector.openPipelineSource(config.connectorId(),
+                provisioner.resolve(config.connectorId()), config.settings(), config.nodeConfig(),
+                null, null, null, null), false);
+    }
+
+    private SourceModel discover(ConnectionConfig config, boolean countRows) {
+        return discover(PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()),
+                config.settings()), countRows);
+    }
+
+    private SourceModel discover(PdkConnector connector, boolean countRows) {
         try {
             List<TapTable> tables = drive(connector);
             return toSourceModel(tables, countRows?counts(connector,tables):Map.of(), null);

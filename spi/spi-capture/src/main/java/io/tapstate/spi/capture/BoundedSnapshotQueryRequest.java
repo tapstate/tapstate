@@ -21,7 +21,8 @@ public record BoundedSnapshotQueryRequest(
         List<String> projection,
         int limit,
         long maxBytes,
-        Instant deadline) {
+        Instant deadline,
+        Map<String, Object> nodeConfig) {
 
     /** Maximum number of rows one query may return to its caller. */
     public static final int MAX_ROWS = 20_000;
@@ -38,7 +39,15 @@ public record BoundedSnapshotQueryRequest(
             int limit,
             Instant deadline) {
         this(sourceId, connectorId, settings, table, stableOrder, selection, projection,
-                limit, MAX_BYTES, deadline);
+                limit, MAX_BYTES, deadline, Map.of());
+    }
+
+    public BoundedSnapshotQueryRequest(
+            String sourceId, String connectorId, Map<String, Object> settings, TableSchema table,
+            List<String> stableOrder, Selection selection, List<String> projection, int limit,
+            long maxBytes, Instant deadline) {
+        this(sourceId, connectorId, settings, table, stableOrder, selection, projection, limit, maxBytes,
+                deadline, Map.of());
     }
 
     public BoundedSnapshotQueryRequest {
@@ -52,6 +61,7 @@ public record BoundedSnapshotQueryRequest(
         } else {
             settings = Collections.unmodifiableMap(new LinkedHashMap<>(settings));
         }
+        nodeConfig = Collections.unmodifiableMap(new LinkedHashMap<>(nodeConfig));
         stableOrder = immutableNames(stableOrder, "stableOrder");
         projection = immutableNames(projection, "projection");
         if (limit < 1 || limit > MAX_ROWS) {

@@ -927,7 +927,7 @@
           "type": "boolean"
         },
         "nodeConfig": {
-          "description": "Connector node parameters for this Pipeline. Omitted fields inherit from the Source.",
+          "description": "Saved connector node parameters for this Pipeline. Omitted values stay unset in the Pipeline configuration.",
           "type": "object",
           "additionalProperties": true
         },

@@ -192,7 +192,8 @@ class ViewsListOnlyShapeOutputsIT {
                             """.formatted(targetUri));
                     control.apply(resources);
                     control.discoverSchema("src", "mongodb", Map.of("uri", sourceUri, "preImage", true));
-                    resources.put("pipeline.tap.yml", "version: tapstate/v1\nkind: pipeline\nid: p\nsource: src\n"
+                    resources.put("pipeline.tap.yml", "version: tapstate/v1\nkind: pipeline\nid: p\n"
+                            + "source: { id: src, nodeConfig: { preImage: true } }\n"
                             + "settings: {read_mode: snapshot_and_cdc}\ntransforms:\n" + transforms + """
                             serve:
                               from: shaped

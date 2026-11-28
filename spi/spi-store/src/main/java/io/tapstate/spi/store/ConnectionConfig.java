@@ -17,11 +17,17 @@ import java.util.Objects;
  * <p>This is a connection <em>instance</em> a user has registered, distinct from the
  * connector-type catalog that ships with the product.
  */
-public record ConnectionConfig(String id, String connectorId, Map<String, Object> settings) {
+public record ConnectionConfig(String id, String connectorId, Map<String, Object> settings,
+        Map<String, Object> nodeConfig) {
+
+    public ConnectionConfig(String id, String connectorId, Map<String, Object> settings) {
+        this(id, connectorId, settings, Map.of());
+    }
 
     public ConnectionConfig {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(connectorId, "connectorId");
         settings = settings == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(settings));
+        nodeConfig = Collections.unmodifiableMap(new LinkedHashMap<>(nodeConfig));
     }
 }

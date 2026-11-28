@@ -59,12 +59,13 @@ final class SharedSrsRecoveryInspector {
             var settings=io.tapstate.core.model.PipelineSourceConfig.settings(ref,source);
             String canonical=io.tapstate.core.model.PipelineSourceConfig.chain(ref,source);
             if(!canonical.equals(selection.canonicalChain()) || !SourceCaptureIdentity.physical(source.connector(),settings).equals(observed.previous().sourceIdentityHash())
-                    || !origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),settings)))throw fenced();
+                    || !ConnectorNoteOrigin.matches(origin,source.connector(),origin.artifactHash(),settings,ref.nodeConfig()))throw fenced();
         }
         for(var resource:artifacts.list())if(resource instanceof SourceResource source) {
             String canonical=SourceCaptureIdentity.resolve(source.connector(),source.config(),source.srs()==null?null:source.srs().key());
             if(canonical.equals(selection.canonicalChain()) && (!SourceCaptureIdentity.physical(source.connector(),source.config())
-                    .equals(observed.previous().sourceIdentityHash()) || !origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),source.config()))))throw fenced();
+                    .equals(observed.previous().sourceIdentityHash())
+                    || !ConnectorNoteOrigin.matches(origin,source.connector(),origin.artifactHash(),source.config(),Map.of())))throw fenced();
         }
         String dependency=CanonicalHash.ofText(JsonWriter.write(List.of("shared-srs-recovery",observed.controlHash(),definitions,
                 token.generation(),origin.connectorId(),origin.artifactHash(),CanonicalHash.ofText(Base64.getEncoder().encodeToString(origin.settings())))));

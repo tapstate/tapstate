@@ -77,12 +77,13 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
                     PipelineNode.Purpose.CAPTURE, scope.stateGeneration()));
             pinned = fixed.origin(retainedScope);
         }
-        if (pinned != null && !pinned.equals(
-                ConnectorNoteOrigin.capture(config.connectorId(), pinned.artifactHash(), config.settings()))) throw unavailable();
+        if (pinned != null && !matches(pinned, config, pinned.artifactHash())) throw unavailable();
         var artifact = pinned != null ? provisioner.resolveRetained(fixed, retainedScope, pinned)
                 : startup ? provisioner.resolveCaptureStartup(config.connectorId()) : provisioner.resolve(config.connectorId());
         requireOriginalStart.run();
-        var expected=ConnectorNoteOrigin.capture(config.connectorId(),artifact.contentHash(),config.settings());
+        var expected = pinned == null
+                ? ConnectorNoteOrigin.capturePipeline(config.connectorId(), artifact, config.settings(), config.nodeConfig())
+                : pinned;
         if (pinned == null) provisioner.retain(artifact);
         var prepared = startup ? fixed.prepareSharedOrigin(primary, expected) : fixed.prepareOrigin(primary, expected);
         if (!expected.equals(prepared)) throw unavailable();
@@ -103,7 +104,6 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
             RequiredNoteStore notes, ConnectorProvisioner provisioner, Runnable guard,
             ConnectorRunBindings.Binding binding, ConnectorRunBindings.Binding previous, boolean sharedStartup) {
         var fixed = notes.guardedBy(guard);
-        var origin = ConnectorNoteOrigin.capture(config.connectorId(), binding.sha256(), config.settings());
         var owner = binding.notes().owner();
         var globalOwner = new RequiredNoteOwner(original.scope().bindingVersion(), "pdk.global-state",
                 RequiredNoteOwner.Kind.GLOBAL, original.scope().clusterId(), 0);
@@ -115,13 +115,19 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
             artifact = provisioner.resolve(config.connectorId(), binding.sha256());
             provisioner.retain(artifact);
             if (previous == null) {
-                fixed.prepareOrigin(scope, origin);
+                var origin = ConnectorNoteOrigin.capturePipeline(config.connectorId(), artifact,
+                        config.settings(), config.nodeConfig());
+                if (!fixed.prepareOrigin(scope, origin).equals(origin)) throw unavailable();
                 provisioner.markBound(fixed, scope, origin);
             } else {
+                var precedingOrigin = fixed.origin(previous.notes());
+                if (!matches(precedingOrigin, config, previous.sha256())) throw unavailable();
+                var origin = new RequiredNoteOrigin(config.connectorId(), binding.sha256(), precedingOrigin.settings());
                 scope = fixed.prepareArtifactBinding(owner, origin, previous.notes());
             }
         } else {
-            if (!origin.equals(existing.orElseThrow())) throw unavailable();
+            var origin = existing.orElseThrow();
+            if (!matches(origin, config, binding.sha256())) throw unavailable();
             artifact = provisioner.resolveRetained(fixed, scope, origin);
         }
         var global = opened == null ? fixed.open(globalOwner) : opened.global();
@@ -178,10 +184,13 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
                                 || !primary.owner().ownerId().equals(config.sharedNotes().sharedBy()))) throw unavailable();
         var artifact = provisioner.resolve(connectorId, artifactHash);
         if (!artifactHash.equals(artifact.contentHash())) throw unavailable();
-        var expected = ConnectorNoteOrigin.capture(connectorId, artifactHash, config.settings());
-        if (!expected.equals(notes.guardedBy(requireRun).origin(primary))) throw unavailable();
+        if (!matches(notes.guardedBy(requireRun).origin(primary), config, artifactHash)) throw unavailable();
         requireRun.run();
         return PdkSourceModelComparison.forVerifiedArtifact(connectorId, artifact);
+    }
+
+    private static boolean matches(RequiredNoteOrigin origin, CaptureConfig config, String artifactHash) {
+        return ConnectorNoteOrigin.matches(origin, config.connectorId(), artifactHash, config.settings(), config.nodeConfig());
     }
     private static TapstateException unavailable() { return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null); }
 }
