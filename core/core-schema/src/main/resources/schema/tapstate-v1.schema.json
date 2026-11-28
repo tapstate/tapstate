@@ -927,7 +927,7 @@
           "type": "boolean"
         },
         "nodeConfig": {
-          "description": "Connector node parameters for this Pipeline. Omitted fields use connector defaults when available.",
+          "description": "Saved connector node parameters for this Pipeline. Omitted values stay unset in the Pipeline configuration.",
           "type": "object",
           "additionalProperties": true
         },

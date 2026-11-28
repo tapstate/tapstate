@@ -503,14 +503,13 @@ final class PdkConnector implements AutoCloseable {
         return nodeConfig;
     }
 
-    // The JDBC connector specs describe these fields as numbers. Their config beans require
-    // Integer for the corresponding setters, including when the values come from schema defaults.
+    // These connector beans require Integer for explicit node values stored as JSON numbers.
     private static final Map<String, Set<String>> INTEGER_PIPELINE_SETTINGS = Map.of(
-            "postgres", Set.of("port", "pgtoPort", "defaultWalLogSize", "maxSplit", "batchReadThreadSize",
-                    "maximumQueueSize", "keepWalHours", "walPageCacheCapacity", "walSpillThreshold", "walLookbackSegments"),
-            "oracle", Set.of("port", "rawLogServerPort", "socketReadTimeOut", "maxSplit", "batchReadThreadSize",
-                    "fetchSize", "pollingInterval", "transactionAliveMinutes", "fzsSocketTimeout", "fzsFileAliveMinutes"),
-            "mysql", Set.of("port", "maxSplit", "batchReadThreadSize", "maximumQueueSize"));
+            "postgres", Set.of("maxSplit", "batchReadThreadSize", "maximumQueueSize", "keepWalHours",
+                    "walPageCacheCapacity", "walSpillThreshold", "walLookbackSegments"),
+            "oracle", Set.of("maxSplit", "batchReadThreadSize", "fetchSize", "pollingInterval",
+                    "transactionAliveMinutes", "fzsSocketTimeout", "fzsFileAliveMinutes"),
+            "mysql", Set.of("maxSplit", "batchReadThreadSize", "maximumQueueSize"));
 
     record PipelineSettings(Map<String, Object> connection, Map<String, Object> node) {}
 
@@ -521,17 +520,14 @@ final class PdkConnector implements AutoCloseable {
         var declaredConnection = ConnectorForm.CONNECTION.itemsIn(forms);
         var connection = new LinkedHashMap<>(settings);
         var selected = new LinkedHashMap<String, Object>();
-        declaredNodes.forEach((name, item) -> {
+        for (String name : declaredNodes.keySet()) {
             if (!declaredConnection.containsKey(name)) connection.remove(name);
             if (nodeSettings.containsKey(name)) selected.put(name, nodeSettings.get(name));
-            else if (item.containsKey("default") && isLiteralDefault(item.get("default"))) {
-                selected.put(name, item.get("default"));
-            }
-        });
+        }
         var effectiveNode = pipelineValueTypes(connectorId, spec, selected);
         // Some PDK connectors load their node parameters from the connection bean as well.
         connection.putAll(effectiveNode);
-        return new PipelineSettings(pipelineValueTypes(connectorId, spec, connection), effectiveNode);
+        return new PipelineSettings(ConfigTypeCoercion.coerce(connectorId, spec, connection), effectiveNode);
     }
 
     private static Map<String, Object> pipelineValueTypes(String connectorId, String spec, Map<String, Object> settings) {
@@ -550,13 +546,6 @@ final class PdkConnector implements AutoCloseable {
             }
         }
         return typed;
-    }
-
-    private static boolean isLiteralDefault(Object value) {
-        if (!(value instanceof String text)) return true;
-        String trimmed = text.strip();
-        // Form expressions are not values supported by the connector runtime.
-        return !trimmed.startsWith("{{") || !trimmed.endsWith("}}") || trimmed.length() < 4;
     }
 
     /**

@@ -94,7 +94,7 @@ class AConnectorsNodeParametersReachItTest {
     }
 
     @Test
-    void aPipelineReadsOnlyItsOwnNodeSettingsAndDeclaredDefaults(@TempDir Path dir) {
+    void aPipelineReadsOnlyItsSavedNodeSettings(@TempDir Path dir) {
         ConnectorRef ref = new ConnectorRef(
                 List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
         var settings = Map.<String, Object>of("uri", "mongodb://host/db", "preImage4Sink", true,
@@ -102,17 +102,16 @@ class AConnectorsNodeParametersReachItTest {
 
         try (PdkConnector connector = PdkConnector.openPipelineSource(
                 "demo", ref, settings, Map.of(), null, null, null, null)) {
-            assertThat(connector.context().getNodeConfig()).containsEntry("batchSize", 100L)
-                    .doesNotContainKeys("preImage4Sink", "autoLog");
+            assertThat(connector.context().getNodeConfig()).doesNotContainKeys("batchSize", "preImage4Sink", "autoLog");
             assertThat(connector.context().getConnectionConfig()).containsEntry("uri", "mongodb://host/db")
-                    .containsEntry("batchSize", 100L).doesNotContainKeys("preImage4Sink", "autoLog");
+                    .doesNotContainKeys("batchSize", "preImage4Sink", "autoLog");
         }
         try (PdkConnector connector = PdkConnector.openPipelineSource(
-                "demo", ref, settings, Map.of("preImage4Sink", false, "autoLog", false), null, null, null, null)) {
+                "demo", ref, settings, Map.of("preImage4Sink", false, "autoLog", false, "batchSize", 121), null, null, null, null)) {
             assertThat(connector.context().getNodeConfig()).containsEntry("preImage4Sink", false)
-                    .containsEntry("autoLog", false);
+                    .containsEntry("autoLog", false).containsEntry("batchSize", 121);
             assertThat(connector.context().getConnectionConfig()).containsEntry("preImage4Sink", false)
-                    .containsEntry("autoLog", false);
+                    .containsEntry("autoLog", false).containsEntry("batchSize", 121);
         }
     }
 

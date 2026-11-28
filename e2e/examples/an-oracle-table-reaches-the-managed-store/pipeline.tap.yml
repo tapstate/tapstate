@@ -1,7 +1,11 @@
 version: tapstate/v1
 kind: pipeline
 id: breadth_crossing
-source: src_ora
+source:
+  - id: src_ora
+    srs: true
+    # Oracle Free needs explicit archived-log selection for LogMiner.
+    nodeConfig: { autoLog: false }
 settings: { read_mode: snapshot_and_cdc }
 view:
   id: order_state
