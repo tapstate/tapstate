@@ -27,6 +27,9 @@ public interface CaptureHandoff extends Consumer<Envelope> {
      */
     void loaded(String table);
 
+    /** The private CDC stream opened and its initial position was confirmed for this hand-off. */
+    default void changesReady() {}
+
     /** A hand-off that takes {@code rows} and has nobody to tell when a table is done. */
     static CaptureHandoff of(Consumer<Envelope> rows) {
         Objects.requireNonNull(rows, "rows");

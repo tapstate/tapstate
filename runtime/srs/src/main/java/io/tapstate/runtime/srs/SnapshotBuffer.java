@@ -178,7 +178,17 @@ public final class SnapshotBuffer {
             public void loaded(String table) {
                 handoff.end();
             }
+
+            @Override
+            public void changesReady() {
+                handoff.changesReady = true;
+            }
         };
+    }
+
+    boolean changesReady(String pipelineId, String ringName) {
+        Handoff handoff = handoffs.get(new BufferKey(pipelineId, ringName));
+        return handoff != null && handoff.changesReady;
     }
 
     /**
@@ -265,6 +275,7 @@ public final class SnapshotBuffer {
         private boolean ended;
         private boolean begun;
         private boolean released;
+        private volatile boolean changesReady;
 
         Handoff() {
             this(true);

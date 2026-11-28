@@ -73,6 +73,8 @@ final class MongoRetiredPipelinePayloads implements RetiredPipelinePayloads {
                     if (deleted < 256 && historyRetired(session, old, inventory))
                         deleted += reclaimRows(session, SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(database),
                                 new Document("scope", scope), 256 - (int) deleted);
+                    if (deleted < 256)
+                        deleted += MongoCachePipelineRunProgressStore.deleteOriginal(database, session, old);
                     var payloads=List.of(
                             java.util.Map.entry(SystemCollections.DIRECT_BATCHES,new Document("_id.channel.scope",scope)),
                             java.util.Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,new Document("_id.scope",scope)),
