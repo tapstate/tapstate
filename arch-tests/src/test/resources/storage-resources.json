@@ -1333,6 +1333,9 @@
       "goal": "Preserve actual source checkpoints and referenced models while permitting one fixed fresh snapshot baseline only for an existing explicit clear-state full operation. The separately confirmed partial shared loss entry replaces only the affected physical namespace and leaves all affected Pipelines stopped for individually confirmed full.",
       "entry": "Original restart/recovery entries remain. The additional path is the original explicit clear-state full preparation before any replacement snapshot pin or row has been published. Additional entry: exact single shared SRS impact preflight and explicit confirmation, original writer drain, guarded namespace replacement and per-Pipeline explicit clear-state full. Read the retained ACK and order under the original consumer scope and revision. Prepare candidate progress with its own chain floors; old offsets stay available if candidate publication fails.",
       "prerequisites": [
+        "An un-tokened writer watermark at the maximum encodable event sequence may be a logical epoch boundary. It remains logical progress; it can advance the physical recovery floor only when a retained record proves the original epoch and sequence in the same table ring. Ordinary finite progress and the physical sequence capacity remain unchanged.",
+        "On original consumer restart, before its writer evidence is replaced, a contaminated maximum floor can be corrected only under the same CACHE, chain, table, membership and snapshot identity. Resume at -1 only when that ring is proved never written and the other physical positions agree, or at a position proved by the original writer token and its retained record in that ring with a replayable suffix. Missing or conflicting evidence and genuine log gaps still refuse. An unproved maximum floor cannot authorize truncation.",
+        "A correction of the old physical floor proves the existing claim, membership and progress revisions and exact chain/model/log evidence in one CACHE client/session transaction and competes with truncation on the existing chain root. It adds no stored fields or retained rows.",
         "Existing ordinary entry only: The canonical chain, old checkpoint, membership, models and original capture preparation are complete. The old source reader and in-flight writes are safely isolated; current NODE/PIPELINE/CAPTURE fences are proved.",
         "Existing ordinary entry only: First publication requires no other non-detached consumer, including paused, stopped, completed or unleased references. The new exact selection must cover the entire serving/requested set. Unknown membership, unrelated override or changed input refuses.",
         "Existing ordinary entry only: A real existing fresh-snapshot preparation supplies exact table models and a nonempty new source cut before first row delivery. No capability or consistency proof is invented for a connector, and no PDK/JAR interface change or online DDL promise is added.",
@@ -3487,7 +3490,7 @@
     {
       "id": "mongo.cache.srs_consumer_offsets",
       "resourceVersion": 1,
-      "proposalVersion": 4,
+      "proposalVersion": 5,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -3508,6 +3511,7 @@
       "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction. Existing bounded per-consumer and per-table progress records. One candidate progress record per switching source; no cumulative handoff history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java",
+        "e2e/src/test/java/io/tapstate/e2e/AQuietNestTableResumesAfterRestartIT.java",
         "e2e/src/test/java/io/tapstate/e2e/ThreeLayerSharedCaptureIT.java"
       ]
     },

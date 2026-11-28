@@ -8,6 +8,7 @@ import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.SourcePositionEdits;
 import io.tapstate.spi.store.SourceResumeOverride;
@@ -25,6 +26,7 @@ import io.tapstate.spi.store.SrsConsumerAcknowledgements;
 import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.spi.store.WriterProgressUpdate;
 import io.tapstate.spi.store.WriterProgressOutcome;
+import io.tapstate.spi.store.WriterFrontier;
 import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.SrsConsumerMembership;
 import io.tapstate.spi.store.SrsConsumerStore;
@@ -924,7 +926,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         for (var member : held.members().values()) {
             if (member.detached() || !member.tables().contains(table)) continue;
             var cursor = held.cursors().get(member.context().key().consumerId());
-            safe = Math.min(safe,cursor.ringDoneThrough().getOrDefault(table,-1L));
+            long floor = cursor.ringDoneThrough().getOrDefault(table,-1L);
+            if (floor == SourceOrder.MAX_FRONTIER_SEQUENCE) {
+                var position = cursor.value().sinkAckedByTable().get(table);
+                if (position == null || position.order().seq() != floor
+                        || !hasPhysicalBoundary(session, held.root(), table, position.order())) floor = -1L;
+            }
+            safe = Math.min(safe,floor);
         }
         var pending=held.state().pendingFreshFull();
         if(pending!=null && pending.models().containsKey(table)) {
@@ -1695,8 +1703,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     }
                     var held = own.cursor();
                     var next = SrsConsumerAcknowledgements.advance(held.writerRun(), held.value(), update.table(), update.writerId(), update.progress());
+                    var writerRoot = own.root();
                     var done = MongoSrsConsumerRecords.reportedFloor(next.cursor(), held.ringDoneThrough(),
-                            next.writerRun(), update.table(), update.progress());
+                            next.writerRun(), update.table(), update.progress(),
+                            order -> hasPhysicalBoundary(session, writerRoot, update.table(), order));
                     if (!next.writerRun().equals(held.writerRun()) || !next.cursor().equals(held.value()) || !done.equals(held.ringDoneThrough()))
                         replaceProgress(session, own, next.cursor(), next.writerRun(), done);
                     outcomes.add(new WriterProgressOutcome(true, null));
@@ -2204,17 +2214,86 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         var next = new SrsConsumerMembership(context, revision + 1, false, selected, fence);
         var previousCursor = held == null || held.detached() ? null : view.cursors().get(context.key().consumerId());
         ConsumerOffset cursor = previousCursor == null ? records.initial(context.key(), selected) : records.include(previousCursor.value(), selected);
+        var done = previousCursor == null ? Map.<String, Long>of()
+                : recoverPhysicalFloors(session, view, held, previousCursor, selected);
         Document cursorRow = records.cursor(next, cursor, previousCursor == null ? 0 : previousCursor.revision(),
                 previousCursor == null ? null : previousCursor.snapshot(), previousCursor == null ? null : previousCursor.writerRun(),
-                previousCursor == null ? Map.of() : previousCursor.ringDoneThrough());
+                done);
         writeMember(session, held, next);
         if (previousCursor == null) SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).insertOne(session, cursorRow);
         else if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
-                new Document("_id", records.id(context.key())).append("membershipRevision", held.revision()), cursorRow).getMatchedCount() != 1)
+                new Document("_id", records.id(context.key())).append("membershipRevision", held.revision())
+                        .append("progressRevision", previousCursor.revision()), cursorRow).getMatchedCount() != 1)
             throw unavailable(chain);
         var root = changeRoot(session, view, held == null || held.detached() ? 1 : 0);
         return new AttachedSnapshot(next, root, records.cursor(next, cursorRow));
     }
+
+    private boolean hasPhysicalBoundary(ClientSession session, Document root, String table, SourceOrder order) {
+        var models = new MongoSrsModelContexts(database, scope);
+        var head = models.head(root, table);
+        if (head == null) return false;
+        return physicalLog().loadInSession(session, head.getString("ringName"), order.seq(), null)
+                .filter(record -> record.epoch() == order.epoch()).isPresent();
+    }
+
+    private MongoSrsLogStore physicalLog() {
+        var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+        return new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database),
+                SystemCollections.SRS_LOG_BOUNDS.on(database), SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);
+    }
+
+    private Map<String, Long> recoverPhysicalFloors(ClientSession session, View view, SrsConsumerMembership member,
+            MongoSrsConsumerRecords.Cursor previous, Set<String> selected) {
+        var floors = previous.ringDoneThrough();
+        var writers = previous.writerRun();
+        if (!floors.containsValue(SourceOrder.MAX_FRONTIER_SEQUENCE) || previous.snapshot() == null || writers == null
+                || writers.membershipRevision() != member.revision() || !writers.commandFence().equals(member.commandFence())) return floors;
+
+        var recovered = new HashMap<>(floors);
+        var writerRun = writers.withSnapshotEpoch(previous.snapshot().snapshotEpoch());
+        for (String table : selected) {
+            if (floors.getOrDefault(table, -1L) != SourceOrder.MAX_FRONTIER_SEQUENCE
+                    || !member.tables().contains(table) || !previous.value().snapshotCompletedTables().contains(table)) continue;
+            var boundary = previous.value().sinkAckedByTable().get(table);
+            if (!MongoSrsConsumerRecords.ambiguousBoundary(boundary) || boundary.order().epoch() > view.state().epoch()) continue;
+            WriterFrontier.landed(writerRun, table).filter(landed -> landed.durableThrough().equals(boundary.order()))
+                    .flatMap(landed -> verifiedLegacyFloor(session, view, previous, table, landed))
+                    .ifPresent(floor -> recovered.put(table, floor));
+        }
+        // Attaching also replaces the chain root in this transaction, competing with retention's cut.
+        return recovered;
+    }
+
+    private Optional<Long> verifiedLegacyFloor(ClientSession session, View view, MongoSrsConsumerRecords.Cursor previous,
+            String table, WriterFrontier.Landed landed) {
+        var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+        String ring = models.requireSnapshotReference(session, previous.snapshot().models().get(table)).ringName();
+        var head = new MongoSrsModelContexts(database, scope).head(view.root(), table);
+        if (head == null || !ring.equals(head.getString("ringName"))) return Optional.empty();
+
+        var log = physicalLog();
+        var bounds = log.boundsInSession(session, ring);
+        if (bounds.largestSequence() >= SourceOrder.MAX_FRONTIER_SEQUENCE) return Optional.empty();
+        var acknowledged = landed.resumableAt();
+        if (acknowledged != null && acknowledged.order().seq() > bounds.trimmedThrough()
+                && acknowledged.order().seq() <= bounds.largestSequence()) {
+            return log.loadInSession(session, ring, acknowledged.order().seq(), null)
+                    .filter(record -> record.epoch() == acknowledged.order().epoch() && acknowledged.token().equals(record.srcToken()))
+                    .map(record -> acknowledged.order().seq());
+        }
+
+        var checkpoint = view.state().checkpoint();
+        var tableCheckpoint = checkpoint == null ? null : checkpoint.tables().get(table);
+        boolean noPhysicalPositions = previous.value().perTableSeq().get(table) == -1
+                && (checkpoint == null || tableCheckpoint != null && tableCheckpoint.sequence() == -1)
+                && (acknowledged == null || acknowledged.order().seq() == SourceOrder.SNAPSHOT_SEQ);
+        if (noPhysicalPositions && bounds.equals(new SrsLogBounds(-1, -1))
+                && SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE))
+                        .limit(1).first() == null) return Optional.of(-1L);
+        return Optional.empty();
+    }
+
     @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision);
         return changingTheConsumer(() -> checkpointTransaction(context.key().pipelineId(), session -> {

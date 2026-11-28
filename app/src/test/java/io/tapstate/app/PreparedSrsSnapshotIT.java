@@ -8,13 +8,19 @@ import io.tapstate.adapters.pdk.ConnectorRef;
 import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.app.fixture.PreparedPinnedSnapshotSource;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.FrontierOrders;
+import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.srs.SnapshotPhase;
+import io.tapstate.runtime.srs.SrsRingReader;
+import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.runtime.srs.SrsSnapshotPreparation;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.*;
@@ -297,6 +303,63 @@ class PreparedSrsSnapshotIT {
                     assertThat(saved.position().token()).isEqualTo(replayed.srcToken()).isNotEqualTo(resumeAt);
                 }
             } finally { nextMember.shutdown(); }
+        });
+    }
+
+    @Test void aNestWatermarkDoesNotPreventRecoveryOfAnEmptyTableLog() throws Exception {
+        withFixture(f -> {
+            String chain = f.run.miningChainId();
+            String quietTable = "t2";
+            String ringName = SrsRingbuffer.ringName(chain, quietTable);
+            var consumers = f.stores.consumers();
+            var run = f.run;
+            var models = new LinkedHashMap<String, SrsModelKey>();
+            for (String table : List.of("t1", quietTable)) {
+                var key = new SrsModelKey(chain, table, run.cacheScope().cacheIncarnation(), 1, 0);
+                var shape = new SourceTable(table, List.of(new SourceField("id", "integer")), List.of("id"), List.of());
+                f.stores.models().publish(new SrsModel(key, SrsRingbuffer.ringName(chain, table), shape, 0), f.capture);
+                models.put(table, key);
+            }
+            var initial = consumers.progress(run.context()).orElseThrow();
+            assertThat(consumers.pinSnapshot(run.context(), run.membershipRevision(), initial.revision(),
+                    new SrsSnapshotPin(1, "snapshot-seam", models), run.originalClaim())).isTrue();
+            var roster = Map.of("t1", List.of("sink"), quietTable, List.of("sink"));
+            assertThat(consumers.beginWriterRun(run.context(), run.membershipRevision(), "before-restart", roster,
+                    run.originalClaim())).isTrue();
+            for (String table : roster.keySet()) {
+                assertThat(consumers.advanceWriter(run.context(), run.membershipRevision(), "before-restart", table,
+                        "sink", new WriterProgress(SourceOrder.snapshotRow(1), null), run.originalClaim())).isTrue();
+            }
+            var loaded = consumers.progress(run.context()).orElseThrow();
+            assertThat(loaded.cursor().snapshotCompletedTables()).containsExactlyInAnyOrder("t1", quietTable);
+            assertThat(loaded.ringDoneThrough()).containsEntry(quietTable, -1L);
+
+            assertThat(f.stores.chains().openEpoch(chain, 1, f.capture)).hasValue(2);
+            // NEST can hold a snapshot row while forwarding a bound at the end of the preceding epoch.
+            var held = SourceOrder.snapshotRow(2);
+            var axes = ChainAxes.assign(List.of(ringName));
+            var level = new LevelBounds(Map.of(0, List.of(ringName)), axes, ignored -> held);
+            var promise = level.observe(0, axes.axisOf(ringName), FrontierOrders.pack(ringName, held)).orElseThrow();
+            var boundary = FrontierOrders.unpack(promise);
+            assertThat(boundary).isEqualTo(new SourceOrder(1, 140737488355326L));
+            assertThat(consumers.advanceWriter(run.context(), run.membershipRevision(), "before-restart", quietTable,
+                    "sink", new WriterProgress(boundary, null), run.originalClaim())).isTrue();
+            assertThat(f.stores.log().bounds(ringName)).isEqualTo(new SrsLogBounds(-1, -1));
+
+            var restarted = member(f.stores.log());
+            var claims = f.domain.workloadClaims(run.cacheScope());
+            try (var authorization = ExecutionAuthorization.scoped(run.cacheScope(), claims, Duration.ofSeconds(2),
+                    System::nanoTime, () -> true)) {
+                restarted.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
+                restarted.getUserContext().put(SrsStoreViews.USER_CONTEXT_KEY, f.domain);
+                var recovery = new ScopedSrsReadCursorPublisherFactory(run, quietTable).recoveryProgress(restarted);
+                var ring = new SrsRingbuffer(restarted.getRingbuffer(ringName));
+                var reader = SrsRingReader.resumingAfter(ring, recovery.sequence().orElseThrow(),
+                        recovery.confirmed().orElse(null), ignored -> {}, ringName, f.stores.log());
+                assertThat(reader.nextReadSequence()).isZero();
+            } finally {
+                restarted.shutdown();
+            }
         });
     }
 

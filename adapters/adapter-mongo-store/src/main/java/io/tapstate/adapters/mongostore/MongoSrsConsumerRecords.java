@@ -134,8 +134,7 @@ final class MongoSrsConsumerRecords {
     static Map<String,Long> confirmedFloors(ConsumerOffset cursor,Map<String,Long> retained) {
         var result = new HashMap<>(retained);
         cursor.sinkAckedByTable().forEach((table,position) -> {
-            var order = position.order();
-            if (order.epoch() > 0 && order.seq() >= 0 && order.seq() < Long.MAX_VALUE) result.merge(table,order.seq(),Math::max);
+            if (!ambiguousBoundary(position)) finiteFloor(result, table, position.order());
         });
         return Map.copyOf(result);
     }
@@ -149,12 +148,20 @@ final class MongoSrsConsumerRecords {
         }
         return Map.copyOf(result);
     }
-    static Map<String,Long> reportedFloor(ConsumerOffset cursor,Map<String,Long> retained,SrsConsumerWriterRun writers,String table,WriterProgress report) {
+    static Map<String,Long> reportedFloor(ConsumerOffset cursor,Map<String,Long> retained,SrsConsumerWriterRun writers,
+            String table,WriterProgress report,java.util.function.Predicate<SourceOrder> provesPhysicalBoundary) {
         var result = new HashMap<>(confirmedFloors(cursor,retained,writers));
         var landed = WriterFrontier.landed(writers.withSnapshotEpoch(null),table);
-        if (landed.isPresent() && passedSnapshot(cursor,landed.get()) && report.durableThrough().compareTo(landed.get().durableThrough()) <= 0)
-            finiteFloor(result,table,report.durableThrough());
+        var order = report.durableThrough();
+        if (order.epoch() > 0 && order.seq() > result.getOrDefault(table, -1L)
+                && landed.isPresent() && passedSnapshot(cursor,landed.get()) && order.compareTo(landed.get().durableThrough()) <= 0
+                && (order.seq() != SourceOrder.MAX_FRONTIER_SEQUENCE || provesPhysicalBoundary.test(order)))
+            finiteFloor(result,table,order);
         return Map.copyOf(result);
+    }
+
+    static boolean ambiguousBoundary(ChainPosition position) {
+        return position != null && position.token() == null && position.order().seq() == SourceOrder.MAX_FRONTIER_SEQUENCE;
     }
     private static boolean passedSnapshot(ConsumerOffset cursor,WriterFrontier.Landed landed) {
         return cursor.snapshotEpoch() == 0 || WriterFrontier.passedLoad(landed,cursor.snapshotEpoch());

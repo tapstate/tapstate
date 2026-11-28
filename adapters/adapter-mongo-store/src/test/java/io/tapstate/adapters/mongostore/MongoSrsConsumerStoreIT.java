@@ -3281,6 +3281,71 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void theSequenceCeilingRequiresARecordFromTheReportedEpoch(boolean matchingEpoch) {
+        withBusiness(f -> {
+            var log = preparedTrimLog(f);
+            long ceiling = SourceOrder.MAX_FRONTIER_SEQUENCE;
+            log.storeAll(ring("orders"), ceiling, List.of(new SrsLogRecord(null, Op.INSERT, 1, null,
+                    Map.of("id", 6), 0, f.captureFence(), 1)));
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().startReadingAfter(A, 1, 0, "orders", -1, f.fenceA())).isTrue();
+            assertThat(f.consumers().beginWriterRun(A, 1, "run", Map.of("orders", List.of("writer")), f.fenceA())).isTrue();
+            var order = new SourceOrder(matchingEpoch ? 1 : 2, ceiling);
+            assertThat(f.consumers().advanceWriter(A, 1, "run", "orders", "writer",
+                    new WriterProgress(order, null), f.fenceA())).isTrue();
+            var stored = f.consumers().progress(A).orElseThrow();
+            assertThat(stored.cursor().sinkAckedByTable()).containsEntry("orders", new ChainPosition(order, null));
+            assertThat(stored.ringDoneThrough()).containsEntry("orders", matchingEpoch ? ceiling : -1L);
+        });
+    }
+
+    @ParameterizedTest
+    @CsvSource({"empty,-1", "matched-token,1", "different-token,140737488355326", "trimmed,140737488355326"})
+    void reattachmentRepairsAnOldCeilingOnlyFromTheOriginalRing(String evidence, long expectedFloor) {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            boolean empty = "empty".equals(evidence);
+            if (empty) publishSnapshotModels(f, tables);
+            var log = empty ? null : preparedTrimLog(f);
+            var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+            var membership = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            assertThat(f.consumers().startReadingAfter(A, 1, 0, "orders", -1, f.fenceA())).isTrue();
+            assertThat(f.consumers().pinSnapshot(A, 1, 1, new SrsSnapshotPin(1, "seam", Map.of("orders", key)),
+                    f.fenceA())).isTrue();
+            assertThat(f.consumers().beginWriterRun(A, 1, "original", Map.of("orders", List.of("writer")), f.fenceA())).isTrue();
+            var acknowledged = empty ? point(1, SourceOrder.SNAPSHOT_SEQ, null)
+                    : point(1, 1, "different-token".equals(evidence) ? "wrong" : "t1");
+            assertThat(f.consumers().advanceWriter(A, 1, "original", "orders", "writer", acknowledged, f.fenceA())).isTrue();
+            if ("trimmed".equals(evidence)) log.trim(ring("orders"), 1, f.captureFence());
+            long ceiling = SourceOrder.MAX_FRONTIER_SEQUENCE;
+            assertThat(f.consumers().advanceWriter(A, 1, "original", "orders", "writer", point(1, ceiling, null),
+                    f.fenceA())).isTrue();
+            var logical = f.consumers().progress(A).orElseThrow();
+            assertThat(logical.cursor().snapshotCompletedTables()).containsExactly("orders");
+            var legacy = new MongoSrsConsumerRecords(SCOPE).cursor(membership, logical.cursor(), logical.revision(),
+                    logical.snapshot(), logical.writerRun(), Map.of("orders", ceiling));
+            assertThat(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).replaceOne(id(A), legacy)
+                    .getMatchedCount()).isOne();
+            assertThat(f.consumers().progress(A).orElseThrow().ringDoneThrough()).containsEntry("orders", ceiling);
+            if (log != null) {
+                var heldBounds = log.bounds(ring("orders"));
+                log.trim(ring("orders"), 4, f.captureFence());
+                assertThat(log.bounds(ring("orders"))).isEqualTo(heldBounds);
+            }
+
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var replacement = WorkloadClaimFence.from(claims.advanceExecution(f.pipelineA(), 1,
+                    Set.of(f.pipelineA().owner().nodeId())).orElseThrow());
+            f.consumers().attachForStartup(A, tables, replacement).orElseThrow();
+            var restored = f.consumers().progress(A).orElseThrow();
+            assertThat(restored.ringDoneThrough()).containsEntry("orders", expectedFloor);
+            assertThat(restored.cursor()).isEqualTo(logical.cursor());
+            assertThat(restored.snapshot()).isEqualTo(logical.snapshot());
+        });
+    }
+
     @Test
     void concurrentOriginalArrivalsNeverOverwriteTheFirstCommittedSafePlace() {
         withBusiness(f -> {

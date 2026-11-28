@@ -32,11 +32,11 @@ import java.util.Map;
  */
 public final class FrontierOrders {
 
-    /** How many of the low bits carry the position within a generation. */
-    private static final int SEQ_BITS = 47;
-
     /** Every value the position field can hold. */
-    private static final long SEQ_FIELD_MASK = (1L << SEQ_BITS) - 1;
+    private static final long SEQ_FIELD_MASK = SourceOrder.MAX_FRONTIER_SEQUENCE + 1;
+
+    /** How many of the low bits carry the position within a generation. */
+    private static final int SEQ_BITS = Long.bitCount(SEQ_FIELD_MASK);
 
     /**
      * The highest generation that keeps the top of the range below the engine's idle signal. One more
@@ -46,7 +46,7 @@ public final class FrontierOrders {
     public static final long HIGHEST_EPOCH = 65_534;
 
     /** The highest position a ring can assign and still be encodable: the field spends one on the shift. */
-    public static final long HIGHEST_SEQ = SEQ_FIELD_MASK - 1;
+    public static final long HIGHEST_SEQ = SourceOrder.MAX_FRONTIER_SEQUENCE;
 
     private FrontierOrders() {
     }
