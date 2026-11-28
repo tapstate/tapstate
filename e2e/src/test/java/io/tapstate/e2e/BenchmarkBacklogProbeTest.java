@@ -26,7 +26,7 @@ class BenchmarkBacklogProbeTest {
     @Test
     void stopsAtTheLastAcknowledgementEvenWhenItsSourceTailWasReadFirst() {
         var result = BenchmarkBacklogProbe.verify(batch(), List.of(LEFT, RIGHT), List.of(RIGHT_ACK, LEFT_ACK),
-                2_000, 2_100);
+                2_000, 2_100, event -> true);
         assertEquals(18, result.durationMillis());
         assertEquals(2, result.confirmedWrites());
         assertEquals(LEFT.token(), result.sourceTails().get("left").token());
@@ -37,14 +37,27 @@ class BenchmarkBacklogProbeTest {
     void rejectsASameTimestampOutsideTokenAndAnyMissingInputOrAcknowledgement() {
         var outside = record("right", 9, "outside-batch", 2_010);
         assertThrows(IllegalArgumentException.class, () -> BenchmarkBacklogProbe.verify(batch(),
-                List.of(LEFT, outside), List.of(LEFT_ACK, RIGHT_ACK), 2_000, 2_100));
+                List.of(LEFT, outside), List.of(LEFT_ACK, RIGHT_ACK), 2_000, 2_100, event -> true));
         assertThrows(IllegalArgumentException.class, () -> BenchmarkBacklogProbe.verify(batch(),
-                List.of(LEFT), List.of(LEFT_ACK), 2_000, 2_100));
+                List.of(LEFT), List.of(LEFT_ACK), 2_000, 2_100, event -> true));
         assertThrows(IllegalArgumentException.class, () -> BenchmarkBacklogProbe.verify(batch(),
-                List.of(LEFT, RIGHT), List.of(LEFT_ACK), 2_000, 2_100));
+                List.of(LEFT, RIGHT), List.of(LEFT_ACK), 2_000, 2_100, event -> true));
         var early = new Confirmation(RIGHT.event(), 2_009);
         assertThrows(IllegalArgumentException.class, () -> BenchmarkBacklogProbe.verify(batch(),
-                List.of(LEFT, RIGHT), List.of(LEFT_ACK, early), 2_000, 2_100));
+                List.of(LEFT, RIGHT), List.of(LEFT_ACK, early), 2_000, 2_100, event -> true));
+    }
+
+    @Test
+    void usesALaterFilteredSourceTailAndRejectsUnexpectedOutput() {
+        var filtered = new SourceRecord(LEFT.stream(), LEFT.event(), LEFT.token(), 2_020);
+        var result = BenchmarkBacklogProbe.verify(batch(), List.of(RIGHT, filtered), List.of(RIGHT_ACK),
+                2_000, 2_100, RIGHT.event()::equals);
+        assertEquals(20, result.durationMillis());
+        assertEquals(2, result.sourceEvents());
+        assertEquals(1, result.confirmedWrites());
+        assertThrows(IllegalArgumentException.class, () -> BenchmarkBacklogProbe.verify(batch(),
+                List.of(RIGHT, filtered), List.of(RIGHT_ACK, new Confirmation(LEFT.event(), 2_025)),
+                2_000, 2_100, RIGHT.event()::equals));
     }
 
     private static SourceRecord record(String stream, long key, String token, long readMillis) {

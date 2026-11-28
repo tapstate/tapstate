@@ -13,16 +13,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import org.bson.BsonDocument;
 
-/** Verifies the bounded source history and successful writer callbacks of one-to-one backlog cases. */
+/** Verifies the bounded source history and successful writer callbacks of supported backlog cases. */
 final class BenchmarkBacklogProbe implements AutoCloseable {
     static final String PROTOCOL = "mongo-backlog-pdk-ack-v1";
     private final Path source;
+    private final Predicate<Event> expectsWrite;
     private boolean started;
 
-    BenchmarkBacklogProbe(Path source) {
+    BenchmarkBacklogProbe(Path source, boolean filtersOddKeys) {
         this.source = source;
+        expectsWrite = event -> !filtersOddKeys || BenchmarkOperatorOracle.evenKey(event.key());
     }
 
     void start() {
@@ -61,16 +64,16 @@ final class BenchmarkBacklogProbe implements AutoCloseable {
                     BsonDocument.parse(fields[4]), Long.parseLong(fields[5])));
         }
         return verify(batch, records, BenchmarkLatencyProbe.read(sibling(".ack"), true),
-                startEpochMillis, observedEpochMillis);
+                startEpochMillis, observedEpochMillis, expectsWrite);
     }
 
     record SourceRecord(String stream, Event event, BsonDocument token, long readEpochMillis) {}
     record SourceTail(int events, BsonDocument token, long readEpochMillis) {}
     record Reading(long durationMillis, long startEpochMillis, long targetAckEpochMillis,
-                   Map<String, SourceTail> sourceTails, int confirmedWrites) {}
+                   Map<String, SourceTail> sourceTails, int sourceEvents, int confirmedWrites) {}
 
     static Reading verify(PhaseReport batch, List<SourceRecord> sourceRecords, List<Confirmation> confirmations,
-            long startEpochMillis, long observedEpochMillis) {
+            long startEpochMillis, long observedEpochMillis, Predicate<Event> expectsWrite) {
         if (!batch.complete() || batch.streams().isEmpty()) {
             throw new IllegalArgumentException("The fixed source batch is incomplete");
         }
@@ -109,18 +112,19 @@ final class BenchmarkBacklogProbe implements AutoCloseable {
         long lastAck = startEpochMillis;
         for (var confirmation : confirmations) {
             Long readTime = readTimes.get(confirmation.event());
-            if (readTime == null || !confirmed.add(confirmation.event())
+            if (readTime == null || !expectsWrite.test(confirmation.event()) || !confirmed.add(confirmation.event())
                     || confirmation.ackMillis() < readTime || confirmation.ackMillis() > observedEpochMillis) {
                 throw new IllegalArgumentException("A target confirmation was out of window, ambiguous or outside the batch");
             }
             lastAck = Math.max(lastAck, confirmation.ackMillis());
         }
-        if (confirmed.size() != sourceRecords.size() || lastAck <= startEpochMillis) {
+        long requiredWrites = readTimes.keySet().stream().filter(expectsWrite).count();
+        if (confirmed.size() != requiredWrites || lastAck <= startEpochMillis) {
             throw new IllegalArgumentException("The target did not confirm the entire batch");
         }
         long lastRead = sourceTails.values().stream().mapToLong(SourceTail::readEpochMillis).max().orElseThrow();
         return new Reading(Math.max(lastRead, lastAck) - startEpochMillis, startEpochMillis, lastAck,
-                Map.copyOf(sourceTails), confirmed.size());
+                Map.copyOf(sourceTails), sourceRecords.size(), confirmed.size());
     }
 
     private Path sibling(String suffix) {

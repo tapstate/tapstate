@@ -147,7 +147,11 @@ final class BenchmarkOperatorOracle {
     }
 
     private static boolean even(BsonDocument row) {
-        return number(row, "_id") % 2 == 0;
+        return evenKey(number(row, "_id"));
+    }
+
+    static boolean evenKey(long key) {
+        return key % 2 == 0;
     }
 
     private static BsonDocument script(BsonDocument source, long value) {

@@ -284,9 +284,11 @@ class BenchmarkRunIT {
         boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && text(definition, "mode").equals("live-latency")
                 && (mapLatency || text(definition, "spec").equals("specs/copy-basic.json") && operators == null);
+        String caseId = text(definition, "id");
+        boolean filteredBacklog = caseId.equals("filter.backlog.basic.standard");
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
-                && List.of("copy.backlog.fixed-iud.standard", "union.backlog.basic.standard")
-                        .contains(text(definition, "id"));
+                && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
+                        "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
         Path connector = seeds.resolve("mongodb-connector.jar");
         Path witness = folder.resolve(backlogProbe ? "source-backlog.tsv" : "source-latency.tsv");
         if (latencyProbe || backlogProbe) {
@@ -317,7 +319,7 @@ class BenchmarkRunIT {
                 var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
                 try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null;
-                        var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness) : null) {
+                        var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness, filteredBacklog) : null) {
                     runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
                             sourceDb, targetDb, client.getDatabase("admin"), limited, latency, backlog);
                 }
@@ -1491,10 +1493,12 @@ class BenchmarkRunIT {
                         "source_tails", tails,
                         "started_epoch_ms", reading.startEpochMillis(),
                         "final_target_ack_epoch_ms", reading.targetAckEpochMillis(),
+                        "source_events", reading.sourceEvents(),
                         "confirmed_target_writes", reading.confirmedWrites(),
                         "completion_ms", reading.durationMillis(),
                         "clock_resolution_ms", 1,
-                        "input_events_per_second", reading.confirmedWrites() * 1000.0 / reading.durationMillis()));
+                        "input_events_per_second", reading.sourceEvents() * 1000.0 / reading.durationMillis(),
+                        "output_writes_per_second", reading.confirmedWrites() * 1000.0 / reading.durationMillis()));
                 result.put("measurement_status", "eligible");
             } catch (IOException | IllegalArgumentException | org.bson.json.JsonParseException unavailable) {
                 result.put("backlog_completion", Map.of("status", "insufficient", "reason", unavailable.toString()));

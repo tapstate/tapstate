@@ -469,7 +469,7 @@ def main():
     execute.add_argument("--endpoint-latency-probe", action="store_true",
                          help="Observe source events and target confirmations on supported Copy and Map live cases.")
     execute.add_argument("--backlog-completion-probe", action="store_true",
-                         help="Observe source tails and final acknowledgements on Copy and Union fixed backlogs.")
+                         help="Observe source tails and final acknowledgements on supported fixed backlog cases.")
     execute.add_argument("--stop-at-epoch-seconds", type=positive,
                          help="Stop the benchmark process at this absolute time, leaving time for evidence collection.")
     reporter = sub.add_parser("report")

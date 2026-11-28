@@ -235,13 +235,14 @@ and backlog source history, zero snapshot rows on resume, confirmed writes and
 final readback. Review `measurement_status` independently from execution `status`.
 Copy and Map live cases can collect source and target callbacks with
 `--endpoint-latency-probe`. Cases without complete correlation report
-`insufficient-event-correlation`. For fixed backlog Copy and
+`insufficient-event-correlation`. For fixed backlog Copy, Map, Filter and
 Union, the formal workflow enables `--backlog-completion-probe`. To reproduce
 the measurement, use that flag with the matching formal recipe and retain
 `source-backlog.tsv`, its `.ack` file, and `result.json`. The probe matches each
 input's first and last MongoDB tokens and event sequence against independent
-source history, then verifies a successful target callback for every batch event.
-The measured interval ends at the later of the final source observation and
+source history, then verifies a successful target callback for every event that
+requires a write. Filter reports the full input batch and the confirmed output
+count separately. The measured interval ends at the later of the final source observation and
 target callback. Independent target readback remains required for the run to
 qualify. The report retains its polling observation and indicates when callback
 evidence is insufficient. For Nest, check the identical root counts and
