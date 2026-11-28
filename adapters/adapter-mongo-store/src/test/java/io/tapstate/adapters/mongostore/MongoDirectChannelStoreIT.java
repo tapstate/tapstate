@@ -16,6 +16,7 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,6 +62,50 @@ class MongoDirectChannelStoreIT {
                 assertThat(reopened.recordBatch(batch,0,f.captureFence(),f.pipelineFence())).isTrue();
                 assertThat(reopened.load(CONTEXT).current().recordedThrough()).isOne();
             }
+        });
+    }
+
+    @Test
+    void aManualResumeKeepsTheCutoffUntilTheQualifyingBatchSettles() {
+        withBusiness(f -> {
+            var cutoff = Instant.parse("2026-01-01T00:00:00.123456789Z");
+            assertThat(f.store().load(CONTEXT).pendingStartAt()).isNull();
+            assertThat(f.store().beginCapture(CONTEXT,0,0,f.captureFence(),f.pipelineFence())).hasValue(1);
+            assertThat(f.store().confirmAnchor(CONTEXT,1,"anchor",cutoff,f.captureFence(),f.pipelineFence())).isTrue();
+            assertThat(f.store().control(CONTEXT,"orders")).isPresent();
+            var heartbeat = batch(1,1,0,Map.of());
+            assertThat(f.store().recordBatch(heartbeat,0,f.captureFence(),f.pipelineFence())).isTrue();
+            var quiet = f.store().load(CONTEXT);
+            assertThat(quiet.resumeToken()).isEqualTo(heartbeat.boundary().token());
+            assertThat(quiet.pendingStartAt()).isEqualTo(cutoff);
+
+            try (var session = f.client().startSession()) {
+                session.withTransaction(() -> {
+                    f.store().editPosition(session,quiet,"manual",Instant.EPOCH,f.captureFence(),f.pipelineFence());
+                    return null;
+                });
+            }
+            var edited = f.store().load(CONTEXT);
+            assertThat(edited.resumeToken()).isEqualTo("manual");
+            assertThat(edited.pendingStartAt()).isEqualTo(cutoff);
+            f.claims().release(f.capture());
+            var replacement = f.claims().acquire(f.capture().key(),new WorkloadOwner("replacement","boot2"),1,TTL).claim();
+            var fence = WorkloadClaimFence.from(replacement);
+            assertThat(f.store().beginCapture(CONTEXT,edited.revision(),1,fence,f.pipelineFence())).hasValue(2);
+            assertThat(f.store().confirmAnchor(CONTEXT,2,"manual",fence,f.pipelineFence())).isTrue();
+            assertThat(f.store().beginWriterRun(CONTEXT,2,"run",roster(),f.pipelineFence())).isTrue();
+            var qualifying = batch(2,1,1,Map.of("orders",0L));
+            assertThat(f.store().recordBatch(qualifying,0,fence,f.pipelineFence())).isTrue();
+            assertThat(f.store().advanceWriter(CONTEXT,2,"run","orders","fast",point(2,0),f.pipelineFence())).isTrue();
+            var partial = f.store().load(CONTEXT);
+            assertThat(partial.resumeToken()).isEqualTo("manual");
+            assertThat(partial.pendingStartAt()).isEqualTo(cutoff);
+
+            assertThat(f.store().advanceWriter(CONTEXT,2,"run","orders","slow",point(2,0),f.pipelineFence())).isTrue();
+            var settled = f.store().load(CONTEXT);
+            assertThat(settled.resumeToken()).isEqualTo(qualifying.boundary().token());
+            assertThat(settled.pendingStartAt()).isNull();
+            assertThat(raw(f)).doesNotContainKey("pendingStartAt");
         });
     }
     @Test void laterCompletedBatchesCannotSkipTheBlockedPrefixAndThenSettleTogether() {

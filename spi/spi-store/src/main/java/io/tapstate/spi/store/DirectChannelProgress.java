@@ -3,14 +3,21 @@ package io.tapstate.spi.store;
 import java.util.Objects;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import java.time.Instant;
 import java.util.Set;
 
 /** Private channel progress and its small ordering control; pending batches are a separate resource. */
 public record DirectChannelProgress(DirectChannelContext context,Set<String> tables,long revision,
-        DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun,SourceResumeOverride resumeOverride) {
+        DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun,
+        SourceResumeOverride resumeOverride,Instant pendingStartAt) {
     public DirectChannelProgress(DirectChannelContext context,Set<String> tables,long revision,
             DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun) {
         this(context,tables,revision,current,retained,cursor,writerRun,null);
+    }
+    public DirectChannelProgress(DirectChannelContext context,Set<String> tables,long revision,
+            DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun writerRun,
+            SourceResumeOverride resumeOverride) {
+        this(context,tables,revision,current,retained,cursor,writerRun,resumeOverride,null);
     }
     public DirectChannelProgress {
         Objects.requireNonNull(context,"context"); Objects.requireNonNull(cursor,"cursor"); tables = Set.copyOf(tables);
@@ -25,6 +32,8 @@ public record DirectChannelProgress(DirectChannelContext context,Set<String> tab
                 || cursor.sinkAcked().order().epoch() > resumeOverride.fromEpoch())) throw new IllegalArgumentException("resume request has no original checkpoint");
         if (current == null && (retained != null || writerRun != null || cursor.sinkAcked() != null || cursor.snapshotEpoch() != 0 || !cursor.sinkAckedByTable().isEmpty()))
             throw new IllegalArgumentException("an unopened channel cannot have capture progress");
+        if (pendingStartAt != null && cursor.sinkAcked() == null)
+            throw new IllegalArgumentException("a pending timestamp start requires a confirmed source anchor");
         if (current != null) {
             requireWindow(context,current);
             if (cursor.snapshotEpoch() > current.epoch() || cursor.sinkAcked() != null && !validBound(cursor.sinkAcked(),current.epoch(),false)

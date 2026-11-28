@@ -197,7 +197,7 @@ class DirectCaptureWriterTest {
             public DirectChannelProgress load(DirectChannelContext context) {
                 assertThat(context).isEqualTo(CONTEXT);if(delivered.size()>=expectedBlockedAfter)blocked.countDown();return progress.get();
             }
-            public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
+            public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,java.time.Instant initialStartAt,WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
                 assertThat(context).isEqualTo(CONTEXT);assertThat(epoch).isEqualTo(progress.get().epoch());assertThat(capture).isEqualTo(CAPTURE);assertThat(pipeline).isEqualTo(PIPELINE);
                 var old=progress.get();var anchored=new DirectCaptureWindow(epoch,CAPTURE,PIPELINE,token,0,0,null,null);
                 var next=new ConsumerOffset(CONTEXT.consumerId(),Map.of(),new ChainPosition(SourceOrder.snapshotRow(epoch),token),List.of(),null,0,Map.of(),ConsumerProgressKind.DIRECT_SOURCE);
