@@ -6,7 +6,6 @@ import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.Frontend;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.HistoryCursorCodec;
-import io.tapstate.control.core.Operation;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PipelineMetrics;
 import io.tapstate.control.core.AuditGate;
@@ -18,6 +17,7 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelinePositionService;
+import io.tapstate.control.core.PipelineRunProgressQuery;
 import io.tapstate.control.core.PipelineSnapshot;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.control.core.Scope;
@@ -39,6 +39,8 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.PipelineRunProgress;
+import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -93,7 +95,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -243,6 +244,40 @@ class PipelineObservationApiTest {
                 .retrieve().toEntity(PipelineStatus.class).getBody();
 
         assertThat(body).isEqualTo(new PipelineStatus("pl1", PipelineState.RUNNING));
+    }
+
+    @Test
+    void runProgressRequiresItsOwnReadOperationAndCanBeUnavailable() {
+        String path = "/api/pipelines/pl1/run-progress";
+        client().get().uri(path).exchange((request, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            return null;
+        });
+        var response = client().get().uri(path).header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        assertThat(response).containsOnlyKeys("availability", "runId", "version", "active", "milestones",
+                "initialLoad", "failedStage", "awaitingMilestones")
+                .containsEntry("availability", "UNAVAILABLE").containsEntry("runId", null)
+                .containsEntry("version", null).containsEntry("active", List.of()).containsEntry("milestones", List.of())
+                .containsEntry("awaitingMilestones", false);
+    }
+
+    @Test
+    void runProgressSerializesItsTimestampedActivitiesAndUnknownMilestoneTimesWithReadScope() {
+        var response = client().get().uri("/api/pipelines/pl2/run-progress")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        assertThat(response).containsOnlyKeys("availability", "runId", "version", "active", "milestones",
+                "initialLoad", "failedStage", "awaitingMilestones")
+                .containsEntry("availability", "AVAILABLE").containsEntry("runId", "fixture-run")
+                .containsEntry("version", 4).containsEntry("awaitingMilestones", true)
+                .containsEntry("active", List.of(Map.of("stage", "WAITING_FOR_CAPTURE", "since", NOW.toString())))
+                .containsEntry("initialLoad", Map.of("landed", 1, "total", 2))
+                .containsEntry("failedStage", null);
+        Map<?, ?> milestone = (Map<?, ?>) ((List<?>) response.get("milestones")).getFirst();
+        assertThat(milestone.get("stage")).isEqualTo("START_ACCEPTED");
+        assertThat(milestone.containsKey("reachedAt")).isTrue();
+        assertThat(milestone.get("reachedAt")).isNull();
     }
 
     @Test
@@ -746,11 +781,8 @@ class PipelineObservationApiTest {
     // ---- the read endpoints are a derivation of the registry ----
 
     @Test
-    void theThreeReadFacesProjectRegisteredCliExposedVerbs() {
-        Set<String> cliExposed = ControlOperations.registry()
-                .exposedOn(Frontend.CLI).stream()
-                .map(Operation::id).collect(Collectors.toSet());
-
+    void observationRoutesProjectRegisteredOperations() {
+        var registry = ControlOperations.registry();
         RequestMappingHandlerMapping mapping =
                 context.getBean("requestMappingHandlerMapping", RequestMappingHandlerMapping.class);
 
@@ -759,15 +791,15 @@ class PipelineObservationApiTest {
             Verb verb = handler.getMethodAnnotation(Verb.class);
             if (verb != null && verb.value().startsWith("pipeline.")) {
                 projectedReadFaces.add(verb.value());
-                assertThat(cliExposed)
-                        .as("a projected observation read face must be a registered, CLI-exposed operation")
-                        .contains(verb.value());
+                assertThat(registry.resolve(verb.value()).exposure().keySet())
+                        .as(verb.value()).anyMatch(face -> face == Frontend.REST || face == Frontend.CLI);
             }
         });
 
         assertThat(projectedReadFaces)
                 .as("every pipeline face imported here projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder("pipeline.status", "pipeline.metrics", "pipeline.snapshot",
+                        "pipeline.run-progress",
                         "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position");
     }
@@ -802,6 +834,16 @@ class PipelineObservationApiTest {
         @Bean
         FakeObservationStore observationStore() {
             return new FakeObservationStore();
+        }
+
+        @Bean
+        PipelineRunProgressQuery pipelineRunProgressQuery() {
+            var progress = new PipelineRunProgress("fixture-run", 4,
+                    List.of(new PipelineRunProgress.Activity(PipelineRunStage.WAITING_FOR_CAPTURE, NOW)),
+                    List.of(new PipelineRunProgress.Milestone(PipelineRunStage.START_ACCEPTED, null)),
+                    new PipelineRunProgress.LoadProgress(1, 2), null);
+            return pipelineId -> pipelineId.equals("pl2")
+                    ? Optional.of(new PipelineRunProgressQuery.Read(progress, true)) : Optional.empty();
         }
 
         @Bean
