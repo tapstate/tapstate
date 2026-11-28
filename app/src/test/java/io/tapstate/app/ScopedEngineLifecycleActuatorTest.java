@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
 import com.hazelcast.jet.core.DAG;
+import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineRunProgress;
 import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineResource;
@@ -16,6 +18,8 @@ import io.tapstate.spi.store.*;
 import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -815,6 +819,36 @@ class ScopedEngineLifecycleActuatorTest {
                 .startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
         var actor = actuator(); actor.start("p"); assertThat(actor.isCarryingAJob("p")).isFalse(); assertThat(actor.failure("p")).isEmpty();
         verify(previous,never()).failure(); verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
+    }
+    @Test void openingCaptureOnTheNextPassEndsItsWaitBeforeTheEngineStarts() {
+        var startingProgress = new AtomicReference<>(PipelineRunProgress.empty("same-start"));
+        // Reduce the actual events without a binding reset, which can also clear the old activity.
+        PipelineRunProgressEvents progress = event -> startingProgress.updateAndGet(event::applyTo);
+        var waitingAt = Instant.parse("2026-11-28T00:00:00Z");
+        var openedAt = waitingAt.plusSeconds(5);
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("capture"))).doNothing()
+                .when(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+
+        new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache", ConnectorReadiness.NONE,
+                Clock.fixed(waitingAt, ZoneOffset.UTC), ports(), submissions, progress).start("p");
+
+        assertThat(startingProgress.get().active()).containsExactly(
+                new PipelineRunProgress.Activity(PipelineRunStage.WAITING_FOR_CAPTURE, waitingAt));
+        verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
+
+        when(engine.captureRun("p")).thenReturn(Optional.empty());
+        when(submitted.status()).thenReturn(JobStatus.STARTING);
+        var nextPass = new PipelineConvergencePass(pass.intent(), held.get(), views, () -> {});
+        when(dags.prepareStart(eq(nextPass), eq("cache"))).thenReturn(preparation);
+        var next = new ScopedEngineLifecycleActuator(nextPass, engine, dags, captures, ownership, "cache", ConnectorReadiness.NONE,
+                Clock.fixed(openedAt, ZoneOffset.UTC), ports(), submissions, progress);
+        next.start("p");
+
+        assertThat(next.isCarryingAJob("p")).isTrue();
+        assertThat(startingProgress.get().active()).containsExactly(
+                new PipelineRunProgress.Activity(PipelineRunStage.WAITING_FOR_ENGINE, openedAt));
+        assertThat(startingProgress.get().milestones()).extracting(PipelineRunProgress.Milestone::stage)
+                .doesNotContain(PipelineRunStage.ENGINE_RUNNING);
     }
     @Test void aSubmissionThatLosesAuthorityIsCancelledThroughOnlyItsReturnedConcreteHandle() {
         when(engine.submitRun(eq("p"),any(),anyMap(),any(),any(OperatorRunManifest.class))).thenAnswer(call -> { held.set(claim(3)); return submitted; });

@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution;
 import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
@@ -20,6 +21,7 @@ import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.FirstPipelineCreationResult;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelinePreparationInputs;
 import io.tapstate.spi.store.StorageBinding;
@@ -103,10 +105,11 @@ class PipelineFirstStatePreparerIT {
             var claims = f.cache.workloadClaims(f.business());
             var owned = claims.acquirePipeline(f.scope, OWNER, 1, TTL).claim();
             var firstClaim = claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
-            var first = f.cache.pipelineRunProgress(f.scope, WorkloadClaimFence.from(firstClaim), ACTIVE);
+            var firstFence = WorkloadClaimFence.from(firstClaim);
+            var first = f.cache.pipelineRunProgress(f.scope, firstFence, ACTIVE);
             var seed = PipelineRunProgress.empty("first");
-            var bind = io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution.BIND;
-            var requireBound = io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore.Execution.REQUIRE_BOUND;
+            var bind = Execution.BIND;
+            var requireBound = Execution.REQUIRE_BOUND;
             assertThat(first.update(1, seed, bind, p -> p.reach(PipelineRunStage.ENGINE_RUNNING, CLOCK.instant()))).isTrue();
             try (var secondMember = MongoCacheDomain.connect(f.cacheConnection, Duration.ofSeconds(5), "run-progress-member-b")) {
                 var reader = secondMember.pipelineRunProgress(f.scope, null, ACTIVE);
@@ -117,17 +120,35 @@ class PipelineFirstStatePreparerIT {
                 assertThat(failed.milestones()).extracting(PipelineRunProgress.Milestone::stage)
                         .containsExactly(PipelineRunStage.ENGINE_RUNNING);
                 var secondClaim = claims.advanceExecution(firstClaim, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
-                var second = secondMember.pipelineRunProgress(f.scope, WorkloadClaimFence.from(secondClaim), ACTIVE);
+                var secondFence = WorkloadClaimFence.from(secondClaim);
+                var second = secondMember.pipelineRunProgress(f.scope, secondFence, ACTIVE);
                 assertCode(() -> first.update(1, seed, requireBound,
                         p -> p.reach(PipelineRunStage.CDC_READY, CLOCK.instant())), IoError.WORKLOAD_CLAIM_FENCED);
-                assertThat(second.update(2, PipelineRunProgress.empty("second"), bind,
-                        p -> p.enter(PipelineRunStage.SOURCE_CAPTURE_PREPARING, CLOCK.instant()))).isTrue();
+                var secondSeed = PipelineRunProgress.empty("second");
+                var waiting = PipelineRunStage.WAITING_FOR_CAPTURE;
+                assertThat(second.update(2, secondSeed, bind, p -> p.enter(waiting, CLOCK.instant()))).isTrue();
                 assertThat(first.update(1, seed, requireBound,
                         p -> p.reach(PipelineRunStage.INITIAL_LOAD_COMPLETED, CLOCK.instant()))).isFalse();
+                var openAt = CLOCK.instant().plusSeconds(5);
+                var desired = new DesiredState(f.scope.pipelineId(), PipelineState.RUNNING, "a".repeat(64));
+                var lateOpen = new PipelineRunProgressEvents.Event(new PipelineIntentSnapshot(f.scope, 1, desired),
+                        firstFence, waiting, PipelineRunProgressEvents.Edge.LEFT, openAt, 1);
+                assertThat(first.update(1, seed, Execution.KEEP, lateOpen::applyTo)).isFalse();
                 var latest = reader.latest().orElseThrow();
                 assertThat(latest.startRevision()).isEqualTo(2);
                 assertThat(latest.progress().runId()).isEqualTo("second");
                 assertThat(latest.progress().milestones()).isEmpty();
+                assertThat(latest.progress().active()).containsExactly(
+                        new PipelineRunProgress.Activity(waiting, CLOCK.instant()));
+
+                var open = new PipelineRunProgressEvents.Event(new PipelineIntentSnapshot(f.scope, 2, desired),
+                        secondFence, waiting, PipelineRunProgressEvents.Edge.LEFT, openAt, 2);
+                assertThat(second.update(2, secondSeed, Execution.KEEP, open::applyTo)).isTrue();
+                var opened = reader.latest().orElseThrow().progress();
+                assertThat(opened.active()).isEmpty();
+                assertThat(opened.version()).isEqualTo(latest.progress().version() + 1);
+                assertThat(second.update(2, secondSeed, Execution.KEEP, open::applyTo)).isTrue();
+                assertThat(reader.latest().orElseThrow().progress()).isEqualTo(opened);
             }
         });
     }
