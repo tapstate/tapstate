@@ -25,6 +25,7 @@ import io.tapdata.pdk.apis.spec.TapNodeSpecification;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * An opened, constructed connector plus its registered functions and a driving context — the shared
@@ -502,6 +503,15 @@ final class PdkConnector implements AutoCloseable {
         return nodeConfig;
     }
 
+    // The JDBC connector specs describe these fields as numbers. Their config beans require
+    // Integer for the corresponding setters, including when the values come from schema defaults.
+    private static final Map<String, Set<String>> INTEGER_PIPELINE_SETTINGS = Map.of(
+            "postgres", Set.of("port", "pgtoPort", "defaultWalLogSize", "maxSplit", "batchReadThreadSize",
+                    "maximumQueueSize", "keepWalHours", "walPageCacheCapacity", "walSpillThreshold", "walLookbackSegments"),
+            "oracle", Set.of("port", "rawLogServerPort", "socketReadTimeOut", "maxSplit", "batchReadThreadSize",
+                    "fetchSize", "pollingInterval", "transactionAliveMinutes", "fzsSocketTimeout", "fzsFileAliveMinutes"),
+            "mysql", Set.of("port", "maxSplit", "batchReadThreadSize", "maximumQueueSize"));
+
     record PipelineSettings(Map<String, Object> connection, Map<String, Object> node) {}
 
     static PipelineSettings pipelineSettings(String connectorId, String spec, Map<String, Object> settings,
@@ -518,10 +528,28 @@ final class PdkConnector implements AutoCloseable {
                 selected.put(name, item.get("default"));
             }
         });
-        var effectiveNode = ConfigTypeCoercion.coerce(connectorId, spec, selected);
+        var effectiveNode = pipelineValueTypes(connectorId, spec, selected);
         // Some PDK connectors load their node parameters from the connection bean as well.
         connection.putAll(effectiveNode);
-        return new PipelineSettings(ConfigTypeCoercion.coerce(connectorId, spec, connection), effectiveNode);
+        return new PipelineSettings(pipelineValueTypes(connectorId, spec, connection), effectiveNode);
+    }
+
+    private static Map<String, Object> pipelineValueTypes(String connectorId, String spec, Map<String, Object> settings) {
+        var coerced = ConfigTypeCoercion.coerce(connectorId, spec, settings);
+        var integerFields = INTEGER_PIPELINE_SETTINGS.get(connectorId);
+        if (integerFields == null) return coerced;
+        var typed = new LinkedHashMap<>(coerced);
+        for (String field : integerFields) {
+            if (typed.get(field) instanceof Number number && !(number instanceof Integer)) {
+                try {
+                    typed.put(field, new java.math.BigDecimal(number.toString()).intValueExact());
+                } catch (NumberFormatException | ArithmeticException invalid) {
+                    throw new TapstateException(ConnectorError.CONFIG_TYPE_MISMATCH,
+                            Map.of("connector", connectorId, "field", field, "expected", "integer", "value", number), null);
+                }
+            }
+        }
+        return typed;
     }
 
     private static boolean isLiteralDefault(Object value) {

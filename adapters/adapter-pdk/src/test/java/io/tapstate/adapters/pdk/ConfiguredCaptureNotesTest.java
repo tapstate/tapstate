@@ -204,7 +204,9 @@ class ConfiguredCaptureNotesTest {
     @Test void newPrivateCaptureUsesItsEffectiveSlotPolicyAndLegacyNotesKeepTheirPolicy() {
         String spec = """
                 {"configOptions":{"node":{"properties":{
-                  "autoClearSlot":{"type":"boolean","default":true}
+                  "autoClearSlot":{"type":"boolean","default":true},
+                  "maximumQueueSize":{"type":"string","x-component":"InputNumber","default":8000},
+                  "autoIncCacheValue":{"type":"string","x-component":"InputNumber","default":100}
                 }}}}
                 """;
         var ref = new ConnectorRef(List.of(), "unused", "2.0.8", null, spec, "a".repeat(64), false);
@@ -214,6 +216,10 @@ class ConfiguredCaptureNotesTest {
         var defaulted = ConnectorNoteOrigin.capturePipeline("postgres", ref, oldAuthored, Map.of());
         var explicit = ConnectorNoteOrigin.capturePipeline("postgres", ref, oldAuthored, oldAuthored);
 
+        assertThat(ConnectorNoteOrigin.pipelineSettings(defaulted).node())
+                .containsEntry("maximumQueueSize", 8000).containsEntry("autoIncCacheValue", 100L);
+        assertThat(ConnectorNoteOrigin.pipelineSettings(defaulted).connection())
+                .containsEntry("maximumQueueSize", 8000).containsEntry("autoIncCacheValue", 100L);
         assertThat(port.automaticallyClearsPrivatePostgres(retained)).isFalse();
         assertThat(port.automaticallyClearsPrivatePostgres(defaulted)).isTrue();
         assertThat(port.automaticallyClearsPrivatePostgres(explicit)).isFalse();
