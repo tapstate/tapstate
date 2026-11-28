@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.srs.SrsReadCursorPublisherFactory;
 import io.tapstate.spi.store.SrsConsumerRun;
 import java.util.Objects;
@@ -73,7 +74,10 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
 
     private Optional<ChainPosition> confirmedPosition(io.tapstate.spi.store.SrsConsumerProgress held) {
         return Optional.ofNullable(held.cursor().sinkAckedByTable().get(table))
-                .filter(position -> position.order().epoch() > 0 && position.order().seq() >= 0 && position.order().seq() < Long.MAX_VALUE);
+                .filter(position -> position.order().epoch() > 0 && position.order().seq() >= 0 && position.order().seq() < Long.MAX_VALUE)
+                // A logical ceiling above the physical floor cannot promote the reader's recovery cursor.
+                .filter(position -> position.token() != null || position.order().seq() != SourceOrder.MAX_FRONTIER_SEQUENCE
+                        || held.ringDoneThrough().get(table) == SourceOrder.MAX_FRONTIER_SEQUENCE);
     }
     private io.tapstate.spi.store.SrsConsumerProgress progress(HazelcastInstance member) {
         var held = ScopedSrsConsumerAccess.bind(member,run).progress();

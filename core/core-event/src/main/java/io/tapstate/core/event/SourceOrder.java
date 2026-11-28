@@ -24,6 +24,9 @@ import java.io.Serializable;
  */
 public record SourceOrder(long epoch, long seq) implements Comparable<SourceOrder>, Serializable {
 
+    /** Largest physical sequence encodable in a packed frontier, also used by a prior-epoch boundary. */
+    public static final long MAX_FRONTIER_SEQUENCE = (1L << 47) - 2;
+
     /**
      * The sequence every snapshot row carries, reserved below every sequence a ring can assign. A ring
      * numbers from zero upwards, so reserving the bottom of the range makes the guarantee total: within one
