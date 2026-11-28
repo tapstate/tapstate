@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenService;
@@ -163,6 +164,76 @@ class OpAuthenticationRequestCostIT {
                         .countDocuments(new Document("_id", "missing_structure_source"))).isOne();
             }
         }
+    }
+
+    @Test
+    void pipelineIdAvailabilityUsesOneReadAndDoesNotCrossConfigurationDatabases() throws Exception {
+        try (var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                .withLabel("io.tapstate.task", "issue-1314-pipeline-id-availability")) {
+            mongo.start();
+            var storage = NativeAppStorage.create(mongo, "pipeline_id_availability", StorageBinding.Mode.OP,
+                    "availability-" + UUID.randomUUID());
+            Path seeds = Files.createDirectory(directory.resolve("seeds"));
+            Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"),
+                    seeds.resolve("mongodb-connector.jar"));
+            try (var application = new SpringApplicationBuilder(Bootstrap.class, Measurements.class)
+                    .environment(CloudFixtureEnvironment.isolated()).run(
+                            "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
+                            "--tapstate.store.mongo.uri=" + storage.configurationUri(),
+                            "--tapstate.control.auth.jwt-secret=local-pipeline-availability-fixture-signing-key",
+                            "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
+                            "--tapstate.connectors.seed-dir=" + seeds,
+                            "--tapstate.connectors.plugins-dir=" + directory.resolve("plugins"));
+                 var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+                 var raw = MongoClients.create(mongo.getReplicaSetUrl())) {
+                NativeAppStorage.awaitBusiness(application);
+                String origin = "http://127.0.0.1:" + ((WebServerApplicationContext) application).getWebServer().getPort();
+                var login = request(http, origin, "POST", "/auth/login", null,
+                        Map.of("username", NativeAppStorage.USERNAME, "password", NativeAppStorage.PASSWORD,
+                                "createSession", false));
+                assertThat(login.status()).isEqualTo(200);
+                String token = (String) login.body().get("token");
+                var configuration = application.getBean(StorageRoot.class).runtime().requireConfiguration();
+                configuration.artifacts().save(new PipelineResource("published-only", null, List.of(), null,
+                        null, null, null, null));
+
+                String draftId = "draft-only";
+                assertThat(request(http, origin, "POST", "/api/pipelines/" + draftId + "/draft", token,
+                        Map.of("pipelineId", draftId, "mode", "dag", "name", "Orders",
+                                "graph", Map.of("nodes", List.of(), "edges", List.of(),
+                                        "viewport", Map.of("x", 0, "y", 0, "zoom", 1)))).status()).isEqualTo(201);
+                var drafts = raw.getDatabase(storage.configurationDatabase()).getCollection("pipeline_drafts");
+                raw.getDatabase("pipeline_availability_other").getCollection("pipeline_drafts")
+                        .insertOne(new Document("_id", "different-cluster-only"));
+                assertAvailabilityRead(http, origin, token, "different-cluster-only", true);
+                assertAvailabilityRead(http, origin, token, "published-only", false);
+                assertAvailabilityRead(http, origin, token, draftId, false);
+                configuration.drafts().delete(draftId, 1);
+                assertAvailabilityRead(http, origin, token, draftId, true);
+
+                drafts.insertOne(new Document("_id", "unreadable").append("deleted", true));
+                var unreadable = request(http, origin, "GET", "/api/pipelines:id-availability?id=unreadable", token, null);
+                assertThat(unreadable.status()).isEqualTo(500);
+                assertThat(unreadable.body().containsKey("available")).isFalse();
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void assertAvailabilityRead(HttpClient http, String origin, String token, String id,
+            boolean available) throws Exception {
+        var result = request(http, origin, "GET", "/api/pipelines:id-availability?id=" + id, token, null);
+        assertThat(result.status()).isEqualTo(200);
+        assertThat(result.body()).isEqualTo(Map.of("available", available));
+        assertThat(hasBusinessWrite(result)).isFalse();
+        // The admission path has its own readiness reads, including aggregates against cluster_identity.
+        var phases = (Map<String, Map<String, Object>>) result.diagnostics().get("mongo_by_phase");
+        assertThat(((Number) phases.get("request_other").get("started")).longValue()).isEqualTo(1);
+        var groups = (List<Map<String, Object>>) result.diagnostics().get("mongo_groups");
+        assertThat(groups).anyMatch(group -> "aggregate".equals(group.get("command"))
+                && "cluster_identity".equals(group.get("collection")));
+        assertThat(groups).noneMatch(group -> "find".equals(group.get("command"))
+                && "pipeline_drafts".equals(group.get("collection")));
     }
 
     private static Map<String, Object> source(String id, String uri) {
