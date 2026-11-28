@@ -173,6 +173,10 @@ public final class RateSampler {
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
     public static RateSample sampleOf(Observation observation) {
+        return sampleOf(observation, null);
+    }
+
+    public static RateSample sampleOf(Observation observation, RateSample.StartupEvidence startupEvidence) {
         if (observation.observedAt() == null || observation.state() == PipelineState.COMPLETED) {
             return null;
         }
@@ -190,11 +194,17 @@ public final class RateSampler {
                 counters.put(fact.name(), fact.points().getFirst().value());
             }
         }
+        Instant since = countingSince(observation.facts());
+        if (since == null && startupEvidence != null && startupEvidence.zeroAt() != null
+                && !counters.containsKey("records.out") && !counters.containsKey("bytes.out")) {
+            counters.put("records.out", 0L);
+            counters.put("bytes.out", 0L);
+        }
         if (counters.isEmpty() && lag.isEmpty()) {
             return null;
         }
         return new RateSample(observation.pipelineId(), observation.observedAt(), counters, lag,
-                countingSince(observation.facts()));
+                since, startupEvidence);
     }
 
     /**

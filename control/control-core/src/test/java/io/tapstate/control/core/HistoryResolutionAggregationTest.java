@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -145,6 +146,124 @@ class HistoryResolutionAggregationTest {
             assertThat(point.cdcDelivery().sampleCount()).isEqualTo(3);
             assertThat(point.cdcDelivery().averageMillis()).isEqualByComparingTo("200");
         });
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void firstConfirmedSnapshotBatchAppearsInOutboundHistory(HistoryResolution resolution) {
+        String from = "2026-09-21T10:00:00Z";
+        Instant firstObservedAt = Instant.parse(from);
+        Instant countingSince = firstObservedAt.plusMillis(4_016);
+        var store = new HistoryTestSupport.MutableHistory();
+        store.add(new RateSample("orders", firstObservedAt, Map.of("recordCount", 0L), Map.of(), null,
+                new RateSample.StartupEvidence(1, 2, null)));
+        Map<String, Long> confirmed = Map.of("records.out", 10_125L, "bytes.out", 1_237_470L,
+                CdcDeliveryTotals.COUNT_METRIC, 0L, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 0L);
+        store.add(new RateSample("orders", firstObservedAt.plusMillis(60_863), confirmed,
+                Map.of(), countingSince, new RateSample.StartupEvidence(1, 2, countingSince)));
+        store.add(new RateSample("orders", firstObservedAt.plusMillis(120_863), confirmed,
+                Map.of(), countingSince, new RateSample.StartupEvidence(1, 2, countingSince)));
+
+        var answer = service(store, 2, 25_000).query(query(from, "2026-09-21T10:03:00Z",
+                resolution, 20, List.of(), null));
+        assertThat(answer.gaps()).isEmpty();
+        assertThat(cdcCount(answer)).isZero();
+
+        var readings = points(answer);
+        var records = readings.stream().map(PipelineMetricsHistory.Point::recordsOut)
+                .filter(Objects::nonNull).map(PipelineMetricsHistory.Rate::delta)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        var bytes = readings.stream().map(PipelineMetricsHistory.Point::bytesOut)
+                .filter(Objects::nonNull).map(PipelineMetricsHistory.Rate::delta)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        assertThat(List.of(records, bytes))
+                .as("%s outbound records and bytes with segment starts %s", resolution,
+                        answer.segments().stream().map(PipelineMetricsHistory.Segment::startReason).toList())
+                .usingElementComparator(BigDecimal::compareTo)
+                .containsExactly(BigDecimal.valueOf(10_125), BigDecimal.valueOf(1_237_470));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void aRetainedStartupBaselineRequiresBothObservedZeros(HistoryResolution resolution) {
+        Instant first = Instant.parse("2026-09-21T10:00:00Z");
+        Instant origin = first.minusSeconds(40);
+        var evidence = new RateSample.StartupEvidence(1, 2, origin);
+        var right = new RateSample("orders", first.plusSeconds(10), Map.of("records.out", 4L, "bytes.out", 100L),
+                Map.of(), first.minusSeconds(30), evidence);
+        for (Map<String, Long> counters : List.of(
+                Map.of("recordCount", 0L), Map.of("records.out", 0L, "bytes.out", 0L))) {
+            var store = new HistoryTestSupport.MutableHistory();
+            store.add(new RateSample("orders", first, counters, Map.of(), null, evidence));
+            store.add(right);
+            var answer = service(store, 2, 25_000).query(new PipelineHistoryQuery("orders", first,
+                    first.plusSeconds(20), resolution, 20, List.of(), null));
+            var measured = points(answer).stream()
+                    .filter(point -> point.recordsOut() != null || point.bytesOut() != null).toList();
+            if (counters.containsKey("records.out")) {
+                assertThat(measured).singleElement().satisfies(point -> {
+                    assertThat(point.intervalStart()).isEqualTo(first);
+                    assertThat(point.recordsOut().delta()).isEqualByComparingTo("4");
+                    assertThat(point.bytesOut().delta()).isEqualByComparingTo("100");
+                });
+            } else {
+                assertThat(measured).isEmpty();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void theSameStartupSamplesWithoutEvidenceOnlyMeasureTheLaterIdleInterval(HistoryResolution resolution) {
+        String from = "2026-09-21T10:00:00Z";
+        Instant firstObservedAt = Instant.parse(from);
+        Instant countingSince = firstObservedAt.plusMillis(4_016);
+        Instant firstConfirmedAt = firstObservedAt.plusMillis(60_863);
+        var store = new HistoryTestSupport.MutableHistory();
+        store.add(new RateSample("orders", firstObservedAt, Map.of("recordCount", 0L), Map.of(), null));
+        Map<String, Long> confirmed = Map.of("records.out", 10_125L, "bytes.out", 1_237_470L,
+                CdcDeliveryTotals.COUNT_METRIC, 0L, CdcDeliveryTotals.TOTAL_MILLIS_METRIC, 0L);
+        store.add(new RateSample("orders", firstConfirmedAt, confirmed, Map.of(), countingSince));
+        store.add(new RateSample("orders", firstObservedAt.plusMillis(120_863), confirmed, Map.of(), countingSince));
+
+        var answer = service(store, 2, 25_000).query(query(from, "2026-09-21T10:03:00Z",
+                resolution, 20, List.of(), null));
+        var measured = points(answer).stream()
+                .filter(point -> point.recordsOut() != null || point.bytesOut() != null).toList();
+        assertThat(measured).singleElement().satisfies(point -> {
+            assertThat(point.intervalStart()).isEqualTo(firstConfirmedAt);
+            assertThat(point.recordsOut().delta()).isZero();
+            assertThat(point.bytesOut().delta()).isZero();
+        });
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void startupEvidenceDoesNotBridgeAnExecutionChangeAGapOrAnOutsideBaseline(HistoryResolution resolution) {
+        Instant first = Instant.parse("2026-09-21T10:00:00Z");
+        Instant origin = first.plusSeconds(4);
+        var left = new RateSample("orders", first, Map.of("recordCount", 0L), Map.of(), null,
+                new RateSample.StartupEvidence(1, 2, null));
+        Map<String, Long> counters = Map.of("records.out", 4L, "bytes.out", 120L);
+        var same = new RateSample("orders", first.plusSeconds(60), counters, Map.of(), origin,
+                new RateSample.StartupEvidence(1, 2, origin));
+        var replaced = new RateSample("orders", same.observedAt(), counters, Map.of(), origin,
+                new RateSample.StartupEvidence(1, 3, origin));
+        var late = new RateSample("orders", first.plusSeconds(120), counters, Map.of(), origin, same.startupEvidence());
+
+        for (var right : List.of(same, replaced, late)) {
+            var store = new HistoryTestSupport.MutableHistory();
+            store.add(left);
+            store.add(right);
+            Instant from = right == same ? origin.plusMillis(1) : first;
+            var answer = service(store, 2, 25_000).query(new PipelineHistoryQuery("orders", from,
+                    first.plusSeconds(180), resolution, 20, List.of(), null));
+            assertThat(points(answer)).isNotEmpty().allSatisfy(point -> {
+                assertThat(point.recordsOut()).isNull();
+                assertThat(point.bytesOut()).isNull();
+            });
+            assertThat(answer.gaps()).hasSize(right == late ? 1 : 0);
+        }
     }
 
     @ParameterizedTest

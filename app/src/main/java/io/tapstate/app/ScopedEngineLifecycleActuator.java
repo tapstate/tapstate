@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.PipelineRunStage;
@@ -84,6 +85,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private boolean invalidated;
     private WorkloadClaimFence command;
     private Engine.Run run;
+    private Optional<DeliveryReading> stoppedDelivery = Optional.empty();
     private OperatorRunManifest manifest;
     private ExecutionFence original;
     private PipelineCaptureCoordinator capture;
@@ -410,7 +412,22 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
 
     private void stopOriginal(boolean trackOnStopWorker) {
         require();
+        stoppedDelivery = Optional.empty();
         if (run != null) {
+            var desired = pass.intent().desired();
+            if (trackOnStopWorker && !desired.purgeState() && !desired.reassemble() && isCurrentRun()) {
+                try {
+                    stoppedDelivery = run.deliveryBeforeStop()
+                            .filter(reading -> reading.startupEvidence() != null && reading.startupEvidence().zeroAt() != null)
+                            .filter(reading -> !reading.bytesByTable().isEmpty()
+                                    && reading.rowsByTableAndOp().values().stream()
+                                            .anyMatch(rows -> rows.values().stream().anyMatch(count -> count > 0)));
+                } catch (RuntimeException unavailable) {
+                    System.getLogger(ScopedEngineLifecycleActuator.class.getName()).log(System.Logger.Level.DEBUG,
+                            "Could not sample confirmed delivery before stopping " + id(), unavailable);
+                }
+                require();
+            }
             stopStep(trackOnStopWorker, "Engine.RunHandle.cancel", run::cancel);
             require();
             stopStep(trackOnStopWorker, "Engine.RunHandle.awaitTerminal", () -> {
@@ -503,6 +520,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         } finally { if (purge) invalidated = true; }
         if (purge) rebuildStopped();
     }
+
+    @Override public Optional<DeliveryReading> stoppedDelivery() { return stoppedDelivery; }
 
     @Override public void clearStopped(String pipeline) {
         requireId(pipeline);
