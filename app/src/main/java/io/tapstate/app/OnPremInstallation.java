@@ -4,6 +4,7 @@ import io.tapstate.adapters.mongostore.*;
 import io.tapstate.control.core.*;
 import io.tapstate.control.restapi.InstallationHttpAccess;
 import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.*;
@@ -88,7 +89,10 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     StorageSetupService setups() { return setups; }
     boolean normalStartupAllowed() { return states.load().phase() == StorageSetupStateStore.Phase.COMPLETE; }
     boolean firstAdministratorReady() {
-        return !closed && installationReady && root.phase() == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
+        return firstAdministratorPublished() && root.runtime().businessStarted();
+    }
+    private boolean firstAdministratorPublished() {
+        return !closed && installationReady && root.phase() == StorageRoot.Phase.BUSINESS_READY;
     }
 
     void attach(Connector connector) {
@@ -232,8 +236,9 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         root.requireActive();
         if (installationReady) return;
         var status = states.load();
-        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY
-                || !root.runtime().businessStarted()) throw StorageRuntime.unavailable();
+        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY)
+            throw StorageRuntime.unavailable();
+        requireBusinessAdmission();
         files.locked(() -> {
             var stage = files.stage(); files.saveStage(stage.withScope(status.scope()).withHandoff(InstallationFiles.Handoff.CONFIGURED, stage.configurationHash()));
             if (files.capability().filter(value -> value.purpose() == StorageSetupStateStore.Purpose.SETUP).isPresent()) files.removeCapability();
@@ -246,9 +251,18 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (closed) throw StorageRuntime.unavailable();
         root.requireActive();
         if (startupCompletedDelivered) return;
-        if (!firstAdministratorReady()) throw StorageRuntime.unavailable();
+        if (!firstAdministratorPublished()) throw StorageRuntime.unavailable();
+        requireBusinessAdmission();
         startupCompleted.run();
         startupCompletedDelivered = true;
+    }
+
+    private void requireBusinessAdmission() {
+        if (!root.runtime().businessStarted()) throw new BusinessAdmissionUnavailable();
+    }
+
+    static final class BusinessAdmissionUnavailable extends TapstateException {
+        private BusinessAdmissionUnavailable() { super(ControlError.STORAGE_UNAVAILABLE, Map.of(), null); }
     }
 
     StorageRecoveryService recoveryService() {
