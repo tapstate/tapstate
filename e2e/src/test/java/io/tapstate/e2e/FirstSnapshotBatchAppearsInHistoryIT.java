@@ -1,9 +1,12 @@
 package io.tapstate.e2e;
 
+import com.hazelcast.core.Hazelcast;
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
@@ -37,6 +40,96 @@ class FirstSnapshotBatchAppearsInHistoryIT {
     private static final Duration WAIT = Duration.ofSeconds(90);
 
     @Test
+    void theFirstConfirmedSnapshotBatchAppearsWhenTheFirstPositiveSampleIsStopped(@TempDir Path directory) throws Exception {
+        DockerGate.require();
+        Path source = Files.createDirectory(directory.resolve("source"));
+        Path target = Files.createDirectory(directory.resolve("target"));
+        Path hold = Files.createDirectory(directory.resolve("hold")).resolve("read-" + TABLE);
+        Files.createFile(hold);
+        var existingMembers = Hazelcast.getAllHazelcastInstances();
+        var interval = Duration.ofSeconds(30);
+
+        try (var endpoints = new FileEndpoints(); var storage = PreparedNativeStore.create("e2e", "e2e-password");
+                var mongo = MongoClients.create(storage.cacheUri());
+                var server = InProcessServer.startPrepared(storage, List.of(
+                        "--tapstate.metrics.history.sample-interval=" + interval.toSeconds() + "s"));
+                var client = HttpClient.newHttpClient()) {
+            endpoints.seed(EndpointAddress.uri(source.toString()), TABLE, SeedRows.generated(ROWS));
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            configure(control, directory, source, target, hold);
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            var history = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(mongo.getDatabase(storage.cacheDatabase()));
+            var filter = new Document("pipelineId", PIPELINE);
+            var zeroFilter = new Document(filter).append("startupEvidence.zeroAt", new Document("$exists", true))
+                    .append("countingSince", new Document("$exists", false));
+            Await.answered("the retained zero before the held snapshot", WAIT,
+                    () -> Optional.ofNullable(history.find(zeroFilter).first()));
+            assertThat(server.stopPublishingObservations()).isEqualTo(1);
+            server.awaitObservationWorkersIdle();
+            var previous = history.find(filter).sort(new Document("observedAt", -1)).first();
+            assertThat(previous).isNotNull();
+            var counters = previous.get("counters", Document.class);
+            assertThat(counters.getLong("records.out")).isZero();
+            assertThat(counters.getLong("bytes.out")).isZero();
+            assertThat(previous.get("startupEvidence", Document.class)).isNotNull();
+
+            Files.delete(hold);
+            var member = Hazelcast.getAllHazelcastInstances().stream()
+                    .filter(candidate -> !existingMembers.contains(candidate) && candidate.getJet().getJob(PIPELINE) != null)
+                    .findFirst().orElseThrow();
+            var engine = new Engine(member);
+            var confirmed = Await.answered("the native target acknowledgement without a new history sample", WAIT,
+                    () -> engine.captureRun(PIPELINE).flatMap(Engine.Run::metrics).map(Engine.RunMetrics::delivered)
+                            .filter(delivered -> delivered.rowsByTableAndOp().values().stream()
+                                    .flatMap(table -> table.values().stream()).mapToLong(Long::longValue).sum() == ROWS)
+                            .filter(delivered -> delivered.bytesByTable().values().stream().anyMatch(bytes -> bytes > 0)));
+            assertThat(endpoints.count(EndpointAddress.uri(target.toString()), TABLE)).isEqualTo(ROWS);
+            var positive = new Document(filter).append("countingSince", new Document("$exists", true));
+            assertThat(history.countDocuments(positive)).isZero();
+
+            control.stop(PIPELINE, false);
+            Await.until("STOPPED is published", WAIT, () -> {
+                assertThat(server.publishObservationsOnce()).isEqualTo(1);
+                return control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent();
+            }, () -> control.logs(PIPELINE));
+            server.awaitObservationWorkersIdle();
+            var stopped = history.find(positive).first();
+            assertThat(stopped).as("the STOPPED history sample holds the first confirmed batch").isNotNull();
+            assertThat(stopped.get("startupEvidence", Document.class)).isEqualTo(previous.get("startupEvidence", Document.class));
+            var from = previous.getDate("observedAt").toInstant();
+            var end = stopped.getDate("observedAt").toInstant();
+            assertThat(Duration.between(from, end)).isLessThan(interval.multipliedBy(2));
+            long bytes = confirmed.bytesByTable().values().stream().mapToLong(Long::longValue).sum();
+            for (String resolution : List.of("raw", "PT5M")) {
+                var response = history(client, server.baseUrl(), control.credential(), from, end.plusMillis(1), resolution);
+                assertThat((List<?>) response.get("gaps")).isEmpty();
+                assertThat(points(response)).noneMatch(point -> point.containsKey("cdcDelivery"));
+                assertRates(points(response), resolution, "recordsOut", BigDecimal.valueOf(ROWS));
+                assertRates(points(response), resolution, "bytesOut", BigDecimal.valueOf(bytes));
+            }
+
+            var previousId = new Document("_id", previous.get("_id"));
+            var otherExecution = new Document(previous.get("startupEvidence", Document.class));
+            otherExecution.append("executionId", otherExecution.getLong("executionId") ^ 1L);
+            for (var update : List.of(new Document("$unset", new Document("startupEvidence", 1)),
+                    new Document("$set", new Document("startupEvidence", otherExecution)))) {
+                assertThat(history.updateOne(previousId, update).getModifiedCount()).isEqualTo(1);
+                for (String resolution : List.of("raw", "PT5M")) {
+                    var response = history(client, server.baseUrl(), control.credential(), from, end.plusMillis(1), resolution);
+                    assertThat(points(response)).isNotEmpty().allSatisfy(point -> {
+                        for (String key : List.of("recordsOut", "bytesOut")) {
+                            if (point.get(key) instanceof Map<?, ?> rate) {
+                                assertThat(number(rate.get("delta"))).isZero();
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    @Test
     void theFirstConfirmedSnapshotBatchIsMeasuredAtBothResolutions(@TempDir Path directory) throws Exception {
         DockerGate.require();
         Path source = Files.createDirectory(directory.resolve("source"));
@@ -52,13 +145,7 @@ class FirstSnapshotBatchAppearsInHistoryIT {
                         "--tapstate.metrics.history.sample-interval=" + SAMPLE_INTERVAL.toSeconds() + "s"))) {
             var control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
-            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
-            control.discoverSchema("startup_source", E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
-            control.apply(Map.of(
-                    "source.tap.yml", Workspaces.cdcSourceYaml("startup_source", source, List.of(TABLE),
-                            Map.of("hold", hold.getParent().toString(), "start_after_existing_rows", "true")),
-                    "target.tap.yml", Workspaces.targetYaml("startup_target", target),
-                    "pipeline.tap.yml", Workspaces.pipelineYaml(PIPELINE, "startup_source", "startup_target", TABLE)));
+            configure(control, directory, source, target, hold);
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             var history = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(mongo.getDatabase(storage.cacheDatabase()));
             var filter = new Document("pipelineId", PIPELINE);
@@ -140,6 +227,16 @@ class FirstSnapshotBatchAppearsInHistoryIT {
                 }
             }
         }
+    }
+
+    private static void configure(ControlPlane control, Path directory, Path source, Path target, Path hold) throws Exception {
+        control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+        control.discoverSchema("startup_source", E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+        control.apply(Map.of(
+                "source.tap.yml", Workspaces.cdcSourceYaml("startup_source", source, List.of(TABLE),
+                        Map.of("hold", hold.getParent().toString(), "start_after_existing_rows", "true")),
+                "target.tap.yml", Workspaces.targetYaml("startup_target", target),
+                "pipeline.tap.yml", Workspaces.pipelineYaml(PIPELINE, "startup_source", "startup_target", TABLE)));
     }
 
     private static Map<?, ?> history(HttpClient client, URI base, String token, Instant from, Instant to,

@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -687,7 +688,7 @@ final class ConvergenceDriver implements AutoCloseable {
             LifecycleActuator actuator, RebuildAdmission rebuilds, boolean refreshTerminal) {
         Optional<ObservationPublisher.Publication> publication;
         try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PUBLISH)) {
-            publication = publishObservationReading(pipelineId, pass, result, config, failure, refreshTerminal);
+            publication = publishObservationReading(pipelineId, pass, result, config, failure, actuator, refreshTerminal);
         }
         StoppedEvidence evidence = null;
         if (publication.isPresent()) {
@@ -709,7 +710,8 @@ final class ConvergenceDriver implements AutoCloseable {
     }
 
     private Optional<ObservationPublisher.Publication> publishObservationReading(String pipelineId, PipelineConvergencePass pass,
-            ConvergeResult result, PipelineIntentStore.ActuationReading config, ObservationFailure failure, boolean refreshTerminal) {
+            ConvergeResult result, PipelineIntentStore.ActuationReading config, ObservationFailure failure,
+            LifecycleActuator actuator, boolean refreshTerminal) {
         var actual = result.checkpoint().map(checkpoint -> StateJson.parse(checkpoint.stateJson())).orElse(null);
         if (scoped == null) return publisher.publish(pipelineId, failure)
                 .map(value -> new ObservationPublisher.Publication(value, true));
@@ -720,7 +722,8 @@ final class ConvergenceDriver implements AutoCloseable {
         }
         boolean allowTerminalReuse = !finalStopSample(pass, actual) && !refreshTerminal
                 && !scoped.alerts().needsFreshTerminalMetrics(pass.scope());
-        return publishScopedObservation(pass, result, failure, allowTerminalReuse);
+        var stoppedDelivery = actual == PipelineState.STOPPED ? actuator.stoppedDelivery().orElse(null) : null;
+        return publishScopedObservation(pass, result, failure, allowTerminalReuse, stoppedDelivery);
     }
 
     private boolean finalStopSample(PipelineConvergencePass pass, PipelineState actual) {
@@ -741,7 +744,7 @@ final class ConvergenceDriver implements AutoCloseable {
         } catch (RuntimeException unavailable) {
             LOG.warn("Could not submit the final alert sample for pipeline {}", pipelineId);
         }
-        var sample = reading.measured() && sampler != null ? RateSampler.sampleOf(published) : null;
+        var sample = reading.measured() && sampler != null ? RateSampler.sampleOf(published, reading.startupEvidence()) : null;
         var history = sample == null ? null : new ProcessObservationWriter.History(sample,
                 remaining -> pass.rateHistory(remaining).append(sample));
         var historyReceipt = scoped.writes().terminalHistory(terminal,
@@ -762,10 +765,12 @@ final class ConvergenceDriver implements AutoCloseable {
     }
 
     private Optional<ObservationPublisher.Publication> publishScopedObservation(PipelineConvergencePass pass,
-            ConvergeResult result, ObservationFailure failure, boolean allowTerminalReuse) {
+            ConvergeResult result, ObservationFailure failure, boolean allowTerminalReuse, DeliveryReading stoppedDelivery) {
         var observations = pass.observationSample();
         try {
-            return publisher.publishScopedReading(pass.scope(), pass.state(), observations, failure, allowTerminalReuse);
+            return stoppedDelivery == null
+                    ? publisher.publishScopedReading(pass.scope(), pass.state(), observations, failure, allowTerminalReuse)
+                    : publisher.publishScopedReading(pass.scope(), pass.state(), observations, failure, allowTerminalReuse, stoppedDelivery);
         } catch (TapstateException unavailable) {
             if (unavailable.code() != IoError.WORKLOAD_CLAIM_FENCED || failure != null
                     || !settledStop(pass, result) || !currentIntent(pass)) throw unavailable;

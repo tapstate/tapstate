@@ -930,7 +930,7 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
-        return publish(pipelineId, failure, state, observations, null, false).map(Publication::observation);
+        return publish(pipelineId, failure, state, observations, null, false, null).map(Publication::observation);
     }
 
     /** Projects through the fixed state and original-claim observation views captured by this pass. */
@@ -943,9 +943,15 @@ public final class ObservationPublisher {
     /** Reuse is allowed only when no consumer requires a fresh terminal metric sample. */
     public Optional<Publication> publishScopedReading(PipelineIntentScope scope, StateStore scopedState,
             ObservationStore scopedObservations, ObservationFailure failure, boolean allowTerminalReuse) {
+        return publishScopedReading(scope, scopedState, scopedObservations, failure, allowTerminalReuse, null);
+    }
+
+    public Optional<Publication> publishScopedReading(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, ObservationFailure failure, boolean allowTerminalReuse,
+            DeliveryReading stoppedDelivery) {
         Objects.requireNonNull(scope, "scope");
         return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
-                Objects.requireNonNull(scopedObservations, "scopedObservations"), scope, allowTerminalReuse);
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), scope, allowTerminalReuse, stoppedDelivery);
     }
 
     /**
@@ -963,7 +969,7 @@ public final class ObservationPublisher {
                 || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING) {
             throw new IllegalArgumentException("periodic observations require the original running checkpoint");
         }
-        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null, state);
+        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent, scope, null, state, null);
     }
 
     /** Capture facts obtained together for the current execution and checked against its checkpoint. */
@@ -984,16 +990,17 @@ public final class ObservationPublisher {
         if (!scope.pipelineId().equals(checkpoint.pipelineId()) || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING)
             throw new IllegalArgumentException("a combined observation requires its running checkpoint");
         return publishCheckpoint(Optional.of(checkpoint), null, store, true, stillCurrent, scope,
-                Objects.requireNonNull(capture), state);
+                Objects.requireNonNull(capture), state, null);
     }
 
     private Optional<Publication> publish(String pipelineId, ObservationFailure failure, StateStore state,
-            ObservationStore observations, PipelineIntentScope scope, boolean allowTerminalReuse) {
+            ObservationStore observations, PipelineIntentScope scope, boolean allowTerminalReuse, DeliveryReading stoppedDelivery) {
         boolean requirePreparedState = scope != null;
         Objects.requireNonNull(pipelineId, "pipelineId");
         var terminalReading = terminalMeasurements.get(pipelineId);
         Instant refreshAt = observedNow();
-        if (allowTerminalReuse && failure == null && terminalReading != null && terminalReading.scope().equals(scope)
+        if (allowTerminalReuse && stoppedDelivery == null && failure == null
+                && terminalReading != null && terminalReading.scope().equals(scope)
                 && !refreshAt.isBefore(terminalReading.measuredAt())
                 && refreshAt.isBefore(terminalReading.measuredAt().plusSeconds(TERMINAL_MEASUREMENT_SECONDS))) {
             Optional<Observation> refreshed;
@@ -1009,12 +1016,12 @@ public final class ObservationPublisher {
         var current = state.read(pipelineId);
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
         return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true, scope, null,
-                state instanceof ScopedPipelineStateStore scoped ? scoped : null);
+                state instanceof ScopedPipelineStateStore scoped ? scoped : null, stoppedDelivery);
     }
 
     private Optional<Publication> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
             ObservationStore observations, boolean requirePreparedState, BooleanSupplier stillCurrent,
-            PipelineIntentScope scope, CaptureSample capture, ScopedPipelineStateStore state) {
+            PipelineIntentScope scope, CaptureSample capture, ScopedPipelineStateStore state, DeliveryReading stoppedDelivery) {
         return expected.flatMap(checkpoint -> {
             if (!stillCurrent.getAsBoolean()) {
                 return Optional.empty();
@@ -1072,6 +1079,7 @@ public final class ObservationPublisher {
                 SnapshotReading readThisRun = capture != null ? capture.run()
                         : measuredCapture == null ? runSnapshots.apply(pipelineId) : measuredCapture.runSnapshot();
                 var resume = state == null || actual != PipelineState.RUNNING ? null : state.resumeCheckpoint(checkpoint);
+                boolean sampledBeforeStop = actual == PipelineState.STOPPED && stoppedDelivery != null;
                 List<MetricFact> movementFacts;
                 DeliveryReading nativeDelivery = null;
                 if (resume != null) {
@@ -1081,7 +1089,7 @@ public final class ObservationPublisher {
                     continuation = projection.publication();
                     movementFacts = projection.facts();
                 } else {
-                    nativeDelivery = deliveries.apply(pipelineId);
+                    nativeDelivery = sampledBeforeStop ? stoppedDelivery : deliveries.apply(pipelineId);
                     movementFacts = nativeFacts(pipelineId, at, captures.apply(pipelineId), nativeDelivery,
                             stages.apply(pipelineId));
                 }
@@ -1105,7 +1113,8 @@ public final class ObservationPublisher {
                                 : measuredCapture == null ? initialLoadAt(pipelineId, at) : measuredCapture.initialLoad());
                 measuredSuccessfully = true;
                 // Carried totals have a different origin from the current execution's native delivery.
-                if (requirePreparedState && actual == PipelineState.RUNNING && nativeDelivery != null && !unavailable) {
+                if (requirePreparedState && (actual == PipelineState.RUNNING || sampledBeforeStop)
+                        && nativeDelivery != null && !unavailable) {
                     startupEvidence = nativeDelivery.startupEvidence();
                 }
             } catch (TapstateException unavailable) {

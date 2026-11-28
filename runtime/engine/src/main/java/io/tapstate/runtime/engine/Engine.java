@@ -276,6 +276,10 @@ public final class Engine {
                     deliveryIn(collected), stageDurationsIn(collected)));
         }
 
+        public Optional<DeliveryReading> deliveryBeforeStop() {
+            return isCarryingAJob() ? Optional.of(deliveryReading(job, false)) : Optional.empty();
+        }
+
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
         public boolean completed() {
             return !isLost() && job.getStatus() == JobStatus.COMPLETED
@@ -991,7 +995,10 @@ public final class Engine {
     /** Reads the outbound facts and their startup provenance from the same job metrics collection. */
     public DeliveryReading deliveryReading(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null) return DeliveryReading.NONE;
+        return job == null ? DeliveryReading.NONE : deliveryReading(job, true);
+    }
+
+    private DeliveryReading deliveryReading(Job job, boolean includePending) {
         long jobId = job.getId();
         OptionalLong execution = JetLiveExecution.forHistory(member, jobId);
         JobMetrics metrics = job.getMetrics();
@@ -1000,14 +1007,14 @@ public final class Engine {
                         outboundZeroAt(metrics, com.hazelcast.jet.Util.idToString(execution.getAsLong()),
                                 JetLiveExecution.historyParticipantAddresses(member, jobId, execution.getAsLong())))
                 : null;
-        return deliveryIn(metrics, evidence);
+        return deliveryIn(metrics, evidence, includePending);
     }
 
     private static DeliveryReading deliveryIn(JobMetrics metrics) {
-        return deliveryIn(metrics, null);
+        return deliveryIn(metrics, null, true);
     }
 
-    private static DeliveryReading deliveryIn(JobMetrics metrics, RateSample.StartupEvidence evidence) {
+    private static DeliveryReading deliveryIn(JobMetrics metrics, RateSample.StartupEvidence evidence, boolean includePending) {
         OptionalLong since = deliveryStart(metrics);
         if (since.isEmpty()) {
             return evidence == null ? DeliveryReading.NONE
@@ -1016,7 +1023,7 @@ public final class Engine {
         return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics),
                 highestIn(metrics, JetDeliveryGauge::reachedTableOf),
                 Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics),
-                pendingCdcWriteIn(metrics, Instant.now()), evidence);
+                includePending ? pendingCdcWriteIn(metrics, Instant.now()) : null, evidence);
     }
 
     static Instant outboundZeroAt(JobMetrics metrics, String execution, Set<String> participants) {
