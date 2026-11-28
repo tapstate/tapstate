@@ -18,6 +18,7 @@ final class BenchmarkSnapshotProbe implements AutoCloseable {
     static final String PROTOCOL = "mongo-copy-snapshot-pdk-ack-v1";
     static final String KEY_PRESERVING_PROTOCOL = "mongo-key-preserving-snapshot-pdk-ack-v1";
     static final String FILTER_PROTOCOL = "mongo-filter-snapshot-pdk-read-ack-v1";
+    static final String UNION_PROTOCOL = "mongo-union-snapshot-pdk-ack-v1";
     private final Path sourceTrace;
     private final Path active;
     private final Path acknowledgements;
@@ -47,15 +48,23 @@ final class BenchmarkSnapshotProbe implements AutoCloseable {
         }
     }
 
-    Reading finish(MongoCollection<BsonDocument> source, long startEpochMillis, long startNanos) throws IOException {
+    Reading finish(List<MongoCollection<BsonDocument>> sources, long startEpochMillis, long startNanos) throws IOException {
         close();
         long limit = System.currentTimeMillis();
         long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
         if (!started || Math.abs(limit - startEpochMillis - elapsedMillis) > 10) {
             throw new IllegalArgumentException("The witness did not start or the fixture clock changed during the snapshot");
         }
-        var expected = source.find().projection(new BsonDocument("_id", new BsonInt32(1)))
-                .map(row -> row.getNumber("_id").longValue()).into(new HashSet<>());
+        var expected = new HashSet<Long>();
+        for (var source : sources) {
+            try (var rows = source.find().projection(new BsonDocument("_id", new BsonInt32(1))).cursor()) {
+                while (rows.hasNext()) {
+                    if (!expected.add(rows.next().getNumber("_id").longValue())) {
+                        throw new IllegalArgumentException("The snapshot sources have overlapping keys");
+                    }
+                }
+            }
+        }
         var writes = Files.readAllLines(acknowledgements);
         return sourceTrace == null ? verify(expected, writes, startEpochMillis, limit)
                 : verifyFiltered(expected, Files.readAllLines(sourceTrace), writes, startEpochMillis, limit);

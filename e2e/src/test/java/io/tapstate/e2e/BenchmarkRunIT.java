@@ -293,7 +293,8 @@ class BenchmarkRunIT {
         String spec = text(definition, "spec");
         boolean operatorSnapshot = operators != null && snapshotMode
                 && List.of("specs/filter-basic.json", "specs/map-basic.json", "specs/js-basic.json",
-                        "specs/mixed-double-map.json").contains(spec);
+                        "specs/mixed-double-map.json", "specs/union-basic.json").contains(spec);
+        boolean unionSnapshot = operatorSnapshot && spec.equals("specs/union-basic.json");
         boolean filteredSnapshot = operatorSnapshot
                 && (spec.equals("specs/filter-basic.json") || spec.equals("specs/mixed-double-map.json"));
         boolean copySnapshot = operators == null && snapshotMode && spec.equals("specs/copy-basic.json");
@@ -314,6 +315,8 @@ class BenchmarkRunIT {
             if (filteredSnapshot) {
                 snapshotIdentity.put("protocol", BenchmarkSnapshotProbe.FILTER_PROTOCOL);
                 snapshotIdentity.put("source_file", witness.getFileName().toString());
+            } else if (unionSnapshot) {
+                snapshotIdentity.put("protocol", BenchmarkSnapshotProbe.UNION_PROTOCOL);
             }
             evidence.result.put("snapshot_probe", snapshotIdentity);
         } else if (latencyProbe || backlogProbe) {
@@ -531,14 +534,14 @@ class BenchmarkRunIT {
         evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
         evidence.window("readback");
         if (probe != null) {
-            recordSnapshotCompletion(probe, source, startEpochMillis, start, evidence);
+            recordSnapshotCompletion(probe, List.of(source), startEpochMillis, start, evidence);
         }
     }
 
-    private static void recordSnapshotCompletion(BenchmarkSnapshotProbe probe, MongoCollection<BsonDocument> source,
+    private static void recordSnapshotCompletion(BenchmarkSnapshotProbe probe, List<MongoCollection<BsonDocument>> sources,
             long startEpochMillis, long startNanos, Evidence evidence) {
         try {
-            var reading = probe.finish(source, startEpochMillis, startNanos);
+            var reading = probe.finish(sources, startEpochMillis, startNanos);
             var completion = new LinkedHashMap<String, Object>(Map.of(
                     "status", "eligible", "started_epoch_ms", startEpochMillis,
                     "final_target_ack_epoch_ms", reading.finalAckEpochMillis(), "confirmed_target_writes", reading.confirmed(),
@@ -843,8 +846,8 @@ class BenchmarkRunIT {
             evidence.measure(initialStart, input, initial.size());
             evidence.window("readback");
             if (snapshotProbe != null) {
-                recordSnapshotCompletion(snapshotProbe, source.getCollection(RECORDS, BsonDocument.class),
-                        initialStartEpochMillis, initialStart, evidence);
+                var inputs = operators.sources().stream().map(table -> source.getCollection(table, BsonDocument.class)).toList();
+                recordSnapshotCompletion(snapshotProbe, inputs, initialStartEpochMillis, initialStart, evidence);
             }
             verifyOperator(operators, target, initial, evidence);
             return;
