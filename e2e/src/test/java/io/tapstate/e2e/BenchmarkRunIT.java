@@ -616,9 +616,14 @@ class BenchmarkRunIT {
                         try (BenchmarkTargetLimit cleanup = limit) {
                             if (targetWindow != null) {
                                 evidence.result.put("target_frontier_requested_epoch_ms", System.currentTimeMillis());
-                                var observed = targetWindow.countThroughBoundary().orElseThrow(() ->
-                                        new Unverified("Target change stream did not reach its majority-visible frontier"));
-                                evidence.result.put("target_majority_visible_before_drain", observed);
+                                var frontier = targetWindow.countThroughBoundary();
+                                evidence.result.put("target_frontier_marker_write_nanos", frontier.markerWriteNanos());
+                                evidence.result.put("target_frontier_cursor_read_nanos", frontier.cursorReadNanos());
+                                evidence.result.put("target_frontier_events_read", frontier.eventsRead());
+                                if (frontier.error() != null) {
+                                    throw new Unverified(frontier.error());
+                                }
+                                evidence.result.put("target_majority_visible_before_drain", frontier.eventsRead());
                             }
                             if (limit != null) {
                                 evidence.result.put("target_delay_millis", delay);

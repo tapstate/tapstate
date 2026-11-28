@@ -11,7 +11,6 @@ import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
-import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
@@ -120,12 +119,14 @@ final class BenchmarkTargetLimit implements AutoCloseable {
     static final class TargetWindow implements AutoCloseable {
         private static final String FRONTIER = "benchmark_target_frontier";
         private static final int ITERATION_MILLIS = 500;
+        private static final long MARKER_TIMEOUT_SECONDS = 3;
+        private static final long READER_TIMEOUT_SECONDS = 30;
         private final MongoDatabase database;
         private final String target;
         private MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor;
 
         TargetWindow(MongoDatabase database, MongoCollection<BsonDocument> target) {
-            this.database = database.withTimeout(3, TimeUnit.SECONDS);
+            this.database = database.withTimeout(MARKER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             this.target = target.getNamespace().getCollectionName();
         }
 
@@ -136,25 +137,39 @@ final class BenchmarkTargetLimit implements AutoCloseable {
                     BsonDocument.class).maxAwaitTime(200, TimeUnit.MILLISECONDS).batchSize(128).cursor();
         }
 
-        OptionalLong countThroughBoundary() {
-            long count = 0;
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        record Frontier(long eventsRead, long markerWriteNanos, Long cursorReadNanos, String error) {
+        }
+
+        Frontier countThroughBoundary() {
+            long markerStart = System.nanoTime();
             try {
                 database.getCollection(FRONTIER, BsonDocument.class).withWriteConcern(WriteConcern.MAJORITY)
                         .insertOne(new BsonDocument("_id", new BsonInt32(1)));
-                while (System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ITERATION_MILLIS) < deadline) {
+            } catch (MongoOperationTimeoutException timeout) {
+                return new Frontier(0, System.nanoTime() - markerStart, null,
+                        "Timed out writing the majority-visible target frontier marker");
+            }
+            long readerStart = System.nanoTime();
+            long markerNanos = readerStart - markerStart;
+            // Drain the existing cursor to the stop-time marker without moving the counting boundary.
+            long deadline = readerStart + TimeUnit.SECONDS.toNanos(READER_TIMEOUT_SECONDS);
+            long count = 0;
+            try {
+                while (deadline - System.nanoTime() > TimeUnit.MILLISECONDS.toNanos(ITERATION_MILLIS)) {
                     var event = cursor.tryNext();
                     if (event != null) {
                         if (event.getNamespace().getCollectionName().equals(FRONTIER)) {
-                            return OptionalLong.of(count);
+                            return new Frontier(count, markerNanos, System.nanoTime() - readerStart, null);
                         }
                         count++;
                     }
                 }
-            } catch (MongoOperationTimeoutException deadlineExpired) {
-                return OptionalLong.empty();
+            } catch (MongoOperationTimeoutException timeout) {
+                return new Frontier(count, markerNanos, System.nanoTime() - readerStart,
+                        "Target change stream poll timed out before the majority-visible frontier");
             }
-            return OptionalLong.empty();
+            return new Frontier(count, markerNanos, System.nanoTime() - readerStart,
+                    "Target change stream did not reach its majority-visible frontier before the reader deadline");
         }
 
         @Override
