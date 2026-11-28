@@ -32,6 +32,28 @@ class ConfiguredCaptureRunTest {
         assertThat(run.artifactHash()).isEqualTo(HASH);verify(provisioner).resolve("demo",HASH);verify(provisioner,never()).resolve("demo");
     }
 
+    @Test void restartingAnUnchangedPrivatePipelineKeepsItsLegacyOriginAndArtifact() {
+        var notes = notes();
+        var config = new CaptureConfig("demo", Map.of("batch", 8000), List.of("orders"), NODE,
+                null, Map.of("batch", 8000));
+        var owner = RequiredNoteOwner.forNode(SCOPE.bindingVersion(), NODE, PipelineNode.Purpose.CAPTURE,
+                SCOPE.stateGeneration());
+        var token = new RequiredNoteScope(owner, 5);
+        var legacy = ConnectorNoteOrigin.capture("demo", HASH, config.settings());
+        when(notes.originIfPresent(token)).thenReturn(Optional.of(legacy));
+        var provisioner = mock(ConnectorProvisioner.class);
+        when(provisioner.withArtifactRetention(any())).thenCallRealMethod();
+        when(provisioner.resolveRetained(notes, token, legacy)).thenReturn(ARTIFACT);
+
+        var restarted = ConfiguredCaptureRun.prepare(ORIGINAL, config, notes, provisioner, () -> {});
+
+        assertThat(restarted.primary()).isEqualTo(token);
+        assertThat(restarted.artifactHash()).isEqualTo(HASH);
+        verify(notes).prepareOrigin(token, legacy);
+        verify(provisioner, never()).resolve("demo");
+        verify(provisioner, never()).retain(any());
+    }
+
     @ParameterizedTest @ValueSource(booleans={false,true})
     void pluginOpenUsesTheOriginalTokensAndExactArtifactWithoutOpeningCurrentScopes(boolean shared) {
         var notes=notes(); var provisioner=mock(ConnectorProvisioner.class);
