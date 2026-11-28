@@ -289,7 +289,8 @@ class BenchmarkRunIT {
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
                         "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
-        boolean filteredSnapshot = caseId.equals("filter.snapshot.basic.standard");
+        boolean filteredSnapshot = operators != null && text(definition, "mode").equals("snapshot")
+                && text(definition, "spec").equals("specs/filter-basic.json");
         boolean operatorSnapshot = filteredSnapshot || caseId.equals("map.snapshot.basic.standard")
                 || caseId.equals("js.snapshot.basic.standard");
         boolean copySnapshot = operators == null && text(definition, "mode").equals("snapshot")
