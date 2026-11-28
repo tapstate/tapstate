@@ -67,7 +67,11 @@ final class PipelineFirstStatePreparer {
 
     /** Keeps CONFIG admission and preparation; the owning startup verifies retained CACHE sources. */
     void prepareForStartIntent(PipelineIntentScope original, PipelinePreparationInputs inputs) {
-        prepareAttempt(original, Objects.requireNonNull(inputs, "inputs"), null, () -> {});
+        prepareForStartIntent(original, inputs, null);
+    }
+
+    void prepareForStartIntent(PipelineIntentScope original, PipelinePreparationInputs inputs, Long intentRevision) {
+        prepareAttempt(original, Objects.requireNonNull(inputs, "inputs"), null, () -> {}, intentRevision);
         requireActive.run();
     }
 
@@ -107,6 +111,11 @@ final class PipelineFirstStatePreparer {
 
     private PipelinePreparation prepareAttempt(PipelineIntentScope original,PipelinePreparationInputs inputs,
             io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,Runnable verifyPredecessor) {
+        return prepareAttempt(original, inputs, confirmation, verifyPredecessor, null);
+    }
+
+    private PipelinePreparation prepareAttempt(PipelineIntentScope original, PipelinePreparationInputs inputs,
+            io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation, Runnable verifyPredecessor, Long intentRevision) {
         Objects.requireNonNull(original, "original");
         if (!business.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation()))) throw fenced();
         requireActive.run();
@@ -123,6 +132,7 @@ final class PipelineFirstStatePreparer {
         requireActive.run();
         if (facts.phase() == PipelinePreparation.Phase.UNASSIGNED) {
             var issued = confirmation!=null ? configuration.issueRecoveredFirstCreate(original,node,inputs,confirmation,verifyPredecessor)
+                    : intentRevision != null ? configuration.issueFirstCreate(original, node, inputs, intentRevision)
                     : inputs == null ? configuration.issueFirstCreate(original,node) : configuration.issueFirstCreate(original,node,inputs);
             requireActive.run();
             if (issued instanceof FirstPipelineCreationResult.Issued winner) {

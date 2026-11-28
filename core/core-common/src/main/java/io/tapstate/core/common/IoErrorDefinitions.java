@@ -99,6 +99,9 @@ public final class IoErrorDefinitions {
     public static final ProductErrorDefinition KEY_MOVE_NOT_INSTALLED =
             DEFINITIONS.define(44, Severity.ERROR, Set.of(PIPELINE));
 
+    public static final ProductErrorDefinition PIPELINE_CLEAR_UNPROVEN =
+            DEFINITIONS.define(45, Severity.ERROR, Set.of(PIPELINE));
+
     private IoErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

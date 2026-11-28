@@ -546,7 +546,8 @@ class MongoValidationIndependentPreparationIT {
             if (!composed) {
                 // Historical validation-only layout; it has no AI configuration component.
                 SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"),
-                        new Document("$set", new Document("installedVersion", 1)));
+                        new Document("$set", new Document("installedVersion", 1))
+                                .append("$unset", new Document("firstClearingStop", "").append("componentVersion", "")));
                 SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(configDb).drop();
             }
             var master = new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://business.invalid/master"), null, null, null, null);
@@ -560,7 +561,7 @@ class MongoValidationIndependentPreparationIT {
                 for (var table : List.of(SystemCollections.VALIDATION_TASKS, SystemCollections.VALIDATION_REPORTS, SystemCollections.VALIDATION_DIFFERENCES)) table.prepareCollectionOn(configDb, session);
             }
             for (var table : MongoValidationSchema.CONFIG) for (var index : table.indexes()) IndexEnsure.ensure(configDb, table.on(configDb), index);
-            SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"), new Document("$set", new Document("installedVersion", composed ? 3 : 2)
+            SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"), new Document("$set", new Document(composed ? "componentVersion" : "installedVersion", composed ? 3 : 2)
                     .append("validation", MongoValidationSchema.marker("fixture", "READY", 1, scope))));
             cacheDomain = MongoCacheDomain.connect(cacheConnection, Duration.ofSeconds(5), "validation-independent-fixture");
             cacheDomain.prepareAuth(new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, scope.cacheIncarnation(), 1), "auth", () -> {});
