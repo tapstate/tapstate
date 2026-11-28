@@ -280,15 +280,17 @@ class BenchmarkRunIT {
         String sourceName = namespace + "_src";
         String targetName = namespace + "_tgt";
         Path seeds = Files.createDirectory(folder.resolve("runtime-input"));
-        boolean mapLatency = text(definition, "id").equals("map.live.basic.standard");
+        String caseId = text(definition, "id");
+        boolean mapLatency = caseId.equals("map.live.basic.standard");
+        boolean jsLatency = caseId.equals("js.live.basic.standard");
         boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && text(definition, "mode").equals("live-latency")
-                && (mapLatency || text(definition, "spec").equals("specs/copy-basic.json") && operators == null);
-        String caseId = text(definition, "id");
+                && (mapLatency || jsLatency || text(definition, "spec").equals("specs/copy-basic.json") && operators == null);
         boolean filteredBacklog = caseId.equals("filter.backlog.basic.standard");
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
-                        "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
+                        "union.backlog.basic.standard", "map.backlog.basic.standard",
+                        "js.backlog.basic.standard").contains(caseId));
         boolean snapshotMode = text(definition, "mode").equals("snapshot");
         String spec = text(definition, "spec");
         boolean operatorSnapshot = operators != null && snapshotMode
@@ -326,7 +328,11 @@ class BenchmarkRunIT {
             byte[] original = Files.readAllBytes(artifact);
             Files.write(connector, backlogProbe ? ObservedMongoConnectorJar.buildBacklogProbe(original, witness, delegate)
                     : ObservedMongoConnectorJar.buildLatencyProbe(original, witness, delegate));
-            String latencyProtocol = mapLatency ? BenchmarkLatencyProbe.MAP_PROTOCOL : BenchmarkLatencyProbe.PROTOCOL;
+            String latencyProtocol = switch (caseId) {
+                case "map.live.basic.standard" -> BenchmarkLatencyProbe.MAP_PROTOCOL;
+                case "js.live.basic.standard" -> BenchmarkLatencyProbe.JS_PROTOCOL;
+                default -> BenchmarkLatencyProbe.PROTOCOL;
+            };
             evidence.result.put(backlogProbe ? "backlog_probe" : "latency_probe",
                     Map.of("protocol", backlogProbe ? BenchmarkBacklogProbe.PROTOCOL : latencyProtocol,
                     "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
