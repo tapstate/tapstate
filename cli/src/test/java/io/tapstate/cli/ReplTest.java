@@ -4671,15 +4671,16 @@ class ReplTest {
                 .containsExactly("jwt-tok@http://node1:7900 stop pl1 purgeState=true");
     }
 
-    @Test
-    void restartRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind() {
-        // The one ordering the product concedes it cannot make atomic: the stop went through, so the
-        // position is already gone, and the start is then refused. Nothing here can undo that, which is
-        // exactly why what it says has to be right.
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void restartRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind(boolean confirmed) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcomeByVerb.put("stop", new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc"));
         client.lifecycleOutcomeByVerb.put(
                 "start", new LifecycleOutcome.Rejected("lifecycle.artifact-missing", "No such pipeline."));
+        client.statusOutcome = confirmed
+                ? new StatusOutcome.NoObservation(new StatusOutcome.StopDetails("CLEARED", null, null, Map.of()))
+                : new StatusOutcome.NoObservation();
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         h.repl().dispatch("restart pl1 --rerun -y");
@@ -4690,11 +4691,12 @@ class ReplTest {
                 "jwt-tok@http://node1:7900 stop pl1 purgeState=true",
                 "jwt-tok@http://node1:7900 start pl1");
 
-        // All three, because a reader told only the first is told the least useful of them.
         String out = h.sink().toString();
-        assertThat(out).contains("was stopped and its state cleared");
-        assertThat(out).contains("no position to resume from");
-        assertThat(out).contains("reads the whole source");
+        if (confirmed) {
+            assertThat(out).contains("state is cleared. Start it with: tapstate start pl1");
+        } else {
+            assertThat(out).contains("clear result is unconfirmed").doesNotContain("state is cleared", "Start it with");
+        }
     }
 
     @Test
@@ -4917,6 +4919,7 @@ class ReplTest {
     @ValueSource(strings = {"409", "412"})
     void aRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind(String status) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = new StatusOutcome.NoObservation(new StatusOutcome.StopDetails("CLEARED", null, null, Map.of()));
         client.startChecksByIntent.put("rerun", new StartChecksOutcome.Found(StartChecks.parse(StartCheckReports
                 .withIntent(StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders")),
                         "RERUN"))));
@@ -4939,8 +4942,32 @@ class ReplTest {
                 .contains(status.equals("409") ? "lifecycle.start-blocked" : "pipeline.version-conflict")
                 // a report that changed since the questions were asked is shown: it is why the start refused
                 .contains(status.equals("409") ? "and on_full_load is fail." : "pl1 changed")
-                .contains("restart: pl1 was stopped and its state cleared, but it has not been started")
+                .contains("restart: pl1 state is cleared.")
                 .contains("Start it with: tapstate start pl1");
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rerunReportsTheClearingFailureBeforeAnyRetryInstructions(boolean supportsChecks) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcomeByVerb.put("stop", new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc"));
+        client.lifecycleOutcomeByVerb.put("start", new LifecycleOutcome.Rejected("TS0480015", "Start is fenced"));
+        if (supportsChecks) {
+            client.startChecksByIntent.put("rerun", new StartChecksOutcome.Found(StartChecks.parse(StartCheckReports
+                    .withIntent(StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders")),
+                            "RERUN"))));
+            client.startAttempts.add(new StartAttempt.Rejected("TS0480015", Map.of(), "Start is fenced", List.of()));
+        }
+        client.statusOutcome = new StatusOutcome.NoObservation(new StatusOutcome.StopDetails(
+                "CLEARING", "io.clear-result-test", "Retain the original clearing evidence", Map.of("pipeline", "pl1")));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        assertThat(h.sink().toString()).contains("Retain the original clearing evidence")
+                .doesNotContain("is still clearing", "state is cleared", "Start it with");
         assertThat(h.repl().lastExitCode()).isNotZero();
     }
 

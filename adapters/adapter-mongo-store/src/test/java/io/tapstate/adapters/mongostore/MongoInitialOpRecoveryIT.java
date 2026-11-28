@@ -98,7 +98,7 @@ class MongoInitialOpRecoveryIT {
             var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
             f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
             try (var ready = MongoConfigurationDomain.openExisting(f.settings); var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
-                assertThat(ready.schemaVersion()).isEqualTo(3);
+                assertThat(ready.schemaVersion()).isEqualTo(4);
                 var configDb = raw.getDatabase(f.configName);
                 MongoConfigurationAiProviderSettingsStore.verifyStructure(configDb);
                 MongoValidationSchema.requireReady(configDb, true);

@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -10,6 +12,9 @@ import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.SystemEnvironmentPropertySource;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mockStatic;
 
 class MigrateCommandCloudConfigTest {
 
@@ -70,6 +75,40 @@ class MigrateCommandCloudConfigTest {
         assertThat(complete.exitCode()).isZero();
         assertThat(complete.err()).isEmpty();
         assertThat(complete.out()).contains("V1BaselineIndexes");
+    }
+
+    @Test
+    void firstClearingStopActivationUsesTheConfiguredClusterAndReportsReplay() {
+        String[] args = {"migrate", "--enable-first-clearing-stop",
+                "--tapstate.cloud.base-url=https://cloud.example",
+                "--tapstate.cloud.token=sentinel-token",
+                "--tapstate.cloud.atlas-uri=mongodb://user:sentinel-password@atlas.example/metadata",
+                "--tapstate.cloud.cluster-id=migrate-cluster"};
+        try (var configuration = mockStatic(MongoConfigurationDomain.class)) {
+            configuration.when(() -> MongoConfigurationDomain.enableFirstClearingStop(
+                    any(MongoConnectionSettings.class), eq("migrate-cluster"))).thenReturn(true, false);
+            var activated = run(args);
+            assertThat(activated.exitCode()).isZero();
+            assertThat(activated.out()).contains("First clearing Stop enabled.");
+            assertThat(activated.err()).isEmpty();
+            var replay = run(args);
+            assertThat(replay.exitCode()).isZero();
+            assertThat(replay.out()).contains("First clearing Stop is already enabled.");
+            assertThat(replay.err()).isEmpty();
+        }
+    }
+
+    @Test
+    void firstClearingStopActivationRefusesEveryOtherMigrationModeBeforeOpeningConfig() {
+        try (var configuration = mockStatic(MongoConfigurationDomain.class)) {
+            for (String mode : java.util.List.of("--status", "--dry-run", "--list",
+                    "--prepare-config-component-identity")) {
+                var conflict = run("migrate", "--enable-first-clearing-stop", mode);
+                assertThat(conflict.exitCode()).isEqualTo(1);
+                assertThat(conflict.err()).contains("Choose either CONFIG component preparation");
+            }
+            configuration.verifyNoInteractions();
+        }
     }
 
     private static Output run(ConfigurableEnvironment environment, String... args) {
