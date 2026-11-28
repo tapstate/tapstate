@@ -17,12 +17,6 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
 import io.tapstate.testsupport.RequiresDocker;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -347,6 +341,7 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private void storageOutage(boolean together) throws Exception {
+        Path connectorDirectory = work.resolve(together ? "plugins" : "connectors");
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String cluster = "outage-" + suffix, configDb = "outage_cfg_" + suffix, cacheDb = "outage_cache_" + suffix;
         String configUri = (together ? CACHE : CONFIG).getReplicaSetUrl(configDb);
@@ -368,11 +363,11 @@ class ThreeLayerRestartContinuationIT {
             Document originalChain;
             boolean paused = false;
             try {
-                var first = start(configUri, cluster, together ? work.resolve("plugins") : null);
+                var first = start(configUri, cluster, connectorDirectory);
                 try (first) {
                     var control = login(first);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-                    var resources = resources(sourceUri, false, "views", together);
+                    var resources = resources(sourceUri, false, "views", true);
                     resources.put("views.tap.yml", control.artifact("views").orElseThrow().canonicalForm());
                     control.apply(resources); control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
                     control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -388,7 +383,6 @@ class ThreeLayerRestartContinuationIT {
                     originalConfiguration = installationFacts(configuration);
                     assertThat(chains.countDocuments()).isOne(); originalChain = chains.find().first();
                     assertThat(originalChain.get("checkpoint", Document.class)).isNotEmpty();
-                    long outageLogOffset = together ? 0 : Files.size(first.output());
                     CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec(); paused = true;
                     mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
                     mongo.delete(source, TABLE, Map.of("id", 3L));
@@ -399,8 +393,11 @@ class ThreeLayerRestartContinuationIT {
                         assertThat(Document.parse(entry.body()))
                                 .containsEntry("entry", "UNAVAILABLE").containsEntry("businessReady", false);
                     } else {
-                        Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
-                                () -> recordedNodeSessionLoss(first.output(), outageLogOffset), first::tail);
+                        // The single-node OP session belongs to the process even while CACHE is unavailable.
+                        Await.until("the original process to refuse a CACHE-backed cluster read", Duration.ofSeconds(45),
+                                () -> control.clusterReadRefusal().filter(
+                                        io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code()::equals).isPresent(),
+                                first::tail);
                     }
                     assertThat(first.isAlive()).isTrue();
                     if (!together) {
@@ -411,7 +408,8 @@ class ThreeLayerRestartContinuationIT {
                 assertThat(first.isAlive()).isFalse();
                 java.util.function.Consumer<RealProcessServer> verifyResume = resumed -> {
                     var control = login(resumed);
-                    awaitRows(mongo, source, target, "all outage changes to resume after normal login");
+                    awaitRows(mongo, source, target, "all outage changes to resume after normal login",
+                            together ? BOUND : Duration.ofSeconds(120));
                     Await.answered("the original target position to advance after restoration", BOUND,
                             () -> control.durablePosition(PIPELINE, TABLE).filter(value -> !value.equals(acknowledged)));
                     mongo.insert(source, TABLE, List.of(Map.of("id", 9L, "seq", 999L)));
@@ -422,7 +420,7 @@ class ThreeLayerRestartContinuationIT {
                     assertThat(configuration.getCollection("operator_generations").find(new Document("_id", PIPELINE)).first())
                             .containsEntry("stateGeneration", 1L);
                 };
-                try (var blocked = start(configUri, cluster, together ? work.resolve("plugins") : null)) {
+                try (var blocked = start(configUri, cluster, connectorDirectory)) {
                     var entry = http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
                             .timeout(Duration.ofSeconds(30)).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
                     assertThat(entry.statusCode()).isEqualTo(200);
@@ -446,7 +444,7 @@ class ThreeLayerRestartContinuationIT {
                     if (!together) verifyResume.accept(blocked);
                 }
                 // A process that could not load CONFIG has no authenticated local context to retry.
-                if (together) try (var restored = start(configUri, cluster, work.resolve("plugins"))) { verifyResume.accept(restored); }
+                if (together) try (var restored = start(configUri, cluster, connectorDirectory)) { verifyResume.accept(restored); }
             } finally {
                 if (paused) CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();
             }
@@ -540,21 +538,11 @@ class ThreeLayerRestartContinuationIT {
         return start(configUri, cluster, null);
     }
 
-    private RealProcessServer start(String configUri, String cluster, Path stagingDirectory) {
-        return RealProcessServer.startPrepared(configUri, "127.0.0.1", stagingDirectory, port -> List.of(
+    private RealProcessServer start(String configUri, String cluster, Path connectorDirectory) {
+        return RealProcessServer.startPrepared(configUri, "127.0.0.1", connectorDirectory, port -> List.of(
                 "--tapstate.cluster.id=" + cluster, "--tapstate.cluster.node-id=restart-node",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.connectors.seed-dir=" + work.resolve("no-seeds")));
-    }
-
-    private static boolean recordedNodeSessionLoss(Path output, long outageLogOffset) {
-        try (var input = Files.newInputStream(output);
-             var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
-            input.skipNBytes(outageLogOffset);
-            return reader.lines().anyMatch(line -> line.contains("Node session lost:"));
-        } catch (IOException e) {
-            throw new UncheckedIOException("could not read server output at " + output, e);
-        }
     }
 
     private static ControlPlane login(RealProcessServer server) {
@@ -574,7 +562,12 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private static void awaitRows(MongoEndpoints mongo, EndpointAddress source, EndpointAddress target, String phase) {
-        Await.until(phase, BOUND, () -> rows(mongo, target).equals(rows(mongo, source)), () -> "target=" + rows(mongo, target));
+        awaitRows(mongo, source, target, phase, BOUND);
+    }
+
+    private static void awaitRows(MongoEndpoints mongo, EndpointAddress source, EndpointAddress target, String phase,
+                                  Duration timeout) {
+        Await.until(phase, timeout, () -> rows(mongo, target).equals(rows(mongo, source)), () -> "target=" + rows(mongo, target));
     }
 
     private static Map<Long, Long> rows(MongoEndpoints mongo, EndpointAddress endpoint) {

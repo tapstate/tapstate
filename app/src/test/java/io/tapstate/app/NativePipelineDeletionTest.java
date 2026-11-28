@@ -8,6 +8,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -15,6 +16,39 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class NativePipelineDeletionTest {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aWaitingDeleteRecognizesTheOriginalSameGenerationResult(boolean unproven) {
+        var configuration = mock(MongoConfigurationDomain.class, RETURNS_DEEP_STUBS);
+        var cache = mock(MongoCacheDomain.class, RETURNS_DEEP_STUBS);
+        var original = new PipelineResource("pipeline", null, List.of(), null, null, null, null, null);
+        var hash = CanonicalHash.of(original);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "pipeline", 1);
+        var mapping = new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.ACTIVE, null);
+        var pending = new PipelineIntentSnapshot(scope, 7, new io.tapstate.core.lifecycle.DesiredState(
+                "pipeline", io.tapstate.core.lifecycle.PipelineState.STOPPED, hash, true));
+        var cleared = new PipelineIntentSnapshot(scope, 8, new io.tapstate.core.lifecycle.DesiredState(
+                "pipeline", io.tapstate.core.lifecycle.PipelineState.STOPPED, hash));
+        when(configuration.pipelineStates().read("pipeline")).thenReturn(Optional.of(mapping));
+        when(configuration.pipelineState(eq("pipeline"), any())).thenReturn(Optional.of(mapping));
+        when(configuration.intents().load("pipeline")).thenReturn(Optional.of(pending), Optional.of(cleared));
+        var result = unproven ? PipelineIntentStore.FirstClearResult.UNPROVEN : PipelineIntentStore.FirstClearResult.CLEARED;
+        when(configuration.intents().firstClearResult(eq(pending), any(Duration.class))).thenReturn(Optional.empty(), Optional.of(result));
+        when(configuration.preparations().read("pipeline")).thenReturn(Optional.of(
+                new PipelinePreparation("pipeline", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null)));
+        when(configuration.artifacts().get("pipeline")).thenReturn(Optional.of(original));
+        var node = mock(WorkloadClaimFence.class);
+        var deletion = new NativePipelineDeletion(configuration, cache, new CacheBusinessScope("cluster", 1, "cache"),
+                mock(PipelineActuationOwnership.class), () -> node, () -> {}, mock(Engine.class),
+                mock(EngineLifecycleActuator.class), mock(HazelcastOperatorReadiness.class),
+                mock(HazelcastExecutionPlans.class), mock(ConnectorProvisioner.class));
+        if (unproven) assertThatThrownBy(() -> deletion.prepare(original, hash)).isInstanceOfSatisfying(
+                TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_CLEAR_UNPROVEN));
+        else assertThat(deletion.prepare(original, hash)).isNotNull();
+        verify(configuration).pipelineState(eq("pipeline"), any());
+        verify(configuration, never()).requireCompletedStopPurge(any(), any(), any());
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"none", "operation", "owner", "intent", "mongo-proof", "interrupted"})
     void onlyTheConfirmedPurgeSuccessorCanBeSelectedForDeletion(String change) {

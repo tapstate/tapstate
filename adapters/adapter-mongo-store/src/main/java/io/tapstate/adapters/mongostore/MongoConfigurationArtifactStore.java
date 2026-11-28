@@ -93,6 +93,10 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return bindings.load().map(io.tapstate.spi.store.StorageBinding::defaultSourceId);
     }
 
+    List<String> artifactIdCollections() {
+        return collections.values().stream().map(collection -> collection.getNamespace().getCollectionName()).toList();
+    }
+
     private static MongoCollection<Document> durable(MongoCollection<Document> collection) {
         return collection.withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));

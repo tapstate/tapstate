@@ -10,6 +10,7 @@ import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.spi.store.PipelineDraftSummary;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -40,6 +41,13 @@ class PipelineDraftController {
     PipelineDraftController(ObjectProvider<PipelineDraftService> service, ObjectMapper json) {
         this.service = Objects.requireNonNull(service, "service");
         this.json = Objects.requireNonNull(json, "json");
+    }
+
+    @Verb("pipeline.id-availability")
+    @GetMapping("/pipelines:id-availability")
+    ResponseEntity<Map<String, Boolean>> idAvailability(@RequestParam(name = "id", required = false) String id) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(Map.of("available", service().idAvailable(id)));
     }
 
     @Verb("pipeline-draft.list")
