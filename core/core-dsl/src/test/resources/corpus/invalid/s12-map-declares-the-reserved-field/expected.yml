@@ -1,0 +1,3 @@
+rule: reserved-field-declared
+path: fields.__tap
+note: "a map step naming an output field with the one top-level name reserved for product data"

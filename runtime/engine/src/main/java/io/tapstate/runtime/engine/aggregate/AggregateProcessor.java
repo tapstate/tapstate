@@ -6,6 +6,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.metrics.Metrics;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.ReservedField;
 import io.tapstate.core.dsl.AggregateRow;
 import io.tapstate.core.dsl.aggregate.AggregateDefinition;
 import io.tapstate.core.dsl.aggregate.AggregateError;
@@ -60,10 +61,6 @@ import java.util.Objects;
  * last had and a marker saying so, and every other group carries on.
  */
 public final class AggregateProcessor extends AbstractProcessor implements Staged {
-
-    /** The reserved field a held group's marker travels under, and the name it is filed under inside it. */
-    static final String MARKER_FIELD = "__tap";
-    static final String MARKER_OWNER = "aggregate";
 
     /**
      * How often stored rows are swept for what a second delivery can no longer need.
@@ -549,8 +546,10 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         marker.put("failed_since", java.time.Instant.ofEpochMilli(outcome.failedSince()).toString());
         marker.put("last_good_at", outcome.lastGood() == null ? null
                 : java.time.Instant.ofEpochMilli(outcome.lastGoodAt()).toString());
-        row.put(MARKER_FIELD, Map.of(MARKER_OWNER, Map.of(step, java.util.Collections.unmodifiableMap(marker))));
-        return Envelope.insert(ts, step, row, null);
+        // Filed under the step's id, because two steps can mark one row once both are embedded in a document.
+        Map<String, Object> marked = ReservedField.with(row, ReservedField.Owner.AGGREGATE,
+                Map.of(step, java.util.Collections.unmodifiableMap(marker)));
+        return Envelope.insert(ts, step, marked, null);
     }
 
     @Override

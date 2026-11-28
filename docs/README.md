@@ -40,6 +40,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
 | [Soft delete](soft-delete/) | Keep a deleted row in the target, or a deleted child in its document, marked deleted instead of removed. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
+| [Reserved row field](reserved-field/) | The one field Tapstate adds to rows, what a target receives under it, how to strip it, and how a source column of the same name is renamed. |
 | [Observability](observability/) | Read current state, bounded output-rate and lag history, and one shared evidence-backed explanation. |
 | [Error diagnostics](diagnostics/) | Candidate request-error definitions, translations, compatibility boundaries and contract checks. |
 | [Start checks](start-checks/) | What a start looks at before it writes anything, how its questions are answered from each client, and how a new check is added. |

@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.common.ReservedField;
 import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -449,9 +450,31 @@ public final class RowExpressions {
     private static String checkedExpressionError(CelAbstractSyntaxTree ast) {
         String diagnostic = indexedRow(ast);
         if (diagnostic == null) {
+            diagnostic = reservedField(ast);
+        }
+        if (diagnostic == null) {
             diagnostic = zoneError(ast);
         }
         return diagnostic == null ? DecimalComparisonFunctions.validationError(ast) : diagnostic;
+    }
+
+    /**
+     * The diagnostic for reading the one row field the product reserves for its own data, or null when
+     * the expression does not. No customer column carries that name once it has been captured, so a
+     * read of it could only see the product's bookkeeping, and nothing an author writes may depend on
+     * that. An indexed read is refused before this, which leaves a named access the only way in.
+     */
+    private static String reservedField(CelAbstractSyntaxTree ast) {
+        return CelNavigableAst.fromAst(ast).getRoot().allNodes()
+                .filter(node -> node.getKind() == CelExpr.ExprKind.Kind.SELECT)
+                .map(node -> node.expr().select())
+                .filter(select -> ReservedField.is(select.field())
+                        && select.operand().getKind() == CelExpr.ExprKind.Kind.IDENT
+                        && (select.operand().ident().name().equals(AFTER)
+                                || select.operand().ident().name().equals(BEFORE)))
+                .findFirst()
+                .map(select -> "the field " + select.field() + " is reserved and cannot be read")
+                .orElse(null);
     }
 
     /**

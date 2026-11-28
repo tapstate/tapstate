@@ -142,5 +142,9 @@
   "TS0010036": {
     "message": "The embed at {path} is `as: rollup` but declares no `rollup:` fields, so it would be held and never shown.",
     "solution": "Add the fields to compute over it under `rollup:`, or declare it `as: array` to render its rows."
+  },
+  "TS0010037": {
+    "message": "Step {step} declares an output field named {field}, a name Tapstate reserves for its own data on a row.",
+    "solution": "Give the field another name. Whatever writes a row to a target removes the reserved field, so a column declared under that name would never arrive."
   }
 }

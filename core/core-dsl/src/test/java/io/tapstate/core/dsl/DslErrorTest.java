@@ -56,6 +56,8 @@ class DslErrorTest {
                 // document, so both are witnessed by an ordinary corpus case
                 "TS0010024",
                 "TS0010025",
+                // a step output field taking the name kept for product-added row data
+                "TS0010037",
                 // Source columns are available during assembly, not offline corpus validation.
                 "TS0010027",
                 // the write-target gate: which connectors may be written to is a property of the

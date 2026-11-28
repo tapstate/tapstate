@@ -495,7 +495,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                                     selected.add(actual);
                                 }
                                 var actual = new LinkedHashMap<String, SourceTable>();
-                                for (SourceTable model : PdkSchemaDiscoverer.structuralModel(selected).tables()) actual.put(model.name(), model);
+                                for (SourceTable model : PdkSchemaDiscoverer.enteredModel(config.connectorId(), selected).tables()) actual.put(model.name(), model);
                                 if (!actual.containsKey(table)) throw snapshotPreparationUnavailable(config, "the table is outside the prepared selection");
                                 snapshotPreparer.prepare(preparation, seam, Map.copyOf(actual));
                             }
@@ -1434,7 +1434,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 selected.add(actual);
             }
             var actual = new LinkedHashMap<String, SourceTable>();
-            for (SourceTable model : PdkSchemaDiscoverer.structuralModel(selected).tables()) {
+            for (SourceTable model : PdkSchemaDiscoverer.enteredModel(config.connectorId(), selected).tables()) {
                 actual.put(model.name(), model);
             }
             streamPreparer.prepare(Map.copyOf(actual));
@@ -1639,7 +1639,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
         List<Envelope> decoded = new ArrayList<>(changes.size());
         for (TapEvent change : changes) {
-            decoded.add(TapEventCodec.decodeChange(change, connector.conversions(), declaredTypes(declared, change)));
+            // A source column carrying the reserved field name enters under its new name here, where a
+            // change becomes a row, so nothing after this point ever sees the reserved name on a customer column.
+            decoded.add(ReservedColumn.entered(connector.connectorId(),
+                    TapEventCodec.decodeChange(change, connector.conversions(), declaredTypes(declared, change))));
         }
         listener.onBatch(decoded, position(connector, offset));
     }
@@ -1959,6 +1962,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             throw new TapstateException(ConnectorError.PROJECTION_FAILED,
                     Map.of(CONNECTOR, connector.connectorId(), DETAIL, detail(e)), e);
         }
+        // Outside the conversion above, so a second collision keeps its own code and is not reported
+        // as a row the connector could not project.
+        rows.replaceAll(row -> ReservedColumn.entered(connector.connectorId(), row));
         return rows;
     }
 

@@ -52,6 +52,8 @@ public final class DslErrorDefinitions {
     public static final ProductErrorDefinition ROLLUP_LEVEL_WITHOUT_FIELDS =
             DEFINITIONS.define(36, Severity.ERROR, Set.of("path"));
 
+    public static final ProductErrorDefinition RESERVED_FIELD_DECLARED = error(37, "step", "field");
+
     private DslErrorDefinitions() {}
 
     private static ProductErrorDefinition error(int serial, String... parameters) {
