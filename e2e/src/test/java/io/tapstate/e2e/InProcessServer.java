@@ -270,6 +270,11 @@ final class InProcessServer implements ServerHandle {
         return cancelled;
     }
 
+    void awaitObservationWorkersIdle() {
+        ObservationWorkerFixture.awaitIdle(refreshedContexts.stream()
+                .filter(owner -> owner.isActive() && belongsToThisServer(owner)).toList());
+    }
+
     /** The real scheduled pass, for a case that controls its storage interleaving. */
     Runnable publishingObservations() {
         var passes = new java.util.ArrayList<Object>();

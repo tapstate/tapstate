@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import java.util.Map;
+
 /**
  * The outcome of a remote pipeline status read ({@code GET /api/pipelines/{id}/status}). Either the read
  * found the pipeline's latest observed lifecycle state, the known pipeline has not published an observation,
@@ -10,6 +12,19 @@ package io.tapstate.cli;
  * as its wire string.
  */
 sealed interface StatusOutcome {
+
+    /** Clearing Stop can have a result or diagnostic before there is a runtime observation. */
+    record StopDetails(String state, String failureCode, String failureMessage, Map<String, Object> failureParams) {
+        static final StopDetails UNKNOWN = new StopDetails(null, null, null, Map.of());
+
+        public StopDetails {
+            failureParams = java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(failureParams));
+        }
+    }
+
+    default StopDetails stopDetails() {
+        return StopDetails.UNKNOWN;
+    }
 
     /**
      * The read found the pipeline's lifecycle state (its wire name, e.g. {@code RUNNING}), the coded reason
@@ -29,11 +44,21 @@ sealed interface StatusOutcome {
      */
     record Found(String pipelineId, String state, String failureCode, String failureMessage,
             Long observedAgeMillis, java.util.Map<String, Object> failureParams,
-            java.util.Map<String, Object> diagnostic) implements StatusOutcome {
+            java.util.Map<String, Object> diagnostic, String stopState) implements StatusOutcome {
         public Found {
             failureParams = failureParams == null ? java.util.Map.of()
                     : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(failureParams));
             diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.fit(diagnostic);
+        }
+
+        Found(String pipelineId, String state, String failureCode, String failureMessage,
+                Long observedAgeMillis, Map<String, Object> failureParams, Map<String, Object> diagnostic) {
+            this(pipelineId, state, failureCode, failureMessage, observedAgeMillis, failureParams, diagnostic, null);
+        }
+
+        @Override
+        public StopDetails stopDetails() {
+            return new StopDetails(stopState, failureCode, failureMessage, failureParams);
         }
 
         Found(String pipelineId, String state, String failureCode, String failureMessage, Long observedAgeMillis) {
@@ -56,7 +81,10 @@ sealed interface StatusOutcome {
     }
 
     /** A current aggregate status response identified a known pipeline with no runtime observation yet. */
-    record NoObservation() implements StatusOutcome {
+    record NoObservation(StopDetails stopDetails) implements StatusOutcome {
+        NoObservation() {
+            this(StopDetails.UNKNOWN);
+        }
     }
 
     /** The server could not be reached (connection refused, timeout, or a malformed target). */

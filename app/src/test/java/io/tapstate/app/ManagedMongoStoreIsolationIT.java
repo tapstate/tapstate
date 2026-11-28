@@ -7,6 +7,8 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
 import io.tapstate.adapters.mongostore.MigrationError;
+import io.tapstate.adapters.mongostore.MongoStructureInspection;
+import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.core.model.SourceResource;
@@ -133,14 +135,22 @@ class ManagedMongoStoreIsolationIT {
             String prepared; String importId; Map<?,?> receipt;
             try (var application = transferRoot(to)) {
                 var client = transferClient(application, to.username(), to.password());
+                var runtime = application.getBean(StorageRoot.class).runtime();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).until(runtime::businessStarted);
                 assertThatThrownBy(() -> client.post().uri("/api/configuration/import/preflight").body(Map.of("transfer", exported.get("transfer"),
                         "transferKey", key, "defaultSourceMapping", Map.of())).retrieve().toBodilessEntity())
-                        .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
+                            assertThat(failure.getStatusCode()).isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+                            var error = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(failure.getResponseBodyAsString());
+                            assertThat(error.get("code")).isEqualTo(IoError.CONFIGURATION_IMPORT_REFUSED.code());
+                            assertThat(error.get("params")).isEqualTo(Map.of("reason", "original-import-conditions-not-satisfied"));
+                        });
                 assertThat(destinationConfig.getCollection("configuration_imports").countDocuments()).isZero();
                 var preflight = client.post().uri("/api/configuration/import/preflight").body(Map.of("transfer", exported.get("transfer"),
                         "transferKey", key, "defaultSourceMapping", Map.of("views", "views"))).retrieve().body(Map.class);
                 prepared = (String)preflight.get("preparedTransfer");
                 importId = (String)((Map<?,?>)((Map<?,?>)preflight.get("operation")).get("ticket")).get("id");
+                assertThat(importId).isNotBlank();
                 assertThat(destinationConfig.getCollection("pipelines").countDocuments()).isZero();
                 var confirmation = Map.of("importId", importId, "transfer", prepared, "transferKey", key, "defaultSourceMapping", Map.of("views", "views"));
                 receipt = client.post().uri("/api/configuration/import/commit").body(confirmation).retrieve().body(Map.class);
@@ -513,6 +523,10 @@ class ManagedMongoStoreIsolationIT {
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             createUser(admin, user, List.of(config, cache, master)); seedOpBoundary(files, user, config, cache, master, "complete");
             try (var process = installationProcess(files, seeds, "admin-response")) {
+                var client = process.publicClient();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() ->
+                        assertThat(client.get().uri("/auth/storage-entry").retrieve().body(Map.class))
+                                .containsEntry("entry", "FIRST_ADMIN_REQUIRED"));
                 var issued = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 var database = admin.getDatabase(config);
                 var administratorAudit = new Document("operationId", io.tapstate.control.core.ControlOperations.USER_CREATE.id());
@@ -2338,16 +2352,44 @@ class ManagedMongoStoreIsolationIT {
                 .body(Map.of()).retrieve().body(String.class);
         assertThat(((Map<?,?>)io.tapstate.core.common.JsonReader.parse(degraded)).get("businessPhase"))
                 .isEqualTo("AUTH_READY");
-        cache.getCollection("op_sessions").drop();
-        assertThatThrownBy(() -> loginWithoutSession(client))
-                .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                        failure -> assertThat(failure.getStatusCode().value()).isEqualTo(503));
-    }
+        var sessions = SystemCollections.OP_SESSIONS;
+        assertThat(cache.listCollectionNames()).contains(sessions.collectionName());
+        sessions.on(cache).drop();
 
-    private static void loginWithoutSession(org.springframework.web.client.RestClient client) {
-        client.post().uri("/auth/login")
+        Instant beforeLogin = Instant.now();
+        var response = client.post().uri("/auth/login")
                 .body(Map.of("username", "admin", "password", "sentinel-login-password", "createSession", false))
-                .retrieve().body(String.class);
+                .retrieve().toEntity(Map.class);
+        Instant afterLogin = Instant.now();
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        Map<?, ?> credentials = response.getBody();
+        assertThat(credentials).isNotNull();
+        assertThat(List.of("sessionToken", "sessionIdleExpiresAt", "sessionAbsoluteExpiresAt"))
+                .noneMatch(credentials::containsKey);
+        assertThat(credentials.get("token")).isInstanceOfSatisfying(String.class, token -> assertThat(token).isNotBlank());
+        assertThat(Instant.parse((String) credentials.get("accessExpiresAt")))
+                .isBetween(beforeLogin.plus(AccessTokenService.DEFAULT_TTL), afterLogin.plus(AccessTokenService.DEFAULT_TTL));
+        var freshStatus = client.post().uri("/api/storage/status")
+                .header("Authorization", "Bearer " + credentials.get("token")).body(Map.of()).retrieve().body(String.class);
+        assertThat(((Map<?, ?>) io.tapstate.core.common.JsonReader.parse(freshStatus)).get("businessPhase")).isEqualTo("AUTH_READY");
+        assertThat(cache.listCollectionNames()).doesNotContain(sessions.collectionName());
+
+        var observations = new ArrayList<ManagedStorageInspection.Observation>();
+        try (var inspection = new ManagedStorageInspection(java.time.Clock.systemUTC(), () -> true,
+                List.of(new ManagedStorageInspection.Domain(SystemCollections.Database.CACHE,
+                        budget -> current.cache().inspectStructure(current.preparation().authScope(), budget))),
+                observations::add)) {
+            inspection.runOnce();
+        }
+        assertThat(observations).singleElement().satisfies(observation -> {
+            assertThat(observation.complete()).isTrue();
+            assertThat(observation.differences()).anySatisfy(difference -> {
+                assertThat(difference.database()).isEqualTo(cache.getName());
+                assertThat(difference.collection()).isEqualTo(sessions.collectionName());
+                assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.COLLECTION_MISSING);
+            });
+        });
+        assertThat(cache.listCollectionNames()).doesNotContain(sessions.collectionName());
     }
 
     private record NativeRootStores(String config, String cache, String master, String configUser, String masterUser) {}
@@ -2910,13 +2952,31 @@ class ManagedMongoStoreIsolationIT {
             var set = prepareNativeDatabases(admin, "ttl_" + suffix);
             var database = admin.getDatabase(set.cache());
             var history = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(database);
-            long originalSeconds = Duration.ofDays(15).toSeconds(), changedSeconds = Duration.ofDays(7).toSeconds();
-            history.insertOne(new Document("_id", "retained-sample").append("observedAt", java.util.Date.from(Instant.now())));
-            Document sample = history.find().first(); Document originalIndex = history.listIndexes().into(new ArrayList<>()).stream()
-                    .filter(row -> row.containsKey("expireAfterSeconds")).findFirst().orElseThrow();
-            assertThat(((Number) originalIndex.get("expireAfterSeconds")).longValue()).isEqualTo(originalSeconds);
+            var unrelated = database.getCollection("unrelated_history");
+            var originalRetention = Duration.ofDays(15);
+            var changedRetention = Duration.ofDays(7);
+            var business = set.preparation().businessScope();
+            var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), "history_flow", 1);
+            Instant observedAt = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+            var retained = new RateSample(scope.pipelineId(), observedAt, Map.of("records.out", 1L), Map.of(), null);
+            var next = new RateSample(scope.pipelineId(), observedAt.plusMillis(1), Map.of("records.out", 2L), Map.of(), null);
+            try (var first = nativeRoot(uri(set.configUser(), set.config()), work.resolve("no-seeds"))) {
+                prepareHistoryPipeline(first.getBean(StorageRoot.class), set, scope);
+                withHistoryWriter(first.getBean(StorageRoot.class), scope, writer -> writer.append(retained));
+            }
+            Document sample = history.find().first();
+            assertThat(sample).isNotNull();
+            List<Document> originalIndexes = history.listIndexes().into(new ArrayList<>());
+            Document originalIndex = originalIndexes.stream().filter(row -> row.containsKey("expireAfterSeconds")).findFirst().orElseThrow();
+            assertThat(originalIndex.get("expireAfterSeconds", Number.class).longValue()).isEqualTo(originalRetention.toSeconds());
+
+            unrelated.createIndex(new Document("observedAt", 1), new IndexOptions().name(originalIndex.getString("name"))
+                    .expireAfter(originalRetention.toSeconds(), TimeUnit.SECONDS));
+            var unrelatedSample = new Document("_id", "unrelated-sample").append("observedAt", java.util.Date.from(observedAt));
+            unrelated.insertOne(unrelatedSample);
+            List<Document> unrelatedIndexes = unrelated.listIndexes().into(new ArrayList<>());
             var alteration = new Document("collMod", history.getNamespace().getCollectionName()).append("index",
-                    new Document("name", originalIndex.getString("name")).append("expireAfterSeconds", changedSeconds));
+                    new Document("name", originalIndex.getString("name")).append("expireAfterSeconds", changedRetention.toSeconds()));
             try (MongoClient limited = MongoClients.create(uri(set.cacheUser(), set.cache()))) {
                 assertThatThrownBy(() -> limited.getDatabase(set.cache()).runCommand(alteration))
                         .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
@@ -2924,17 +2984,22 @@ class ManagedMongoStoreIsolationIT {
             try (var application = nativeRoot(uri(set.configUser(), set.config()), work.resolve("no-seeds"),
                     "--tapstate.metrics.history.retention=7d")) {
                 var root = application.getBean(StorageRoot.class);
-                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
-                assertThat(root.runtime().businessStarted()).isFalse();
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
                 assertThat(ordinaryLogin(application, true)).isNotNull();
+                assertThat(history.listIndexes().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(originalIndexes);
+                var reader = root.runtime().current().orElseThrow().cache().pipelineRateHistory(scope);
+                assertThat(reader.retention()).isEqualTo(changedRetention);
+                assertHistoryRetentionMismatch(() -> reader.readPage(scope.pipelineId(), observedAt, observedAt.plusSeconds(1), null, 10));
+                withHistoryWriter(root, scope, writer -> assertHistoryRetentionMismatch(() -> writer.append(next)));
             }
-            assertThat(history.listIndexes().into(new ArrayList<>())).contains(originalIndex);
+            assertThat(history.listIndexes().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(originalIndexes);
+            assertThat(history.find().into(new ArrayList<>())).containsExactly(sample);
+
             String role = "alter_history_" + suffix;
             database.runCommand(new Document("createRole", role).append("roles", List.of()).append("privileges", List.of(
                     new Document("resource", new Document("db", set.cache()).append("collection", history.getNamespace().getCollectionName()))
                             .append("actions", List.of("collMod")))));
             admin.getDatabase("admin").runCommand(new Document("grantRolesToUser", set.cacheUser()).append("roles", List.of(new Document("role", role).append("db", set.cache()))));
-            database.getCollection("unrelated_history").createIndex(new Document("observedAt", 1), new IndexOptions().name("observedAt_idx").expireAfter(originalSeconds, TimeUnit.SECONDS));
             // No application is running: maintenance is an explicit database operation between owners.
             try (MongoClient limited = MongoClients.create(uri(set.cacheUser(), set.cache()))) {
                 assertThatThrownBy(() -> limited.getDatabase(set.cache()).runCommand(new Document(alteration).append("collMod", "unrelated_history")))
@@ -2946,11 +3011,65 @@ class ManagedMongoStoreIsolationIT {
                 var root = reopened.getBean(StorageRoot.class);
                 assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
                 assertThat(ordinaryLogin(reopened, true)).isNotNull();
+                withHistoryWriter(root, scope, writer -> writer.append(next));
+                var reader = root.runtime().current().orElseThrow().cache().pipelineRateHistory(scope);
+                assertThat(reader.retention()).isEqualTo(changedRetention);
+                assertThat(reader.readPage(scope.pipelineId(), observedAt, observedAt.plusSeconds(1), null, 10).entries())
+                        .extracting(RateHistoryStore.Entry::sample).containsExactly(retained, next);
             }
-            assertThat(history.find().first()).isEqualTo(sample);
-            assertThat(history.listIndexes().into(new ArrayList<>()).stream().filter(row -> row.containsKey("expireAfterSeconds")).findFirst().orElseThrow()
-                    .get("expireAfterSeconds", Number.class).longValue()).isEqualTo(changedSeconds);
+            List<Document> maintainedIndexes = history.listIndexes().into(new ArrayList<>());
+            Document maintainedIndex = maintainedIndexes.stream()
+                    .filter(index -> originalIndex.getString("name").equals(index.getString("name"))).findFirst().orElseThrow();
+            assertThat(maintainedIndex.get("expireAfterSeconds", Number.class).longValue()).isEqualTo(changedRetention.toSeconds());
+            maintainedIndex.put("expireAfterSeconds", originalIndex.get("expireAfterSeconds"));
+            assertThat(maintainedIndexes).containsExactlyInAnyOrderElementsOf(originalIndexes);
+            assertThat(history.find(new Document("_id", sample.get("_id"))).first()).isEqualTo(sample);
+            assertThat(unrelated.listIndexes().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(unrelatedIndexes);
+            assertThat(unrelated.find().into(new ArrayList<>())).containsExactly(unrelatedSample);
         }
+    }
+
+    private static void prepareHistoryPipeline(StorageRoot root, NativeDatabases set, PipelineIntentScope scope) {
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+        var current = root.runtime().current().orElseThrow();
+        var source = new SourceResource("history_input", null, "mongodb", Map.of("uri", uri(set.masterUser(), set.master())),
+                SourceMode.SNAPSHOT, List.of(TableRef.literal("orders")), null, null);
+        var pipeline = new PipelineResource(scope.pipelineId(), null, List.of(SourceRef.spec(source.id(), false)), null, null, null, null, null);
+        root.runtime().requireConfiguration().artifacts().saveAll(List.of(source, pipeline));
+        var schemas = current.cache().schemas(current.preparation().businessScope(), () -> {});
+        schemas.save(new DiscoveredSourceModel(source.id(), "mongodb", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(new SourceField("id", "bigint",
+                        io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
+        var inputs = SourceModelSnapshot.capture(pipeline.id(), List.of(source), schemas)
+                .preparationInputs(scope, pipeline, pipeline, Map.of(source.id(), source));
+        historyBusinessContext(root).getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
+    }
+
+    private static ConfigurableApplicationContext historyBusinessContext(StorageRoot root) {
+        var business = root.runtime().business().orElseThrow();
+        return (ConfigurableApplicationContext) org.springframework.test.util.ReflectionTestUtils.getField(business, "context");
+    }
+
+    private static void withHistoryWriter(StorageRoot root, PipelineIntentScope scope, java.util.function.Consumer<RateHistoryStore> operation) {
+        var bound = root.runtime().current().orElseThrow();
+        var claims = bound.cache().workloadClaims(bound.preparation().businessScope());
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+        var node = historyBusinessContext(root).getBean(NodeSessionLease.class).currentFence().orElseThrow();
+        var lease = claims.acquireNodeBackedPipeline(scope, node, 1);
+        assertThat(lease.acquired()).isTrue();
+        try {
+            operation.accept(bound.cache().pipelineRateHistory(scope, WorkloadClaimFence.from(lease.claim()), () -> {}));
+        } finally {
+            claims.release(lease.claim());
+        }
+    }
+
+    private static void assertHistoryRetentionMismatch(org.assertj.core.api.ThrowableAssert.ThrowingCallable operation) {
+        assertThatThrownBy(operation).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(StoreError.HISTORY_RETENTION_MISMATCH);
+            assertThat(failure.args()).containsEntry("configuredSeconds", Duration.ofDays(7).toSeconds())
+                    .containsEntry("storedSeconds", Duration.ofDays(15).toSeconds());
+        });
     }
 
     @Test
@@ -3149,7 +3268,7 @@ class ManagedMongoStoreIsolationIT {
     }
     private static void assertComposedConfiguration(MongoDatabase configuration, MongoDatabase cache, String operation) {
         var schema = configuration.getCollection("schema_migrations").find(new Document("_id", "config")).first();
-        assertThat(schema.getInteger("installedVersion")).isEqualTo(3);
+        assertThat(schema).containsEntry("installedVersion", 4).containsEntry("componentVersion", 3);
         var marker = schema.get("validation", Document.class);
         assertThat(marker).containsEntry("phase", "READY").containsEntry("initializedPipelines", 0L);
         assertThat(UUID.fromString(marker.getString("operationId")).toString()).isEqualTo(marker.getString("operationId"));

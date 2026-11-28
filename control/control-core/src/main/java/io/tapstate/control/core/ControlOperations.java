@@ -299,6 +299,9 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LAYOUT_UPDATE = new Operation(
             "pipeline.layout.update", Scope.WRITE, false, null,
             "Replace editor-only node positions and viewport state for one Pipeline.", CLI_ONLY);
+    public static final Operation PIPELINE_ID_AVAILABILITY = new Operation(
+            "pipeline.id-availability", Scope.WRITE, false, null,
+            "Check whether a new Pipeline ID is unoccupied, without reserving it.", REST_ONLY);
     public static final Operation PIPELINE_CREATE = new Operation(
             "pipeline.create", Scope.WRITE, true, null,
             "Create one Pipeline definition after its referenced Sources and composition have been validated.",
@@ -537,6 +540,7 @@ public final class ControlOperations {
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,
             PIPELINE_LAYOUT_UPDATE,
+            PIPELINE_ID_AVAILABILITY,
             PIPELINE_CREATE,
             PIPELINE_UPDATE,
             PIPELINE_DRAFT_LIST,

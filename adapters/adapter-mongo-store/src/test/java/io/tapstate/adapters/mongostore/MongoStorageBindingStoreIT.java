@@ -21,6 +21,8 @@ import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -51,6 +53,38 @@ class MongoStorageBindingStoreIT {
     private static final StorageBinding.Connection CACHE = new StorageBinding.Connection(
             StorageBinding.Connection.Kind.MONGODB, "mongodb://cache-user:cache-secret@cache.invalid/cache?tls=true",
             "cache", "CA-material-sentinel");
+
+    @ParameterizedTest
+    @ValueSource(strings = {"listIndexes", "find"})
+    void setupObservationBoundsTheIndexReadAndSnapshot(String delayedCommand) {
+        withPrepared(f -> {
+            var initial = f.domain.bindings().commitWithFirstCache(
+                    SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            f.domain.bindings().complete(SCOPE);
+            var processId = UUID.randomUUID().toString();
+            var settings = new MongoConnectionSettings(f.settings.uri(), null, Duration.ofSeconds(5), processId);
+            try (var observer = MongoConfigurationDomain.open(settings, SCOPE.clusterId())) {
+                var admin = f.admin.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of(delayedCommand))
+                                .append("appName", MongoConnection.processTag(processId))
+                                .append("blockConnection", true).append("blockTimeMS", 4000)));
+                try {
+                    long started = System.nanoTime();
+                    assertThatThrownBy(() -> observer.storageSetupView(new MongoReadBudget(Duration.ofMillis(500))))
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    failure -> assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                    assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
+                } finally {
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+                var view = observer.storageSetupView(new MongoReadBudget(Duration.ofSeconds(2)));
+                assertThat(view.binding()).contains(initial.binding());
+                assertThat(view.cachePreparation()).contains(initial.preparation());
+                assertThat(view.status().phase()).isEqualTo(io.tapstate.spi.store.StorageSetupStateStore.Phase.COMPLETE);
+            }
+        });
+    }
 
     @Test void requestPublicationReadsOneSnapshotAndDoesNotAuditBusinessBodies() {
         withPrepared(f -> {

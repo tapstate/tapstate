@@ -41,6 +41,7 @@ final class MigrateCommand {
     private static final String DRY_RUN = "--dry-run";
     private static final String LIST = "--list";
     private static final String PREPARE_COMPONENT_IDENTITY = "--prepare-config-component-identity";
+    private static final String ENABLE_FIRST_CLEAR = "--enable-first-clearing-stop";
 
     /** Exit code when a coded diagnostic was reported, matching the rest of the binary. */
     private static final int EXIT_CODED_DIAGNOSTIC = 1;
@@ -75,12 +76,15 @@ final class MigrateCommand {
             CloudRuntimeSettings cloud = CloudRuntimeSettings.resolve(
                     context.getBean(CloudProperties.class), context.getEnvironment().getProperty("CLUSTER_ID"));
             var given = Arrays.asList(args);
-            if (given.contains(PREPARE_COMPONENT_IDENTITY)) {
-                if (given.contains(STATUS) || given.contains(DRY_RUN) || given.contains(LIST)) {
+            boolean enableFirstClear = given.contains(ENABLE_FIRST_CLEAR);
+            if (given.contains(PREPARE_COMPONENT_IDENTITY) || enableFirstClear) {
+                if (given.contains(STATUS) || given.contains(DRY_RUN) || given.contains(LIST)
+                        || enableFirstClear && given.contains(PREPARE_COMPONENT_IDENTITY)) {
                     throw new TapstateException(BootError.MIGRATION_MODE_CONFLICT, java.util.Map.of(), null);
                 }
-                boolean recorded = prepareComponentIdentity(properties, cloud, context.getEnvironment());
-                out.println(recorded ? "CONFIG component identity recorded." : "CONFIG component identity requires no update.");
+                boolean recorded = prepareConfiguration(properties, cloud, context.getEnvironment(), enableFirstClear);
+                if (enableFirstClear) out.println(recorded ? "First clearing Stop enabled." : "First clearing Stop is already enabled.");
+                else out.println(recorded ? "CONFIG component identity recorded." : "CONFIG component identity requires no update.");
             } else {
                 report(args, properties, cloud, out);
             }
@@ -95,8 +99,8 @@ final class MigrateCommand {
         }
     }
 
-    private static boolean prepareComponentIdentity(MongoProperties properties, CloudRuntimeSettings cloud,
-            ConfigurableEnvironment environment) {
+    private static boolean prepareConfiguration(MongoProperties properties, CloudRuntimeSettings cloud,
+            ConfigurableEnvironment environment, boolean enableFirstClear) {
         String directory = environment.getProperty(OnPremInstallation.DIRECTORY_PROPERTY);
         if (!cloud.cloud() && directory != null && !directory.isBlank()) {
             InstallationFiles files;
@@ -106,13 +110,17 @@ final class MigrateCommand {
                 var stage = files.stage();
                 if (!OnPremInstallation.configurationHash(OnPremInstallation.connection(files)).equals(stage.configurationHash()))
                     throw InstallationFiles.refused();
-                return MongoConfigurationDomain.prepareConfigComponentIdentity(OnPremInstallation.settings(files, properties),
-                        stage.scope().clusterId());
+                return prepareConfiguration(OnPremInstallation.settings(files, properties), stage.scope().clusterId(), enableFirstClear);
             });
         }
-        return MongoConfigurationDomain.prepareConfigComponentIdentity(new MongoConnectionSettings(
+        return prepareConfiguration(new MongoConnectionSettings(
                 cloud.metadataUri(properties.getUri()), properties.getTlsCaFile(), properties.getServerSelectionTimeout()),
-                cloud.cloud() ? cloud.clusterId() : null);
+                cloud.cloud() ? cloud.clusterId() : null, enableFirstClear);
+    }
+
+    private static boolean prepareConfiguration(MongoConnectionSettings settings, String clusterId, boolean enableFirstClear) {
+        return enableFirstClear ? MongoConfigurationDomain.enableFirstClearingStop(settings, clusterId)
+                : MongoConfigurationDomain.prepareConfigComponentIdentity(settings, clusterId);
     }
 
     private static void report(

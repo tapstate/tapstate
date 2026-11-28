@@ -121,8 +121,8 @@ async function request(base, path, options = {}) {
   return fetch(new URL(path, base), { redirect: 'manual', signal: AbortSignal.timeout(10000), ...options });
 }
 
-async function proof(base, minimumReports = 1) {
-  const until = Date.now() + 20000;
+async function proof(base, minimumReports = 1, timeoutMs = 20000) {
+  const until = Date.now() + timeoutMs;
   do {
     const response = await request(base, '/proof');
     assert.equal(response.status, 200);
@@ -283,10 +283,13 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     const saved = JSON.parse(readFileSync(statePath, 'utf8'));
     await web(base, metadata);
     await connectors(base, saved.cookie, metadata.connectorIds);
-    stage = 'fresh restart status without exchange or JWKS';
-    const after = await proof(fixture, saved.reports + 1);
+    // The startup report can precede storage readiness; allow the next 30-second heartbeat.
+    stage = 'fresh status report after Cloud restart';
+    const after = await proof(fixture, saved.reports + 1, 40000);
+    stage = 'unchanged exchange and JWKS counts after Cloud restart';
     assert.equal(after.exchanges, saved.exchanges, 'restarting a Cluster must not redeem another code');
     assert.equal(after.jwks, saved.jwks, 'stored sessions must not revalidate a JWT');
+    stage = 'fresh status nonce after Cloud restart';
     assert(after.reports.some((row) => !saved.nonces.includes(row.nonce)));
   } else if (phase === 'logout') {
     stage = 'local session logout and revocation';

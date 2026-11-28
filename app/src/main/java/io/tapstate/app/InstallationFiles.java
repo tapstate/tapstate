@@ -91,9 +91,13 @@ final class InstallationFiles {
             // runtime ownership as well. Nonblocking attempts preserve it when a caller cancels.
             var acquired = channel.tryLock(0, 1, false);
             if (acquired != null) return acquired;
-            if (System.nanoTime() - deadline >= 0) throw refused();
+            if (System.nanoTime() - deadline >= 0) throw new MutationLockTimeout();
             java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10));
         }
+    }
+
+    static final class MutationLockTimeout extends TapstateException {
+        private MutationLockTimeout() { super(ControlError.BOOTSTRAP_FORBIDDEN, Map.of(), null); }
     }
 
     /** A separate lock region admits one service process without blocking owner CLI file updates. */

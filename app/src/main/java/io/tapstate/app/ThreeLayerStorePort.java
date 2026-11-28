@@ -17,8 +17,7 @@ final class ThreeLayerStorePort implements StorePort {
     private final MongoConfigurationDomain configuration;
     private final StorageRuntime.Bound bound;
     private final PipelineConvergencePass pass;
-    private final Consumer<PipelineIntentScope> prepare;
-    private final BiConsumer<PipelineIntentScope, PipelinePreparationInputs> prepareCaptured;
+    private final PrepareStart prepare;
     private final Control control;
     private final boolean deferFirstStart;
     private SrsStores metadataStores;
@@ -27,6 +26,10 @@ final class ThreeLayerStorePort implements StorePort {
     }
     private record Control(PipelineIntentScope scope, WorkloadClaimFence claim, Runnable active,
             MongoConfigurationDomain.AuthoringModels models) {}
+
+    @FunctionalInterface interface PrepareStart {
+        void prepare(PipelineIntentScope scope, long intentRevision, PipelinePreparationInputs inputs);
+    }
 
     ThreeLayerStorePort(MongoConfigurationDomain configuration, StorageRuntime.Bound bound,
             Consumer<PipelineIntentScope> prepare) {
@@ -39,13 +42,20 @@ final class ThreeLayerStorePort implements StorePort {
     ThreeLayerStorePort(MongoConfigurationDomain configuration, StorageRuntime.Bound bound,
             Consumer<PipelineIntentScope> prepare, BiConsumer<PipelineIntentScope, PipelinePreparationInputs> prepareCaptured,
             boolean deferFirstStart) {
-        this(configuration, bound, prepare, prepareCaptured, null, null, deferFirstStart);
+        this(configuration, bound, (scope, revision, inputs) -> {
+            if (inputs == null) prepare.accept(scope);
+            else prepareCaptured.accept(scope, inputs);
+        }, null, null, deferFirstStart);
     }
+
+    ThreeLayerStorePort(MongoConfigurationDomain configuration, StorageRuntime.Bound bound, PrepareStart prepare) {
+        this(configuration, bound, prepare, null, null, true);
+    }
+
     private ThreeLayerStorePort(MongoConfigurationDomain configuration, StorageRuntime.Bound bound,
-            Consumer<PipelineIntentScope> prepare, BiConsumer<PipelineIntentScope, PipelinePreparationInputs> prepareCaptured,
-            PipelineConvergencePass pass, Control control, boolean deferFirstStart) {
+            PrepareStart prepare, PipelineConvergencePass pass, Control control, boolean deferFirstStart) {
         this.configuration = Objects.requireNonNull(configuration); this.bound = Objects.requireNonNull(bound);
-        this.prepare = Objects.requireNonNull(prepare); this.prepareCaptured = Objects.requireNonNull(prepareCaptured);
+        this.prepare = Objects.requireNonNull(prepare);
         this.pass = pass; this.control = control; this.deferFirstStart = deferFirstStart;
         bound.requireBusiness();
     }
@@ -53,20 +63,20 @@ final class ThreeLayerStorePort implements StorePort {
         original.requirePipeline(original.scope().pipelineId());
         if (!business().equals(new CacheBusinessScope(original.scope().clusterId(), original.scope().bindingVersion(),
                 original.scope().cacheIncarnation()))) throw refused();
-        return new ThreeLayerStorePort(configuration, bound, prepare, prepareCaptured, original, null, false);
+        return new ThreeLayerStorePort(configuration, bound, prepare, original, null, false);
     }
     ThreeLayerStorePort forControl(PipelineIntentScope scope, WorkloadClaimFence claim, Runnable guard) {
         Objects.requireNonNull(guard).run();
         if (!scope.equals(scope(scope.pipelineId())) || claim.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
                 || !claim.key().resourceId().equals(scope.pipelineId()) || !claim.key().clusterId().equals(scope.clusterId())) throw refused();
-        return new ThreeLayerStorePort(configuration, bound, prepare, prepareCaptured, null, new Control(scope, claim, guard, null), false);
+        return new ThreeLayerStorePort(configuration, bound, prepare, null, new Control(scope, claim, guard, null), false);
     }
     ThreeLayerStorePort forUnpreparedControl(MongoConfigurationDomain.AuthoringModels models, WorkloadClaimFence node, Runnable guard) {
         var scope = models.scope();
         Objects.requireNonNull(guard).run();
         if (!scope.equals(scope(scope.pipelineId())) || node.key().type() != WorkloadClaimType.NODE_SESSION
                 || !node.key().clusterId().equals(scope.clusterId())) throw refused();
-        return new ThreeLayerStorePort(configuration, bound, prepare, prepareCaptured, null, new Control(scope, node, guard, models), false);
+        return new ThreeLayerStorePort(configuration, bound, prepare, null, new Control(scope, node, guard, models), false);
     }
     private void active() {
         bound.requireBusiness();
@@ -392,12 +402,12 @@ final class ThreeLayerStorePort implements StorePort {
                         && previous.filter(value -> value.targetState() == PipelineState.STOPPED
                                 && value.purgeState()).isPresent();
                 if (desired.targetState() == PipelineState.RUNNING && !clearsFirst) {
-                    if (captured.isEmpty()) prepare.accept(original);
+                    if (captured.isEmpty()) prepare.prepare(original, revision, null);
                     else {
                         var inputs = captured.orElseThrow();
                         if (!original.equals(inputs.scope()) || !desired.revision().equals(inputs.inputs().pipelineHash()))
                             throw refused();
-                        prepareCaptured.accept(original, inputs.inputs());
+                        prepare.prepare(original, revision, inputs.inputs());
                     }
                 }
                 var intents = configuration.intents().guardedBy(ThreeLayerStorePort.this::active);
@@ -497,7 +507,10 @@ final class ThreeLayerStorePort implements StorePort {
             if (includeIntents && header.recovering()) return;
             if (header.preparation().phase() != PipelinePreparation.Phase.COMPLETE) {
                 result.put(id, new PipelineCatalogState(startFailure(id, header), header.desired(),
-                        header.intentFailure(), false, io.tapstate.core.lifecycle.PipelineState.NEW));
+                        header.intentFailure(), false, io.tapstate.core.lifecycle.PipelineState.NEW, null,
+                        header.completedStopClear(), header.unprovenStopClear()
+                                ? new io.tapstate.core.lifecycle.ObservationFailure(IoError.PIPELINE_CLEAR_UNPROVEN.code(),
+                                        Map.of("pipeline", id)) : null));
             }
         });
     }

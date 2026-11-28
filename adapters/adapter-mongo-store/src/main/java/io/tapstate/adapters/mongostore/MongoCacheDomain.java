@@ -6,6 +6,7 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.CachePreparation;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -459,6 +460,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         facts(original.authScope()).verifyValidationMaintenance(original.businessScope(), operation, configurationComplete);
     }
 
+    void verifyStoppedBusiness(CachePreparation original) {
+        facts(original.authScope()).verifyStoppedBusiness(original.businessScope());
+    }
+
     void verifyStoppedValidationMaintenance(io.tapstate.spi.store.CachePreparation original, String originalOperation) {
         businessActive(); new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
         facts(original.authScope()).verifyStoppedValidationMaintenance(original.businessScope(), originalOperation);
@@ -671,6 +676,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     public io.tapstate.spi.store.PipelineCacheRetirements pipelineRetirements(CacheBusinessScope expected,Runnable requireActive) {
         Objects.requireNonNull(requireActive);return new MongoCachePipelineRetirements(client,database,expected,() -> {businessActive();requireActive.run();});
+    }
+
+    @Override
+    public void requireUnpreparedPipelineAbsent(PipelineIntentScope scope, Runnable requireActive) {
+        var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+        new MongoCachePipelineRetirements(client, database, business, () -> {
+            businessActive();
+            requireActive.run();
+        }).requireUnpreparedAbsent(scope, rateRetention);
     }
 
     /** Controlled successor preparation retains the original history, client and caller lifecycle. */

@@ -10,6 +10,11 @@ public interface PipelineRetirements {
     default PipelineRetirementPreparation begin(PipelineRetirementRequest original, PipelineIntentSnapshot expectedIntent) {
         throw new UnsupportedOperationException("the retirement store must support exact intent admission");
     }
+    /** Requires the same-generation receipt for the original clearing Stop. */
+    default PipelineRetirementPreparation beginAfterFirstClear(PipelineRetirementRequest original,
+            PipelineIntentSnapshot expectedIntent, PipelineIntentSnapshot clearingStop) {
+        throw new UnsupportedOperationException("the retirement store must support first clearing Stop");
+    }
     Optional<PipelineRetirementPreparation> pending(PipelineIntentScope scope,String operationId);
     void requirePending(PipelineRetirementPreparation original);
     PipelineRetirementResult complete(PipelineRetirementReceipt original);

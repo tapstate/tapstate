@@ -29,6 +29,40 @@ class PipelineDraftServiceTest {
             new PipelineDraftCompiler(), new CanonicalWriter(), Clock.fixed(NOW, ZoneOffset.UTC), null, null);
 
     @Test
+    void exactOccupancyDoesNotReadDefinitionsAndLookupFailuresCannotBecomeAvailable() {
+        var exactStore = new MemoryDraftStore() {
+            private int observations;
+
+            @Override public Optional<Boolean> idOccupied(String id) {
+                assertThat(id).isEqualTo("orders");
+                return switch (++observations) {
+                    case 1 -> Optional.of(false);
+                    case 2 -> Optional.of(true);
+                    default -> throw new IllegalStateException("primary unavailable");
+                };
+            }
+
+            @Override public Optional<PipelineDraft> get(String id) {
+                throw new AssertionError("availability must not read the draft body");
+            }
+        };
+        var service = new PipelineDraftService(exactStore);
+        assertThat(service.idAvailable("orders")).isTrue();
+        assertThat(service.idAvailable("orders")).isFalse();
+        assertThatThrownBy(() -> service.idAvailable("orders")).hasMessage("primary unavailable");
+    }
+
+    @Test
+    void validatesCanonicalIdsAndNeverAssumesAnUnwiredPortableStoreIsFree() {
+        for (String id : new String[]{null, "   ", "a.b", "a\nb"}) {
+            assertThatThrownBy(() -> service.idAvailable(id))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, failure ->
+                            assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        }
+        assertThatThrownBy(() -> service.idAvailable("valid id")).hasMessage("artifact store is not configured");
+    }
+
+    @Test
     void createAssignsInitialRevisionAndServerOwnedMetadata() {
         PipelineDraft submitted = draft(9, "client", null, 8L, "forged-published",
                 Instant.EPOCH, Instant.EPOCH);
@@ -346,7 +380,7 @@ class PipelineDraftServiceTest {
                 baseHash, publishedRevision, publishedHash, createdAt, updatedAt, updatedBy);
     }
 
-    private static final class MemoryDraftStore implements PipelineDraftStore {
+    private static class MemoryDraftStore implements PipelineDraftStore {
         private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
         private final Map<String, Long> lastRevision = new LinkedHashMap<>();
         private PipelineDraft.Publication lastPublication;

@@ -70,6 +70,15 @@ final class MongoCacheIdentity {
         });
     }
 
+    void verifyStoppedBusiness(io.tapstate.spi.store.CacheBusinessScope business) {
+        transaction(session -> {
+            requireReady(session);
+            new MongoCacheBusinessIdentity(database, business).requireReady(session);
+            requireStoppedClaims(session, business);
+            return null;
+        });
+    }
+
     private void requireStoppedClaims(ClientSession session, io.tapstate.spi.store.CacheBusinessScope business) {
         var unsafe = new Document("_id.clusterId", business.clusterId()).append("$or", java.util.List.of(
                 new Document("leaseUntil", java.util.Date.from(io.tapstate.spi.store.ProcessNodeSession.PROCESS_OWNED)),

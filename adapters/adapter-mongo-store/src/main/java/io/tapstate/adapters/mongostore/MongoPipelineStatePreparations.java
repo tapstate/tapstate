@@ -75,24 +75,30 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     }
 
     @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode) {
-        return issue(scope,originalNode,null,null,() -> {},null);
+        return issue(scope,originalNode,null,null,() -> {},null,null);
     }
     @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode,PipelinePreparationInputs inputs) {
-        return issue(scope,originalNode,Objects.requireNonNull(inputs,"inputs"),null,() -> {},null);
+        return issue(scope,originalNode,Objects.requireNonNull(inputs,"inputs"),null,() -> {},null,null);
+    }
+
+    @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode,
+            PipelinePreparationInputs inputs, long expectedIntentRevision) {
+        if (expectedIntentRevision < 0) throw new IllegalArgumentException("invalid intent revision");
+        return issue(scope, originalNode, inputs, null, () -> {}, null, expectedIntentRevision);
     }
     @Override public FirstPipelineCreationResult issueRecoveredFirstCreate(PipelineIntentScope scope,WorkloadClaimFence originalNode,
             PipelinePreparationInputs inputs,io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,Runnable verifyPredecessor) {
         if (!(confirmation instanceof MongoCacheRecoveryStore.Permission permission) || !scope.equals(permission.recovery().targetScope())) throw fenced();
-        return issue(scope, originalNode, Objects.requireNonNull(inputs,"inputs"), permission, Objects.requireNonNull(verifyPredecessor,"verifyPredecessor"), null);
+        return issue(scope, originalNode, Objects.requireNonNull(inputs,"inputs"), permission, Objects.requireNonNull(verifyPredecessor,"verifyPredecessor"), null, null);
     }
     @Override public FirstPipelineCreationResult issueDeferred(io.tapstate.spi.store.PipelineIntentStore.PendingStart pending,
             WorkloadClaimFence node) {
-        return issue(pending.intent().scope(), node, pending.inputs(), null, () -> {}, pending);
+        return issue(pending.intent().scope(), node, pending.inputs(), null, () -> {}, pending, null);
     }
 
     private FirstPipelineCreationResult issue(PipelineIntentScope scope,WorkloadClaimFence originalNode,PipelinePreparationInputs requested,
             MongoCacheRecoveryStore.Permission recovery,Runnable verifyPredecessor,
-            io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
+            io.tapstate.spi.store.PipelineIntentStore.PendingStart pending, Long expectedIntentRevision) {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(originalNode, "originalNode");
         if (originalNode.key().type() != WorkloadClaimType.NODE_SESSION || !clusterId.equals(originalNode.key().clusterId())
                 || !originalNode.key().resourceId().equals(originalNode.owner().nodeId())) throw fenced();
@@ -109,6 +115,14 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
                 }
                 if (pending != null) verifyInputs(session, scope, requested);
                 return new Issuance(previous, false, null,Optional.empty(),Optional.empty());
+            }
+            if (pending == null && recovery == null) {
+                var current = new MongoPipelineIntentStore(client, database, clusterId, bindings)
+                        .loadInTransaction(session, scope.pipelineId()).orElse(null);
+                if (expectedIntentRevision != null && (current == null ? expectedIntentRevision != 0
+                        : current.intentRevision() != expectedIntentRevision || !scope.equals(current.scope()))) throw fenced();
+                if (MongoPipelineIntentStore.clearingStop(current) && scope.stateGeneration() == 1
+                        && MongoFirstClearingStopSchema.enabled(session, database, clusterId)) throw fenced();
             }
             var summary = MongoCacheRecoveryFacts.read(row);
             if (summary.isPresent() && recovery == null) throw new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",scope.pipelineId()),null);
@@ -386,6 +400,12 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         var values = new Document("cachePreparation", MongoPipelinePreparationFacts.encode(next));
         if (replayable != null) values.append("deferredPreparationInputs", MongoPipelineSourcePreparations.encode(replayable));
         var update = new Document("$set", values);
+        if (next.phase() == PipelinePreparation.Phase.ISSUED) {
+            long fence = original.getLong("noteWriteFence");
+            if (fence >= Long.MAX_VALUE - 1) throw fenced();
+            filter.append("noteWriteFence", fence);
+            update.append("$inc", new Document("noteWriteFence", 1L));
+        }
         if (next.phase() == PipelinePreparation.Phase.COMPLETE && original.containsKey("deferredPreparationInputs"))
             update.append("$unset", new Document("deferredPreparationInputs", ""));
         if (mappings.updateOne(session, filter, update)

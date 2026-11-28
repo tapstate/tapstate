@@ -18,6 +18,7 @@ import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.PendingCdcWrite;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestOrigin;
@@ -38,6 +39,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -272,6 +274,10 @@ public final class Engine {
             var collected = job.getMetrics();
             return Optional.of(new RunMetrics(jobId(), manifest, SourceArrivals.reading(collected),
                     deliveryIn(collected), stageDurationsIn(collected)));
+        }
+
+        public Optional<DeliveryReading> deliveryBeforeStop() {
+            return isCarryingAJob() ? Optional.of(deliveryReading(job, false)) : Optional.empty();
         }
 
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
@@ -979,33 +985,81 @@ public final class Engine {
      */
     public OptionalLong countingSince(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null) {
-            return OptionalLong.empty();
-        }
-        return countingSinceIn(job.getMetrics());
+        return job == null ? OptionalLong.empty() : deliveryStart(job.getMetrics());
     }
 
+    private static OptionalLong deliveryStart(JobMetrics metrics) {
+        return metrics.get(JetDeliveryGauge.SINCE_METRIC).stream().mapToLong(Measurement::value).max();
+    }
+
+    /** Reads the outbound facts and their startup provenance from the same job metrics collection. */
     public DeliveryReading deliveryReading(String pipelineId) {
         Job job = liveJob(pipelineId);
-        return job == null ? DeliveryReading.NONE : deliveryIn(job.getMetrics());
+        return job == null ? DeliveryReading.NONE : deliveryReading(job, true);
     }
 
-    private static DeliveryReading deliveryIn(JobMetrics collected) {
-        var start = countingSinceIn(collected);
-        if (start.isEmpty()) return DeliveryReading.NONE;
-        return new DeliveryReading(deliveredRowsIn(collected), settledBytesIn(collected),
-                highestIn(collected, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(start.getAsLong()),
-                settledDurationsIn(collected), cdcDeliveryIn(collected), pendingCdcWriteIn(collected, Instant.now()));
+    private DeliveryReading deliveryReading(Job job, boolean includePending) {
+        long jobId = job.getId();
+        OptionalLong execution = JetLiveExecution.forHistory(member, jobId);
+        JobMetrics metrics = job.getMetrics();
+        var evidence = execution.isPresent() && execution.equals(JetLiveExecution.forHistory(member, jobId))
+                ? new RateSample.StartupEvidence(jobId, execution.getAsLong(),
+                        outboundZeroAt(metrics, com.hazelcast.jet.Util.idToString(execution.getAsLong()),
+                                JetLiveExecution.historyParticipantAddresses(member, jobId, execution.getAsLong())))
+                : null;
+        return deliveryIn(metrics, evidence, includePending);
     }
 
-    private static OptionalLong countingSinceIn(JobMetrics collected) {
-        OptionalLong latest = OptionalLong.empty();
-        for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
-            latest = latest.isPresent()
-                    ? OptionalLong.of(Math.max(latest.getAsLong(), measurement.value()))
-                    : OptionalLong.of(measurement.value());
+    private static DeliveryReading deliveryIn(JobMetrics metrics) {
+        return deliveryIn(metrics, null, true);
+    }
+
+    private static DeliveryReading deliveryIn(JobMetrics metrics, RateSample.StartupEvidence evidence, boolean includePending) {
+        OptionalLong since = deliveryStart(metrics);
+        if (since.isEmpty()) {
+            return evidence == null ? DeliveryReading.NONE
+                    : new DeliveryReading(Map.of(), Map.of(), Map.of(), null, Map.of(), null, null, evidence);
         }
-        return latest;
+        return new DeliveryReading(deliveredRowsIn(metrics), settledBytesIn(metrics),
+                highestIn(metrics, JetDeliveryGauge::reachedTableOf),
+                Instant.ofEpochMilli(since.getAsLong()), settledDurationsIn(metrics), cdcDeliveryIn(metrics),
+                includePending ? pendingCdcWriteIn(metrics, Instant.now()) : null, evidence);
+    }
+
+    static Instant outboundZeroAt(JobMetrics metrics, String execution, Set<String> participants) {
+        if (participants.isEmpty()) return null;
+        // Job metrics combine independently collected member snapshots. A member's entire snapshot can be absent.
+        Set<String> reported = new HashSet<>();
+        for (Measurement point : metrics.get(MetricNames.EXECUTION_START_TIME)) {
+            if (execution.equals(point.tag(MetricTags.EXECUTION))) reported.add(point.tag(MetricTags.ADDRESS));
+        }
+        if (!reported.equals(participants)) return null;
+
+        Map<CdcWriterScrape, Long> starts = new HashMap<>();
+        for (Measurement point : metrics.get(JetDeliveryGauge.SINCE_METRIC)) {
+            var writer = CdcWriterScrape.of(point);
+            if (!execution.equals(writer.execution()) || writer.member() == null
+                    || writer.vertex() == null || writer.processor() == null || point.value() <= 0
+                    || !reported.contains(point.tag(MetricTags.ADDRESS))
+                    || starts.putIfAbsent(writer, point.value()) != null) return null;
+        }
+        Set<CdcWriterScrape> writers = new HashSet<>();
+        for (Measurement point : metrics.get(MetricNames.RECEIVED_COUNT)) {
+            // Jet emits a received count for each sink tasklet input, even before the tasklet receives a row.
+            if (execution.equals(point.tag(MetricTags.EXECUTION))
+                    && SinkProcessor.class.getSimpleName().equals(point.tag(MetricTags.PROCESSOR_TYPE))) {
+                writers.add(CdcWriterScrape.of(point));
+            }
+        }
+        if (!writers.equals(starts.keySet())) return null;
+        for (String name : metrics.metrics()) {
+            if (JetDeliveryGauge.deliveredOf(name) == null && JetDeliveryGauge.carriedTableOf(name) == null) continue;
+            for (Measurement point : metrics.get(name)) {
+                if (!starts.containsKey(CdcWriterScrape.of(point))) return null;
+            }
+        }
+        // At the earliest initialization all writers that contribute to these totals were still at zero.
+        return starts.values().stream().min(Long::compareTo).map(Instant::ofEpochMilli).orElse(null);
     }
 
     /**
