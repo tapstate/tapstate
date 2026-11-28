@@ -28,6 +28,7 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
     static final String MAP_PROTOCOL = "mongo-map-pdk-ack-v1";
     static final String JS_PROTOCOL = "mongo-js-pdk-ack-v1";
     static final String FILTER_PROTOCOL = "mongo-filter-pdk-ack-v1";
+    static final String HANDOFF_PROTOCOL = "mongo-copy-handoff-pdk-ack-v1";
     private static final long CLOCK_ALLOWANCE_MILLIS = 100;
     private final Path source;
     private final MongoDatabase mongo;

@@ -236,6 +236,8 @@ final readback. Review `measurement_status` independently from execution `status
 Copy, Map, JS and Filter live cases can collect source and target callbacks
 with `--endpoint-latency-probe`. Filter records intentionally excluded source
 events separately. Confirmation coverage uses all retained events.
+For the Copy handoff, retain the snapshot overlap witness together with the
+latency trace for events in the scored CDC window.
 Cases without complete correlation report
 `insufficient-event-correlation`. For fixed backlog Copy, Map, JS, Filter
 and Union, the formal workflow enables `--backlog-completion-probe`. To reproduce
