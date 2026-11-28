@@ -133,7 +133,7 @@ class DirectSnapshotPreparationTest {
         }
         public DirectChannelStore guardedBy(Runnable guard){return this;}
         public boolean pinSnapshot(DirectChannelContext context,long revision,long epoch,String token,WorkloadClaimFence pipeline){assertThat(context).isEqualTo(CONTEXT);assertThat(revision).isEqualTo(3);assertThat(epoch).isEqualTo(1);assertThat(pipeline).isEqualTo(PIPELINE);actions.add("pin:"+token);return allowPin;}
-        public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,WorkloadClaimFence capture,WorkloadClaimFence pipeline){
+        public boolean confirmAnchor(DirectChannelContext context,long epoch,String token,java.time.Instant initialStartAt,WorkloadClaimFence capture,WorkloadClaimFence pipeline){
             assertThat(context).isEqualTo(CONTEXT);assertThat(epoch).isEqualTo(original.epoch());assertThat(capture).isEqualTo(CAPTURE);assertThat(pipeline).isEqualTo(PIPELINE);
             actions.add("anchor:"+token); var held=current.get();
             if(held.resumeOverride()!=null) {

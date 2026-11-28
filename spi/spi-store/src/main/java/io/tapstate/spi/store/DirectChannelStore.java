@@ -1,6 +1,7 @@
 package io.tapstate.spi.store;
 
 import io.tapstate.core.event.ChainPosition;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
@@ -20,7 +21,11 @@ public interface DirectChannelStore {
     List<DirectBatch> pending(DirectChannelContext context,long epoch);
     OptionalLong beginCapture(DirectChannelContext context,long expectedRevision,long expectedEpoch,
                              WorkloadClaimFence originalCapture,WorkloadClaimFence originalPipeline);
-    boolean confirmAnchor(DirectChannelContext context,long epoch,String sourcePosition,
+    default boolean confirmAnchor(DirectChannelContext context,long epoch,String sourcePosition,
+                          WorkloadClaimFence originalCapture,WorkloadClaimFence originalPipeline) {
+        return confirmAnchor(context,epoch,sourcePosition,null,originalCapture,originalPipeline);
+    }
+    boolean confirmAnchor(DirectChannelContext context,long epoch,String sourcePosition,Instant initialStartAt,
                           WorkloadClaimFence originalCapture,WorkloadClaimFence originalPipeline);
     boolean pinSnapshot(DirectChannelContext context,long expectedRevision,long snapshotEpoch,String sourcePosition,WorkloadClaimFence originalPipeline);
     boolean beginWriterRun(DirectChannelContext context,long epoch,String runId,Map<String,List<String>> expected,WorkloadClaimFence originalPipeline);
