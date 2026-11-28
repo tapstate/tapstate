@@ -10,17 +10,24 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
+import org.bson.types.Decimal128;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Witnesses draft CAS and publication preconditions against a real Mongo replica-set. */
 @RequiresDocker
@@ -298,6 +305,69 @@ class MongoPipelineDraftStoreIT {
             assertThat(fixture.artifacts.find(new Document("_id", "orders")).first().getString("contentHash"))
                     .isEqualTo(before);
             assertThat(fixture.store.get("orders")).contains(draft);
+        }
+    }
+
+    @Test
+    void idStaysOccupiedWhenPublicationAndDeletionInterleaveWithTheProbe() {
+        String uri = REPLICA_SET.getReplicaSetUrl();
+        String databaseName = REPLICA_SET.database("tapstate_draft_occupancy_race");
+        try (MongoClient writer = MongoClients.create(uri)) {
+            var db = writer.getDatabase(databaseName);
+            var drafts = db.getCollection("pipeline_drafts");
+            var artifacts = db.getCollection("artifacts");
+            var writerStore = new MongoPipelineDraftStore(writer, drafts, artifacts);
+            artifacts.insertOne(new Document("_id", "existing"));
+            assertThat(writerStore.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            var moved = new AtomicBoolean();
+            var interleave = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!"find".equals(event.getCommandName())
+                            || !"pipeline_drafts".equals(event.getCommand().getString("find").getValue())
+                            || !moved.compareAndSet(false, true)) return;
+                    Resource pipeline = artifact("orders");
+                    assertThat(writerStore.publish(new PipelineDraft.Publication("orders", 1, null, pipeline,
+                            CanonicalHash.of(pipeline), Instant.parse("2026-09-21T01:00:00Z"), "publisher")))
+                            .isEqualTo(PipelineDraftMutation.PUBLISHED);
+                    assertThat(writerStore.delete("orders", 1)).isEqualTo(PipelineDraftMutation.DELETED);
+                }
+            };
+            try (var reader = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(uri)).addCommandListener(interleave).build())) {
+                var readerDb = reader.getDatabase(databaseName);
+                var store = new MongoPipelineDraftStore(reader, readerDb.getCollection("pipeline_drafts"),
+                        readerDb.getCollection("artifacts"));
+                assertThat(store.idOccupied("orders")).contains(true);
+                assertThat(moved).isTrue();
+                assertThat(drafts.find(new Document("_id", "orders")).first().getBoolean("deleted")).isTrue();
+                assertThat(artifacts.find(new Document("_id", "orders")).first()).isNotNull();
+            }
+        }
+    }
+
+    @Test
+    void idPreflightAndCreateAgreeOnIntegralAndFractionalLegacyTombstones() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var db = client.getDatabase(REPLICA_SET.database("tapstate_draft_decimal_revision"));
+            var drafts = db.getCollection("pipeline_drafts");
+            var store = new MongoPipelineDraftStore(client, drafts, db.getCollection("artifacts"));
+            drafts.insertOne(new Document("_id", "integral").append("deleted", true)
+                    .append("revision", Decimal128.parse("2.000")));
+            drafts.insertOne(new Document("_id", "fractional").append("deleted", true)
+                    .append("revision", 1.5));
+            assertThat(store.idOccupied("integral")).contains(false);
+            assertThat(store.create(draft("integral", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.get("integral").orElseThrow().revision()).isEqualTo(3L);
+            for (Runnable readOrCreate : List.<Runnable>of(() -> store.idOccupied("fractional"),
+                    () -> store.create(draft("fractional", 1, PipelineDraft.Mode.DAG)))) {
+                assertThatThrownBy(readOrCreate::run)
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            }
+            assertThat(drafts.find(new Document("_id", "fractional")).first().getDouble("revision"))
+                    .isEqualTo(1.5);
         }
     }
 

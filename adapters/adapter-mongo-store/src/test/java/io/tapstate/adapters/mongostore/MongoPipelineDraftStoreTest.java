@@ -1,6 +1,9 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoException;
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.TransactionOptions;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
@@ -14,6 +17,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import org.bson.Document;
+import org.bson.types.Decimal128;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -86,32 +90,73 @@ class MongoPipelineDraftStoreTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void legacyOccupancyChecksOnlyPrimaryIdHeadersAndRejectsUnreadableTombstones() {
+    void legacyOccupancyChecksBothPrimaryHeadersInTheSameSnapshot() {
         var client = mock(MongoClient.class);
+        var session = mock(ClientSession.class);
+        when(client.startSession()).thenReturn(session);
         MongoCollection<Document> drafts = mock(MongoCollection.class, RETURNS_SELF);
         MongoCollection<Document> artifacts = mock(MongoCollection.class, RETURNS_SELF);
         FindIterable<Document> draftQuery = mock(FindIterable.class, RETURNS_SELF);
         FindIterable<Document> artifactQuery = mock(FindIterable.class, RETURNS_SELF);
         var id = new Document("_id", "orders");
-        when(artifacts.find(id)).thenReturn(artifactQuery);
-        when(drafts.find(id)).thenReturn(draftQuery);
+        when(artifacts.find(session, id)).thenReturn(artifactQuery);
+        when(drafts.find(session, id)).thenReturn(draftQuery);
         var store = new MongoPipelineDraftStore(client, drafts, artifacts);
         when(artifactQuery.first()).thenReturn(id, null);
-        when(draftQuery.first()).thenReturn(null, id, new Document("deleted", true).append("revision", 1L),
-                new Document("deleted", true));
+        when(draftQuery.first()).thenReturn(null, id, tombstone(1L), tombstone(1.5));
 
         assertThat(store.idOccupied("orders")).contains(true);
-        verify(drafts, never()).find(id);
+        verify(drafts, never()).find(session, id);
         assertThat(store.idOccupied("orders")).contains(false);
         assertThat(store.idOccupied("orders")).contains(true);
         assertThat(store.idOccupied("orders")).contains(false);
         assertThatThrownBy(() -> store.idOccupied("orders"))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
-        verify(artifacts, times(5)).withReadPreference(com.mongodb.ReadPreference.primary());
-        verify(drafts, times(4)).withReadPreference(com.mongodb.ReadPreference.primary());
+        verify(session, times(5)).startTransaction(TransactionOptions.builder()
+                .readConcern(ReadConcern.SNAPSHOT).readPreference(ReadPreference.primary()).build());
+        verify(session, times(5)).abortTransaction();
+        verify(session, times(5)).close();
+        verify(session, never()).commitTransaction();
+        verify(artifacts, never()).find(id);
+        verify(drafts, never()).find(id);
         verify(artifactQuery, times(5)).projection(new Document("_id", 1));
         verify(draftQuery, times(4)).projection(new Document("_id", 1).append("deleted", 1).append("revision", 1));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void legacyOccupancyAcceptsLosslessIntegralTombstonesAndRejectsCorruptRevisions() {
+        var client = mock(MongoClient.class);
+        var session = mock(ClientSession.class);
+        when(client.startSession()).thenReturn(session);
+        MongoCollection<Document> drafts = mock(MongoCollection.class, RETURNS_SELF);
+        MongoCollection<Document> artifacts = mock(MongoCollection.class, RETURNS_SELF);
+        FindIterable<Document> draftQuery = mock(FindIterable.class, RETURNS_SELF);
+        FindIterable<Document> artifactQuery = mock(FindIterable.class, RETURNS_SELF);
+        var id = new Document("_id", "orders");
+        when(artifacts.find(session, id)).thenReturn(artifactQuery);
+        when(drafts.find(session, id)).thenReturn(draftQuery);
+        var store = new MongoPipelineDraftStore(client, drafts, artifacts);
+
+        for (Object revision : List.of(1, 1L, 1.0, Decimal128.parse("1.000"))) {
+            when(draftQuery.first()).thenReturn(tombstone(revision));
+            assertThat(store.idOccupied("orders")).as("revision %s", revision).contains(false);
+        }
+        for (Object revision : List.of(1.5, 0L, -1L, Long.MAX_VALUE, 0x1.0p63, Double.NaN,
+                Double.POSITIVE_INFINITY, Decimal128.parse("1.5"), Decimal128.parse("9223372036854775808"),
+                Decimal128.POSITIVE_INFINITY, "1")) {
+            when(draftQuery.first()).thenReturn(tombstone(revision));
+            assertThatThrownBy(() -> store.idOccupied("orders")).as("revision %s", revision)
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        }
+        when(draftQuery.first()).thenReturn(new Document("deleted", true));
+        assertThatThrownBy(() -> store.idOccupied("orders")).isInstanceOf(TapstateException.class);
+    }
+
+    private static Document tombstone(Object revision) {
+        return new Document("deleted", true).append("revision", revision);
     }
 
     private record CommitAttempt(ClientSession session, Supplier<PipelineDraftMutation> write,
