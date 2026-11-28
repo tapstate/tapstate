@@ -1393,19 +1393,27 @@ public final class DslParser {
      */
     private static String idOf(YamlMap m) {
         String id = m.string("id");
-        if (id != null && id.indexOf('.') >= 0) {
-            throw m.errorAt("id", DslError.ILLEGAL_VALUE,
-                    Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, "an id without '.', the reserved addressing separator (§2)"));
+        if (id != null) {
+            var required = idCharacterRequirement(id);
+            if (required.isPresent()) {
+                throw m.errorAt("id", DslError.ILLEGAL_VALUE,
+                        Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, required.orElseThrow()));
+            }
+        }
+        return id;
+    }
+
+    /** The canonical DSL character requirement an id violates, excluding presence checks. */
+    public static java.util.Optional<String> idCharacterRequirement(String id) {
+        if (id.indexOf('.') >= 0) {
+            return java.util.Optional.of("an id without '.', the reserved addressing separator (§2)");
         }
         // An id travels into places that write it as a line of text and read it back by splitting on
         // lines, so one carrying a newline is recorded as several and read back as names that were never
         // used. Refused here rather than encoded around downstream: every such place would have to be
         // found, and one missed is state left behind or another id's state dropped in its place.
-        if (id != null && hasControlCharacter(id)) {
-            throw m.errorAt("id", DslError.ILLEGAL_VALUE,
-                    Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, "an id without control characters"));
-        }
-        return id;
+        return hasControlCharacter(id) ? java.util.Optional.of("an id without control characters")
+                : java.util.Optional.empty();
     }
 
     private static boolean hasControlCharacter(String id) {
