@@ -23,6 +23,7 @@ import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -345,7 +346,7 @@ class MongoPipelineIntentStoreIT {
                     new Document("$set", new Document("cachePreparation", MongoPipelinePreparationFacts.encode(preparation))));
             var desired = intent(PipelineState.RUNNING, false, false, null);
             assertThat(domain.intents().compareAndSet(scope, 0, desired)).isTrue();
-            var commands = new ArrayList<org.bson.BsonDocument>();
+            var commands = new ArrayList<BsonDocument>();
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommand().clone()); }
             };
@@ -358,17 +359,16 @@ class MongoPipelineIntentStoreIT {
                 var store = new MongoPipelineIntentStore(client, db, scope.clusterId(), new MongoStorageBindingStore(client, db, ciphers));
                 commands.clear();
                 assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 1, desired));
-                System.out.println("ACTUATION_READ commands=" + commands.stream().map(command -> command.getFirstKey()).toList());
-                assertThat(commands).hasSize(1);
-                assertThat(commands.getFirst().getString("aggregate").getValue()).isEqualTo("pipeline_intents");
-                assertThat(commands.getFirst().getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
-                assertThat(commands.getFirst().containsKey("txnNumber")).isFalse();
-                assertThat(commands.stream().map(command -> command.getFirstKey()).toList()).containsExactly("aggregate");
+                assertThat(commands).extracting(BsonDocument::getFirstKey).containsExactly("listCollections", "aggregate");
+                var snapshot = commands.getLast();
+                assertThat(snapshot.getString("aggregate").getValue()).isEqualTo("pipeline_intents");
+                assertThat(snapshot.getDocument("readConcern").getString("level").getValue()).isEqualTo("snapshot");
+                assertThat(snapshot.containsKey("txnNumber")).isFalse();
                 var stopped = intent(PipelineState.STOPPED, false, false, null);
                 assertThat(domain.intents().compareAndSet(scope, 1, stopped)).isTrue();
                 commands.clear();
                 assertThat(store.loadForActuation(scope.pipelineId())).contains(new PipelineIntentSnapshot(scope, 2, stopped));
-                assertThat(commands).hasSize(1);
+                assertThat(commands).extracting(BsonDocument::getFirstKey).containsExactly("aggregate");
             }
         });
     }
