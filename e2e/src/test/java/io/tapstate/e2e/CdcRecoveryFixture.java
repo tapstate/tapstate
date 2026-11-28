@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.TapEvent;
+import io.tapdata.entity.event.control.HeartbeatEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapUpdateRecordEvent;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
@@ -18,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -61,8 +63,21 @@ public final class CdcRecoveryFixture {
 
     static void change(Path source, long sequence, String table, String id, String before, String after)
             throws IOException {
-        append(source, sequence + "," + System.currentTimeMillis() + ","
+        changeAt(source, sequence, Instant.now(), table, id, before, after);
+    }
+
+    static void changeAt(Path source, long sequence, Instant time, String table, String id, String before, String after)
+            throws IOException {
+        append(source, sequence + "," + time.toEpochMilli() + ","
                 + table + "," + id + "," + before + "," + after + "\n");
+    }
+
+    static void heartbeat(Path source, long sequence) throws IOException {
+        changeAt(source, sequence, Instant.now(), "", "", "", "");
+    }
+
+    static void deliverUntimedChangeOnWorker(Path source) throws IOException {
+        Files.createFile(source.resolve("untimed-worker-delivery"));
     }
 
     static void updates(Path source, long firstSequence, int count, String table, String id) throws IOException {
@@ -193,7 +208,7 @@ public final class CdcRecoveryFixture {
         }
 
         private void tail(TapConnectionContext context, List<String> tables, Object offset, int size,
-                StreamReadConsumer consumer) {
+                StreamReadConsumer consumer) throws InterruptedException {
             if (!(offset instanceof Map<?, ?> position) || !(position.get("sequence") instanceof Number number)) {
                 throw new IllegalArgumentException("the recovery fixture requires its recorded source position");
             }
@@ -205,10 +220,38 @@ public final class CdcRecoveryFixture {
             try {
                 while (!stopped && !Thread.currentThread().isInterrupted()
                         && !Files.exists(source.resolve("end-stream"))) {
+                    if (Files.exists(source.resolve("untimed-worker-delivery"))) {
+                        var event = TapInsertRecordEvent.create().table(tables.getFirst())
+                                .after(Map.of("id", "untimed", "priority", "invalid"));
+                        event.setReferenceTime(null);
+                        event.setTime(null);
+                        long next = delivered + 1;
+                        Thread worker = Thread.ofVirtual().uncaughtExceptionHandler(
+                                (thread, failure) -> note(witness, "CALLBACK_FAILED"))
+                                .start(() -> consumer.accept(List.of(event), position(next)));
+                        worker.join();
+                        var later = new Change(next + 1, System.currentTimeMillis(), tables.getFirst(),
+                                "later", "", "valid");
+                        note(witness, "CALLBACK_RETRIED");
+                        try {
+                            consumer.accept(List.of(later.event()), position(later.sequence()));
+                        } catch (RuntimeException failure) {
+                            note(witness, "CALLBACK_REJECTED");
+                            throw failure;
+                        }
+                        return;
+                    }
                     List<TapEvent> batch = new ArrayList<>();
                     long through = delivered;
                     for (Change change : changes(source)) {
                         if (change.sequence() <= delivered) continue;
+                        if (change.table().isEmpty()) {
+                            if (through == delivered) {
+                                through = change.sequence();
+                                batch.add(new HeartbeatEvent().init());
+                            }
+                            break;
+                        }
                         through = change.sequence();
                         if (tables.contains(change.table())) batch.add(change.event());
                         if (batch.size() >= size) break;

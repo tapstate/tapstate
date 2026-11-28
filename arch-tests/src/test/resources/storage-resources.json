@@ -34,6 +34,14 @@
         "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding."
       ]
     },
+    "direct-channel-start": {
+      "goal": "Resume at the settled source checkpoint while retaining any pending initial timestamp cutoff.",
+      "entry": "Original direct channel restart from its safe source token or an admitted manual resume token, applying its saved cutoff until a qualifying batch settles.",
+      "prerequisites": [
+        "Original CACHE scope, claims and direct batch closure are intact.",
+        "The source can resume from the selected token. Records without a pending cutoff use their original position-only recovery."
+      ]
+    },
     "pipeline-resume-metric-continuation": {
       "goal": "Continue the known cumulative native metrics of a rebuilding RESUME while retaining the original counter starts and the existing execution authority.",
       "entry": "Reopen the same CACHE and reconcile the original prepared Pipeline. Read the optional handoff from the scoped checkpoint and accept it only for the original intent revision and the actual Jet execution verified through its original manifest and the current full claim. No continuation after loss of that CACHE is promised.",
@@ -1444,6 +1452,10 @@
     "cache": {
       "atomicDomain": "CACHE",
       "fencing": "Same CACHE client/session with original identity and resource-specific guard/revision. Ownership-protected writes additionally compete with the full live claim; CONFIG cannot supply a CACHE fence."
+    },
+    "direct-channel-start": {
+      "atomicDomain": "CACHE",
+      "fencing": "Use the original scope, revision and workload fences in the same CACHE transaction. Save the pending cutoff with the initial anchor. Preserve it through heartbeat settlement and manual resume. Clear it in the transaction that settles the first qualifying batch and advances the source checkpoint."
     },
     "auth": {
       "atomicDomain": "CACHE",
@@ -3501,24 +3513,24 @@
     },
     {
       "id": "mongo.cache.direct_channel_offsets",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "direct_channel_offsets"
       ],
-      "responsibility": "Private direct-channel original checkpoint and target ACK frontier.",
+      "responsibility": "Private direct-channel original checkpoint, target ACK frontier and pending initial timestamp cutoff.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoDirectChannelStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoDirectChannelStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "direct-channel-start",
+      "consistency": "direct-channel-start",
+      "growth": "Existing bounded progress per channel plus at most one ISO-8601 instant preserving full precision, present only while an initial cutoff is pending.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoDirectChannelStoreIT.java"
       ]
