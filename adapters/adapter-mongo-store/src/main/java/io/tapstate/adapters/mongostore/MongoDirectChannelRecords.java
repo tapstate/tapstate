@@ -6,6 +6,8 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.*;
 import org.bson.Document;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.*;
 
 /** Strict private-channel records; the pending ledger is independent from its small high-water receipt. */
@@ -57,19 +59,27 @@ final class MongoDirectChannelRecords {
     }
     private static Document progress(DirectChannelProgress value,String currentHash,String retainedHash) {
         if (currentHash == null || retainedHash == null || !currentHash.matches("[0-9a-f]{64}") || !retainedHash.matches("[0-9a-f]{64}")) throw unreadable();
-        return hash(new Document("_id",id(value.context())).append("formatVersion",1).append("tables",sorted(value.tables())).append("revision",value.revision())
+        Instant cutoff = value.pendingStartAt();
+        var row = new Document("_id",id(value.context())).append("formatVersion",cutoff == null ? 1 : 2).append("tables",sorted(value.tables())).append("revision",value.revision())
                 .append("current",window(value.current())).append("retained",window(value.retained())).append("cursor",cursor(value.cursor()))
-                .append("writerRun",writers(value.writerRun())).append("resumeOverride",MongoResumeOverrides.stored(value.resumeOverride())).append("currentPendingHash",currentHash).append("retainedPendingHash",retainedHash));
+                .append("writerRun",writers(value.writerRun())).append("resumeOverride",MongoResumeOverrides.stored(value.resumeOverride())).append("currentPendingHash",currentHash).append("retainedPendingHash",retainedHash);
+        if (cutoff != null) row.append("pendingStartAt",cutoff.toString());
+        return hash(row);
+    }
+    static boolean supportsProgressVersion(Object version) {
+        return Integer.valueOf(1).equals(version) || Integer.valueOf(2).equals(version);
     }
     static DirectChannelProgress progress(Document row) {
         try {
-            if (row == null || !row.keySet().equals(Set.of("_id","formatVersion","tables","revision","current","retained","cursor","writerRun","resumeOverride","currentPendingHash","retainedPendingHash","contentHash"))
-                    || !Integer.valueOf(1).equals(row.get("formatVersion"))) throw unreadable();
+            if (row == null || !supportsProgressVersion(row.get("formatVersion"))) throw unreadable();
+            Instant cutoff = Integer.valueOf(2).equals(row.get("formatVersion"))
+                    ? Instant.parse(row.getString("pendingStartAt")) : null;
             var context = context(row.get("_id",Document.class));
             var result = new DirectChannelProgress(context,strings(row.get("tables")),number(row,"revision"),window(row.get("current",Document.class)),
-                    window(row.get("retained",Document.class)),cursor(context,row.get("cursor",Document.class)),writers(row.get("writerRun",Document.class)),MongoResumeOverrides.read(row.get("resumeOverride")));
+                    window(row.get("retained",Document.class)),cursor(context,row.get("cursor",Document.class)),writers(row.get("writerRun",Document.class)),
+                    MongoResumeOverrides.read(row.get("resumeOverride")),cutoff);
             if (!progress(result,row.getString("currentPendingHash"),row.getString("retainedPendingHash")).equals(row)) throw unreadable(); return result;
-        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException | DateTimeParseException invalid) { throw unreadable(); }
     }
     /** A fixed-size original receipt covers every pending descriptor, including its targets and order. */
     static String pendingHash(List<DirectBatch> batches) {
