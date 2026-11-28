@@ -52,6 +52,8 @@ a-real-change-stream-carries-rows-written-after-start on IN_PROCESS
 a-real-change-stream-carries-rows-written-after-start on REAL_PROCESS
 a-real-mongo-collection-syncs-to-a-real-mongo-target on IN_PROCESS
 a-real-mongo-collection-syncs-to-a-real-mongo-target on REAL_PROCESS
+a-root-read-by-its-source-id-lands-in-that-sources-table on IN_PROCESS
+a-root-read-by-its-source-id-lands-in-that-sources-table on REAL_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on IN_PROCESS
 a-row-keeps-its-sequence-across-the-crossing on REAL_PROCESS
 a-script-reshapes-the-assembled-document on IN_PROCESS

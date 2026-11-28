@@ -2809,15 +2809,15 @@ final class StoreBackedDagSource implements DagSource {
         }
 
         KeyProjection.GuardedCandidates projectKeys(TransformBody.MapProjection map) {
-            return KeyProjection.guardedCandidates(candidates, map.fields(), knownFields, possibleFields);
+            return KeyProjection.guardedCandidates(candidates, map.outputFields(), knownFields, possibleFields);
         }
 
         ParentKeyState through(TransformBody body) {
             return switch (body) {
                 case TransformBody.MapProjection map -> new ParentKeyState(
                         projectKeys(map).names(),
-                        KeyProjection.projectedFields(map.fields(), knownFields),
-                        KeyProjection.projectedFields(map.fields(), possibleFields));
+                        KeyProjection.projectedFields(map.outputFields(), knownFields),
+                        KeyProjection.projectedFields(map.outputFields(), possibleFields));
                 case TransformBody.Unwind unwind -> expanded(unwind);
                 case TransformBody.Filter ignored -> this;
                 case TransformBody.Union ignored -> this;
@@ -4918,11 +4918,12 @@ final class StoreBackedDagSource implements DagSource {
 
     private record RowPreservingSource(String stream, List<Map<String, FieldRule>> projections) { }
 
-    /** A reference as the stream it reads: a stream or table name as written, a one-table source's id as that table's stream. */
+    /**
+     * A reference as the stream it reads. A source id comes first, as it does where the DAG wires the
+     * reference: a one-table source's id is that table's stream even when another source has a table
+     * of the same name. Anything else is a stream or table name as written.
+     */
     private static String streamOf(String ref, Map<String, SourceVertex> sourceTables) {
-        if (sourceTables.containsKey(ref)) {
-            return ref;
-        }
         Set<String> streams = new LinkedHashSet<>();
         sourceTables.values().stream().filter(vertex -> vertex.sourceId().equals(ref))
                 .forEach(vertex -> streams.add(vertex.stream()));
