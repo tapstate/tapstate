@@ -288,6 +288,29 @@ writer. For a reported pending deletion, the maintainer must verify that exact r
 and its required permission before retrying cleanup. Never replace this check with a database-wide
 drop, deletion of a claim or administrator record, manual generation edits, or a new operation ID.
 
+### Enable first clearing Stop on an existing installation
+
+New installations enable this behavior during setup. For an existing installation, schedule
+a full stop and isolate every old Tapstate process that can write CONFIG or CACHE. Verify that
+their in-flight storage, source and target work has ended. Take a coordinated backup of CONFIG
+and its keyring, CACHE and the deployment materials. Keep all old writers isolated while enabling
+the feature and restarting only the upgraded processes.
+
+Run the new server binary in maintenance mode with the original installation settings.
+
+```sh
+./bin/tapstate-server migrate --enable-first-clearing-stop
+```
+
+The command checks retained storage identity and leases. The operator verifies process isolation
+across the deployment. Activation commits CONFIG version 4, which older binaries refuse to open.
+After activation, returning to an older binary requires another full stop and restoration of the
+compatible backup. Check that the restored source positions and target effects agree before running work.
+
+If a first clearing Stop reports that the result could not be confirmed, keep the pipeline's original
+state and save its status and available logs. A deployment administrator can compare the original
+CONFIG intent and preparation with the bound CACHE evidence using the pipeline ID.
+
 ## Transfer selected configuration
 
 Use **Transfer configuration** in Settings with ordinary administrator authorization and admitted

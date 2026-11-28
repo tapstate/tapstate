@@ -8,6 +8,15 @@ public interface PipelineDraftStore {
 
     Optional<PipelineDraft> get(String pipelineId);
 
+    /**
+     * A point observation of the shared draft/artifact ID namespace in this store's scope.
+     * Empty means the store does not implement the combined observation, not that the ID is free.
+     * A store read failure must propagate.
+     */
+    default Optional<Boolean> idOccupied(String pipelineId) {
+        return Optional.empty();
+    }
+
     List<PipelineDraft> list();
 
     /** Metadata-only catalog read; implementations should avoid loading graph and Wizard payloads. */

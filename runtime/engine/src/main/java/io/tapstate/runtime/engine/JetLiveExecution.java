@@ -4,9 +4,12 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.instance.impl.HazelcastInstanceImpl;
 import com.hazelcast.instance.impl.HazelcastInstanceProxy;
+import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.impl.JetServiceBackend;
 import java.io.Serializable;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Exact local live execution identity from the pinned Jet implementation. No metrics, arrival order
@@ -21,6 +24,28 @@ public final class JetLiveExecution {
         if (actual == null) return OptionalLong.empty();
         Long execution = jetService(actual).getJobExecutionService().getExecutionIdForJobId(jobId);
         return execution == null ? OptionalLong.empty() : OptionalLong.of(execution);
+    }
+
+    /** A coordinator has an exact attempt before the local writer execution context has opened. */
+    static OptionalLong forHistory(HazelcastInstance member, long jobId) {
+        var local = current(member, jobId);
+        if (local.isPresent()) return local;
+        var actual = localMember(member);
+        if (actual == null) return OptionalLong.empty();
+        var context = jetService(actual).getJobCoordinationService().getMasterContext(jobId);
+        if (context == null) return OptionalLong.empty();
+        var status = context.jobStatus();
+        long execution = context.executionId();
+        return execution != 0 && (status == JobStatus.STARTING || status == JobStatus.RUNNING)
+                ? OptionalLong.of(execution) : OptionalLong.empty();
+    }
+
+    static Set<String> historyParticipantAddresses(HazelcastInstance member, long jobId, long executionId) {
+        var actual = localMember(member);
+        if (actual == null) return Set.of();
+        var context = jetService(actual).getJobExecutionService().getExecutionContext(executionId);
+        if (context == null || context.jobId() != jobId || context.participants() == null) return Set.of();
+        return context.participants().stream().map(Object::toString).collect(Collectors.toSet());
     }
 
     enum StartupPhase { PROCESSOR, PLANNING }

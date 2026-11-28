@@ -534,6 +534,7 @@ class StartFlowTest {
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(report));
         server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of()));
+        server.status = new StatusOutcome.NoObservation(new StatusOutcome.StopDetails("CLEARED", null, null, Map.of()));
         StartFlow flow = rerunFlow(false, new ScriptedPrompter());
 
         StartFlow.RerunPlan.Ready plan = (StartFlow.RerunPlan.Ready) flow.planRerun("pl1",
@@ -543,8 +544,24 @@ class StartFlowTest {
         assertThat(result.exitCode()).isNotZero();
         assertThat(reported).containsExactly(code);
         assertThat(server.startsSent()).hasSize(1);
-        assertThat(err.toString()).contains("restart: pl1 was stopped and its state cleared, but it has not been "
-                + "started").contains("Start it with: tapstate start pl1 --decide target-not-empty=<answer> (or -y)");
+        assertThat(server.calls.getLast()).isEqualTo("status pl1");
+        assertThat(err.toString()).contains("restart: pl1 state is cleared.")
+                .contains("Start it with: tapstate start pl1 --decide target-not-empty=<answer> (or -y)");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void rerunDoesNotClaimAnUnconfirmedClear(boolean pending) {
+        if (pending) {
+            server.status = new StatusOutcome.NoObservation(new StatusOutcome.StopDetails("CLEARING", null, null, Map.of()));
+        }
+
+        rerunFlow(false, new ScriptedPrompter()).reportRerunStartFailure("pl1", null);
+
+        assertThat(server.calls).containsExactly("status pl1");
+        assertThat(err.toString()).doesNotContain("state is cleared", "Start it with").contains(pending
+                ? "is still clearing. After clearing completes, run: tapstate start pl1"
+                : "clear result is unconfirmed. Check its status before retrying Start.");
     }
 
     @Test
@@ -661,6 +678,7 @@ class StartFlowTest {
     private static final class FakeServer implements StartFlow.Server {
         final Deque<StartAttempt> starts = new ArrayDeque<>();
         StartChecksOutcome checks = new StartChecksOutcome.NotSupported();
+        StatusOutcome status = new StatusOutcome.Unreachable();
         final List<String> calls = new ArrayList<>();
 
         @Override
@@ -675,6 +693,12 @@ class StartFlowTest {
         public StartChecksOutcome checks(String pipelineId, String intent) {
             calls.add("checks " + intent + " " + pipelineId);
             return checks;
+        }
+
+        @Override
+        public StatusOutcome status(String pipelineId) {
+            calls.add("status " + pipelineId);
+            return status;
         }
 
         List<String> startsSent() {

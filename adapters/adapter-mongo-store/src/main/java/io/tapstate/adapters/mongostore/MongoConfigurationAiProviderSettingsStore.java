@@ -114,13 +114,13 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         if (identity == null || !cluster.equals(identity.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId")))
             throw invalid("identity");
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-        if (schema == null || !Integer.valueOf(2).equals(schema.get("installedVersion"))
-                && !Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion"))
-                || Integer.valueOf(2).equals(schema.get("installedVersion")) && (!openedWithAiOnlySchema || schema.containsKey("validation")))
+        int componentVersion = schema == null ? 0 : MongoFirstClearingStopSchema.componentVersion(schema);
+        if (componentVersion != 2 && componentVersion != MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION
+                || componentVersion == 2 && (!openedWithAiOnlySchema || schema.containsKey("validation")))
             throw new TapstateException(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED,
                     Map.of("required", "2"), null);
         if (MongoValidationSchema.isAiOnlyVersion(schema)) MongoValidationSchema.requireAiOnlyIdentity(schema);
-        if (Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion"))) {
+        if (componentVersion == MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION) {
             var validation = MongoValidationSchema.readyConfiguration(schema);
             if (!cluster.equals(MongoValidationSchema.scope(validation).clusterId())) throw invalid("identity");
         }

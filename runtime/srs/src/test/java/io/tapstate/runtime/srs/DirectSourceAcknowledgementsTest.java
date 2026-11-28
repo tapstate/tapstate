@@ -96,7 +96,7 @@ class DirectSourceAcknowledgementsTest {
         @Override public DirectChannelStore guardedBy(Runnable guard) { throw new AssertionError(); }
         @Override public List<DirectBatch> pending(DirectChannelContext c,long e) { throw new AssertionError(); }
         @Override public OptionalLong beginCapture(DirectChannelContext c,long r,long e,WorkloadClaimFence a,WorkloadClaimFence b) { throw new AssertionError(); }
-        @Override public boolean confirmAnchor(DirectChannelContext c,long e,String s,WorkloadClaimFence a,WorkloadClaimFence b) { throw new AssertionError(); }
+        @Override public boolean confirmAnchor(DirectChannelContext c,long e,String s,java.time.Instant initialStartAt,WorkloadClaimFence a,WorkloadClaimFence b) { throw new AssertionError(); }
         @Override public boolean pinSnapshot(DirectChannelContext c,long r,long e,String s,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public boolean beginWriterRun(DirectChannelContext c,long e,String r,Map<String,List<String>> t,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public boolean recordBatch(DirectBatch b,long r,WorkloadClaimFence a,WorkloadClaimFence f) { throw new AssertionError(); }

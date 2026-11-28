@@ -20,6 +20,49 @@ class MongoValidationAiSchemaCompositionIT {
     private static final String OWNER=JsonWriter.write(List.of("cloud","organization","cluster"));
     private static final AiProviderSettingsStore.Settings SETTING=new AiProviderSettingsStore.Settings("openai-compatible","https://api.example/v1","model","private-fixture-key");
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void firstValidationPreparationPreservesTheActivatedVersionFence(boolean offline) {
+        try (var f = new MongoValidationSchemaIT.Fixture(offline ? 1 : 0, StorageBinding.Mode.CLOUD, true)) {
+            assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(2);
+            f.configuration.aiProviderSettings().put(OWNER, SETTING);
+            var aiRow = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first();
+            assertThat(MongoConfigurationDomain.enableFirstClearingStop(f.settings, "cluster")).isTrue();
+            assertThat(MongoConfigurationDomain.enableFirstClearingStop(f.settings, "cluster")).isFalse();
+            var enablement = f.configSchema().get("firstClearingStop");
+            assertThat(enablement).isNotNull();
+            assertThat(f.configSchema()).containsEntry("installedVersion", 4).containsEntry("componentVersion", 2);
+
+            if (offline) {
+                var operation = UUID.randomUUID();
+                try (var preparing = f.prepare(operation)) {
+                    assertThat(f.configSchema()).containsEntry("installedVersion", 4)
+                            .containsEntry("firstClearingStop", enablement).containsEntry("componentVersion", 3);
+                    assertThat(preparing.advance(1).ready()).isFalse();
+                    preparing.prepareCache(f.cache);
+                }
+                try (var resumed = f.resume(operation)) {
+                    assertThat(resumed.advance(20).ready()).isTrue();
+                }
+            } else {
+                try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                    var original = reopened.bindings().cachePreparation().orElseThrow();
+                    var result = reopened.prepareInitialValidationSchema(original, f.cache, () -> {});
+                    assertThat(result.ready()).isTrue();
+                    assertThat(reopened.prepareInitialValidationSchema(original, f.cache, () -> {})).isEqualTo(result);
+                }
+            }
+            assertThat(f.configSchema()).containsEntry("installedVersion", 4)
+                    .containsEntry("firstClearingStop", enablement).containsEntry("componentVersion", 3);
+            assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first()).isEqualTo(aiRow);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.schemaVersion()).isEqualTo(4);
+                assertThat(reopened.aiProviderSettings().get(OWNER)).contains(SETTING);
+                assertThat(reopened.validationPreparations()).isNotNull();
+            }
+        }
+    }
+
     @Test void originalAiInstallationAndControlledValidationPreparationComposeWithoutChangingTheEncryptedRow(){
         try(var f=new MongoValidationSchemaIT.Fixture(0,StorageBinding.Mode.CLOUD,true)){
             assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(2);

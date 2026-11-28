@@ -8,6 +8,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.*;
 import org.bson.Document;
+import java.time.Instant;
 import java.util.*;
 import java.util.function.BiFunction;
 
@@ -37,7 +38,7 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
                     .append("currentType",new Document("$type","$current")).append("tablesType",new Document("$type","$tables"))
                     .append("selected",new Document("$in",List.of(new Document("$literal",table),new Document("$ifNull",List.of("$tables",List.of())))));
             var row=MongoValidationMetadata.read(session,SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database),new Document("_id",MongoDirectChannelRecords.id(context)),projection,64*1024);
-            if(row==null||!context.equals(MongoDirectChannelRecords.context(row.get("_id",Document.class)))||!Integer.valueOf(1).equals(row.get("formatVersion"))
+            if(row==null||!context.equals(MongoDirectChannelRecords.context(row.get("_id",Document.class)))||!MongoDirectChannelRecords.supportsProgressVersion(row.get("formatVersion"))
                     ||!(row.get("revision") instanceof Long revision)||revision<0||revision==Long.MAX_VALUE||!"array".equals(row.get("tablesType"))||!(row.get("selected") instanceof Boolean selected))throw unavailable(context);
             if("null".equals(row.get("currentType")))return Optional.empty();
             if(!"object".equals(row.get("currentType"))||!(row.get("current") instanceof Document current)||!(current.get("epoch") instanceof Long epoch)||epoch<1||epoch==Long.MAX_VALUE)throw unavailable(context);
@@ -69,7 +70,8 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
             return OptionalLong.of(current.epoch());
         });
     }
-    @Override public boolean confirmAnchor(DirectChannelContext context,long epoch,String sourcePosition,WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
+    @Override public boolean confirmAnchor(DirectChannelContext context,long epoch,String sourcePosition,Instant initialStartAt,
+            WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
         requireToken(sourcePosition); requireCapture(context,capture);
         return transaction(context,pipeline,(session,held) -> {
             proveCapture(session,capture); var old = held.value(); var current = original(old,epoch,capture,pipeline);
@@ -81,8 +83,10 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
             if (old.retained() != null) remove(session,held.retained());
             var cursor = cursor(old.cursor(),new ChainPosition(SourceOrder.snapshotRow(epoch),sourcePosition));
             var anchored = new DirectCaptureWindow(epoch,capture,pipeline,sourcePosition,0,0,null,null);
+            Instant cutoff = old.cursor().sinkAcked() == null ? initialStartAt : old.pendingStartAt();
             if (old.revision() >= Long.MAX_VALUE - 1) throw unavailable(context);
-            var next = new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,anchored,null,cursor,old.writerRun(),overriding?null:old.resumeOverride());
+            var next = new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,anchored,null,cursor,old.writerRun(),
+                    overriding?null:old.resumeOverride(),cutoff);
             replace(session,old,next,List.of(),List.of()); return true;
         });
     }
@@ -219,15 +223,21 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
                 before.cdcStartPosition(), before.snapshotEpoch(), Map.of(), ConsumerProgressKind.DIRECT_SOURCE);
         if (old.revision() >= Long.MAX_VALUE - 1) throw unavailable(context);
         var next = new DirectChannelProgress(context, old.tables(), old.revision()+1, old.current(), old.retained(), cursor, null,
-                new SourceResumeOverride(token, old.epoch(), at));
+                new SourceResumeOverride(token, old.epoch(), at), old.pendingStartAt());
         replace(session, old, next, held.current(), held.retained());
     }
     private void settleAndReplace(ClientSession session,DirectChannelProgress before,DirectCaptureWindow window,ConsumerOffset cursor,DirectWriterRun run,List<DirectBatch> pending) {
-        var prospective = new DirectChannelProgress(before.context(),before.tables(),before.revision(),window,null,cursor,run,before.resumeOverride());
+        var prospective = new DirectChannelProgress(before.context(),before.tables(),before.revision(),window,null,cursor,run,
+                before.resumeOverride(),before.pendingStartAt());
         var settled = DirectChannelAccounting.settle(prospective,pending);
-        remove(session,pending.stream().filter(batch -> batch.ordinal() <= settled.through()).toList());
+        int settledCount = Math.toIntExact(settled.through() - window.settledThrough());
+        var finished = pending.subList(0,settledCount);
+        Instant cutoff = before.pendingStartAt();
+        // Before the cutoff opens, only a qualifying batch can contribute target rows.
+        if (cutoff != null && finished.stream().anyMatch(batch -> !batch.targets().isEmpty())) cutoff = null;
+        remove(session,finished);
         var nextWindow = new DirectCaptureWindow(window.epoch(),window.captureFence(),window.pipelineFence(),window.anchor(),window.recordedThrough(),settled.through(),window.lastBoundary(),window.lastBatchHash());
-        replace(session,before,next(before,nextWindow,null,settled.cursor(),run),pending.stream().filter(batch -> batch.ordinal() > settled.through()).toList(),List.of());
+        replace(session,before,next(before,nextWindow,null,settled.cursor(),run,cutoff),pending.subList(settledCount,pending.size()),List.of());
     }
     private void remove(ClientSession session,List<DirectBatch> batches) {
         for (var batch : batches) if (SystemCollections.DIRECT_BATCHES.on(database).deleteOne(session,
@@ -239,8 +249,12 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
                 .append("revision",before.revision()),MongoDirectChannelRecords.progress(after,current,retained)).getMatchedCount() != 1) throw unavailable(before.context());
     }
     private static DirectChannelProgress next(DirectChannelProgress old,DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,DirectWriterRun run) {
+        return next(old,current,retained,cursor,run,old.pendingStartAt());
+    }
+    private static DirectChannelProgress next(DirectChannelProgress old,DirectCaptureWindow current,DirectCaptureWindow retained,ConsumerOffset cursor,
+            DirectWriterRun run,Instant cutoff) {
         if (old.revision() >= Long.MAX_VALUE - 1) throw unavailable(old.context());
-        return new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,current,retained,cursor,run,old.resumeOverride());
+        return new DirectChannelProgress(old.context(),old.tables(),old.revision()+1,current,retained,cursor,run,old.resumeOverride(),cutoff);
     }
     private record Held(DirectChannelProgress value,List<DirectBatch> current,List<DirectBatch> retained) {}
     void requireChannel(ClientSession session,DirectChannelContext context) { held(session,context); }

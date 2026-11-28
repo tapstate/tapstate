@@ -238,7 +238,9 @@ class MongoConfigurationAiProviderSettingsIT {
 
     @Test void oldSchemaKeepsSourceConfigurationButRefusesProviderAccess() {
         fixture((uri, config, raw) -> {
-            SystemCollections.SCHEMA_MIGRATIONS.on(raw).updateOne(new Document("_id", "config"), new Document("$set", new Document("installedVersion", 1)));
+            SystemCollections.SCHEMA_MIGRATIONS.on(raw).updateOne(new Document("_id", "config"),
+                    new Document("$set", new Document("installedVersion", 1))
+                            .append("$unset", new Document("firstClearingStop", "").append("componentVersion", "")));
             SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).drop();
             try (var old = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
                 old.artifacts().save(new io.tapstate.core.model.SourceResource("source", null, "mongodb", Map.of("uri", "mongodb://localhost/data"), null, null, null, null));

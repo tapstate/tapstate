@@ -69,7 +69,7 @@ final class MongoValidationSchema {
 
     /** Logical migration marker validation for an already opened configuration domain. */
     static boolean configurationDeclaresValidation(Document schema) {
-        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable("version");
+        int version = MongoFirstClearingStopSchema.componentVersion(schema);
         if (version == 1 || version == VERSION && !schema.containsKey("validation")) {
             if (schema.containsKey("validation")) throw unreadable("marker");
             return false;
@@ -178,7 +178,7 @@ final class MongoValidationSchema {
 
     /** Version-two components have distinct positive structures; absence never selects a fallback. */
     static boolean configurationHasValidation(MongoDatabase database, Document schema) {
-        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable("version");
+        int version = MongoFirstClearingStopSchema.componentVersion(schema);
         if (version == 1) {
             if (schema.containsKey("validation")) throw unreadable("marker");
             return false;
@@ -206,7 +206,7 @@ final class MongoValidationSchema {
     }
 
     static boolean isAiOnlyVersion(Document schema) {
-        return Integer.valueOf(VERSION).equals(schema.get("installedVersion")) && !schema.containsKey("validation");
+        return MongoFirstClearingStopSchema.componentVersion(schema) == VERSION && !schema.containsKey("validation");
     }
 
     static void requireAiOnlyIdentity(Document schema) {
@@ -220,8 +220,8 @@ final class MongoValidationSchema {
     }
 
     static Document configurationMarker(Document schema) {
-        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)
-                || version != VERSION && version != COMPOSED_CONFIGURATION_VERSION) throw unreadable("version");
+        int version = MongoFirstClearingStopSchema.componentVersion(schema);
+        if (version != VERSION && version != COMPOSED_CONFIGURATION_VERSION) throw unreadable("version");
         if (!(schema.get("validation") instanceof Document marker)) throw unreadable("marker");
         return validateMarker(marker);
     }
@@ -240,8 +240,9 @@ final class MongoValidationSchema {
     }
 
     static int preparedConfigurationVersion(Document original) {
-        if (Integer.valueOf(1).equals(original.get("installedVersion"))) return VERSION;
-        if (Integer.valueOf(VERSION).equals(original.get("installedVersion")) && !original.containsKey("validation"))
+        int version = MongoFirstClearingStopSchema.componentVersion(original);
+        if (version == 1) return VERSION;
+        if (version == VERSION && !original.containsKey("validation"))
             return COMPOSED_CONFIGURATION_VERSION;
         throw refused();
     }

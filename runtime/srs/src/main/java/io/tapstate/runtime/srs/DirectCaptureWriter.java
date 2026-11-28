@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.*;
 import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.*;
@@ -27,6 +28,7 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
     private final Deque<Pending> pending=new ArrayDeque<>();
     private final Map<String,Long> targets=new HashMap<>();
     private volatile String expectedResume;
+    private volatile Instant initialStartAt;
     // Publishes CaptureHealth before callbacks; that object uses atomic fields and concurrent maps.
     @SuppressWarnings("java:S3077")
     private volatile CaptureHealth health;
@@ -70,10 +72,13 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
                 || known==null && start instanceof CaptureStart.Resume) throw unavailable();
         expectedResume=known;
         if (!started.compareAndSet(false,true)) throw unavailable();
+        initialStartAt=start instanceof CaptureStart.At at ? at.instant() : null;
+        CaptureStart sourceStart=start instanceof CaptureStart.Resume resume
+                ? new CaptureStart.Resume(resume.position(),opened.pendingStartAt()) : start;
         this.health=health;
         Subscription source=null;
         try {
-            source=Objects.requireNonNull(observation.start(health.recording(this), listener -> port.cdc(config,start,listener)),"source subscription"); sourceHandles.add(source); requireUsable();
+            source=Objects.requireNonNull(observation.start(health.recording(this), listener -> port.cdc(config,sourceStart,listener)),"source subscription"); sourceHandles.add(source); requireUsable();
             var original=source; var ended=new AtomicBoolean();
             return new Subscription() {
                 @Override public void acknowledge(SourcePosition position) { requireUsable(); original.acknowledge(position); }
@@ -100,7 +105,7 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
         try {
             requireStarted(); Objects.requireNonNull(position,"position");
             if (expectedResume!=null && !expectedResume.equals(position.token()) || anchor!=null && !anchor.equals(position.token())) throw unavailable();
-            if (!channels.confirmAnchor(context,opened.epoch(),position.token(),capture,pipeline)) throw unavailable();
+            if (!channels.confirmAnchor(context,opened.epoch(),position.token(),initialStartAt,capture,pipeline)) throw unavailable();
             requireUsable(); anchor=position.token();
             changesReady.run();
         } catch(RuntimeException|Error failed) { fail(failed); throw failed; }

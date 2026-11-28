@@ -634,12 +634,14 @@ public final class TapEventCodec {
 
     /** The source reference time, falling back to the event time, or {@code 0} when neither is set. */
     private static long ts(TapBaseEvent event) {
-        Long reference = event.getReferenceTime();
-        if (reference != null) {
-            return reference;
-        }
-        Long time = event.getTime();
+        Long time = sourceTime(event);
         return time != null ? time : 0L;
+    }
+
+    /** Source time before any envelope default is applied. */
+    static Long sourceTime(TapBaseEvent event) {
+        Long reference = event.getReferenceTime();
+        return reference != null ? reference : event.getTime();
     }
 
     private static String src(TapBaseEvent event) {

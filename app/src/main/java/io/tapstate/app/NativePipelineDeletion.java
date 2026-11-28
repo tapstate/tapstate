@@ -77,6 +77,13 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
         while (scope(mapping).equals(purge.scope())) {
             if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE
                     && !(mapping.phase() == PipelineStateMapping.Phase.REBUILDING && operation.equals(mapping.operationId()))) throw fenced();
+            if (mapping.phase() == PipelineStateMapping.Phase.ACTIVE
+                    && firstClearCompleted(purge, Duration.ofNanos(purgeRemaining(deadline)))) {
+                requireHash(initial.pipelineId(), hash);
+                requirePurgeSuccessor(purge.scope(), handoff);
+                purgeRemaining(deadline);
+                return mapping;
+            }
             long remaining = purgeRemaining(deadline);
             java.util.concurrent.locks.LockSupport.parkNanos(Math.min(Duration.ofMillis(50).toNanos(),remaining));
             remaining = purgeRemaining(deadline);
@@ -93,6 +100,15 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
         requirePurgeSuccessor(scope(mapping), handoff);
         purgeRemaining(deadline);
         return mapping;
+    }
+
+    private boolean firstClearCompleted(PipelineIntentSnapshot original, Duration budget) {
+        var result = configuration.intents().firstClearResult(original, budget).orElse(null);
+        if (result == PipelineIntentStore.FirstClearResult.UNPROVEN) {
+            throw new TapstateException(IoError.PIPELINE_CLEAR_UNPROVEN,
+                    Map.of("pipeline", original.scope().pipelineId()), null);
+        }
+        return result == PipelineIntentStore.FirstClearResult.CLEARED;
     }
 
     private static long purgeRemaining(long deadline) {
@@ -118,11 +134,15 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
         var pending=mapping.phase()==PipelineStateMapping.Phase.RETIRING
                 ? lifecycle.pending(scope,mapping.operationId()) : Optional.<PipelineRetirementPreparation>empty();
         if (mapping.phase()!=PipelineStateMapping.Phase.ACTIVE && pending.isEmpty()) throw fenced();
-        if (handoff != null && !PipelineRebuildCoordinator.operationId(handoff.intent()).equals(mapping.operationId())) throw fenced();
+        boolean firstClear = handoff != null && scope.equals(handoff.intent().scope());
+        if (firstClear) {
+            if (!firstClearCompleted(handoff.intent(), LOCAL_PASS_WAIT)) throw fenced();
+        } else if (handoff != null && !PipelineRebuildCoordinator.operationId(handoff.intent()).equals(mapping.operationId())) throw fenced();
         if (pending.isPresent() && !pending.orElseThrow().request().definitionHash().equals(expectedHash)) throw conflict(original.id());
         var preparation=configuration.preparations().read(original.id()).orElseThrow(NativePipelineDeletion::fenced);
         if (preparation.phase()==PipelinePreparation.Phase.ISSUED) throw fenced();
-        if (handoff != null && (preparation.phase() != PipelinePreparation.Phase.COMPLETE || !scope.equals(preparation.scope()))) throw fenced();
+        if (handoff != null && (firstClear ? preparation.phase() != PipelinePreparation.Phase.UNASSIGNED
+                : preparation.phase() != PipelinePreparation.Phase.COMPLETE || !scope.equals(preparation.scope()))) throw fenced();
         boolean alreadyRetired=pending.isPresent() && pending.orElseThrow().request().cache().isPresent()
                 && retirement.completed(pending.orElseThrow(),node.get()).isPresent();
         boolean unprepared = alreadyRetired || preparation.phase()==PipelinePreparation.Phase.UNASSIGNED;
@@ -216,6 +236,7 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
             },(fixed,current,local) -> configuration.retireValidation(fixed,cache,current,local));
             try {
                 if (pending.isPresent()) { if (coordinator.resume(scope,request.operationId(),manifest).isEmpty()) throw fenced(); }
+                else if (firstClear) coordinator.deleteAfterFirstClear(request, manifest, successor, handoff.intent());
                 else coordinator.delete(request,manifest,successor);
             } catch (TapstateException failed) {
                 var current=configuration.artifacts().get(original.id());

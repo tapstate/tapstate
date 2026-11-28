@@ -146,7 +146,9 @@ class PipelinePreviewStreamingSocketTest {
         }
         @Bean
         SecurityFilterChain testSecurity(HttpSecurity http) throws Exception {
-            return http.csrf(AbstractHttpConfigurer::disable).authorizeHttpRequests(rules -> rules.anyRequest().permitAll())
+            return http.csrf(AbstractHttpConfigurer::disable)
+                    .headers(RestApiSecurityConfiguration::writeApiHeadersEagerly)
+                    .authorizeHttpRequests(rules -> rules.anyRequest().permitAll())
                     .addFilterBefore((request, response, chain) -> {
                         var principal = TapstatePrincipal.humanJwt(new VerifiedToken("preview-author", Scope.READ));
                         SecurityContextHolder.getContext().setAuthentication(
