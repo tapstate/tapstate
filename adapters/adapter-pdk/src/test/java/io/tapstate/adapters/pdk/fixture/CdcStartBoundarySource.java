@@ -20,9 +20,22 @@ public final class CdcStartBoundarySource implements TapConnector {
         functions.supportTimestampToStreamOffset((context, timestamp) -> timestamp);
         functions.supportStreamRead((context, tables, offset, size, consumer) -> {
             consumer.streamReadStarted();
-            consumer.accept(List.of(row(1, 10L, 30L), row(2, null, 17L)), 11L);
-            consumer.accept(List.of(row(3, null, 20L), row(4, null, null)), 12L);
-            consumer.accept(List.of(row(5, 5L, null)), 13L);
+            if (Boolean.TRUE.equals(context.getConnectionConfig().getObject("retry_failed_delivery"))) {
+                try {
+                    consumer.accept(List.of(row(1, null, null)), 11L);
+                } catch (RuntimeException ignored) {
+                    // Exercise a connector that catches a failed delivery and attempts another batch.
+                }
+                try {
+                    consumer.accept(List.of(row(2, 21L, null)), 12L);
+                } catch (RuntimeException failure) {
+                    throw new IllegalStateException("the connector stopped after the next callback failed", failure);
+                }
+            } else {
+                consumer.accept(List.of(row(1, 10L, 30L), row(2, null, 17L)), 11L);
+                consumer.accept(List.of(row(3, null, 20L), row(4, null, null)), 12L);
+                consumer.accept(List.of(row(5, 5L, null)), 13L);
+            }
             consumer.streamReadEnded();
         });
     }

@@ -24,7 +24,8 @@ class DirectTimestampHeartbeatIT {
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
 
     @Test
-    void anUntimedChangeOnAConnectorWorkerFailsThePipeline(@TempDir Path directory) throws Exception {
+    void anUntimedChangeOnAConnectorWorkerFailsThePipelineAndBlocksTheNextBatch(@TempDir Path directory)
+            throws Exception {
         DockerGate.require();
         Path source = Files.createDirectory(directory.resolve("source"));
         Path target = Files.createDirectory(directory.resolve("target"));
@@ -44,14 +45,18 @@ class DirectTimestampHeartbeatIT {
                     () -> streamHasLine(source, "START 0 orders"), () -> control.logs(PIPELINE));
 
             CdcRecoveryFixture.deliverUntimedChangeOnWorker(source);
-            Await.until("the worker to throw and the stream read to return", TIMEOUT,
-                    () -> streamHasLine(source, "CALLBACK_FAILED") && streamHasLine(source, "END 0"),
+            Await.until("the worker to throw and the connector to attempt another delivery", TIMEOUT,
+                    () -> streamHasLine(source, "CALLBACK_FAILED") && streamHasLine(source, "CALLBACK_RETRIED")
+                            && streamHasLine(source, "END 0"),
                     () -> control.logs(PIPELINE));
             Await.until("the pipeline to expose the projection failure", TIMEOUT,
                     () -> control.state(PIPELINE).orElse(null) == PipelineState.FAILED
                             && control.failureCode(PIPELINE).isPresent(),
                     () -> "state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
             assertThat(control.failureCode(PIPELINE)).contains(ConnectorError.PROJECTION_FAILED.code());
+            assertThat(streamHasLine(source, "CALLBACK_REJECTED"))
+                    .as("the connector must see its later callback rejected")
+                    .isTrue();
             assertThat(rows(target)).isEmpty();
         }
     }

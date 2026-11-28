@@ -230,6 +230,15 @@ public final class CdcRecoveryFixture {
                                 (thread, failure) -> note(witness, "CALLBACK_FAILED"))
                                 .start(() -> consumer.accept(List.of(event), position(next)));
                         worker.join();
+                        var later = new Change(next + 1, System.currentTimeMillis(), tables.getFirst(),
+                                "later", "", "valid");
+                        note(witness, "CALLBACK_RETRIED");
+                        try {
+                            consumer.accept(List.of(later.event()), position(later.sequence()));
+                        } catch (RuntimeException failure) {
+                            note(witness, "CALLBACK_REJECTED");
+                            throw failure;
+                        }
                         return;
                     }
                     List<TapEvent> batch = new ArrayList<>();

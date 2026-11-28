@@ -620,7 +620,7 @@ class PdkCapturePortTest {
     }
 
     @Test
-    void aMissingTimeWhileSeekingTheStartReportsFailureWithoutDeliveringTheBatch() throws Exception {
+    void aMissingTimeWhileSeekingTheStartPreventsDeliveryAfterTheConnectorRetries() throws Exception {
         BlockingQueue<FailureFact> failures = new LinkedBlockingQueue<>();
         List<Envelope> delivered = new CopyOnWriteArrayList<>();
         CaptureListener listener = new CaptureListener() {
@@ -634,8 +634,9 @@ class PdkCapturePortTest {
                 failures.add(fact);
             }
         };
+        var config = new CaptureConfig("demo", Map.of("retry_failed_delivery", true), List.of("t1"));
         try (var port = startBoundaryPort();
-                var subscription = port.cdc(config("t1"), CaptureStart.at(Instant.ofEpochMilli(21)), listener)) {
+                var subscription = port.cdc(config, CaptureStart.at(Instant.ofEpochMilli(21)), listener)) {
             FailureFact failure = failures.poll(5, TimeUnit.SECONDS);
             assertThat(failure).isNotNull();
             assertThat(failure.publicFailure().code()).isEqualTo(ConnectorError.PROJECTION_FAILED.code());
