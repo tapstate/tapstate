@@ -1,0 +1,22 @@
+package io.tapstate.core.lifecycle;
+
+/** Wire names for observations of work and milestones within one Pipeline run. */
+public enum PipelineRunStage {
+    START_ACCEPTED,
+    WAITING_FOR_SCHEDULER,
+    EXECUTION_PLAN_PREPARING,
+    EXECUTION_PLAN_PREPARED,
+    CONNECTORS_CHECKING,
+    CONNECTORS_READY,
+    WAITING_FOR_PREVIOUS_RUN,
+    RUN_RESOURCES_PREPARING,
+    SOURCE_CAPTURE_PREPARING,
+    WAITING_FOR_CAPTURE,
+    ENGINE_JOB_SUBMITTING,
+    WAITING_FOR_ENGINE,
+    ENGINE_RUNNING,
+    INITIAL_LOAD_IN_PROGRESS,
+    INITIAL_LOAD_COMPLETED,
+    CDC_READY,
+    RUN_COMPLETED
+}

@@ -9,6 +9,7 @@ import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -87,6 +88,8 @@ class ASlowerSinkHoldsTheResumePositionIT {
             Progress initial = progress(documents, chain);
 
             try {
+                Await.until("idle CDC lag to be unknown", TIMEOUT,
+                        () -> "UNKNOWN".equals(syncLag(control).get("state")), () -> syncLag(control).toString());
                 for (int expected = 1; expected <= 3; expected++) {
                     files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
                     int count = expected;
@@ -104,6 +107,14 @@ class ASlowerSinkHoldsTheResumePositionIT {
                 Await.until("one writer to advance without moving the shared resume floor", TIMEOUT,
                         () -> oneWriterIsAhead(progress(documents, chain), initial),
                         () -> progress(documents, chain).toString());
+                Await.until("the catalog to report the held write's CDC lag", TIMEOUT,
+                        () -> {
+                            var lag = syncLag(control);
+                            return "BEHIND".equals(lag.get("state"))
+                                    && lag.get("lowerBoundMillis") instanceof Number age && age.longValue() > 0
+                                    && lag.get("observedAt") instanceof String observedAt
+                                    && !Instant.parse(observedAt).isAfter(Instant.now());
+                        }, () -> syncLag(control).toString());
                 Progress divided = progress(documents, chain);
                 assertThat(divided.runId()).isEqualTo(initial.runId());
                 assertThat(divided.epoch()).isEqualTo(initial.epoch());
@@ -142,10 +153,19 @@ class ASlowerSinkHoldsTheResumePositionIT {
                         },
                         () -> progress(documents, chain).toString());
                 assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+                Await.until("the catalog to clear the lag after the writes are confirmed", Duration.ofSeconds(30),
+                        () -> "UNKNOWN".equals(syncLag(control).get("state"))
+                                && syncLag(control).get("lowerBoundMillis") == null,
+                        () -> syncLag(control).toString());
             } finally {
                 Files.writeString(signals.resolve("release"), "");
             }
         }
+    }
+
+    private static Map<?, ?> syncLag(ControlPlane control) {
+        Object value = control.pipelineCatalogItem(PIPELINE).get("syncLag");
+        return value instanceof Map<?, ?> lag ? lag : Map.of();
     }
 
     private static boolean oneWriterIsAhead(Progress progress, Progress initial) {

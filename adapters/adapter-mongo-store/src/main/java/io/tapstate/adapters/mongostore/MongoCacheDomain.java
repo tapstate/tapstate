@@ -982,14 +982,19 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     public record ObservationWrite(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active,
-            Observation observation, long checkpointEpoch) {}
+            Observation observation, long checkpointEpoch, io.tapstate.spi.store.ResumeMetrics.Publication publication) {
+        public ObservationWrite(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active,
+                Observation observation, long checkpointEpoch) {
+            this(scope, original, active, observation, checkpointEpoch, null);
+        }
+    }
 
     /** Writes independent latest observations and returns each original entry's failure, or null on success. */
     public List<RuntimeException> writeObservations(List<ObservationWrite> batch) {
         return MongoCachePipelineObservationStore.writeBatch(batch.stream().map(write ->
                 new MongoCachePipelineObservationStore.BatchWrite(
                         new MongoCachePipelineObservationStore(pipelineAccess(write.scope(), write.original(), write.active())),
-                        write.observation(), write.checkpointEpoch())).toList());
+                        write.observation(), write.checkpointEpoch(), write.publication())).toList());
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */
@@ -1008,6 +1013,33 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Objects.requireNonNull(requireActive, "requireActive");
         return new MongoCachePipelineAccess(client, database, scope, original,
                 () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases);
+    }
+
+    public MongoCachePipelineRunProgressStore pipelineRunProgress(PipelineIntentScope scope,
+            WorkloadClaimFence claim, Runnable requireActive) {
+        return new MongoCachePipelineRunProgressStore(pipelineAccess(scope, claim, requireActive), claim);
+    }
+
+    /** Prepares the optional display resource without placing schema work on the Start path. */
+    public void preparePipelineRunProgress(CacheBusinessScope expected, Runnable requireActive) {
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        StoreIo.run(() -> {
+            active.run();
+            if (structure.hasPipelineRunProgress()) {
+                structure.verifyFacet(SystemCollections.CACHE_PIPELINE_RUN_PROGRESS);
+                return;
+            }
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    active.run();
+                    new MongoCacheBusinessIdentity(database, expected).admitMetadataWrite(session);
+                    structure.preparePipelineRunProgressInTransaction(session, active);
+                    return null;
+                }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.LOCAL)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+        });
     }
 
     /**

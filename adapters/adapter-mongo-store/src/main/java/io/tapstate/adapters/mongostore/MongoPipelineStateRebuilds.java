@@ -5,6 +5,7 @@ import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
@@ -54,10 +55,31 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     @Override public PipelineRebuildPreparation begin(PipelineRebuildRequest original) {
         Objects.requireNonNull(original, "original");
         String hash = confirmationHash(original), id = UUID.randomUUID().toString();
+        var replay = transaction(session -> existingRegistration(session, original, hash));
+        if (replay != null) return replay;
+        return register(original, hash, id);
+    }
+
+    private Pending existingRegistration(ClientSession session, PipelineRebuildRequest original, String hash) {
+        var filter = MongoPipelineRebuildFacts.rebuildingMappingFilter(original.originalScope().pipelineId());
+        var rebuilding = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, filter)
+                .projection(new Document("_id", 1)).first();
+        return rebuilding == null ? null : retained(original, hash, requireOriginal(session, original));
+    }
+
+    private Pending register(PipelineRebuildRequest original, String hash, String id) {
         return transaction(session -> {
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(database);
+            // Claim the shared document before dependency reads can age the snapshot behind alert writes.
+            var reserved = ConfigurationVersion.reserveRevision(session, versions, Long.MAX_VALUE - 2);
             Document mapping = requireOriginal(session, original);
             var state = MongoPipelineStateMappings.decode(original.originalScope().pipelineId(), mapping);
-            if (state.phase() == PipelineStateMapping.Phase.REBUILDING) return retained(original, hash, mapping);
+            if (state.phase() == PipelineStateMapping.Phase.REBUILDING) {
+                // Another begin won after the replay check. Discard our provisional increment.
+                var winner = retained(original, hash, mapping);
+                session.abortTransaction();
+                return winner;
+            }
             if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw fenced();
             var previous = MongoPipelinePreparationFacts.decode(state.pipelineId(), mapping, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.COMPLETE || !original.originalScope().equals(previous.scope())) throw fenced();
@@ -66,8 +88,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             var pending = new Pending(this, original, id, previous.preparationId(), hash, version,
                     version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
             long fence = mapping.getLong("noteWriteFence");
-            if (fence >= Long.MAX_VALUE - 2 || ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database)) >= Long.MAX_VALUE - 2) throw fenced();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
+            requireWritableRegistration(session, versions, reserved, fence);
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", state.pipelineId()).append("stateGeneration", state.stateGeneration()).append("phase", "ACTIVE")
                             .append("noteWriteFence", fence).append("cachePreparation", mapping.get("cachePreparation")),
@@ -77,6 +98,17 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             return pending;
         });
     }
+
+    private void requireWritableRegistration(ClientSession session, MongoCollection<Document> versions,
+            Document reserved, long fence) {
+        if (fence >= Long.MAX_VALUE - 2) throw fenced();
+        if (reserved == null) {
+            ConfigurationVersion.read(session, versions); // Preserve the diagnostic for a malformed revision.
+            throw fenced();
+        }
+        ConfigurationVersion.requireWritable(session, versions, client);
+    }
+
     @Override public java.util.Optional<PipelineRebuildPreparation> pending(String pipelineId,PipelinePreparationInputs inputs,Map<String,String> dependencyHashes) {
         Objects.requireNonNull(pipelineId,"pipelineId");Objects.requireNonNull(inputs,"inputs");var captured=Map.copyOf(dependencyHashes);
         return transaction(session -> {

@@ -12,9 +12,11 @@ import java.util.Set;
 /** One actual document orders authoring changes and alert transactions without invalidating import preflight. */
 final class ConfigurationVersion {
     static final String ID = "configuration";
+    private static final String FIELD = "field";
+    private static final String REVISION = "revision";
     static final String ALERT_FENCE = "alertWriteFence";
-    private static final Set<String> LEGACY_FIELDS = Set.of("_id", "revision");
-    private static final Set<String> ALERT_FIELDS = Set.of("_id", "revision", ALERT_FENCE);
+    private static final Set<String> LEGACY_FIELDS = Set.of("_id", REVISION);
+    private static final Set<String> ALERT_FIELDS = Set.of("_id", REVISION, ALERT_FENCE);
 
     private ConfigurationVersion() {}
 
@@ -23,10 +25,10 @@ final class ConfigurationVersion {
     }
 
     static long revision(Document current) {
-        if (current == null || !(current.get("revision") instanceof Long revision)
+        if (current == null || !(current.get(REVISION) instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", ID, "field", "revision"), null);
+                    Map.of("id", ID, FIELD, REVISION), null);
         }
         return revision;
     }
@@ -44,14 +46,20 @@ final class ConfigurationVersion {
     static void advanceForPublication(ClientSession session, MongoCollection<Document> versions,
             com.mongodb.client.MongoClient originalClient) {
         if (!session.hasActiveTransaction()) throw new IllegalStateException("publication requires an active transaction");
-        var legalRevision = new Document("$gte", 0L).append("$lt", Long.MAX_VALUE - 1);
-        var filter = new Document("_id", ID).append("revision", legalRevision)
+        if (reserveRevision(session, versions, Long.MAX_VALUE - 1) == null) throw unreadable(REVISION);
+        requireWritable(session, versions, originalClient);
+    }
+
+    /** The update and all later validation share one transaction and roll back together. */
+    static Document reserveRevision(ClientSession session, MongoCollection<Document> versions, long exclusiveLimit) {
+        var legalRevision = new Document("$gte", 0L).append("$lt", exclusiveLimit);
+        var filter = new Document("_id", ID).append(REVISION, legalRevision)
                 .append("$expr", new Document("$eq", java.util.List.of(new Document("$type", "$revision"), "long")));
-        var previous = versions.findOneAndUpdate(session, filter,
-                new Document("$inc", new Document("revision", 1L)));
-        if (previous == null) throw unreadable("revision");
-        // The provisional increment rolls back with every refusal. Maintenance is still checked
-        // against this same snapshot before any artifact, draft marker or note reservation commits.
+        return versions.findOneAndUpdate(session, filter, new Document("$inc", new Document(REVISION, 1L)));
+    }
+
+    static void requireWritable(ClientSession session, MongoCollection<Document> versions,
+            com.mongodb.client.MongoClient originalClient) {
         requireNoValidationMaintenance(session, versions, null,
                 originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
     }
@@ -82,7 +90,7 @@ final class ConfigurationVersion {
     static void advanceStart(ClientSession session, MongoCollection<Document> versions,
             com.mongodb.client.MongoDatabase database, Document version, Document schema, Document identity) {
         long revision = revision(version);
-        var captured = new Document("revision", revision)
+        var captured = new Document(REVISION, revision)
                 .append("schema", schema == null ? java.util.List.of() : java.util.List.of(schema))
                 .append("identity", java.util.List.of(identity));
         advanceRaw(session, versions, requireNoValidationMaintenance(captured, null, versions, database));
@@ -130,9 +138,9 @@ final class ConfigurationVersion {
 
     private static void advanceRaw(ClientSession session, MongoCollection<Document> versions, long revision) {
         if (revision >= Long.MAX_VALUE - 1) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", ID, "field", "revision"), null);
-        long modified = versions.updateOne(session, new Document("_id", ID).append("revision", revision),
-                new Document("$inc", new Document("revision", 1L))).getModifiedCount();
+                Map.of("id", ID, FIELD, REVISION), null);
+        long modified = versions.updateOne(session, new Document("_id", ID).append(REVISION, revision),
+                new Document("$inc", new Document(REVISION, 1L))).getModifiedCount();
         if (modified != 1) throw new IllegalStateException("revision changed within one transaction snapshot");
     }
 
@@ -153,7 +161,7 @@ final class ConfigurationVersion {
         MongoAlertStateStore.requireTransaction(session);
         requireAlertWriteHeadroom(current);
         long fence = current.getLong(ALERT_FENCE);
-        if (versions.updateOne(session, new Document("_id", ID).append("revision", current.get("revision"))
+        if (versions.updateOne(session, new Document("_id", ID).append(REVISION, current.get(REVISION))
                         .append(ALERT_FENCE, fence), new Document("$inc", new Document(ALERT_FENCE, 1L)))
                 .getModifiedCount() != 1) {
             throw new IllegalStateException("alert fence changed within one transaction snapshot");
@@ -171,7 +179,7 @@ final class ConfigurationVersion {
         MongoAlertStateStore.requireTransaction(session);
         Document current = versions.find(session, new Document("_id", ID)).first();
         validateAlertState(current, false);
-        if (versions.updateOne(session, new Document("_id", ID).append("revision", current.get("revision"))
+        if (versions.updateOne(session, new Document("_id", ID).append(REVISION, current.get(REVISION))
                         .append(ALERT_FENCE, new Document("$exists", false)),
                         new Document("$set", new Document(ALERT_FENCE, 0L))).getModifiedCount() != 1) {
             throw unreadable(ALERT_FENCE);
@@ -180,8 +188,8 @@ final class ConfigurationVersion {
 
     static void validateAlertState(Document current, boolean prepared) {
         if (current == null || !current.keySet().equals(prepared ? ALERT_FIELDS : LEGACY_FIELDS)
-                || !ID.equals(current.get("_id")) || !(current.get("revision") instanceof Long revision)
-                || revision < 0 || revision == Long.MAX_VALUE) { throw unreadable("revision"); }
+                || !ID.equals(current.get("_id")) || !(current.get(REVISION) instanceof Long revision)
+                || revision < 0 || revision == Long.MAX_VALUE) { throw unreadable(REVISION); }
         if (prepared && (!(current.get(ALERT_FENCE) instanceof Long fence) || fence < 0 || fence == Long.MAX_VALUE)) {
             throw unreadable(ALERT_FENCE);
         }
@@ -189,10 +197,10 @@ final class ConfigurationVersion {
     }
 
     static Document initial() {
-        return new Document("_id", ID).append("revision", 0L).append(ALERT_FENCE, 0L);
+        return new Document("_id", ID).append(REVISION, 0L).append(ALERT_FENCE, 0L);
     }
 
     private static TapstateException unreadable(String field) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", ID, "field", field), null);
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", ID, FIELD, field), null);
     }
 }

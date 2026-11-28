@@ -1265,9 +1265,13 @@ class MongoCachePipelineStoresIT {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(code));
     }
     private static void withFixture(Scenario scenario) {
+        withFixture(MONGO.getReplicaSetUrl(), scenario);
+    }
+
+    static void withFixture(String uri, Scenario scenario) {
         String name = "cache_pipeline_" + UUID.randomUUID().toString().replace("-", "");
-        var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, MONGO.getReplicaSetUrl(name), name, null);
-        try (var admin = MongoClients.create(MONGO.getReplicaSetUrl()); var domain = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "pipeline-test")) {
+        var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, uri, name, null);
+        try (var admin = MongoClients.create(uri); var domain = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "pipeline-test")) {
             var database = admin.getDatabase(name);
             try {
                 domain.prepareAuth(new CacheAuthScope(SCOPE.clusterId(), 1, StorageBinding.Mode.OP, SCOPE.cacheIncarnation(), 1), "auth-a", ACTIVE);
@@ -1292,8 +1296,8 @@ class MongoCachePipelineStoresIT {
         } catch (RuntimeException | Error failure) { throw failure; }
         catch (Exception failure) { throw new AssertionError(failure); }
     }
-    private record Fixture(MongoClient admin, MongoDatabase database, MongoCacheDomain domain, WorkloadClaimFence fence) {}
-    @FunctionalInterface private interface Scenario { void run(Fixture fixture) throws Exception; }
+    record Fixture(MongoClient admin, MongoDatabase database, MongoCacheDomain domain, WorkloadClaimFence fence) {}
+    @FunctionalInterface interface Scenario { void run(Fixture fixture) throws Exception; }
     @Test void exhaustedLeaseRecoveryProjectsTheCurrentEngineIdentityWithoutWritingAnObservation() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);

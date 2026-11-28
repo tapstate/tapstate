@@ -19,12 +19,27 @@ public record PipelineCatalogItem(
         Instant updatedAt,
         String contentHash,
         boolean hasArtifact,
-        Status status) {
+        Status status,
+        SyncLag syncLag) {
+
+    public PipelineCatalogItem(String id, String name, String description, String mode, Long revision,
+            Instant updatedAt, String contentHash, boolean hasArtifact, Status status) {
+        this(id, name, description, mode, revision, updatedAt, contentHash, hasArtifact, status, null);
+    }
 
     public PipelineCatalogItem {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(status, "status");
+    }
+
+    /** A positive observation is a lower bound on lag, limited to CDC writes visible at the sink. */
+    public record SyncLag(SyncLagState state, Long lowerBoundMillis, Instant observedAt) {
+    }
+
+    public enum SyncLagState {
+        BEHIND,
+        UNKNOWN
     }
 
     /** Runtime truth and the current lifecycle target, exposed together so a list can show in-flight changes. */

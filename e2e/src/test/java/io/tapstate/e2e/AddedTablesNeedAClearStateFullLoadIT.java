@@ -53,6 +53,41 @@ class AddedTablesNeedAClearStateFullLoadIT {
         retainedStartsRejectAddedTablesAndOnlyAnExplicitFullLoadAppliesThem(true, LifecycleVerb.START, temporary, true);
     }
 
+    @Test
+    void clearingARunningPipelineReservesTheRevisionBeforeValidation(@TempDir Path temporary) throws Exception {
+        Path source = Files.createDirectory(temporary.resolve("source"));
+        Path target = Files.createDirectory(temporary.resolve("target"));
+        FileEndpoints.replaceTable(source.resolve(ORDERS + ".csv"), "id,priority\n1,initial\n");
+        byte[] connector = CdcRecoveryFixture.connectorJar(E2eConnectorJar.buildInto(
+                Files.createDirectory(temporary.resolve("connectors"))));
+        try (var mongo = ClearStateCompletionInterleaving.startMongo();
+                var storage = PreparedNativeStore.createOn(mongo);
+                var server = Tiers.IN_PROCESS.launch(storage);
+                var client = MongoClients.create(storage.configurationUri())) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
+            control.apply(resources(source, target, true, ORDERS));
+            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            awaitPriority(control, target, ORDERS, "1", "initial");
+
+            var original = NativePipelineScopes.current(storage, PIPELINE);
+            var db = client.getDatabase(storage.configurationDatabase());
+            var reservation = new Document("command.findAndModify", "configuration_version")
+                    .append("command.query._id", "configuration").append("command.startTransaction", true);
+            db.runCommand(new Document("profile", 1).append("filter", reservation));
+            try {
+                control.stop(PIPELINE, true);
+                NativePipelineScopes.awaitCleared(control, storage, original, BOUND);
+                assertThat(db.getCollection("system.profile").countDocuments(reservation))
+                        .as("a clearing stop must reserve the CONFIG revision before reading its snapshot").isPositive();
+            } finally {
+                db.runCommand(new Document("profile", 0).append("filter", "unset"));
+            }
+        }
+    }
+
     private void retainedStartsRejectAddedTablesAndOnlyAnExplicitFullLoadAppliesThem(
             boolean shared, LifecycleVerb verb, Path temporary, boolean controlledClear) throws Exception {
         Path source = Files.createDirectory(temporary.resolve("source"));

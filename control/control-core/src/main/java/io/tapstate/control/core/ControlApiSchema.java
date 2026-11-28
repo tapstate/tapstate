@@ -1,7 +1,9 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.PipelineRunStage;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -16,7 +18,7 @@ public final class ControlApiSchema {
     private ControlApiSchema() {
     }
 
-    /** Returns the request/result references for an MCP operation. */
+    /** Returns the request/result references for a registered operation with a schema. */
     public static SchemaRef ref(String operationId) {
         SchemaRef ref = REFS.get(operationId);
         if (ref == null) {
@@ -74,6 +76,7 @@ public final class ControlApiSchema {
         bind(refs, "pipeline.pause", "PipelinePause");
         bind(refs, "pipeline.resume", "PipelineResume");
         bind(refs, "pipeline.status", "PipelineStatus");
+        bind(refs, "pipeline.run-progress", "PipelineRunProgress");
         bind(refs, "pipeline.metrics", "PipelineMetrics");
         bind(refs, "pipeline.snapshot", "PipelineSnapshot");
         bind(refs, "pipeline.logs", "PipelineLogs");
@@ -265,6 +268,7 @@ public final class ControlApiSchema {
         pair(defs, "PipelinePause", pipelineId, opaque);
         pair(defs, "PipelineResume", pipelineId, opaque);
         pair(defs, "PipelineStatus", pipelineId, opaque);
+        pair(defs, "PipelineRunProgress", pipelineId, runProgressResult());
         pair(defs, "PipelineMetrics", pipelineId, opaque);
         pair(defs, "PipelineSnapshot", pipelineId, opaque);
         Map<String, Object> logsRequest = object(
@@ -619,6 +623,23 @@ public final class ControlApiSchema {
                 "parallelism", integer(1, ExecutionSpec.MAX_PARALLELISM,
                         "Target total number of processors for the node across the whole cluster"),
                 "batch", batch), false);
+    }
+
+    private static Map<String, Object> runProgressResult() {
+        Map<String, Object> stage = enumString(Arrays.stream(PipelineRunStage.values()).map(Enum::name).toArray(String[]::new));
+        Map<String, Object> activity = object(List.of("stage", "since"),
+                Map.of("stage", stage, "since", nullable(instant("When the current activity began, if known"))), false);
+        Map<String, Object> milestone = object(List.of("stage", "reachedAt"),
+                Map.of("stage", stage, "reachedAt", nullable(instant("When the milestone was first observed, if known"))), false);
+        Map<String, Object> counts = object(List.of("landed", "total"),
+                Map.of("landed", nonNegativeInteger(), "total", nonNegativeInteger()), false);
+        return object(List.of("availability", "runId", "version", "active", "milestones", "initialLoad", "failedStage", "awaitingMilestones"),
+                Map.of("availability", enumString("AVAILABLE", "UNAVAILABLE"),
+                        "runId", nullable(string("Opaque identifier for the explicit run")),
+                        "version", nullable(nonNegativeInteger()),
+                        "active", array(activity), "milestones", array(milestone),
+                        "initialLoad", nullable(counts), "failedStage", nullable(stage),
+                        "awaitingMilestones", Map.of("type", "boolean")), false);
     }
 
     private static Map<String, Object> string(String description) {
