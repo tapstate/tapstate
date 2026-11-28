@@ -255,13 +255,16 @@ evidence is insufficient. For Nest, check the identical root counts and
 the four versus sixteen children per root, then inspect `op-resource.jsonl`,
 `gc.log`, and the per-window coverage in both arms. Re-run the same command with
 a fresh output directory to reproduce the window under the same definition.
-The MongoDB Copy, Filter, Map, JS and Union snapshot profiles and the
+The MongoDB Copy, Filter, Map, JS, Union and Unwind snapshot profiles and the
 double-Map composition support `--snapshot-completion-probe`. Retain
 `snapshot-writes.tsv.ack` and `result.json` to verify the write acknowledgements.
 For Filter and the double-Map composition, also retain `snapshot-writes.tsv`
 to verify every source key and compute the later of the final source read and
 final target confirmation.
 Union verifies both disjoint source key ranges and checks each target table.
+Unwind retains both traces and identifies each confirmed output by its parent
+and element keys. Completion is the later of the final parent read and final
+output confirmation.
 The status polling upper bound stays available in the same report.
 
 ## Operator cases

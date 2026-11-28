@@ -97,6 +97,17 @@ public final class LatencyWitness {
         return target(file, delegate, LatencyWitness::snapshotKey);
     }
 
+    static WriteRecordFunction unwindSnapshotTarget(Path file, WriteRecordFunction delegate) {
+        return target(file, delegate, event -> {
+            if (event instanceof TapInsertRecordEvent insert && insert.getAfter() != null
+                    && insert.getAfter().get("parent_identity") instanceof Number parent
+                    && insert.getAfter().get("k") instanceof Number element) {
+                return parent.longValue() + "/" + element.longValue();
+            }
+            return "invalid";
+        });
+    }
+
     private static WriteRecordFunction target(Path file, WriteRecordFunction delegate,
             Function<TapRecordEvent, String> describe) {
         return (context, events, table, consumer) -> {

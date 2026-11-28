@@ -38,9 +38,13 @@ final class ObservedMongoConnectorJar {
         return build(original, witness, delegate, "mongo-backlog-witness-path.txt", null);
     }
 
-    static byte[] buildSnapshotProbe(byte[] original, Path witness, Path delegate, boolean filtered)
+    static byte[] buildSnapshotProbe(byte[] original, Path witness, Path delegate, BenchmarkSnapshotProbe.Mode mode)
             throws IOException, URISyntaxException {
-        String resource = filtered ? "mongo-filter-snapshot-witness-path.txt" : "mongo-snapshot-witness-path.txt";
+        String resource = switch (mode) {
+            case DIRECT -> "mongo-snapshot-witness-path.txt";
+            case FILTERED -> "mongo-filter-snapshot-witness-path.txt";
+            case UNWIND -> "mongo-unwind-snapshot-witness-path.txt";
+        };
         return build(original, witness, delegate, resource, null);
     }
 

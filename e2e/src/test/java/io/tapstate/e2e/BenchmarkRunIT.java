@@ -299,10 +299,13 @@ class BenchmarkRunIT {
         String spec = text(definition, "spec");
         boolean operatorSnapshot = operators != null && snapshotMode
                 && List.of("specs/filter-basic.json", "specs/map-basic.json", "specs/js-basic.json",
-                        "specs/mixed-double-map.json", "specs/union-basic.json").contains(spec);
+                        "specs/mixed-double-map.json", "specs/union-basic.json", "specs/unwind-basic.json").contains(spec);
         boolean unionSnapshot = operatorSnapshot && spec.equals("specs/union-basic.json");
-        boolean filteredSnapshot = operatorSnapshot
-                && (spec.equals("specs/filter-basic.json") || spec.equals("specs/mixed-double-map.json"));
+        BenchmarkSnapshotProbe.Mode snapshotProof = switch (spec) {
+            case "specs/unwind-basic.json" -> BenchmarkSnapshotProbe.Mode.UNWIND;
+            case "specs/filter-basic.json", "specs/mixed-double-map.json" -> BenchmarkSnapshotProbe.Mode.FILTERED;
+            default -> BenchmarkSnapshotProbe.Mode.DIRECT;
+        };
         boolean copySnapshot = operators == null && snapshotMode && spec.equals("specs/copy-basic.json");
         boolean snapshotProbe = evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (copySnapshot || operatorSnapshot);
@@ -313,13 +316,15 @@ class BenchmarkRunIT {
             Path delegate = folder.resolve("verified-snapshot-delegate").resolve("mongodb.jar");
             Files.createDirectory(delegate.getParent());
             Files.write(connector, ObservedMongoConnectorJar.buildSnapshotProbe(
-                    Files.readAllBytes(artifact), witness, delegate, filteredSnapshot));
+                    Files.readAllBytes(artifact), witness, delegate, snapshotProof));
             String protocol = operatorSnapshot ? BenchmarkSnapshotProbe.KEY_PRESERVING_PROTOCOL : BenchmarkSnapshotProbe.PROTOCOL;
             var snapshotIdentity = new LinkedHashMap<>(Map.of(
                     "protocol", protocol, "original_connector_sha256", digest(artifact),
                     "probe_connector_sha256", digest(connector), "ack_file", witness.getFileName() + ".ack"));
-            if (filteredSnapshot) {
-                snapshotIdentity.put("protocol", BenchmarkSnapshotProbe.FILTER_PROTOCOL);
+            if (snapshotProof != BenchmarkSnapshotProbe.Mode.DIRECT) {
+                snapshotIdentity.put("protocol", snapshotProof == BenchmarkSnapshotProbe.Mode.UNWIND
+                        ? BenchmarkSnapshotProbe.UNWIND_PROTOCOL
+                        : BenchmarkSnapshotProbe.FILTER_PROTOCOL);
                 snapshotIdentity.put("source_file", witness.getFileName().toString());
             } else if (unionSnapshot) {
                 snapshotIdentity.put("protocol", BenchmarkSnapshotProbe.UNION_PROTOCOL);
@@ -361,7 +366,7 @@ class BenchmarkRunIT {
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
                 try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb, filteredLatency) : null;
                         var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness, filteredBacklog) : null;
-                        var snapshot = snapshotProbe ? new BenchmarkSnapshotProbe(witness, filteredSnapshot) : null) {
+                        var snapshot = snapshotProbe ? new BenchmarkSnapshotProbe(witness, snapshotProof) : null) {
                     runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
                             sourceDb, targetDb, client.getDatabase("admin"), limited, latency, backlog, snapshot);
                 }
@@ -547,14 +552,14 @@ class BenchmarkRunIT {
         evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
         evidence.window("readback");
         if (probe != null) {
-            recordSnapshotCompletion(probe, List.of(source), startEpochMillis, start, evidence);
+            recordSnapshotCompletion(probe, List.of(source), java.util.Set.of(), startEpochMillis, start, evidence);
         }
     }
 
     private static void recordSnapshotCompletion(BenchmarkSnapshotProbe probe, List<MongoCollection<BsonDocument>> sources,
-            long startEpochMillis, long startNanos, Evidence evidence) {
+            java.util.Set<String> expectedTargetKeys, long startEpochMillis, long startNanos, Evidence evidence) {
         try {
-            var reading = probe.finish(sources, startEpochMillis, startNanos);
+            var reading = probe.finish(sources, expectedTargetKeys, startEpochMillis, startNanos);
             var completion = new LinkedHashMap<String, Object>(Map.of(
                     "status", "eligible", "started_epoch_ms", startEpochMillis,
                     "final_target_ack_epoch_ms", reading.finalAckEpochMillis(), "confirmed_target_writes", reading.confirmed(),
@@ -866,7 +871,7 @@ class BenchmarkRunIT {
             evidence.window("readback");
             if (snapshotProbe != null) {
                 var inputs = operators.sources().stream().map(table -> source.getCollection(table, BsonDocument.class)).toList();
-                recordSnapshotCompletion(snapshotProbe, inputs, initialStartEpochMillis, initialStart, evidence);
+                recordSnapshotCompletion(snapshotProbe, inputs, initial.keySet(), initialStartEpochMillis, initialStart, evidence);
             }
             verifyOperator(operators, target, initial, evidence);
             return;
