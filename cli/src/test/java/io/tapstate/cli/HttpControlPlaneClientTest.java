@@ -1951,6 +1951,22 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anUnobservedStopStatusCarriesTheClearingResultAndItsDiagnostic() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200, """
+                {"pipelineId":"pl1","state":"NEW","displayState":"FAILED","desiredState":"STOPPED",
+                 "stopState":"CLEARING","failure":{"code":"io.clear-result-test","message":"Check the original scope",
+                 "params":{"pipeline":"pl1"}}}
+                """, new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.NoObservation(new StatusOutcome.StopDetails(
+                            "CLEARING", "io.clear-result-test", "Check the original scope", Map.of("pipeline", "pl1"))));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void hasArtifactAloneDoesNotMarkAStatusAsAnAggregateProjection() throws Exception {
         HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
                 "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"hasArtifact\":true}",

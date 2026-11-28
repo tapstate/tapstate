@@ -172,15 +172,16 @@ public final class PipelineCatalogService {
                 && (observed == null || observed == PipelineState.NEW || observed == PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest ? asDisplayState(observed)
                 : displayState(target, effective, intent.failure() == null);
-        if (stoppedBeforeFirstRun) {
-            state = PipelineCatalogItem.DisplayState.NEW;
-        }
+        var clearFailure = stateFacts == null ? null : stateFacts.stopClearFailure();
+        if (clearFailure != null) state = PipelineCatalogItem.DisplayState.FAILED;
+        else if (stoppedBeforeFirstRun) state = stateFacts.completedStopClear()
+                ? PipelineCatalogItem.DisplayState.STOPPED : PipelineCatalogItem.DisplayState.NEW;
 
         return new PipelineCatalogItem.Status(
                 runtimeState(engineState, observation, stateFacts, checkpoint, effective, state),
                 recoveryAtRest ? PipelineCatalogItem.UiState.RECOVERY_REQUIRED
                         : PipelineCatalogItem.UiState.of(state, hasArtifact),
-                target, observed, observation == null ? null : observation.failure(),
+                target, observed, clearFailure != null ? clearFailure : observation == null ? null : observation.failure(),
                 observation == null ? null : observation.observedAt(),
                 intent.failure(), stopState(intent.desired(), stateFacts, state, recoveryAtRest));
     }
@@ -244,9 +245,11 @@ public final class PipelineCatalogService {
             PipelineCatalogState facts, PipelineCatalogItem.DisplayState state, boolean recovering) {
         if (recovering || intent == null || intent.targetState() != PipelineState.STOPPED) return null;
         if (intent.purgeState()) return PipelineCatalogItem.StopState.CLEARING;
+        if (facts != null && facts.completedStopClear() && state == PipelineCatalogItem.DisplayState.STOPPED)
+            return PipelineCatalogItem.StopState.CLEARED;
         if (facts == null || facts.checkpoint() != PipelineState.STOPPED
                 || state != PipelineCatalogItem.DisplayState.STOPPED) return null;
-        return facts.completedStopClear() ? PipelineCatalogItem.StopState.CLEARED : PipelineCatalogItem.StopState.RETAINED;
+        return PipelineCatalogItem.StopState.RETAINED;
     }
 
     private static String descriptionOf(ArtifactSummary artifact) {
