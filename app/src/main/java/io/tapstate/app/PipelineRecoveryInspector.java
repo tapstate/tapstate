@@ -22,12 +22,12 @@ import java.util.function.BiFunction;
 final class PipelineRecoveryInspector {
     record Target(String node,String source,OnFullLoad policy) {}
     record Inspection(StorageRecoveryCommands.Manifest manifest,PipelinePreparationInputs inputs,
-            Map<String,SourceResource> privateContexts,Map<String,String> connectorHashes,List<Target> targets,long intentRevision,Set<String> operatorDatabases) {
+            Map<String,SourceResource> privateContexts,Map<String,String> connectorHashes,List<Target> targets,long intentRevision,Set<String> operatorDatabases,Map<String,Map<String,Object>> nodeConfigs) {
         Inspection(StorageRecoveryCommands.Manifest manifest,PipelinePreparationInputs inputs,Map<String,SourceResource> privateContexts,
                 Map<String,String> connectorHashes,List<Target> targets,long intentRevision) {
-            this(manifest,inputs,privateContexts,connectorHashes,targets,intentRevision,Set.of());
+            this(manifest,inputs,privateContexts,connectorHashes,targets,intentRevision,Set.of(),Map.of());
         }
-        Inspection {privateContexts=Map.copyOf(privateContexts);connectorHashes=Map.copyOf(connectorHashes);targets=List.copyOf(targets);operatorDatabases=Set.copyOf(operatorDatabases);}
+        Inspection {privateContexts=Map.copyOf(privateContexts);connectorHashes=Map.copyOf(connectorHashes);targets=List.copyOf(targets);operatorDatabases=Set.copyOf(operatorDatabases);nodeConfigs=Map.copyOf(nodeConfigs);}
         @Override public String toString(){return "PipelineRecoveryInspection[redacted]";}
     }
     private final MongoConfigurationDomain configuration;
@@ -86,6 +86,7 @@ final class PipelineRecoveryInspector {
         if(inputs.selectedTables().values().stream().allMatch(Set::isEmpty))throw invalid("Full recovery requires a non-empty resolved source selection.");
         var artifacts=new TreeMap<String,String>();var modelHashes=new TreeMap<String,String>();
         var originalContexts=new LinkedHashMap<String,SourceResource>();
+        var nodeConfigs=new LinkedHashMap<String,Map<String,Object>>();
         var predecessor = configuration.intents().connectorBindings().previousForRecovery(scope).orElse(null);
         var resolver=new TargetModelResolver(store,snapshot,models::model);
         for(var ref:pipeline.sources()) {
@@ -111,7 +112,9 @@ final class PipelineRecoveryInspector {
                 for(String table:selected)if(actual.get(table)==null || !PdkSinkPreparations.modelHash(actual.get(table)).equals(modelHashes.get(source.id()+"."+table)))
                     throw staleModel(source);
             }
-            originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE),PipelineSourceConfig.effective(ref, source));
+            String namespace = RequiredNoteOwner.namespace(new PipelineNode(id,ref.binding()),PipelineNode.Purpose.CAPTURE);
+            originalContexts.put(namespace,PipelineSourceConfig.effective(ref, source));
+            nodeConfigs.put(namespace,ref.nodeConfig());
             boolean shared=ref instanceof SourceRef.Spec spec && spec.srs()
                     && (pipeline.settings()==null || pipeline.settings().readMode()!=ReadMode.SNAPSHOT_ONLY);
             if(shared) {
@@ -119,13 +122,15 @@ final class PipelineRecoveryInspector {
                 if (bound != null && bound.chainId() != null) {
                     var notes = configuration.requiredNotes().guardedBy(active);
                     var origin = notes.origin(bound.notes());
-                    var expected = ConnectorNoteOrigin.capture(source.connector(), bound.sha256(), PipelineSourceConfig.settings(ref, source));
-                    if (!origin.equals(expected)) throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
+                    if (!ConnectorNoteOrigin.matches(origin, source.connector(), bound.sha256(),
+                            PipelineSourceConfig.settings(ref, source), ref.nodeConfig()))
+                        throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
                     connectors.resolveRetained(notes, bound.notes(), origin);
                 } else {
                     var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),ref.binding(),CanonicalHash.of(source),pipeline.id(),CanonicalHash.of(authored));
-                    var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),PipelineSourceConfig.settings(ref, source));
-                    if(retained.isPresent() && !retained.orElseThrow().equals(expected))throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH,Map.of(),null);
+                    if(retained.isPresent() && !ConnectorNoteOrigin.matches(retained.orElseThrow(), source.connector(),
+                            artifacts.get(source.connector()), PipelineSourceConfig.settings(ref, source), ref.nodeConfig()))
+                        throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH,Map.of(),null);
                 }
             }
         }
@@ -145,11 +150,13 @@ final class PipelineRecoveryInspector {
         }
         if(targets.isEmpty())throw invalid("Full recovery requires a configured write target.");
         var recoveryContexts = PipelinePrivateNoteRetirement.recoveryContexts(originalContexts, predecessor);
+        var recoveryNodeConfigs = PipelinePrivateNoteRetirement.recoveryContexts(nodeConfigs, predecessor);
         for(var context:configuration.cacheRecoveries().inspectPrivateContexts(id)) {
-            var desired=recoveryContexts.get(context.scope().owner().namespace());
+            var namespace = context.scope().owner().namespace();
+            var desired=recoveryContexts.get(namespace);
             if(context.completed() || context.origin().isEmpty() || desired==null)continue;
-            var origin=context.origin().orElseThrow();var expected=ConnectorNoteOrigin.capture(desired.connector(),artifacts.get(desired.connector()),desired.config());
-            if(!origin.equals(expected)) {
+            var origin=context.origin().orElseThrow();
+            if(!ConnectorNoteOrigin.matches(origin, desired.connector(), artifacts.get(desired.connector()), desired.config(), recoveryNodeConfigs.get(namespace))) {
                 ConnectorNoteOrigin.requireReadable(origin);
                 connectors.resolve(origin.connectorId(),origin.artifactHash());capabilities.apply(origin.connectorId(),origin.artifactHash());
                 configuration.cacheRecoveries().requirePrivateRetirable(id,context.scope());
@@ -174,7 +181,7 @@ final class PipelineRecoveryInspector {
             if(step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest && nest.state()!=null)
                 operatorDatabases.add(nest.state().database());
         active.run();return new Inspection(new StorageRecoveryCommands.Manifest(selection,Set.of(id),definitions,hash,configuration.configurationRevision()),
-                inputs,originalContexts,artifacts,targets,intent.intentRevision(),operatorDatabases);
+                inputs,originalContexts,artifacts,targets,intent.intentRevision(),operatorDatabases,nodeConfigs);
     }
     private Set<String> inspectConnector(SourceResource source,Map<String,String> hashes) {
         var ref=connectors.resolve(source.connector());String hash=ref.contentHash();

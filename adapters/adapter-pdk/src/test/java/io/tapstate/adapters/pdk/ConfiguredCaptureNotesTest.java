@@ -201,6 +201,26 @@ class ConfiguredCaptureNotesTest {
         }
     }
 
+    @Test void newPrivateCaptureUsesItsEffectiveSlotPolicyAndLegacyNotesKeepTheirPolicy() {
+        String spec = """
+                {"configOptions":{"node":{"properties":{
+                  "autoClearSlot":{"type":"boolean","default":true}
+                }}}}
+                """;
+        var ref = new ConnectorRef(List.of(), "unused", "2.0.8", null, spec, "a".repeat(64), false);
+        var port = new PdkCapturePort(id -> ref);
+        var oldAuthored = Map.<String,Object>of("autoClearSlot", false);
+        var retained = ConnectorNoteOrigin.capture("postgres", ref.contentHash(), oldAuthored);
+        var defaulted = ConnectorNoteOrigin.capturePipeline("postgres", ref, oldAuthored, Map.of());
+        var explicit = ConnectorNoteOrigin.capturePipeline("postgres", ref, oldAuthored, oldAuthored);
+
+        assertThat(port.automaticallyClearsPrivatePostgres(retained)).isFalse();
+        assertThat(port.automaticallyClearsPrivatePostgres(defaulted)).isTrue();
+        assertThat(port.automaticallyClearsPrivatePostgres(explicit)).isFalse();
+        assertThat(ConnectorNoteOrigin.matches(defaulted, "postgres", ref.contentHash(), oldAuthored, Map.of())).isTrue();
+        assertThat(ConnectorNoteOrigin.matches(defaulted, "postgres", ref.contentHash(), oldAuthored, oldAuthored)).isFalse();
+    }
+
     private static CaptureConfig config() {
         return new CaptureConfig("postgres", Map.of(), List.of("t1")).at(NODE);
     }

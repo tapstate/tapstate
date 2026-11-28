@@ -614,11 +614,9 @@ final class ThreeLayerStorePort implements StorePort {
             for (var reference : pipeline.sources()) {
                 if (!(reference instanceof io.tapstate.core.model.SourceRef.Spec spec) || spec.srs()) continue;
                 var source = StoredArtifacts.requireSource(configuration.artifacts(), reference.id());
-                var key = source.srs() == null ? null : source.srs().key();
-                var settings = io.tapstate.core.model.PipelineSourceConfig.settings(reference, source);
-                var overrides = io.tapstate.core.model.PipelineSourceConfig.overrides(reference, source);
+                var coordinate = io.tapstate.core.model.PipelineSourceConfig.directCoordinate(reference, source);
                 if (!chain.equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
-                        source.connector(), settings, key, pipeline.id(), reference.binding(), overrides))) continue;
+                        coordinate, pipeline.id(), reference.binding()))) continue;
                 if (unprepared(pipeline.id())) return Optional.empty();
                 var tables = PipelineTableSelection.resolve(pipeline, reference, source, SourceDiscovery.model(this, source));
                 var channel = DirectChannelPreparation.of(scope(pipeline.id()), source, reference, mode,

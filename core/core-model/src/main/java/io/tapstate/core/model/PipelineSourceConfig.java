@@ -1,8 +1,11 @@
 package io.tapstate.core.model;
 
+import io.tapstate.core.model.canonical.SourceCaptureIdentity;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /** Resolves one Pipeline's effective connector settings without changing the shared Source. */
 public final class PipelineSourceConfig {
@@ -14,13 +17,22 @@ public final class PipelineSourceConfig {
     }
 
     public static String chain(SourceRef reference, SourceResource source) {
-        return io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(),
+        return SourceCaptureIdentity.resolve(source.connector(),
                 settings(reference, source), source.srs() == null ? null : source.srs().key(), overrides(reference, source));
+    }
+
+    /** Independent captures retain their persisted coordinates for unchanged Pipeline definitions. */
+    public static String directCoordinate(SourceRef reference, SourceResource source) {
+        boolean qualified = overrides(reference, source).entrySet().stream().anyMatch(entry ->
+                !source.config().containsKey(entry.getKey())
+                        || !Objects.equals(source.config().get(entry.getKey()), entry.getValue()));
+        return SourceCaptureIdentity.directCoordinate(source.connector(), settings(reference, source),
+                source.srs() == null ? null : source.srs().key(), qualified);
     }
 
     /** The connector/configuration fingerprint used by preparation guards. */
     public static String physical(PipelineResource pipeline, SourceResource source) {
-        return io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(), settings(pipeline, source));
+        return SourceCaptureIdentity.physical(source.connector(), settings(pipeline, source));
     }
 
     /** A detached runtime view used by connector operations that accept a Source value. */

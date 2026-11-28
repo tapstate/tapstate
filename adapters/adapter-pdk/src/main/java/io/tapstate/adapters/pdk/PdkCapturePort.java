@@ -883,7 +883,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     public boolean automaticallyClearsPrivatePostgres(io.tapstate.spi.store.RequiredNoteOrigin origin) {
         if(!origin.connectorId().equals("postgres"))throw new IllegalArgumentException("private PostgreSQL origin required");
         var ref=provisioner.resolve(origin.connectorId(),origin.artifactHash());
-        var settings=ConfigTypeCoercion.coerce(origin.connectorId(),ref.spec(),ConnectorNoteOrigin.settings(origin));
+        var retained = ConnectorNoteOrigin.pipelineSettings(origin);
+        var settings = retained == null
+                ? ConfigTypeCoercion.coerce(origin.connectorId(), ref.spec(), ConnectorNoteOrigin.settings(origin))
+                : retained.connection();
         Object policy=settings.get("autoClearSlot");
         if(policy==null)return true;
         if(policy instanceof Boolean flag)return flag;

@@ -63,7 +63,11 @@ public record MiningChainId(String value) {
             throw new IllegalArgumentException("a direct channel names a non-blank pipeline and source");
         }
         return new MiningChainId(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
-                config.connectorId(),config.settings(),srsKey,pipelineId,sourceId,config.nodeConfig()));
+                directCoordinate(config, srsKey), pipelineId, sourceId));
+    }
+
+    static String directCoordinate(CaptureConfig config, String srsKey) {
+        return config.directCoordinate() != null ? config.directCoordinate() : resolve(config, srsKey).value();
     }
 
 }

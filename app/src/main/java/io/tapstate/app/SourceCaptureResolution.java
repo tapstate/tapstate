@@ -109,7 +109,8 @@ record SourceCaptureResolution(
     private static SourceCaptureResolution withTables(SourceResource source, List<String> tables, SourceRef ref) {
         var settings = ref == null ? source.config() : io.tapstate.core.model.PipelineSourceConfig.settings(ref, source);
         var overrides = ref == null ? java.util.Map.<String,Object>of() : io.tapstate.core.model.PipelineSourceConfig.overrides(ref, source);
-        CaptureConfig config = new CaptureConfig(source.connector(), settings, tables, null, null, overrides);
+        String directCoordinate = ref == null ? null : io.tapstate.core.model.PipelineSourceConfig.directCoordinate(ref, source);
+        CaptureConfig config = new CaptureConfig(source.connector(), settings, tables, null, null, overrides, directCoordinate);
         String srsKey = source.srs() != null ? source.srs().key() : null;
         return new SourceCaptureResolution(
                 ref == null ? source.id() : ref.binding(), config, tables, srsKey, MiningChainId.resolve(config, srsKey));

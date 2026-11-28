@@ -314,7 +314,7 @@ class PrivatePostgresSlotLifecycleIT {
             kind: source
             id: %s
             connector: postgres
-            config: { host: %s, port: %s, database: %s, schema: public, user: %s, password: %s, autoClearSlot: true }
+            config: { host: %s, port: %s, database: %s, schema: public, user: %s, password: %s, autoClearSlot: false }
             mode: cdc
             tables: [ orders ]
             """.formatted(SOURCE,s.get("host"),s.get("port"),s.get("database"),s.get("username"),s.get("password"));}

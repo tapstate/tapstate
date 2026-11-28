@@ -40,7 +40,7 @@ public record CaptureId(String value) {
         String reader = Objects.requireNonNull(spec.pipelineId(), "spec.pipelineId");
         String source = Objects.requireNonNull(spec.sourceId(), "spec.sourceId");
         return new CaptureId(io.tapstate.core.model.canonical.SourceCaptureIdentity.directCapture(
-                spec.config().connectorId(),spec.config().settings(),spec.srsKey(),reader,source,directStart(spec.startFrom()),spec.config().streams(),spec.config().nodeConfig()));
+                MiningChainId.directCoordinate(spec.config(), spec.srsKey()), reader, source, directStart(spec.startFrom()), spec.config().streams()));
     }
 
     private static String directStart(StartFrom startFrom) {

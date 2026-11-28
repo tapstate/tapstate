@@ -306,7 +306,7 @@ final class StoreBackedDagSource implements DagSource {
             boolean shared = !bounded && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs();
             nodes.add(new PipelineConnectorExecutions.Node(reference.binding(), PipelineNode.Purpose.CAPTURE,
                     source.connector(), PipelineSourceConfig.settings(reference, source),
-                    shared ? selection.orElseThrow().chainId().value() : null));
+                    shared ? selection.orElseThrow().chainId().value() : null, reference.nodeConfig()));
         }
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             var source = StoredArtifacts.requireSource(artifacts(), ViewTargetResolver.resolve(view, viewStoreId()).sourceId());

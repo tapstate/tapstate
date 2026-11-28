@@ -202,9 +202,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (held != null && !held.sha256().equals(origin.artifactHash())) throw refused();
         var artifact = connectors.resolveRetained(notes, token, origin);
         if (!origin.artifactHash().equals(artifact.contentHash())
-                || !origin.equals(
-                        io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(
-                                source.connector(), origin.artifactHash(), io.tapstate.core.model.PipelineSourceConfig.settings(reference, source))))
+                || !io.tapstate.adapters.pdk.ConnectorNoteOrigin.matches(origin, source.connector(), origin.artifactHash(),
+                        io.tapstate.core.model.PipelineSourceConfig.settings(reference, source), reference.nodeConfig()))
             throw refused();
         if (io.tapstate.adapters.pdk.PdkSourceModelComparison.forVerifiedArtifact(
                         source.connector(), artifact)
@@ -585,7 +584,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             var selectedSource = selected.orElseThrow();
             binding = connectorExecutions.recoveryBinding(session.original.scope(),
                     new PipelineConnectorExecutions.Node(reference.binding(), PipelineNode.Purpose.CAPTURE,
-                            definition.connector(), io.tapstate.core.model.PipelineSourceConfig.settings(reference, definition), selectedSource.chainId().value()),
+                            definition.connector(), io.tapstate.core.model.PipelineSourceConfig.settings(reference, definition),
+                            selectedSource.chainId().value(), reference.nodeConfig()),
                     session.inputs.sourceHashes().get(reference.binding()), session.inputs.pipelineHash(), () -> requireSession(session));
         }
         var previous = session.selection.previous(reference.binding(), PipelineNode.Purpose.CAPTURE);
@@ -1888,7 +1888,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening,
             java.util.function.Consumer<io.tapstate.core.common.FailureFact> openingFailure, boolean recoverMismatch) {
         owner.require();if(owner.physical!=null || owner.configured==null || !opened.miningChainId().equals(owner.prepared.chainId()))throw refused();
-        var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes(),owner.config.nodeConfig());
+        var config=owner.config.forStreams(opened.servingTables().stream().sorted().toList());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;
         var captured = new AtomicReference<io.tapstate.core.common.FailureFact>();

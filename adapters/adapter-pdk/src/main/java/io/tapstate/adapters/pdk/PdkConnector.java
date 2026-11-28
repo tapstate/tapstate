@@ -188,6 +188,7 @@ final class PdkConnector implements AutoCloseable {
             noteScopes.requireActive();
         };
         Map<String, Object> effectiveSettings = settings;
+        Map<String, Object> pipelineNodeValues = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredState = null;
         io.tapdata.entity.utils.cache.KVMap<Object> configuredGlobal = null;
         long logGeneration = noteScopes == null ? 0 : noteScopes.logStateGeneration();
@@ -220,11 +221,12 @@ final class PdkConnector implements AutoCloseable {
                     : prepared.stream().map(RequiredNoteCarry::source).toList();
             // Opening a connector must revalidate the fixed scope even after sink preflight.
             var origin = startup != null ? startup.origin() : captured.store().origin(primary);
-            var requestedOrigin = ConnectorNoteOrigin.capture(connectorId, ref.contentHash(), settings);
-            if (!origin.equals(requestedOrigin)) {
+            if (!ConnectorNoteOrigin.matches(origin, connectorId, ref.contentHash(), settings, nodeSettings)) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
             }
-            effectiveSettings = ConnectorNoteOrigin.settings(requestedOrigin);
+            var retained = ConnectorNoteOrigin.pipelineSettings(origin);
+            effectiveSettings = retained == null ? ConnectorNoteOrigin.settings(origin) : retained.connection();
+            pipelineNodeValues = retained == null ? null : retained.node();
             var global = captured.open(ConnectorStateNamespace.GLOBAL);
             configuredState = new ScopedDurableStateMap(captured.store(), primary, earlier, notes != null, captured::requireActive);
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
@@ -244,23 +246,10 @@ final class PdkConnector implements AutoCloseable {
         boolean opened = false;
         ConnectorTrustMaterial material = null;
         try {
-            Map<String, Object> pipelineNodeValues = null;
-            if (nodeSettings != null) {
-                var forms = ref.spec() != null && JsonReader.parse(ref.spec()) instanceof Map<?, ?> root
-                        ? root : Map.of();
-                var declaredNodes = ConnectorForm.NODE.itemsIn(forms);
-                var declaredConnection = ConnectorForm.CONNECTION.itemsIn(forms);
-                var connection = new LinkedHashMap<>(effectiveSettings);
-                var selected = new LinkedHashMap<String, Object>();
-                declaredNodes.forEach((name, item) -> {
-                    if (!declaredConnection.containsKey(name)) connection.remove(name);
-                    if (nodeSettings.containsKey(name)) selected.put(name, nodeSettings.get(name));
-                    else if (item.containsKey("default")) selected.put(name, item.get("default"));
-                });
-                pipelineNodeValues = ConfigTypeCoercion.coerce(connectorId, ref.spec(), selected);
-                // Some PDK connectors load their node parameters from the connection bean as well.
-                connection.putAll(pipelineNodeValues);
-                effectiveSettings = connection;
+            if (noteScopes == null && nodeSettings != null) {
+                var resolved = pipelineSettings(connectorId, ref.spec(), effectiveSettings, nodeSettings);
+                pipelineNodeValues = resolved.node();
+                effectiveSettings = resolved.connection();
             }
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
             effectiveSettings = material.settings();
@@ -511,6 +500,35 @@ final class PdkConnector implements AutoCloseable {
             }
         });
         return nodeConfig;
+    }
+
+    record PipelineSettings(Map<String, Object> connection, Map<String, Object> node) {}
+
+    static PipelineSettings pipelineSettings(String connectorId, String spec, Map<String, Object> settings,
+            Map<String, Object> nodeSettings) {
+        var forms = spec != null && JsonReader.parse(spec) instanceof Map<?, ?> root ? root : Map.of();
+        var declaredNodes = ConnectorForm.NODE.itemsIn(forms);
+        var declaredConnection = ConnectorForm.CONNECTION.itemsIn(forms);
+        var connection = new LinkedHashMap<>(settings);
+        var selected = new LinkedHashMap<String, Object>();
+        declaredNodes.forEach((name, item) -> {
+            if (!declaredConnection.containsKey(name)) connection.remove(name);
+            if (nodeSettings.containsKey(name)) selected.put(name, nodeSettings.get(name));
+            else if (item.containsKey("default") && isLiteralDefault(item.get("default"))) {
+                selected.put(name, item.get("default"));
+            }
+        });
+        var effectiveNode = ConfigTypeCoercion.coerce(connectorId, spec, selected);
+        // Some PDK connectors load their node parameters from the connection bean as well.
+        connection.putAll(effectiveNode);
+        return new PipelineSettings(ConfigTypeCoercion.coerce(connectorId, spec, connection), effectiveNode);
+    }
+
+    private static boolean isLiteralDefault(Object value) {
+        if (!(value instanceof String text)) return true;
+        String trimmed = text.strip();
+        // Form expressions are not values supported by the connector runtime.
+        return !trimmed.startsWith("{{") || !trimmed.endsWith("}}") || trimmed.length() < 4;
     }
 
     /**

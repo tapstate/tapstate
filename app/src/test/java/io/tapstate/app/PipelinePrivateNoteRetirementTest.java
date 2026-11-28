@@ -45,10 +45,10 @@ class PipelinePrivateNoteRetirementTest {
         var executor=new PipelinePrivateNoteRetirement(notes,operations,(id,settings) -> io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(id,"a".repeat(64),settings),
                 (fixed,config,purpose,cluster,guard) -> {guard.run();releases.add(fixed.scope());assertThat(fixed.origin()).contains(held);return Optional.empty();});
         var unchanged=new io.tapstate.core.model.SourceResource("source",null,"connector",connection,null,null,null,null);
-        executor.reconcile(original,Map.of(token.owner().namespace(),unchanged),() -> {});
+        executor.reconcile(original,Map.of(token.owner().namespace(),unchanged),Map.of(),() -> {});
         assertThat(releases).isEmpty();verify(notes,never()).retirement(any(),anyString());
         var changed=new io.tapstate.core.model.SourceResource("source",null,"connector",Map.of("uri","database-y"),null,null,null,null);
-        executor.reconcile(original,Map.of(token.owner().namespace(),changed),() -> {});
+        executor.reconcile(original,Map.of(token.owner().namespace(),changed),Map.of(),() -> {});
         assertThat(releases).containsExactly(token);verify(retirement).completeAfterVerifiedRelease();
     }
 

@@ -25,6 +25,15 @@ public final class SourceCaptureIdentity {
         value(input, nodeConfig);
         return "mcn-" + CanonicalHash.ofText(input.toString());
     }
+    /** Preserves the persisted source coordinate of an independent capture. */
+    public static String directCoordinate(String connector, Map<String, Object> settings, String key,
+            boolean qualified) {
+        if (!qualified || key == null || key.isBlank()) return resolve(connector, settings, key);
+        var input = new StringBuilder();
+        token(input, key);
+        token(input, physical(connector, settings));
+        return "mcn-" + CanonicalHash.ofText(input.toString());
+    }
     public static String sharedCapture(String chainId) {
         named(chainId);return "capture-"+CanonicalHash.ofText(chainId+"|tail:ring");
     }
@@ -50,8 +59,11 @@ public final class SourceCaptureIdentity {
     }
     public static String directChannel(String connector,Map<String,Object> settings,String key,String pipeline,String source,
             Map<String,Object> nodeConfig) {
+        return directChannel(resolve(connector,settings,key,nodeConfig),pipeline,source);
+    }
+    public static String directChannel(String coordinate, String pipeline, String source) {
         named(pipeline); named(source); var input = new StringBuilder();
-        token(input,resolve(connector,settings,key,nodeConfig)); token(input,pipeline); token(input,source);
+        token(input,coordinate); token(input,pipeline); token(input,source);
         return "mcd-"+CanonicalHash.ofText(input.toString());
     }
     public static String directCapture(String connector,Map<String,Object> settings,String key,String pipeline,String source,String start,Collection<String> streams) {
@@ -59,8 +71,11 @@ public final class SourceCaptureIdentity {
     }
     public static String directCapture(String connector,Map<String,Object> settings,String key,String pipeline,String source,String start,Collection<String> streams,
             Map<String,Object> nodeConfig) {
+        return directCapture(resolve(connector,settings,key,nodeConfig),pipeline,source,start,streams);
+    }
+    public static String directCapture(String coordinate, String pipeline, String source, String start, Collection<String> streams) {
         named(pipeline); named(source); String axis = "tail:direct:"+startAxis(start)+'|'+pipeline.length()+':'+pipeline+'|'+source.length()+':'+source;
-        var input = new StringBuilder(resolve(connector,settings,key,nodeConfig)).append('|').append(axis);
+        var input = new StringBuilder(coordinate).append('|').append(axis);
         var sorted = new ArrayList<>(streams); sorted.sort(String::compareTo); input.append('|').append(sorted.size());
         for (String stream : sorted) input.append('|').append(stream.length()).append(':').append(stream);
         return "capture-"+CanonicalHash.ofText(input.toString());

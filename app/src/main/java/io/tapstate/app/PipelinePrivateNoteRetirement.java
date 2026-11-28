@@ -70,13 +70,14 @@ final class PipelinePrivateNoteRetirement {
     }
 
     /** A cache-only rebuild preserves necessary identities; only a changed connection context is retired. */
-    void reconcile(PipelineRebuildPreparation original,Map<String,SourceResource> desired,Runnable requireRetiredExecution) {
+    void reconcile(PipelineRebuildPreparation original,Map<String,SourceResource> desired,
+            Map<String,Map<String,Object>> nodeConfigs,Runnable requireRetiredExecution) {
         requireRetiredExecution.run();operations.requirePending(original);var request=original.request();
         for(var context:notes.guardedBy(requireRetiredExecution).privateContexts(request.originalScope(),request.operationId())) {
             requireRetiredExecution.run();if(context.completed() || context.origin().isEmpty())continue;
             var source=desired.get(context.scope().owner().namespace());
             // A no-longer-drawn node still retains its necessary identity until an authorized deletion.
-            if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
+            if(source==null || sameOrigin(context.origin().orElseThrow(),source,nodeConfigs.get(context.scope().owner().namespace())))continue;
             operations.requirePending(original);
             releaseOne(original.request().originalScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),request.operationId()),requireRetiredExecution);
         }
@@ -85,6 +86,11 @@ final class PipelinePrivateNoteRetirement {
 
     /** Only an explicit clearing stop may retire its proven private PostgreSQL capture notes. */
     void retireDirectPostgres(PipelineRebuildPreparation original,Map<String,SourceResource> direct,Runnable guard) {
+        retireDirectPostgres(original,direct,Map.of(),guard);
+    }
+
+    void retireDirectPostgres(PipelineRebuildPreparation original,Map<String,SourceResource> direct,
+            Map<String,Map<String,Object>> nodeConfigs,Runnable guard) {
         guard.run();operations.requirePending(original);var request=original.request();
         for(var context:notes.guardedBy(guard).privateContexts(request.originalScope(),request.operationId())) {
             guard.run();if(context.completed() || context.origin().isEmpty())continue;
@@ -95,7 +101,7 @@ final class PipelinePrivateNoteRetirement {
                     || owner.bindingVersion()!=request.originalScope().bindingVersion()
                     || owner.stateGeneration()!=request.originalScope().stateGeneration()
                     || !source.connector().equals("postgres"))continue;
-            if(!context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))throw unavailable();
+            if(!sameOrigin(context.origin().orElseThrow(),source,nodeConfigs.get(owner.namespace())))throw unavailable();
             var retirement=notes.guardedBy(guard).retirement(context.scope(),request.operationId());
             if(retirement.completed())continue;
             var config=new CaptureConfig("postgres",source.config(),List.of(),node.orElseThrow());
@@ -108,23 +114,34 @@ final class PipelinePrivateNoteRetirement {
 
     /** Runs only for the winning first-preparation invocation after the original execution is isolated. */
     void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,Runnable requireRetiredExecution) {
-        reconcileRecovered(confirmation, desired, null, requireRetiredExecution);
+        reconcileRecovered(confirmation, desired, Map.of(), null, requireRetiredExecution);
     }
     void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,
             ConnectorRunBindings predecessor,Runnable requireRetiredExecution) {
+        reconcileRecovered(confirmation, desired, Map.of(), predecessor, requireRetiredExecution);
+    }
+
+    void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,
+            Map<String,Map<String,Object>> nodeConfigs,ConnectorRunBindings predecessor,Runnable requireRetiredExecution) {
         var contexts = recoveryContexts(desired, predecessor);
+        var recoveredNodeConfigs = recoveryContexts(nodeConfigs, predecessor);
         Runnable guard=() -> {requireRetiredExecution.run();confirmation.requireActive();};
         guard.run();
         for(var context:notes.guardedBy(requireRetiredExecution).privateContexts(confirmation)) {
             guard.run();if(context.completed() || context.origin().isEmpty())continue;
             var source=contexts.get(context.scope().owner().namespace());
-            if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
+            if(source==null || sameOrigin(context.origin().orElseThrow(),source,recoveredNodeConfigs.get(context.scope().owner().namespace())))continue;
             releaseOne(confirmation.recovery().targetScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),confirmation),guard);
         }
         guard.run();
     }
 
-    static Map<String, SourceResource> recoveryContexts(Map<String, SourceResource> canonical, ConnectorRunBindings predecessor) {
+    private boolean sameOrigin(RequiredNoteOrigin origin, SourceResource source, Map<String,Object> nodeConfig) {
+        var expected = origins.apply(source.connector(), source.config());
+        return origin.equals(expected) || ConnectorNoteOrigin.matches(origin, expected.connectorId(), expected.artifactHash(), source.config(), nodeConfig);
+    }
+
+    static <T> Map<String, T> recoveryContexts(Map<String, T> canonical, ConnectorRunBindings predecessor) {
         if (predecessor == null) return canonical;
         var result = new java.util.HashMap<>(canonical);
         var bindings = new java.util.ArrayList<>(predecessor.effective());

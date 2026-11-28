@@ -51,7 +51,8 @@ class AConnectorsNodeParametersReachItTest {
                 "node": {
                   "properties": {
                     "preImage4Sink": {"type": "boolean", "x-component": "Switch"},
-                    "batchSize": {"type": "integer", "default": 100}
+                    "batchSize": {"type": "integer", "default": 100},
+                    "autoLog": {"type": "boolean", "default": "{{ $values.attrs.db_version === undefined ? true : false }}"}
                   }
                 }
               }
@@ -96,19 +97,22 @@ class AConnectorsNodeParametersReachItTest {
     void aPipelineReadsOnlyItsOwnNodeSettingsAndDeclaredDefaults(@TempDir Path dir) {
         ConnectorRef ref = new ConnectorRef(
                 List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
-        var settings = Map.<String, Object>of("uri", "mongodb://host/db", "preImage4Sink", true, "batchSize", 999);
+        var settings = Map.<String, Object>of("uri", "mongodb://host/db", "preImage4Sink", true,
+                "batchSize", 999, "autoLog", true);
 
         try (PdkConnector connector = PdkConnector.openPipelineSource(
                 "demo", ref, settings, Map.of(), null, null, null, null)) {
             assertThat(connector.context().getNodeConfig()).containsEntry("batchSize", 100L)
-                    .doesNotContainKey("preImage4Sink");
+                    .doesNotContainKeys("preImage4Sink", "autoLog");
             assertThat(connector.context().getConnectionConfig()).containsEntry("uri", "mongodb://host/db")
-                    .containsEntry("batchSize", 100L).doesNotContainKey("preImage4Sink");
+                    .containsEntry("batchSize", 100L).doesNotContainKeys("preImage4Sink", "autoLog");
         }
         try (PdkConnector connector = PdkConnector.openPipelineSource(
-                "demo", ref, settings, Map.of("preImage4Sink", false), null, null, null, null)) {
-            assertThat(connector.context().getNodeConfig()).containsEntry("preImage4Sink", false);
-            assertThat(connector.context().getConnectionConfig()).containsEntry("preImage4Sink", false);
+                "demo", ref, settings, Map.of("preImage4Sink", false, "autoLog", false), null, null, null, null)) {
+            assertThat(connector.context().getNodeConfig()).containsEntry("preImage4Sink", false)
+                    .containsEntry("autoLog", false);
+            assertThat(connector.context().getConnectionConfig()).containsEntry("preImage4Sink", false)
+                    .containsEntry("autoLog", false);
         }
     }
 

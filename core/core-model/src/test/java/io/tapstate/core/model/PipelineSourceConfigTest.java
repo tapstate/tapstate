@@ -34,6 +34,20 @@ class PipelineSourceConfigTest {
                 .isNotEqualTo(SourceCaptureIdentity.resolve(source.connector(), source.config(), null));
     }
 
+    @Test void unchangedDirectDefinitionsFindTheirPreUpgradeCaptureCoordinates() {
+        var unconfigured = pipeline(Map.of()).sourceReference(source.id());
+        var explicit = pipeline(Map.of("preImage", true)).sourceReference(source.id());
+        var changed = pipeline(Map.of("preImage", false)).sourceReference(source.id());
+        assertThat(PipelineSourceConfig.directCoordinate(unconfigured, source)).isEqualTo("mck-shared");
+        assertThat(PipelineSourceConfig.directCoordinate(explicit, source)).isEqualTo("mck-shared");
+        assertThat(PipelineSourceConfig.directCoordinate(changed, source))
+                .isEqualTo("mcn-8b5fcb23c3e49185f87ae0daf60d211a2af6ee1cdb5be99db986e42db4adee8e");
+        var unkeyed = new SourceResource(source.id(), source.metadata(), source.connector(), source.config(),
+                source.mode(), source.tables(), null, source.execution(), source.experimental());
+        assertThat(PipelineSourceConfig.directCoordinate(changed, unkeyed))
+                .isEqualTo(SourceCaptureIdentity.physical(source.connector(), Map.of("host", "shared", "preImage", false)));
+    }
+
     private PipelineResource pipeline(Map<String, Object> config) {
         return new PipelineResource("pipeline", null, List.of(new SourceRef.Spec("source", true, config)),
                 null, null, null, null, null);

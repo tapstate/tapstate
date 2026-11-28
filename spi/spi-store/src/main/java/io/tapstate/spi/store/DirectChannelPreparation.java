@@ -28,11 +28,10 @@ public record DirectChannelPreparation(DirectChannelContext context,Set<String> 
         String checked = checkedStart(scope,start);
         var tables = Set.copyOf(selected);
         if (tables.size() != selected.size()) throw new IllegalArgumentException("a private preparation cannot repeat a selected table");
-        String key = source.srs() == null ? null : source.srs().key();
+        String coordinate = PipelineSourceConfig.directCoordinate(reference, source);
         var settings = PipelineSourceConfig.settings(reference, source);
-        var overrides = PipelineSourceConfig.overrides(reference, source);
-        var context = new DirectChannelContext(scope,SourceCaptureIdentity.directChannel(source.connector(),settings,key,scope.pipelineId(),reference.binding(),overrides),reference.binding(),
-                SourceCaptureIdentity.directCapture(source.connector(),settings,key,scope.pipelineId(),reference.binding(),checked,tables,overrides));
+        var context = new DirectChannelContext(scope,SourceCaptureIdentity.directChannel(coordinate,scope.pipelineId(),reference.binding()),reference.binding(),
+                SourceCaptureIdentity.directCapture(coordinate,scope.pipelineId(),reference.binding(),checked,tables));
         return new DirectChannelPreparation(context,tables,mode,SourceCaptureIdentity.physical(source.connector(),settings));
     }
     static String checkedStart(PipelineIntentScope scope,String start) {
