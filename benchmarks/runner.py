@@ -218,6 +218,7 @@ def run_entries(entries, binding, args, manifest=None):
         "output": str(output),
         "endpoint_latency_probe": getattr(args, "endpoint_latency_probe", False),
         "backlog_completion_probe": getattr(args, "backlog_completion_probe", False),
+        "snapshot_completion_probe": getattr(args, "snapshot_completion_probe", False),
     }
     request_file = output / "request.json"
     write_json(request_file, request)
@@ -470,6 +471,8 @@ def main():
                          help="Observe source events and target confirmations on supported Copy and Map live cases.")
     execute.add_argument("--backlog-completion-probe", action="store_true",
                          help="Observe source tails and final acknowledgements on supported fixed backlog cases.")
+    execute.add_argument("--snapshot-completion-probe", action="store_true",
+                         help="Observe the final target acknowledgement on the standard Copy snapshot.")
     execute.add_argument("--stop-at-epoch-seconds", type=positive,
                          help="Stop the benchmark process at this absolute time, leaving time for evidence collection.")
     reporter = sub.add_parser("report")

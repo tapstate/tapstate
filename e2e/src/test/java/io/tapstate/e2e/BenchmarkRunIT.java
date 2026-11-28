@@ -289,9 +289,19 @@ class BenchmarkRunIT {
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
                         "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
+        boolean snapshotProbe = caseId.equals("copy.snapshot.basic.standard")
+                && evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue();
         Path connector = seeds.resolve("mongodb-connector.jar");
-        Path witness = folder.resolve(backlogProbe ? "source-backlog.tsv" : "source-latency.tsv");
-        if (latencyProbe || backlogProbe) {
+        Path witness = folder.resolve(snapshotProbe ? "snapshot-writes.tsv"
+                : backlogProbe ? "source-backlog.tsv" : "source-latency.tsv");
+        if (snapshotProbe) {
+            Path delegate = folder.resolve("verified-snapshot-delegate").resolve("mongodb.jar");
+            Files.createDirectory(delegate.getParent());
+            Files.write(connector, ObservedMongoConnectorJar.buildSnapshotProbe(Files.readAllBytes(artifact), witness, delegate));
+            evidence.result.put("snapshot_probe", Map.of("protocol", BenchmarkSnapshotProbe.PROTOCOL,
+                    "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
+                    "ack_file", witness.getFileName() + ".ack"));
+        } else if (latencyProbe || backlogProbe) {
             String delegateFolder = backlogProbe ? "verified-backlog-delegate" : "verified-latency-delegate";
             Path delegate = folder.resolve(delegateFolder).resolve("mongodb.jar");
             Files.createDirectory(delegate.getParent());
@@ -319,9 +329,10 @@ class BenchmarkRunIT {
                 var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
                 try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null;
-                        var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness, filteredBacklog) : null) {
+                        var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness, filteredBacklog) : null;
+                        var snapshot = snapshotProbe ? new BenchmarkSnapshotProbe(witness) : null) {
                     runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
-                            sourceDb, targetDb, client.getDatabase("admin"), limited, latency, backlog);
+                            sourceDb, targetDb, client.getDatabase("admin"), limited, latency, backlog, snapshot);
                 }
             }
         }
@@ -331,7 +342,7 @@ class BenchmarkRunIT {
             BenchmarkOperators operators, MongoWorkloadGenerator.HotKeys hot, Map<String, Integer> baseLengths,
             Path seeds, String sourceUri, String targetUri, MongoDatabase sourceDb, MongoDatabase targetDb,
             MongoDatabase admin, boolean limited, BenchmarkLatencyProbe latencyProbe,
-            BenchmarkBacklogProbe backlogProbe) throws Exception {
+            BenchmarkBacklogProbe backlogProbe, BenchmarkSnapshotProbe snapshotProbe) throws Exception {
         var memoryProfile = definition.getDocument("workload_spec").getDocument("memory_profile", null);
         boolean memory = memoryProfile != null;
         boolean steady = operators != null && operators.scenario.equals("join-steady-state");
@@ -403,7 +414,7 @@ class BenchmarkRunIT {
                                         backlogProbe, latencyProbe);
                             } else {
                                 if (snapshot) {
-                                    mongoSnapshot(entry, control, evidence);
+                                    mongoSnapshot(entry, control, source, evidence, snapshotProbe);
                                 } else {
                                     int delay = limited ? number(definition.getDocument("workload_spec")
                                             .getDocument("scenario").getDocument("parameters"),
@@ -490,17 +501,31 @@ class BenchmarkRunIT {
         }
     }
 
-    private static void mongoSnapshot(BsonDocument entry, ControlPlane control, Evidence evidence) {
+    private static void mongoSnapshot(BsonDocument entry, ControlPlane control, MongoCollection<BsonDocument> source,
+            Evidence evidence, BenchmarkSnapshotProbe probe) {
         evidence.stage = "snapshot";
         evidence.window("snapshot");
         int rows = number(entry, "rows");
+        if (probe != null) probe.start();
         long start = System.nanoTime();
+        long startEpochMillis = System.currentTimeMillis();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
         waitFor(entry, "the MongoDB snapshot and settled writes",
                 () -> snapshotLanded(control, RECORDS, rows));
         evidence.measure(start, rows, rows);
         evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
         evidence.window("readback");
+        if (probe != null) {
+            try {
+                var reading = probe.finish(source, startEpochMillis, start);
+                evidence.result.put("snapshot_completion", Map.of("status", "eligible", "started_epoch_ms", startEpochMillis,
+                        "final_target_ack_epoch_ms", reading.finalAckEpochMillis(), "confirmed_target_writes", reading.confirmed(),
+                        "completion_ms", reading.durationMillis(), "clock_resolution_ms", 1));
+                evidence.result.put("measurement_status", "eligible");
+            } catch (IOException | IllegalArgumentException unavailable) {
+                evidence.result.put("snapshot_completion", Map.of("status", "insufficient", "reason", unavailable.toString()));
+            }
+        }
     }
 
     private static boolean snapshotLanded(ControlPlane control, String table, int rows) {

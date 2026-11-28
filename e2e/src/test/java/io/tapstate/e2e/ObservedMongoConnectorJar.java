@@ -36,6 +36,10 @@ final class ObservedMongoConnectorJar {
         return build(original, witness, delegate, "mongo-backlog-witness-path.txt", null);
     }
 
+    static byte[] buildSnapshotProbe(byte[] original, Path witness, Path delegate) throws IOException, URISyntaxException {
+        return build(original, witness, delegate, "mongo-snapshot-witness-path.txt", null);
+    }
+
     private static byte[] build(byte[] original, Path witness, Path delegate, String resourceName, String wrapperVersion)
             throws IOException, URISyntaxException {
         Manifest manifest;

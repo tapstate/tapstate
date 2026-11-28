@@ -62,6 +62,19 @@ class PerfReportTest(unittest.TestCase):
         self.row["backlog_completion"] = {"status": "insufficient"}
         self.assertNotIn("completion_ms", {metric for metric, _, _ in report.source_metrics(self.row)})
 
+    def test_snapshot_callback_comparison_keeps_the_polling_bound_separate(self):
+        self.row.update(measurement_status="eligible",
+                        snapshot_probe={"protocol": "mongo-copy-snapshot-pdk-ack-v1"},
+                        snapshot_completion={"status": "eligible", "completion_ms": 23, "clock_resolution_ms": 1})
+        self.row["phase_nanos"]["completion_observed"] = 100_000_000
+        completion = [(value, binding) for metric, value, binding in report.source_metrics(self.row)
+                      if metric == "completion_ms"]
+        self.assertEqual(1, len(completion))
+        self.assertEqual(23, completion[0][0])
+        self.assertEqual("mongo-copy-snapshot-pdk-ack-v1", completion[0][1]["conditions"]["protocol"])
+        self.row["snapshot_completion"] = {"status": "insufficient"}
+        self.assertNotIn("completion_ms", {metric for metric, _, _ in report.source_metrics(self.row)})
+
     def test_duplicate_repeat_invalidates_observation(self):
         result = report.reconcile(self.manifest, [self.summary, self.summary], self.baseline)
         self.assertEqual("invalid", result["results"][0]["status"])

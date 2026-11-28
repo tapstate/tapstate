@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 /** Captures only identities and times from the unchanged connector's CDC and confirmation callbacks. */
 public final class LatencyWitness {
@@ -71,12 +72,21 @@ public final class LatencyWitness {
     }
 
     public static WriteRecordFunction target(Path file, WriteRecordFunction delegate) {
+        return target(file, delegate, LatencyWitness::identity);
+    }
+
+    static WriteRecordFunction snapshotTarget(Path file, WriteRecordFunction delegate) {
+        return target(file, delegate, LatencyWitness::snapshotKey);
+    }
+
+    private static WriteRecordFunction target(Path file, WriteRecordFunction delegate,
+            Function<TapRecordEvent, String> describe) {
         return (context, events, table, consumer) -> {
             if (!active(file)) {
                 delegate.writeRecord(context, events, table, consumer);
                 return;
             }
-            List<String> batch = events.stream().map(LatencyWitness::identity).toList();
+            List<String> batch = events.stream().map(describe).toList();
             var confirmation = new Confirmation();
             delegate.writeRecord(context, events, table, result -> {
                 confirmation.callbacks++;
@@ -114,6 +124,14 @@ public final class LatencyWitness {
             return "invalid";
         }
         return operation + "\t" + key.longValue() + "\t" + event.getReferenceTime();
+    }
+
+    private static String snapshotKey(TapRecordEvent event) {
+        if (event instanceof TapInsertRecordEvent insert && insert.getAfter() != null
+                && insert.getAfter().get("_id") instanceof Number key) {
+            return Long.toString(key.longValue());
+        }
+        return "invalid";
     }
 
     private static synchronized void append(Path file, StringBuilder lines) {

@@ -192,15 +192,23 @@ def summarize_repeats(results):
     return statistics
 
 
+COMPLETION_PROBES = {
+    "backlog-throughput": ("backlog_completion", "backlog_probe", "source tails and target writer acknowledgements"),
+    "snapshot": ("snapshot_completion", "snapshot_probe", "snapshot target writer acknowledgements"),
+}
+
+
 def eligible_metrics(arm):
     if arm.get("paired_source_comparable") is False:
         return
-    if arm.get("mode") == "backlog-throughput" and "backlog_completion" in arm:
-        completion = arm["backlog_completion"]
+    probe = COMPLETION_PROBES.get(arm.get("mode"))
+    if probe and probe[0] in arm:
+        completion_key, identity_key, source = probe
+        completion = arm[completion_key]
         duration = completion.get("completion_ms")
         if (completion.get("status") == "eligible" and type(duration) is int and duration > 0
-                and identified_source(arm.get("backlog_probe", {}).get("protocol"))):
-            yield "completion_nanos", duration * 1_000_000, "source tails and target writer acknowledgements"
+                and identified_source(arm.get(identity_key, {}).get("protocol"))):
+            yield "completion_nanos", duration * 1_000_000, source
     elif arm.get("measurement_status") == "eligible":
         yield "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"), "completion observation"
     latency = arm.get("live_latency", {})
@@ -270,9 +278,11 @@ def resource_conditions(arm):
 
 
 def metric_conditions(arm, metric):
-    if metric == "completion_nanos" and "backlog_completion" in arm:
-        return {"protocol": arm.get("backlog_probe", {}).get("protocol"),
-                "clock_resolution_ms": arm["backlog_completion"].get("clock_resolution_ms")}
+    probe = COMPLETION_PROBES.get(arm.get("mode"))
+    if metric == "completion_nanos" and probe and probe[0] in arm:
+        completion_key, identity_key, _ = probe
+        return {"protocol": arm.get(identity_key, {}).get("protocol"),
+                "clock_resolution_ms": arm[completion_key].get("clock_resolution_ms")}
     if metric == "endpoint_p95_nanos":
         return {"protocol": arm.get("latency_probe", {}).get("protocol"),
                 "source_clock_resolution_ms": arm.get("latency_source_clock_resolution_ms")}
