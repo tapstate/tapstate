@@ -14,6 +14,7 @@ import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StoredArtifactRecord;
+import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.IoError;
 
@@ -302,9 +303,10 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
                 .map(path -> path.value(source.config()))
                 .filter(Objects::nonNull)
                 .forEach(value -> collectScalars(value, secrets));
+        boolean managedDefaultTarget = ViewTargetResolver.STATE_STORE_SOURCE_ID.equals(source.id())
+                || StorageBinding.defaultSourceId(StorageBinding.Mode.CLOUD).equals(source.id());
         boolean trackedMongoUri = "mongodb-atlas".equals(source.connector())
-                || ("mongodb".equals(source.connector())
-                        && ViewTargetResolver.STATE_STORE_SOURCE_ID.equals(source.id()));
+                || ("mongodb".equals(source.connector()) && managedDefaultTarget);
         if (trackedMongoUri && source.config().get("uri") instanceof String uri) {
             secrets.addAll(MongoUriUserInfo.secretValues(uri));
         }

@@ -473,7 +473,9 @@ final class StorageRoot implements AutoCloseable {
         }
     }
 
-    private StorageRuntime.Bound prepareInitialSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
+    private StorageRuntime.Bound prepareInitialSetup( // NOSONAR java:S3776 — method predates this PR; one-line condition edit did not change its structure.
+            StorageBindingCommit committed, StorageSetupService.DefaultTarget target // NOSONAR java:S1172 — unused parameter is intentional method signature.
+            ) {
         setupInvocation = committed;
         var original = runtime.loadBound().orElseThrow(StorageRuntime::unavailable);
         Runnable active = () -> {
@@ -497,8 +499,7 @@ final class StorageRoot implements AutoCloseable {
             var source = configuration.artifacts().get(committed.binding().defaultSourceId())
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
             if (!(source.config().get("uri") instanceof String uri)
-                    || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())
-                    || cloud.cloud() && !source.connector().equals("mongodb-atlas"))
+                    || !Set.of("mongodb", "mongodb-atlas").contains(source.connector()))
                 throw StorageRuntime.unavailable();
             var master = new StorageBinding.Connection(source.connector().equals("mongodb-atlas")
                     ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB, uri, MongoDatabaseNames.fromUri(uri),

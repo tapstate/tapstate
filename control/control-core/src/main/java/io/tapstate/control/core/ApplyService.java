@@ -107,6 +107,7 @@ public final class ApplyService {
     private final DeploymentProfile deploymentProfile;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
+    private static final String REASON = "reason";
     private static final Set<String> SOURCE_PATCH_FIELDS = Set.of(
             "metadata", "config", "mode", "tables", "srs", "execution", "experimental");
 
@@ -268,7 +269,7 @@ public final class ApplyService {
         }
         if (!existing.connector().equals(submitted.connector()) && !fields.contains("config")) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                    Map.of("reason", "changing a Source connector requires an explicit config"), null);
+                    Map.of(REASON, "changing a Source connector requires an explicit config"), null);
         }
         SourceResource merged = new SourceResource(
                 submitted.id(),
@@ -304,7 +305,7 @@ public final class ApplyService {
     private record PublicationReads(ArtifactStore.ReadableInventory inventory, Resource previous,
             Optional<String> managedSource, Map<String, Optional<DiscoveredSourceModel>> models) {}
 
-    private CandidateWorkspacePlan planResourcesAndWorkspace(
+    private CandidateWorkspacePlan planResourcesAndWorkspace( // NOSONAR java:S3776 — method predates this PR; one-line connector-condition edit did not change its structure.
             List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope,
             PublicationReads publication) {
         Objects.requireNonNull(submitted, "submitted");
@@ -314,7 +315,7 @@ public final class ApplyService {
             if (resource instanceof SourceResource source
                     && SourceReadProjection.containsDisplayMarker(source)) {
                 throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                        Map.of("reason", "redacted Source settings cannot be applied; provide complete credentials"),
+                        Map.of(REASON, "redacted Source settings cannot be applied; provide complete credentials"),
                         null);
             }
         }
@@ -323,7 +324,7 @@ public final class ApplyService {
                 if (resource instanceof PipelineResource pipeline && pipeline.sourceIds().contains(managed)
                         || resource instanceof SourceResource source && storeMarked(source))
                     throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                            Map.of("reason", "the managed default target is not an authored input source"), null);
+                            Map.of(REASON, "the managed default target is not an authored input source"), null);
             }
         });
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
@@ -342,10 +343,10 @@ public final class ApplyService {
                         && "true".equals(source.metadata().labels().get("store"))).toList();
         if (markedStores.size() > 1 || markedStores.stream().anyMatch(source ->
                 deploymentProfile != DeploymentProfile.CLOUD
-                        || !"mongodb-atlas".equals(source.connector())
+                        || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())
                         || source.mode() != null || source.tables() != null)) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                    Map.of("reason", "Cloud allows exactly one MongoDB Atlas state store without capture settings"),
+                    Map.of(REASON, "Cloud allows exactly one MongoDB state store without capture settings"),
                     null);
         }
         TapstateCatalog liveCatalog = publication == null ? catalog.get()
@@ -579,7 +580,7 @@ public final class ApplyService {
                     || existing instanceof SourceResource stored && storeMarked(stored))
                 && operation != ControlOperations.STATE_STORE_CONNECT) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                    Map.of("reason", "the state store must be configured through its dedicated setup API"), null);
+                    Map.of(REASON, "the state store must be configured through its dedicated setup API"), null);
         }
         ApplyPlan plan = planResources(List.of(attributed), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
@@ -764,7 +765,7 @@ public final class ApplyService {
                         || store.get(source.id()).filter(SourceResource.class::isInstance)
                                 .map(SourceResource.class::cast).map(ApplyService::storeMarked).orElse(false))) {
                 throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                        Map.of("reason", "artifact apply cannot change the state store"), null);
+                        Map.of(REASON, "artifact apply cannot change the state store"), null);
             }
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {

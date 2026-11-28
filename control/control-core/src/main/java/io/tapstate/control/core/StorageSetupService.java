@@ -321,8 +321,6 @@ public final class StorageSetupService {
         if (java.util.stream.Stream.of(normalized.configuration(), normalized.cache(), normalized.master())
                 .map(StorageBinding.Connection::database).distinct().count() != Layer.values().length)
             throw new TapstateException(ControlError.STORAGE_DATABASES_OVERLAP, Map.of(), null);
-        if (mode == StorageBinding.Mode.CLOUD && (normalized.cache().kind() != StorageBinding.Connection.Kind.ATLAS
-                || normalized.master().kind() != StorageBinding.Connection.Kind.ATLAS)) throw conflict();
         ConnectorIdentity connector = target.identity(normalized.master());
         SourceResource source = (SourceResource) new DslParser().parse(new CanonicalWriter().write(
                 target.definition(normalized.master(), StorageBinding.defaultSourceId(mode))));
@@ -362,9 +360,24 @@ public final class StorageSetupService {
         if (java.util.stream.Stream.of(local.configuration(), local.cache(), local.master())
                 .map(StorageBinding.Connection::database).distinct().count() != Layer.values().length)
             throw new TapstateException(ControlError.STORAGE_DATABASES_OVERLAP, Map.of(), null);
-        if (mode == StorageBinding.Mode.CLOUD && (local.cache().kind() != StorageBinding.Connection.Kind.ATLAS
-                || local.master().kind() != StorageBinding.Connection.Kind.ATLAS)) throw conflict();
+        requireCloudKindFollowsUri(local.cache(), local.master());
         return local;
+    }
+
+    /**
+     * Cloud storage has no operator-chosen connection kind: an SRV seed addresses Atlas, a plain host
+     * list addresses a standard MongoDB deployment. The request's declared kind must be that same
+     * derivation, so an Atlas-only validation rule cannot be skipped by relabelling an SRV seed.
+     */
+    private void requireCloudKindFollowsUri(StorageBinding.Connection... connections) {
+        if (mode != StorageBinding.Mode.CLOUD) return;
+        for (StorageBinding.Connection connection : connections) {
+            var expected = connection.uri().regionMatches(true, 0, "mongodb+srv://", 0, "mongodb+srv://".length())
+                    ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB;
+            if (connection.kind() != expected)
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "a Cloud storage kind must follow its connection URI scheme"), null);
+        }
     }
     private static String cacheHash(StorageBinding.Connection cache) {
         return CanonicalHash.ofText(JsonWriter.write(connectionTree(cache)));

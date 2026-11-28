@@ -1423,8 +1423,8 @@ class ManagedMongoStoreIsolationIT {
             })) {
                 String temporary=exchangeCookie(application,"old"); var root=application.getBean(StorageRoot.class);
                 var original=root.runtime().requireConfiguration().setupStates().load().scope();
-                var candidate=Map.of("cache",Map.of("kind","ATLAS","uri",uri(customerUser,cacheDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",cacheDb,"caPem",TLS.ca()),
-                        "master",Map.of("kind","ATLAS","uri",uri(customerUser,masterDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",masterDb,"caPem",TLS.ca()));
+                var candidate=Map.of("cache",Map.of("kind","MONGODB","uri",uri(customerUser,cacheDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",cacheDb,"caPem",TLS.ca()),
+                        "master",Map.of("kind","MONGODB","uri",uri(customerUser,masterDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",masterDb,"caPem",TLS.ca()));
                 var stamps=new LinkedHashMap<String,Object>();
                 for (var layer:List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE)) {
                     var tested=cloudPost(application,temporary,"/api/storage/test",Map.of("operationId",original.operationId(),"generation",original.generation(),
@@ -1640,8 +1640,8 @@ class ManagedMongoStoreIsolationIT {
                 var original = configuration.setupStates().load().scope();
                 String cacheUri = uri(customerUser, cacheDb) + "&tls=true&authMechanism=SCRAM-SHA-256";
                 String masterUri = uri(customerUser, masterDb) + "&tls=true&authMechanism=SCRAM-SHA-256";
-                var candidate = Map.of("cache", Map.of("kind", "ATLAS", "uri", cacheUri, "database", cacheDb, "caPem", TLS.ca()),
-                        "master", Map.of("kind", "ATLAS", "uri", masterUri, "database", masterDb, "caPem", TLS.ca()));
+                var candidate = Map.of("cache", Map.of("kind", "MONGODB", "uri", cacheUri, "database", cacheDb, "caPem", TLS.ca()),
+                        "master", Map.of("kind", "MONGODB", "uri", masterUri, "database", masterDb, "caPem", TLS.ca()));
                 var stamps = new java.util.LinkedHashMap<String,Object>();
                 for (var layer : List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE)) {
                     var tested = cloudPost(application, temporary, "/api/storage/test", Map.of("operationId", original.operationId(),
