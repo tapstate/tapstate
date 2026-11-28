@@ -7,9 +7,10 @@ import json
 import os
 import shutil
 from pathlib import Path
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 def load(name, filename):
@@ -57,7 +58,8 @@ class PublishedConnectorsTest(unittest.TestCase):
         self.assertEqual(command[command.index("--max-filesize") + 1], "512000000")
 
     def test_op_download_timeout_preserves_safe_diagnostics(self):
-        settings = {"TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS": "600", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "1"}
+        settings = {"TAPSTATE_OP_DOWNLOAD_TIMEOUT_SECONDS": "600", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "1",
+                    "TAPSTATE_OP_DOWNLOAD_RETRY": "0"}
         failure = SimpleNamespace(returncode=28, stdout=b"http=200 bytes=42",
                                   stderr=b"curl: (28) timed out at https://example.test/jar?token=secret")
         output = io.StringIO()
@@ -67,9 +69,85 @@ class PublishedConnectorsTest(unittest.TestCase):
         command = curl.call_args.args[0]
         self.assertEqual(command[command.index("--max-time") + 1], "600")
         self.assertEqual(curl.call_args.kwargs["timeout"], 605)
+        self.assertEqual(curl.call_count, 1)
         self.assertIn("http=200 bytes=42", output.getvalue())
         self.assertIn("curl: (28) timed out at [URL]", output.getvalue())
         self.assertNotIn("token=secret", output.getvalue())
+
+    def test_retry_spaces_download_starts_at_least_thirty_seconds_apart(self):
+        for elapsed, expected_delays in ((10, [call(20)]), (30, []), (35, [])):
+            with self.subTest(elapsed=elapsed):
+                destination = self.fixture.jars.parent / f"download-{elapsed}.jar"
+                now = 0
+                starts = []
+
+                def curl(*args, **kwargs):
+                    nonlocal now
+                    self.assertFalse(destination.exists())
+                    starts.append(now)
+                    if len(starts) == 1:
+                        destination.write_bytes(b"partial")
+                        now += elapsed
+                        return SimpleNamespace(returncode=92)
+                    destination.write_bytes(b"complete")
+                    return SimpleNamespace(returncode=0)
+
+                def sleep(seconds):
+                    nonlocal now
+                    now += seconds
+
+                with patch.dict(os.environ, {"TAPSTATE_OP_DOWNLOAD_RETRY": "1", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "0"}), \
+                        patch.object(PUBLISHED.subprocess, "run", side_effect=curl), \
+                        patch.object(time, "monotonic", side_effect=lambda: now), \
+                        patch.object(time, "sleep", side_effect=sleep) as delay, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    PUBLISHED.download("https://maven.example.test/mysql-connector.jar", destination)
+                self.assertEqual(starts, [0, max(30, elapsed)])
+                self.assertEqual(delay.call_args_list, expected_delays)
+                self.assertEqual(destination.read_bytes(), b"complete")
+
+    def test_persistent_failure_stops_after_five_total_attempts(self):
+        destination = self.fixture.jars.parent / "download.jar"
+        with patch.dict(os.environ, {"TAPSTATE_OP_DOWNLOAD_RETRY": "1", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "0"}), \
+                patch.object(PUBLISHED.subprocess, "run", return_value=SimpleNamespace(returncode=92)) as curl, \
+                patch.object(time, "monotonic", return_value=0), \
+                patch.object(time, "sleep") as sleep, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(PUBLISHED.STAGE.StageError, "curl exit=92"):
+                PUBLISHED.download("https://maven.example.test/mysql-connector.jar", destination)
+        self.assertEqual(curl.call_count, 5)
+        self.assertEqual(sleep.call_args_list, [call(30)] * 4)
+
+    def test_retry_policy_distinguishes_transfer_and_http_failures(self):
+        settings = {"TAPSTATE_OP_DOWNLOAD_RETRY": "1", "TAPSTATE_OP_DOWNLOAD_DIAGNOSTICS": "0"}
+        cases = (
+            (22, b"http=404", False),
+            (22, b"http=401", False),
+            (63, b"http=200", False),
+            (60, b"http=000", False),
+            (22, b"http=429", True),
+            (22, b"http=503", True),
+            (18, b"http=200", True),
+        )
+        for exit_code, metrics, retryable in cases:
+            with self.subTest(exit_code=exit_code, metrics=metrics):
+                destination = self.fixture.jars.parent / "policy.jar"
+                failure = SimpleNamespace(returncode=exit_code, stdout=metrics)
+                success = SimpleNamespace(returncode=0, stdout=b"http=200")
+                destination.write_bytes(b"partial")
+                with patch.dict(os.environ, settings), \
+                        patch.object(PUBLISHED.subprocess, "run", side_effect=[failure, success]) as curl, \
+                        patch.object(time, "monotonic", return_value=0), \
+                        patch.object(time, "sleep") as sleep, contextlib.redirect_stderr(io.StringIO()):
+                    if retryable:
+                        PUBLISHED.download("https://maven.example.test/mysql-connector.jar", destination)
+                    else:
+                        with self.assertRaisesRegex(PUBLISHED.STAGE.StageError, f"curl exit={exit_code}"):
+                            PUBLISHED.download("https://maven.example.test/mysql-connector.jar", destination)
+                self.assertFalse(destination.exists())
+                self.assertEqual(curl.call_count, 2 if retryable else 1)
+                self.assertEqual(sleep.call_args_list, [call(30)] if retryable else [])
+                command = curl.call_args.args[0]
+                self.assertEqual(command[command.index("--write-out") + 1], "http=%{http_code}")
 
     def test_op_keeps_its_licenses_when_the_selection_matches_cloud(self):
         selected = [entry for entry in self.selection if entry["id"] in PUBLISHED.STAGE.CLOUD_IDS]
