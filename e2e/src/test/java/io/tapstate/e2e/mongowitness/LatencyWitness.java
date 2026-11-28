@@ -19,16 +19,23 @@ import java.util.Map;
 public final class LatencyWitness {
     private LatencyWitness() {}
 
-    static StreamReadFunction source(Path file, StreamReadFunction delegate) {
+    static StreamReadFunction source(Path file, StreamReadFunction delegate, boolean recordPositions) {
         return (context, tables, offset, size, downstream) -> delegate.streamRead(context, tables, offset, size,
                 new StreamReadConsumer() {
                     @Override
                     public void accept(List<TapEvent> events, Object latest) {
                         if (active(file)) {
                             var lines = new StringBuilder();
+                            long readMillis = recordPositions ? System.currentTimeMillis() : 0;
                             for (var event : events) {
                                 if (event instanceof TapRecordEvent record) {
-                                    lines.append(identity(record)).append('\n');
+                                    lines.append(identity(record));
+                                    if (recordPositions) {
+                                        lines.append('\t').append(record.getTableId())
+                                                .append('\t').append(record.getExactlyOnceId())
+                                                .append('\t').append(readMillis);
+                                    }
+                                    lines.append('\n');
                                 }
                             }
                             append(file, lines);

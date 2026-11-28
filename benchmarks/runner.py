@@ -217,6 +217,7 @@ def run_entries(entries, binding, args, manifest=None):
         "connector_dir": str(args.connectors.resolve()),
         "output": str(output),
         "endpoint_latency_probe": getattr(args, "endpoint_latency_probe", False),
+        "backlog_completion_probe": getattr(args, "backlog_completion_probe", False),
     }
     request_file = output / "request.json"
     write_json(request_file, request)
@@ -467,6 +468,8 @@ def main():
     execute.add_argument("--offline", action="store_true")
     execute.add_argument("--endpoint-latency-probe", action="store_true",
                          help="Observe source events and target confirmations on supported Copy live cases.")
+    execute.add_argument("--backlog-completion-probe", action="store_true",
+                         help="Observe source tails and final acknowledgements on Copy and Union fixed backlogs.")
     execute.add_argument("--stop-at-epoch-seconds", type=positive,
                          help="Stop the benchmark process at this absolute time, leaving time for evidence collection.")
     reporter = sub.add_parser("report")

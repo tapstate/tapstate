@@ -49,6 +49,19 @@ class PerfReportTest(unittest.TestCase):
         self.assertEqual({"snapshot.rss_peak_kib"}, set(comparisons["arms"]["single"]))
         self.assertAlmostEqual(0.20, comparisons["arms"]["single"]["snapshot.rss_peak_kib"]["change_ratio"])
 
+    def test_backlog_comparison_uses_verified_callbacks_and_binds_the_protocol(self):
+        self.row.update(mode="backlog-throughput", measurement_status="eligible",
+                        backlog_probe={"protocol": "mongo-backlog-pdk-ack-v1"},
+                        backlog_completion={"status": "eligible", "completion_ms": 23, "clock_resolution_ms": 1})
+        completion = [(value, binding) for metric, value, binding in report.source_metrics(self.row)
+                      if metric == "completion_ms"]
+        self.assertEqual(1, len(completion))
+        self.assertEqual(23, completion[0][0])
+        self.assertEqual("mongo-backlog-pdk-ack-v1", completion[0][1]["conditions"]["protocol"])
+        self.assertEqual(1, completion[0][1]["conditions"]["clock_resolution_ms"])
+        self.row["backlog_completion"] = {"status": "insufficient"}
+        self.assertNotIn("completion_ms", {metric for metric, _, _ in report.source_metrics(self.row)})
+
     def test_duplicate_repeat_invalidates_observation(self):
         result = report.reconcile(self.manifest, [self.summary, self.summary], self.baseline)
         self.assertEqual("invalid", result["results"][0]["status"])

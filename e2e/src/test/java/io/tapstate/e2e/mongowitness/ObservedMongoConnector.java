@@ -41,9 +41,12 @@ public final class ObservedMongoConnector implements TapConnector {
     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         delegate.registerCapabilities(functions, codecs);
         Path latency = witnessPath("mongo-latency-witness-path.txt");
-        if (latency != null) {
-            functions.supportWriteRecord(LatencyWitness.target(latency, functions.getWriteRecordFunction()));
-            functions.supportStreamRead(LatencyWitness.source(latency, functions.getStreamReadFunction()));
+        Path backlog = witnessPath("mongo-backlog-witness-path.txt");
+        Path measurement = latency == null ? backlog : latency;
+        if (measurement != null) {
+            functions.supportWriteRecord(LatencyWitness.target(measurement, functions.getWriteRecordFunction()));
+            functions.supportStreamRead(LatencyWitness.source(measurement, functions.getStreamReadFunction(),
+                    backlog != null));
             return;
         }
         Path witness = witnessPath("mongo-write-witness-path.txt");

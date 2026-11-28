@@ -113,15 +113,18 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
         for (String line : Files.readAllLines(path)) {
             String[] fields = line.split("\t", -1);
             if (fields.length != (ack ? 4 : 3)) throw new IllegalArgumentException("Unrecognized probe evidence");
-            int operation = Integer.parseInt(fields[0]);
-            long epochMillis = Long.parseLong(fields[2]);
-            if (operation < 0 || operation > 2 || epochMillis <= 0 || epochMillis % 1000 != 0) {
-                throw new IllegalArgumentException("Unexpected MongoDB connector event time or operation");
-            }
-            parsed.add(new Confirmation(new Event(operation, Long.parseLong(fields[1]), epochMillis),
-                    ack ? Long.parseLong(fields[3]) : 0));
+            parsed.add(new Confirmation(event(fields), ack ? Long.parseLong(fields[3]) : 0));
         }
         return parsed;
+    }
+
+    static Event event(String[] fields) {
+        int operation = Integer.parseInt(fields[0]);
+        long epochMillis = Long.parseLong(fields[2]);
+        if (operation < 0 || operation > 2 || epochMillis <= 0 || epochMillis % 1000 != 0) {
+            throw new IllegalArgumentException("Unexpected MongoDB connector event time or operation");
+        }
+        return new Event(operation, Long.parseLong(fields[1]), epochMillis);
     }
 
     static List<LiveLatencyEligibility.Sample> correlate(List<Confirmation> source, List<Confirmation> target,

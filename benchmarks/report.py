@@ -195,7 +195,13 @@ def summarize_repeats(results):
 def eligible_metrics(arm):
     if arm.get("paired_source_comparable") is False:
         return
-    if arm.get("measurement_status") == "eligible":
+    if arm.get("mode") == "backlog-throughput" and "backlog_completion" in arm:
+        completion = arm["backlog_completion"]
+        duration = completion.get("completion_ms")
+        if (completion.get("status") == "eligible" and type(duration) is int and duration > 0
+                and identified_source(arm.get("backlog_probe", {}).get("protocol"))):
+            yield "completion_nanos", duration * 1_000_000, "source tails and target writer acknowledgements"
+    elif arm.get("measurement_status") == "eligible":
         yield "completion_nanos", arm.get("phase_nanos", {}).get("completion_observed"), "completion observation"
     latency = arm.get("live_latency", {})
     if latency.get("status") == "eligible" and identified_source(latency.get("source")):
@@ -264,6 +270,9 @@ def resource_conditions(arm):
 
 
 def metric_conditions(arm, metric):
+    if metric == "completion_nanos" and "backlog_completion" in arm:
+        return {"protocol": arm.get("backlog_probe", {}).get("protocol"),
+                "clock_resolution_ms": arm["backlog_completion"].get("clock_resolution_ms")}
     if metric == "endpoint_p95_nanos":
         return {"protocol": arm.get("latency_probe", {}).get("protocol"),
                 "source_clock_resolution_ms": arm.get("latency_source_clock_resolution_ms")}

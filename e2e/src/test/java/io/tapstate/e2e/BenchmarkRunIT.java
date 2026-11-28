@@ -283,13 +283,20 @@ class BenchmarkRunIT {
         boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && text(definition, "mode").equals("live-latency")
                 && text(definition, "spec").equals("specs/copy-basic.json") && operators == null;
+        boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
+                && List.of("copy.backlog.fixed-iud.standard", "union.backlog.basic.standard")
+                        .contains(text(definition, "id"));
         Path connector = seeds.resolve("mongodb-connector.jar");
-        Path witness = folder.resolve("source-latency.tsv");
-        if (latencyProbe) {
-            Path delegate = folder.resolve("verified-latency-delegate").resolve("mongodb.jar");
+        Path witness = folder.resolve(backlogProbe ? "source-backlog.tsv" : "source-latency.tsv");
+        if (latencyProbe || backlogProbe) {
+            String delegateFolder = backlogProbe ? "verified-backlog-delegate" : "verified-latency-delegate";
+            Path delegate = folder.resolve(delegateFolder).resolve("mongodb.jar");
             Files.createDirectory(delegate.getParent());
-            Files.write(connector, ObservedMongoConnectorJar.buildLatencyProbe(Files.readAllBytes(artifact), witness, delegate));
-            evidence.result.put("latency_probe", Map.of("protocol", BenchmarkLatencyProbe.PROTOCOL,
+            byte[] original = Files.readAllBytes(artifact);
+            Files.write(connector, backlogProbe ? ObservedMongoConnectorJar.buildBacklogProbe(original, witness, delegate)
+                    : ObservedMongoConnectorJar.buildLatencyProbe(original, witness, delegate));
+            evidence.result.put(backlogProbe ? "backlog_probe" : "latency_probe",
+                    Map.of("protocol", backlogProbe ? BenchmarkBacklogProbe.PROTOCOL : BenchmarkLatencyProbe.PROTOCOL,
                     "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
                     "source_file", witness.getFileName().toString(), "ack_file", witness.getFileName() + ".ack"));
         } else {
@@ -307,9 +314,10 @@ class BenchmarkRunIT {
             try (var client = MongoClients.create(sourceUri)) {
                 var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
-                try (var probe = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null) {
+                try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null;
+                        var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness) : null) {
                     runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
-                            sourceDb, targetDb, client.getDatabase("admin"), limited, probe);
+                            sourceDb, targetDb, client.getDatabase("admin"), limited, latency, backlog);
                 }
             }
         }
@@ -318,7 +326,8 @@ class BenchmarkRunIT {
     private static void runMongo(BsonDocument entry, BsonDocument definition, Evidence evidence, Path folder,
             BenchmarkOperators operators, MongoWorkloadGenerator.HotKeys hot, Map<String, Integer> baseLengths,
             Path seeds, String sourceUri, String targetUri, MongoDatabase sourceDb, MongoDatabase targetDb,
-            MongoDatabase admin, boolean limited, BenchmarkLatencyProbe latencyProbe) throws Exception {
+            MongoDatabase admin, boolean limited, BenchmarkLatencyProbe latencyProbe,
+            BenchmarkBacklogProbe backlogProbe) throws Exception {
         var memoryProfile = definition.getDocument("workload_spec").getDocument("memory_profile", null);
         boolean memory = memoryProfile != null;
         boolean steady = operators != null && operators.scenario.equals("join-steady-state");
@@ -386,7 +395,7 @@ class BenchmarkRunIT {
                         evidence.phase("startup", startup);
                         try {
                             if (operators != null) {
-                                operatorRun(entry, prepared, control, sourceDb, targetDb, operators, evidence, hot);
+                                operatorRun(entry, prepared, control, sourceDb, targetDb, operators, evidence, hot, backlogProbe);
                             } else {
                                 if (snapshot) {
                                     mongoSnapshot(entry, control, evidence);
@@ -403,7 +412,7 @@ class BenchmarkRunIT {
                                             target.getNamespace().getFullName(), delay) : null;
                                             var window = slowTarget ? new BenchmarkTargetLimit.TargetWindow(targetDb, target) : null) {
                                         mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"),
-                                                limit, delay, window, handoff, latencyProbe);
+                                                limit, delay, window, handoff, latencyProbe, backlogProbe);
                                     }
                                 }
                                 evidence.stage = "readback";
@@ -499,7 +508,7 @@ class BenchmarkRunIT {
     private static void mongoCdc(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, Evidence evidence, String mode,
             BenchmarkTargetLimit limit, int delay, BenchmarkTargetLimit.TargetWindow targetWindow,
-            BenchmarkTargetLimit handoffLimit, BenchmarkLatencyProbe latencyProbe) {
+            BenchmarkTargetLimit handoffLimit, BenchmarkLatencyProbe latencyProbe, BenchmarkBacklogProbe backlogProbe) {
         evidence.stage = "initial-state";
         evidence.window("load");
         int initial = number(entry, "rows");
@@ -574,7 +583,9 @@ class BenchmarkRunIT {
             }
             evidence.result.put("resumed_from_retained_position", resume.equals(retainedPosition));
             evidence.stage = "catch-up";
+            if (backlogProbe != null) backlogProbe.start();
             long catchup = System.nanoTime();
+            long catchupEpochMillis = System.currentTimeMillis();
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             settleExpected(entry, control, events);
             waitFor(entry, "zero snapshot rows in the catch-up run",
@@ -583,6 +594,7 @@ class BenchmarkRunIT {
             evidence.result.put("source_tail_token_directly_comparable", false);
             evidence.result.put("measurement_status", "insufficient-source-end-evidence");
             evidence.result.put("retained_initial_state", true);
+            evidence.backlogCompletion(backlogProbe, backlog.batch(), catchupEpochMillis, catchup);
         } else {
             evidence.stage = "live";
             long baseline = settled(control);
@@ -753,7 +765,7 @@ class BenchmarkRunIT {
 
     private static void operatorRun(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
-            MongoWorkloadGenerator.HotKeys hot) {
+            MongoWorkloadGenerator.HotKeys hot, BenchmarkBacklogProbe backlogProbe) {
         boolean lifecycle = operators.scenario.equals("join-lifecycle-release");
         String mode = lifecycle ? "live-latency" : text(entry.getDocument("case"), "mode");
         evidence.stage = "initial-state";
@@ -806,7 +818,7 @@ class BenchmarkRunIT {
         }
         var mix = operators.paired() ? new WorkloadRecipe.Mix(0, 70, 30) : mix(entry);
         if (mode.equals("backlog-throughput")) {
-            operatorBacklog(entry, prepared, control, source, target, operators, evidence, anchor, mix);
+            operatorBacklog(entry, prepared, control, source, target, operators, evidence, anchor, mix, backlogProbe);
         } else {
             operatorLive(entry, prepared, control, source, target, operators, evidence, mix, hot);
         }
@@ -953,7 +965,7 @@ class BenchmarkRunIT {
 
     private static void operatorBacklog(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
-            Map<String, BsonDocument> initial, WorkloadRecipe.Mix mix) {
+            Map<String, BsonDocument> initial, WorkloadRecipe.Mix mix, BenchmarkBacklogProbe backlogProbe) {
         control.stop(PIPELINE, false);
         waitFor(entry, "operator stopped before prewrite",
                 () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent());
@@ -985,7 +997,9 @@ class BenchmarkRunIT {
         }
 
         evidence.stage = "catch-up";
+        if (backlogProbe != null) backlogProbe.start();
         long start = System.nanoTime();
+        long startEpochMillis = System.currentTimeMillis();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
         awaitOperatorPhase(entry, control, target, operators, expected, Map.of(), backlog.batch(),
                 initial.equals(expected) ? -1 : 0);
@@ -999,6 +1013,7 @@ class BenchmarkRunIT {
         evidence.result.put("target_settled_units", settled(control));
         evidence.result.put("source_captured_changes", capturedChanges(control));
         verifyOperator(operators, target, expected, evidence);
+        evidence.backlogCompletion(backlogProbe, backlog.batch(), startEpochMillis, start);
     }
 
     private static void operatorLive(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
@@ -1445,6 +1460,30 @@ class BenchmarkRunIT {
             result.put("confirmed_output_units", confirmed);
             result.put("completion_clock", "monotonic observed upper bound including telemetry publication and polling");
             result.put("measurement_status", "bounded-observation");
+        }
+
+        void backlogCompletion(BenchmarkBacklogProbe probe, MongoWorkloadGenerator.PhaseReport batch,
+                long startEpochMillis, long startNanos) {
+            if (probe == null) return;
+            try {
+                var reading = probe.finish(batch, startEpochMillis, startNanos);
+                var tails = new LinkedHashMap<String, Object>();
+                reading.sourceTails().forEach((stream, tail) -> tails.put(stream, Map.of(
+                        "events", tail.events(), "resume_token", tail.token().toJson(),
+                        "observed_epoch_ms", tail.readEpochMillis())));
+                result.put("backlog_completion", Map.of(
+                        "status", "eligible",
+                        "source_tails", tails,
+                        "started_epoch_ms", reading.startEpochMillis(),
+                        "final_target_ack_epoch_ms", reading.targetAckEpochMillis(),
+                        "confirmed_target_writes", reading.confirmedWrites(),
+                        "completion_ms", reading.durationMillis(),
+                        "clock_resolution_ms", 1,
+                        "input_events_per_second", reading.confirmedWrites() * 1000.0 / reading.durationMillis()));
+                result.put("measurement_status", "eligible");
+            } catch (IOException | IllegalArgumentException | org.bson.json.JsonParseException unavailable) {
+                result.put("backlog_completion", Map.of("status", "insufficient", "reason", unavailable.toString()));
+            }
         }
 
         void diagnostic(String name, Supplier<?> reading) {

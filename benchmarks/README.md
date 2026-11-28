@@ -233,9 +233,16 @@ retain the request and summary from each command. Check the keys and values prod
 Check live warm-up and window counts and final readback,
 and backlog source history, zero snapshot rows on resume, confirmed writes and
 final readback. Review `measurement_status` independently from execution `status`.
-Live Copy may report `insufficient-event-correlation` and backlog Copy may
-report `insufficient-source-end-evidence`. Record those limits, including when
-target contents and counts agree. For Nest, check the identical root counts and
+Live Copy may report `insufficient-event-correlation`. For fixed backlog Copy and
+Union, the formal workflow enables `--backlog-completion-probe`. To reproduce
+the measurement, use that flag with the matching formal recipe and retain
+`source-backlog.tsv`, its `.ack` file, and `result.json`. The probe matches each
+input's first and last MongoDB tokens and event sequence against independent
+source history, then verifies a successful target callback for every batch event.
+The measured interval ends at the later of the final source observation and
+target callback. Independent target readback remains required for the run to
+qualify. The report retains its polling observation and indicates when callback
+evidence is insufficient. For Nest, check the identical root counts and
 the four versus sixteen children per root, then inspect `op-resource.jsonl`,
 `gc.log`, and the per-window coverage in both arms. Re-run the same command with
 a fresh output directory to reproduce the window under the same definition.

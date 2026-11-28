@@ -316,7 +316,7 @@ jobs:
           fi
           python3 -B benchmarks/runner.py run \
             --manifest "$RUNNER_TEMP/performance-inputs/manifest.json" --batch "$BATCH" \
-            --stop-at-epoch-seconds "$STOP_AT" --endpoint-latency-probe --offline \
+            --stop-at-epoch-seconds "$STOP_AT" --endpoint-latency-probe --backlog-completion-probe --offline \
             --connectors "$RUNNER_TEMP/connectors" --output "$output/run"
       - name: Upload batch evidence
         uses: actions/upload-artifact@v4
@@ -329,6 +329,7 @@ jobs:
             !${{ runner.temp }}/performance-batch/run/**/witness-input/**
             !${{ runner.temp }}/performance-batch/run/**/verified-connectors/**
             !${{ runner.temp }}/performance-batch/run/**/verified-latency-delegate/**
+            !${{ runner.temp }}/performance-batch/run/**/verified-backlog-delegate/**
           if-no-files-found: error
           retention-days: 30
 
