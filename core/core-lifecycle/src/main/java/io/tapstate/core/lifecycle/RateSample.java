@@ -25,7 +25,19 @@ import java.util.Objects;
  * Absent when the run reported no start, which is a run that has counted nothing.
  */
 public record RateSample(String pipelineId, Instant observedAt, Map<String, Long> counters,
-        Map<String, Long> lag, Instant countingSince) {
+        Map<String, Long> lag, Instant countingSince, StartupEvidence startupEvidence) {
+
+    /** The actual runtime execution and, when verified, the common origin of both outbound counters. */
+    public record StartupEvidence(long jobId, long executionId, Instant zeroAt) {
+        public boolean sameExecution(StartupEvidence other) {
+            return other != null && jobId == other.jobId && executionId == other.executionId;
+        }
+    }
+
+    public RateSample(String pipelineId, Instant observedAt, Map<String, Long> counters,
+            Map<String, Long> lag, Instant countingSince) {
+        this(pipelineId, observedAt, counters, lag, countingSince, null);
+    }
 
     public RateSample {
         Objects.requireNonNull(pipelineId, "pipelineId");

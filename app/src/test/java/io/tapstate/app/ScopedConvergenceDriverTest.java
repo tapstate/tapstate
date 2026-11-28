@@ -4,13 +4,16 @@ import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.IoError;
@@ -86,6 +89,7 @@ class ScopedConvergenceDriverTest {
     private NativeObservationSampling nativeSampling;
     private ProcessObservationWriter observationWrites;
     private StoppedTerminalRecheck stoppedRecheck;
+    private DeliveryReading stoppedDelivery;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -102,6 +106,7 @@ class ScopedConvergenceDriverTest {
                 @Override public void pause(String id) { carrying.set(false); }
                 @Override public void resume(String id) { carrying.set(true); }
                 @Override public void stop(String id, boolean purge) { carrying.set(false); }
+                @Override public Optional<DeliveryReading> stoppedDelivery() { return Optional.ofNullable(stoppedDelivery); }
                 @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
                 @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
                 @Override public boolean isCarryingAJob(String id) { return carrying.get(); }
@@ -364,6 +369,46 @@ class ScopedConvergenceDriverTest {
                 scheduledPass(driver);
                 assertThat(carrying).isTrue();
             }
+        }
+    }
+
+    @Test void stopWithActiveMetricAlertsKeepsConfirmedDeliveryInsideTheSamplingInterval() {
+        var baselineAt = Instant.now().minusSeconds(1);
+        var zeroAt = baselineAt.minusSeconds(1);
+        var interval = Duration.ofMinutes(1);
+        var evidence = new RateSample.StartupEvidence(1, 2, zeroAt);
+        var baseline = new RateSample("orders", baselineAt, Map.of("records.out", 0L, "bytes.out", 0L),
+                Map.of(), zeroAt, evidence);
+        sampler = new RateSampler(views.rates, interval);
+        sampler.offerPrepared(baseline, FIRST, views.rates);
+        stoppedDelivery = new DeliveryReading(Map.of("orders", Map.of("insert", 4L)), Map.of("orders", 32L),
+                Map.of(), zeroAt, Map.of(), null, null, evidence);
+        views.state(FIRST).compareAndSwap("orders", 0, StateJson.of(PipelineState.RUNNING), zeroAt);
+        carrying.set(true);
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 5, new DesiredState("orders", PipelineState.STOPPED, "original"));
+        stoppedRecheck = (processed, checkpoint, original, tenure) -> true;
+        when(ownership.finishStoppedRelease("orders")).thenReturn(true);
+        nativeSampling = mock(NativeObservationSampling.class);
+        alertFeed = mock(PipelineAlertFeed.class);
+        when(alertFeed.needsFrequentTerminalSamples(FIRST, PipelineState.STOPPED)).thenReturn(true);
+        observationWrites = mock(ProcessObservationWriter.class);
+        org.mockito.Mockito.doAnswer(call -> { call.<Runnable>getArgument(1).run(); return null; })
+                .when(observationWrites).now(any(), any());
+        org.mockito.Mockito.doAnswer(call -> {
+            var history = call.<ProcessObservationWriter.History>getArgument(0);
+            assertThat(history.observedAt()).isBetween(baselineAt, baselineAt.plus(interval));
+            history.requireActive().run();
+            history.append().accept(Duration.ofSeconds(1));
+            return null;
+        }).when(observationWrites).offerHistory(any());
+
+        try (var driver = driver()) {
+            driver.reconcile();
+            assertThat(views.observations(FIRST).read("orders").orElseThrow().state()).isEqualTo(PipelineState.STOPPED);
+            assertThat(views.rates.all()).as("confirmed STOPPED history survives sampling cadence").hasSize(2);
+            var stopped = views.rates.all().getLast();
+            assertThat(stopped.counters()).containsEntry("records.out", 4L).containsEntry("bytes.out", 32L);
+            assertThat(stopped.startupEvidence()).isEqualTo(evidence);
         }
     }
 

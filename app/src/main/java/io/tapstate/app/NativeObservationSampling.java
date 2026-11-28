@@ -30,7 +30,7 @@ import java.util.function.UnaryOperator;
 final class NativeObservationSampling {
     private record Published(long epoch, ExecutionFence execution) {}
 
-    private record Attempt(boolean resolved, Optional<Observation> observation) {
+    private record Attempt(boolean resolved, Optional<ObservationPublisher.Publication> observation) {
         static Attempt fallback() { return new Attempt(false, Optional.empty()); }
     }
 
@@ -63,12 +63,12 @@ final class NativeObservationSampling {
                 .isPresent();
     }
 
-    Optional<Observation> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
+    Optional<ObservationPublisher.Publication> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
             PipelineIntentStore.ActuationReading config, ObservationFailure failure) {
         return publish(publisher, pass, result, config, failure, null);
     }
 
-    Optional<Observation> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
+    Optional<ObservationPublisher.Publication> publish(ObservationPublisher publisher, PipelineConvergencePass pass, ConvergeResult result,
             PipelineIntentStore.ActuationReading config, ObservationFailure failure,
             UnaryOperator<ObservationStore> deferred) {
         String id = pass.scope().pipelineId();
@@ -79,23 +79,23 @@ final class NativeObservationSampling {
                     () -> {
                         var store = pass.observationSample();
                         if (deferred != null) store = deferred.apply(guarded(store, () -> requireExecution(pass, original)));
-                        return publisher.publishScoped(pass.scope(), pass.state(), store, null);
+                        return publisher.publishScopedReading(pass.scope(), pass.state(), store, null, false);
                     }, deferred);
         }
         forget(id);
         var store = pass.observationSample();
-        return publisher.publishScoped(pass.scope(), pass.state(), deferred == null ? store : deferred.apply(store), failure);
+        return publisher.publishScopedReading(pass.scope(), pass.state(), deferred == null ? store : deferred.apply(store), failure, false);
     }
 
-    Optional<Observation> publishRunning(ObservationPublisher publisher, PipelineConvergencePass pass, CheckpointDoc checkpoint,
+    Optional<ObservationPublisher.Publication> publishRunning(ObservationPublisher publisher, PipelineConvergencePass pass, CheckpointDoc checkpoint,
             PipelineIntentStore.ActuationReading config, BooleanSupplier stillCurrent, Runnable requireCurrentTicket,
-            Supplier<Optional<Observation>> fallback) {
+            Supplier<Optional<ObservationPublisher.Publication>> fallback) {
         return publishRunning(publisher, pass, checkpoint, config, stillCurrent, requireCurrentTicket, fallback, null);
     }
 
-    Optional<Observation> publishRunning(ObservationPublisher publisher, PipelineConvergencePass pass, CheckpointDoc checkpoint,
+    Optional<ObservationPublisher.Publication> publishRunning(ObservationPublisher publisher, PipelineConvergencePass pass, CheckpointDoc checkpoint,
             PipelineIntentStore.ActuationReading config, BooleanSupplier stillCurrent, Runnable requireCurrentTicket,
-            Supplier<Optional<Observation>> fallback, UnaryOperator<ObservationStore> deferred) {
+            Supplier<Optional<ObservationPublisher.Publication>> fallback, UnaryOperator<ObservationStore> deferred) {
         String id = pass.scope().pipelineId();
         if (!afterTerminal(pass, checkpoint)) return Optional.empty();
         var original = new ExecutionFence(pass.scope(), pass.claim());
@@ -109,7 +109,7 @@ final class NativeObservationSampling {
             if (fast.resolved()) return fast.observation();
         }
         var observation = fallback.get();
-        if (deferred == null && observation.filter(value -> value.state() == PipelineState.RUNNING).isPresent()
+        if (deferred == null && observation.filter(value -> value.observation().state() == PipelineState.RUNNING).isPresent()
                 && execution.apply(id).filter(original::equals).isPresent()) {
             synchronized (published) { if (afterTerminal(pass, checkpoint)) published.put(id, reading); }
         }

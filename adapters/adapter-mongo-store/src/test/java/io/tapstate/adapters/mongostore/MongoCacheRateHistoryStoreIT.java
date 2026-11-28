@@ -62,6 +62,26 @@ class MongoCacheRateHistoryStoreIT {
     private static final Instant T0 = Instant.now().truncatedTo(ChronoUnit.MILLIS);
     private static RateSample sample(long seconds, long count) { return new RateSample("orders", T0.plusSeconds(seconds), Map.of("records.out", count), Map.of("orders", 3L), T0.minusSeconds(100)); }
 
+    @Test void startupEvidenceRoundTripsAlongsideOriginalRows() {
+        withFixture(Duration.ofDays(15), f -> {
+            var original = sample(0, 1);
+            var before = new RateSample("orders", T0.plusSeconds(1), Map.of("recordCount", 0L), Map.of(), null,
+                    new RateSample.StartupEvidence(11, 22, null));
+            Instant origin = T0.plusSeconds(2);
+            var confirmed = new RateSample("orders", T0.plusSeconds(3), Map.of("records.out", 4L, "bytes.out", 120L),
+                    Map.of(), origin, new RateSample.StartupEvidence(11, 22, origin));
+            var writer = f.writer();
+            writer.append(original);
+            writer.append(before);
+            writer.append(confirmed);
+            assertThat(f.domain.pipelineRateHistory(SCOPE).readPage("orders", T0, T0.plusSeconds(4), null, 10).entries())
+                    .extracting(RateHistoryStore.Entry::sample).containsExactly(original, before, confirmed);
+            assertThat(f.rows().countDocuments(new Document("startupEvidence", new Document("$exists", false))))
+                    .isEqualTo(1);
+            assertThat(MongoRateHistoryStore.toDocument(confirmed)).doesNotContainKey("startupEvidence");
+        });
+    }
+
     @Test void sameTimeSamplesHaveStableDistinctKeysAndBoundedPagesAndBoundariesKeepTheOriginalNumbers() {
         withFixture(Duration.ofDays(15), f -> {
             var writer = f.writer(); writer.append(sample(0, 1)); writer.append(sample(0, 2)); writer.append(sample(1, 3)); writer.append(sample(2, 4));
