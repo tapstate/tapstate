@@ -58,7 +58,7 @@ public sealed interface SourceRef {
             @Doc(value = "Whether this pipeline reads that source through the shared replay store. "
                     + "Materialized on apply when omitted.")
             Boolean srs,
-            @Doc(value = "Connector node parameters for this Pipeline. Omitted fields use connector defaults when available.",
+            @Doc(value = "Saved connector node parameters for this Pipeline. Omitted values stay unset in the Pipeline configuration.",
                     key = "nodeConfig")
             Map<String, Object> nodeConfig,
             @Doc(value = "Pipeline-local input name used in from references.", key = "as")
