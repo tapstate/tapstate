@@ -1,6 +1,14 @@
 {
   "schemaVersion": 1,
   "recoveryProfiles": {
+    "cache-pipeline-run-progress-v1": {
+      "goal": "Retain the current or most recent run within the same CACHE across member replacement and process restart. Recover only provable display facts after CACHE replacement.",
+      "entry": "Read the admitted current Start intent and current engine and destination-confirmation evidence. Republish when the active runtime observes those facts. Absent projection and earlier event times remain unknown.",
+      "prerequisites": [
+        "Current CONFIG Start and CACHE business and Pipeline state scope must agree.",
+        "Recovery authority remains the existing intent, engine, checkpoint and destination acknowledgement paths. The projection grants no recovery or execution authority."
+      ]
+    },
     "aggregate-state-startup-upgrade": {
       "goal": "Continue from the complete original aggregate state. Prepare the empty aggregate structure when upgrading a pre-aggregate CACHE that has no recorded aggregate placements.",
       "entry": "Original runtime restart. Before retained business readiness, the startup upgrade may prepare only the missing aggregate_state collection and its existing operator_placement index.",
@@ -1429,6 +1437,10 @@
     }
   },
   "consistencyProfiles": {
+    "cache-pipeline-run-progress-v1": {
+      "atomicDomain": "CACHE",
+      "fencing": "One document per cluster and Pipeline in the original CACHE. Its scope and Start revision identify the run. Mutate within the CACHE transaction that checks the current physical state and touches the original live command or execution claim. Same-run versions advance monotonically. CONFIG Start truth is read independently and rechecked around the CACHE read. Ignore mismatched projections. Pipeline retirement removes the original scoped document."
+    },
     "aggregate-state-startup-upgrade": {
       "atomicDomain": "CACHE",
       "fencing": "Ordinary leased operator reads and writes retain their full existing fences. The startup upgrade uses the original CACHE metadata admission fence and verifies absence of current aggregate placements in the same CACHE client/session transaction as collection and index creation."
@@ -1743,6 +1755,31 @@
     }
   },
   "resources": [
+  {
+    "id": "mongo.cache.pipeline_run_progress",
+    "resourceVersion": 1,
+    "proposalVersion": 1,
+    "kind": "COLLECTION",
+    "layer": "CACHE",
+    "database": "CACHE",
+    "physicalNames": [
+      "pipeline_run_progress"
+    ],
+    "responsibility": "User-visible startup activity and confirmed runtime milestones for the current or most recent explicit Pipeline run.",
+    "writers": [
+      "io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore"
+    ],
+    "readers": [
+      "io.tapstate.adapters.mongostore.MongoCachePipelineRunProgressStore"
+    ],
+    "recovery": "cache-pipeline-run-progress-v1",
+    "consistency": "cache-pipeline-run-progress-v1",
+    "growth": "One row per Pipeline. Fixed stage set with at most one activity and one first time per stage, plus aggregate table counts. No per-table, per-row or per-attempt history. Events are published on background stage boundaries. Zero additional synchronous MongoDB commands for Start.",
+    "evidence": [
+      "app/src/test/java/io/tapstate/app/PipelineFirstStatePreparerIT.java",
+      "core/core-lifecycle/src/test/java/io/tapstate/core/lifecycle/PipelineRunProgressTest.java"
+    ]
+  },
     {
       "id": "mongo.store.artifacts",
       "resourceVersion": 1,
