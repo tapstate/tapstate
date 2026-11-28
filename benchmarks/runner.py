@@ -472,7 +472,7 @@ def main():
     execute.add_argument("--backlog-completion-probe", action="store_true",
                          help="Observe source tails and final acknowledgements on supported fixed backlog cases.")
     execute.add_argument("--snapshot-completion-probe", action="store_true",
-                         help="Observe the final target acknowledgement on the standard Copy snapshot.")
+                         help="Observe the final target acknowledgement on MongoDB Copy snapshots.")
     execute.add_argument("--stop-at-epoch-seconds", type=positive,
                          help="Stop the benchmark process at this absolute time, leaving time for evidence collection.")
     reporter = sub.add_parser("report")

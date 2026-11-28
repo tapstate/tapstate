@@ -289,8 +289,9 @@ class BenchmarkRunIT {
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
                         "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
-        boolean snapshotProbe = caseId.equals("copy.snapshot.basic.standard")
-                && evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue();
+        boolean snapshotProbe = evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
+                && operators == null && text(definition, "mode").equals("snapshot")
+                && text(definition, "spec").equals("specs/copy-basic.json");
         Path connector = seeds.resolve("mongodb-connector.jar");
         Path witness = folder.resolve(snapshotProbe ? "snapshot-writes.tsv"
                 : backlogProbe ? "source-backlog.tsv" : "source-latency.tsv");
