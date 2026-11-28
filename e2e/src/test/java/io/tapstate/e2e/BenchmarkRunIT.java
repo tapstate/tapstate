@@ -289,12 +289,12 @@ class BenchmarkRunIT {
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
                         "union.backlog.basic.standard", "map.backlog.basic.standard").contains(caseId));
-        boolean filteredSnapshot = operators != null && text(definition, "mode").equals("snapshot")
-                && text(definition, "spec").equals("specs/filter-basic.json");
-        boolean operatorSnapshot = filteredSnapshot || caseId.equals("map.snapshot.basic.standard")
-                || caseId.equals("js.snapshot.basic.standard");
-        boolean copySnapshot = operators == null && text(definition, "mode").equals("snapshot")
-                && text(definition, "spec").equals("specs/copy-basic.json");
+        boolean snapshotMode = text(definition, "mode").equals("snapshot");
+        String spec = text(definition, "spec");
+        boolean operatorSnapshot = operators != null && snapshotMode
+                && List.of("specs/filter-basic.json", "specs/map-basic.json", "specs/js-basic.json").contains(spec);
+        boolean filteredSnapshot = operatorSnapshot && spec.equals("specs/filter-basic.json");
+        boolean copySnapshot = operators == null && snapshotMode && spec.equals("specs/copy-basic.json");
         boolean snapshotProbe = evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (copySnapshot || operatorSnapshot);
         Path connector = seeds.resolve("mongodb-connector.jar");
