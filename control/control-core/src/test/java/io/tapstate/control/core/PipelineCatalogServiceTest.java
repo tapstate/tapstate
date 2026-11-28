@@ -3,7 +3,12 @@ package io.tapstate.control.core;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
@@ -18,7 +23,9 @@ import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.spi.store.PipelineDraftStore;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -28,6 +35,43 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class PipelineCatalogServiceTest {
+
+    @Test
+    void syncLagUsesTheSinkSampleTimeAndNeverTreatsMissingEvidenceAsCaughtUp() {
+        var now = Instant.parse("2026-11-27T00:00:00Z");
+        var sample = now.minusSeconds(3);
+        var artifacts = new ArtifactQueryService(artifactStore(List.of(pipeline("orders", null))));
+        var desired = new MemoryDesiredStore();
+        desired.save(intent("orders", PipelineState.RUNNING));
+        var stored = new MemoryObservationStore();
+        var query = new PipelineObservationQueryService(artifacts, stored,
+                io.tapstate.core.lifecycle.ExecutionPlans.NONE, List::of, Clock.fixed(now, ZoneOffset.UTC));
+        var service = new PipelineCatalogService(artifacts, new PipelineDraftService(new MemoryDraftStore()), desired, query);
+        var unknown = new PipelineCatalogItem.SyncLag(PipelineCatalogItem.SyncLagState.UNKNOWN, null, null);
+
+        stored.save(observation("orders", PipelineState.RUNNING, now));
+        assertThat(service.list().getFirst().syncLag()).isEqualTo(unknown);
+
+        stored.save(observationWithPendingCdcWrite(now, sample));
+        assertThat(service.list().getFirst().syncLag()).isEqualTo(
+                new PipelineCatalogItem.SyncLag(PipelineCatalogItem.SyncLagState.BEHIND, 1_250L, sample));
+
+        stored.save(observationWithPendingCdcWrite(now, now.minusSeconds(61)));
+        assertThat(service.list().getFirst().syncLag()).isEqualTo(unknown);
+        stored.save(observationWithPendingCdcWrite(now, now.plusSeconds(1)));
+        assertThat(service.list().getFirst().syncLag()).isEqualTo(unknown);
+
+        stored.save(observationWithPendingCdcWrite(now, sample));
+        desired.save(intent("orders", PipelineState.STOPPED));
+        assertThat(service.list().getFirst().syncLag()).isNull();
+    }
+
+    private static Observation observationWithPendingCdcWrite(Instant publishedAt, Instant sampledAt) {
+        var pending = MetricFact.single(PendingCdcWrite.METRIC, MetricType.GAUGE, "ms",
+                MetricPoint.reading(Map.of(MetricAttributes.PIPELINE_ID, "orders"), sampledAt, 1_250L));
+        return new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, publishedAt, List.of(pending));
+    }
 
     @Test void aStopReadAfterADiagnosisCannotDiscardItsEffectiveFailure() {
         var artifacts = new ArtifactQueryService(artifactStore(List.of(pipeline("orders", null))));
