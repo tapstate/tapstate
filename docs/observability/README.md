@@ -24,6 +24,7 @@ pipeline. The history and explanation responses, including coded errors, carry
 |---|---|---|---|
 | What runtime state was last observed? | `GET /api/pipelines/{id}/status` | `status <id>` | `pipeline_status` |
 | What lifecycle target was requested? | `desiredState` in `GET /api/pipelines/{id}/status` | — | `desiredState` in `pipeline_status` |
+| What is the current or latest run doing, and what milestones has it reached? | `GET /api/pipelines/{id}/run-progress` (`pipeline.run-progress`, read scope) | — | — |
 | How can I follow runtime state changes? | WebSocket `/api/pipelines/{id}/status/watch` | `status <id> --watch` | — |
 | What are the current counters and positions? | `GET /api/pipelines/{id}/metrics` | `metrics <id>` | `pipeline_metrics` |
 | How far has the initial snapshot loaded? | `GET /api/pipelines/{id}/snapshot` | `snapshot <id>` | `pipeline_snapshot` |

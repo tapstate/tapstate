@@ -86,6 +86,31 @@ class ControlApiSchemaTest {
     }
 
     @Test
+    void runProgressHasItsOwnReadScopedRestContract() {
+        var registry = ControlOperations.registry();
+        var operation = registry.resolve("pipeline.run-progress");
+        assertThat(operation.scope()).isEqualTo(Scope.READ);
+        assertThat(operation.audited()).isFalse();
+        assertThat(operation.exposure()).containsOnlyKeys(Frontend.REST);
+        assertThat(registry.exposedOn(Frontend.CLI)).doesNotContain(operation);
+        assertThat(registry.exposedOn(Frontend.MCP)).doesNotContain(operation);
+        assertThat(operation.schema()).isNotEqualTo(registry.resolve("pipeline.status").schema());
+
+        var params = ControlApiSchema.resolve(operation.schema().params());
+        assertThat(params).containsEntry("required", List.of("id")).containsEntry("additionalProperties", false);
+        var result = ControlApiSchema.resolve(operation.schema().result());
+        assertThat(result).containsEntry("additionalProperties", false).containsEntry("required",
+                List.of("availability", "runId", "version", "active", "milestones", "initialLoad", "failedStage", "awaitingMilestones"));
+        Map<?, ?> fields = (Map<?, ?>) result.get("properties");
+        assertThat(((Map<?, ?>) fields.get("availability")).get("enum")).isEqualTo(List.of("AVAILABLE", "UNAVAILABLE"));
+        for (String field : List.of("active", "milestones")) {
+            Map<?, ?> item = (Map<?, ?>) ((Map<?, ?>) fields.get(field)).get("items");
+            assertThat(item.get("additionalProperties")).isEqualTo(false);
+            assertThat(item.get("required")).isEqualTo(List.of("stage", field.equals("active") ? "since" : "reachedAt"));
+        }
+    }
+
+    @Test
     void observabilityReadsPublishClosedTypedSchemas() {
         Map<?, ?> historyRequest = ControlApiSchema.resolve(
                 ControlOperations.PIPELINE_METRICS_HISTORY.schema().params());

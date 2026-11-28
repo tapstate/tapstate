@@ -1425,8 +1425,9 @@ class PipelineApiTest {
     // ---- the endpoint table is a derivation of the registry: the pipeline verbs project onto /api ----
 
     @Test
-    void everyPipelineVerbProjectsARegisteredCliExposedVerb() {
-        Set<String> cliExposed = ControlOperations.registry()
+    void everyPipelineRouteProjectsARegisteredOperation() {
+        var registry = ControlOperations.registry();
+        Set<String> cliExposed = registry
                 .exposedOn(io.tapstate.control.core.Frontend.CLI).stream()
                 .map(io.tapstate.control.core.Operation::id).collect(Collectors.toSet());
 
@@ -1438,11 +1439,10 @@ class PipelineApiTest {
             Verb verb = handler.getMethodAnnotation(Verb.class);
             if (verb != null && verb.value().startsWith("pipeline.")) {
                 projectedPipelineVerbs.add(verb.value());
-                assertThat(ControlOperations.registry().ids())
-                        .as("a projected pipeline verb must be registered")
-                        .contains(verb.value());
-                if (!"pipeline.delete".equals(verb.value())) {
-                    assertThat(cliExposed).contains(verb.value());
+                var operation = registry.resolve(verb.value());
+                if (!cliExposed.contains(verb.value())) {
+                    assertThat(operation.exposure()).as(verb.value())
+                            .containsOnlyKeys(io.tapstate.control.core.Frontend.REST);
                 }
             }
         });
@@ -1456,7 +1456,7 @@ class PipelineApiTest {
                         "pipeline.preview",
                         "pipeline.start", "pipeline.start-checks", "pipeline.stop", "pipeline.pause",
                         "pipeline.resume",
-                        "pipeline.status", "pipeline.status",
+                        "pipeline.status", "pipeline.run-progress",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs", "pipeline.log-level", "pipeline.logs",
 
                         "pipeline.metrics.history", "pipeline.explain",

@@ -60,7 +60,7 @@ class PipelineObservationController {
         return response.withConnectorVersions(usage == null ? java.util.List.of() : usage.forPipeline(id));
     }
 
-    @Verb("pipeline.status")
+    @Verb("pipeline.run-progress")
     @GetMapping("/pipelines/{id}/run-progress")
     PipelineRunProgressResponse runProgress(@PathVariable("id") String id) {
         return runProgress == null ? PipelineRunProgressResponse.unavailable()
