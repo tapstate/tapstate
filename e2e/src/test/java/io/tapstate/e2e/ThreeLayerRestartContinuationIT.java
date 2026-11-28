@@ -491,7 +491,9 @@ class ThreeLayerRestartContinuationIT {
             var pipeline = (PipelineResource) new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: retired\nsource: []\n");
             configuration.artifacts().create(pipeline);
             var old = new PipelineIntentScope(cluster, business.bindingVersion(), business.cacheIncarnation(), "retired", 1);
-            configuration.intents().compareAndSet(old, 0, new DesiredState("retired", PipelineState.STOPPED, CanonicalHash.of(pipeline), true));
+            String revision = CanonicalHash.of(pipeline);
+            assertThat(configuration.intents().compareAndSet(old, 0,
+                    new DesiredState("retired", PipelineState.STOPPED, revision, false))).isTrue();
             var grant = ((FirstPipelineCreationResult.Issued) configuration.preparations().issueFirstCreate(old, nodeFence)).creation();
             var preparer = cache.pipelinePreparations(business, active);
             configuration.preparations().complete(preparer.seed(preparer.reserveFirst(grant, ttl), configuration.preparations(), java.time.Instant.now()));
@@ -500,6 +502,10 @@ class ThreeLayerRestartContinuationIT {
             var cold = cache.operatorState(location, WorkloadClaimFence.from(claim), active);
             for (int index = 0; index < 270; index++) cold.save(location.mapName(), "key-" + index, new byte[]{1, 2});
             var successor = new PipelineIntentScope(cluster, business.bindingVersion(), business.cacheIncarnation(), "retired", 2);
+            // Request the clearing rebuild after the first generation has been prepared and populated.
+            var initialIntent = configuration.intents().load("retired").orElseThrow();
+            assertThat(configuration.intents().compareAndSet(old, initialIntent.intentRevision(),
+                    new DesiredState("retired", PipelineState.STOPPED, revision, true))).isTrue();
             var request = new PipelineRebuildRequest("fixture-full", configuration.intents().load("retired").orElseThrow(),
                     WorkloadClaimFence.from(claim), 0, PipelinePreparationInputs.of(successor, pipeline, Map.of(), Map.of()));
             var pending = configuration.rebuilds().begin(request);
