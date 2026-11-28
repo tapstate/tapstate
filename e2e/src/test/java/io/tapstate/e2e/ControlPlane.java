@@ -919,18 +919,29 @@ final class ControlPlane {
     }
 
     List<Map<String, Object>> pipelineCatalogItems(int offset) {
+        return readPipelineCatalogItems(offset).stream().map(item -> {
+            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String)) {
+                throw new AssertionError("the pipeline catalog contained an invalid entry: " + item);
+            }
+            return asObject(entry);
+        }).toList();
+    }
+
+    Map<String, Object> pipelineCatalogItem(String id) {
+        for (Object item : readPipelineCatalogItems(0)) {
+            if (item instanceof Map<?, ?> entry && id.equals(entry.get("id"))) return asObject(entry);
+        }
+        throw new AssertionError("Pipeline missing from the catalog: " + id);
+    }
+
+    private List<?> readPipelineCatalogItems(int offset) {
         HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=" + offset));
         expect(response, 200, "read the Pipeline catalog");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("items") instanceof List<?> items)) {
             throw new AssertionError("the pipeline catalog was not a list: " + response.body());
         }
-        return items.stream().map(item -> {
-            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String)) {
-                throw new AssertionError("the pipeline catalog contained an invalid entry: " + item);
-            }
-            return asObject(entry);
-        }).toList();
+        return items;
     }
 
     /** Removes the applied Pipeline and the exact authoring revision the caller read. */

@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
@@ -140,19 +141,24 @@ public final class PipelineCatalogService {
     private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact, PipelineCatalogState stateFacts,
             PipelineState engineState) {
         boolean hasArtifact = artifact != null;
-        var status = statusOf(id, hasArtifact, stateFacts, engineState);
+        var observation = readObservation(id, hasArtifact, stateFacts);
+        var status = statusOf(id, hasArtifact, stateFacts, engineState,
+                observation == null ? null : observations.statusOf(observation));
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
         String name = draft != null && draft.name() != null && !draft.name().isBlank() ? draft.name() : id;
+        var syncLag = status.displayState() == PipelineCatalogItem.UiState.RUNNING
+                && status.state() == PipelineCatalogItem.DisplayState.RUNNING
+                ? observations.syncLagOf(observation)
+                : null;
         return new PipelineCatalogItem(id, name, description, mode, draft == null ? null : draft.revision(),
                 draft == null ? null : draft.updatedAt(), artifact == null ? null : artifact.contentHash(),
-                hasArtifact, status);
+                hasArtifact, status, syncLag);
     }
 
     private PipelineCatalogItem.Status statusOf(String id, boolean hasArtifact, PipelineCatalogState stateFacts,
-            PipelineState engineState) {
+            PipelineState engineState, PipelineStatus observation) {
         boolean needsRecovery = stateFacts == null && hasArtifact && recoveryRequired.test(id);
-        PipelineStatus observation = readObservation(id, hasArtifact, stateFacts);
         PipelineState observed = observation == null ? null : observation.observedState();
         PipelineState checkpoint = stateFacts == null ? null : stateFacts.checkpoint();
         PipelineState effective = effectiveState(engineState, observation, stateFacts, checkpoint);
@@ -180,11 +186,11 @@ public final class PipelineCatalogService {
                 intent.failure(), stopState(intent.desired(), stateFacts, state, recoveryAtRest));
     }
 
-    private PipelineStatus readObservation(String id, boolean hasArtifact, PipelineCatalogState stateFacts) {
+    private Observation readObservation(String id, boolean hasArtifact, PipelineCatalogState stateFacts) {
         if (stateFacts != null) {
-            return stateFacts.observation().map(observations::statusOf).orElse(null);
+            return stateFacts.observation().orElse(null);
         }
-        return hasArtifact ? observations.findStatus(id).orElse(null) : null;
+        return hasArtifact ? observations.findObservation(id).orElse(null) : null;
     }
 
     private static PipelineState effectiveState(PipelineState engineState, PipelineStatus observation,
