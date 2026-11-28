@@ -292,8 +292,10 @@ class BenchmarkRunIT {
         boolean snapshotMode = text(definition, "mode").equals("snapshot");
         String spec = text(definition, "spec");
         boolean operatorSnapshot = operators != null && snapshotMode
-                && List.of("specs/filter-basic.json", "specs/map-basic.json", "specs/js-basic.json").contains(spec);
-        boolean filteredSnapshot = operatorSnapshot && spec.equals("specs/filter-basic.json");
+                && List.of("specs/filter-basic.json", "specs/map-basic.json", "specs/js-basic.json",
+                        "specs/mixed-double-map.json").contains(spec);
+        boolean filteredSnapshot = operatorSnapshot
+                && (spec.equals("specs/filter-basic.json") || spec.equals("specs/mixed-double-map.json"));
         boolean copySnapshot = operators == null && snapshotMode && spec.equals("specs/copy-basic.json");
         boolean snapshotProbe = evidence.request.getBoolean("snapshot_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (copySnapshot || operatorSnapshot);
