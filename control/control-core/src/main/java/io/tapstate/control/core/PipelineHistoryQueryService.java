@@ -350,7 +350,8 @@ public final class PipelineHistoryQueryService {
             RateSample left = previous == null ? null : previous.sample();
             RateSample right = current.sample();
             StartReason boundary = left == null ? null : boundary(left, right);
-            if (boundary != null) {
+            Instant startup = HistoryAggregator.startupBaseline(left, right, from, boundary);
+            if (boundary != null && startup == null) {
                 segment++;
                 reason = boundary;
                 if (boundary == StartReason.GAP) {
@@ -361,7 +362,7 @@ public final class PipelineHistoryQueryService {
                     }
                 }
             }
-            Point point = rawPoint(left, right, boundary, from, tables, skipFirstCdc);
+            Point point = rawPoint(left, right, boundary, from, tables, skipFirstCdc, startup);
             points.add(new Emitted(point, segment, reason, current.key(), right.observedAt()));
             previous = current;
             skipFirstCdc = false;
@@ -370,18 +371,20 @@ public final class PipelineHistoryQueryService {
     }
 
     private static Point rawPoint(RateSample left, RateSample right, StartReason boundary,
-            Instant from, List<String> tables, boolean skipCdc) {
+            Instant from, List<String> tables, boolean skipCdc, Instant startup) {
         var cdc = skipCdc ? CdcDeliveryTotals.ZERO : HistoryAggregator.cdcDelta(left, right, from, boundary);
         var cdcReading = HistoryAggregator.cdcReading(cdc.count(), cdc.totalMillis());
         Instant end = right.observedAt();
         List<Lag> lag = lag(right, tables);
-        if (left == null || boundary != null) {
+        if (left == null || boundary != null && startup == null) {
             return new Point(end, end, null, null, lag, cdcReading);
         }
 
-        Rate records = rawRate(left, right, HistoryAggregator.RECORDS_OUT);
-        Rate bytes = rawRate(left, right, HistoryAggregator.BYTES_OUT);
-        Instant start = records == null && bytes == null ? end : left.observedAt();
+        Instant baseline = startup == null ? left.observedAt() : startup;
+        Duration elapsed = Duration.between(baseline, end);
+        Rate records = rawRate(HistoryAggregator.outboundGrowth(left, right, HistoryAggregator.RECORDS_OUT, startup), elapsed);
+        Rate bytes = rawRate(HistoryAggregator.outboundGrowth(left, right, HistoryAggregator.BYTES_OUT, startup), elapsed);
+        Instant start = records == null && bytes == null ? end : baseline;
         return new Point(start, end, records, bytes, lag, cdcReading);
     }
 
@@ -405,9 +408,7 @@ public final class PipelineHistoryQueryService {
         return before != null && after != null && after < before;
     }
 
-    private static Rate rawRate(RateSample left, RateSample right, String counter) {
-        Long growth = HistoryAggregator.growth(left, right, counter);
-        Duration elapsed = Duration.between(left.observedAt(), right.observedAt());
+    private static Rate rawRate(Long growth, Duration elapsed) {
         if (elapsed.isZero() || elapsed.isNegative() || growth == null) {
             return null;
         }

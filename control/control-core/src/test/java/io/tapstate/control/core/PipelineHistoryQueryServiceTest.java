@@ -8,6 +8,8 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.RateHistoryStore;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -114,6 +116,48 @@ class PipelineHistoryQueryServiceTest {
                     .extracting(PipelineMetricsHistory.Unavailable::metric)
                     .doesNotContain(HistoryAggregator.RECORDS_OUT, HistoryAggregator.BYTES_OUT);
         }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = HistoryResolution.class, names = {"RAW", "PT5M"})
+    void retainedStartupZerosSurviveBothExplicitAndLegacySamplePairs(HistoryResolution resolution) {
+        Instant first = Instant.parse("2026-09-21T10:00:00Z");
+        var evidence = new RateSample.StartupEvidence(1, 2, first.minusSeconds(30));
+        Map<String, Long> legacy = Map.of("recordCount", 5L);
+        Map<String, Long> explicit = Map.of("recordCount", 5L, "records.out", 0L, "bytes.out", 0L);
+        var request = new PipelineHistoryQuery("orders", first, first.plusSeconds(540), resolution, 20, List.of(), null);
+
+        for (var pair : List.of(List.of(explicit, explicit), List.of(legacy, explicit), List.of(explicit, legacy))) {
+            var history = new RecordingHistory();
+            history.add(new RateSample("orders", first, pair.getFirst(), Map.of(), null,
+                    pair.getFirst() == explicit ? evidence : null));
+            history.add(new RateSample("orders", first.plusSeconds(60), pair.getLast(), Map.of(), null,
+                    pair.getLast() == explicit ? evidence : null));
+            var answer = service(history, 2, 25_000).query(request);
+            var intervals = points(answer).stream().filter(point -> point.intervalStart().isBefore(point.intervalEnd())).toList();
+            assertThat(intervals).as("startup sample pair %s", pair).singleElement().satisfies(point -> {
+                assertThat(point.recordsOut()).isNotNull();
+                assertThat(point.recordsOut().delta()).isZero();
+                assertThat(point.recordsOut().averageRate()).isZero();
+                assertThat(point.bytesOut()).isNotNull();
+                assertThat(point.bytesOut().delta()).isZero();
+                assertThat(point.bytesOut().averageRate()).isZero();
+                assertThat(point.cdcDelivery()).isNull();
+            });
+            assertThat(answer.unavailable()).isEmpty();
+        }
+
+        var missing = new RecordingHistory();
+        missing.add(new RateSample("orders", first, explicit, Map.of(), null, evidence));
+        missing.add(new RateSample("orders", first.plusSeconds(480), explicit, Map.of(), null, evidence));
+        var answer = service(missing, 2, 25_000).query(request);
+        assertThat(answer.gaps()).hasSize(1);
+        assertThat(points(answer)).isNotEmpty().allSatisfy(point -> {
+            assertThat(point.recordsOut()).isNull();
+            assertThat(point.bytesOut()).isNull();
+        });
+        assertThat(answer.unavailable()).extracting(PipelineMetricsHistory.Unavailable::metric)
+                .containsExactly("records.out", "bytes.out");
     }
 
     @Test

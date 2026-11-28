@@ -12,8 +12,10 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -74,6 +76,38 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
                 List.of(firstTotal, Measurement.of(millis, 400, 599, second)))))).isNull();
         assertThat(Engine.cdcDeliveryIn(JobMetrics.of(Map.of(count, counts, millis,
                 List.of(firstTotal, Measurement.of(millis, 600, 600, first)))))).isNull();
+    }
+
+    @Test
+    void theOutboundZeroMustCoverEveryContributingWriterInThisExecution() {
+        String start = JetDeliveryGauge.SINCE_METRIC;
+        String rows = "recordsOut.i.orders";
+        String bytes = "bytesOut.orders";
+        String received = com.hazelcast.jet.core.metrics.MetricNames.RECEIVED_COUNT;
+        String memberStart = com.hazelcast.jet.core.metrics.MetricNames.EXECUTION_START_TIME;
+        Set<String> participants = Set.of("first", "second");
+        Map<String, String> first = Map.of(MetricTags.MEMBER, "a", MetricTags.ADDRESS, "first", MetricTags.EXECUTION, "live",
+                MetricTags.VERTEX, "sink", MetricTags.PROCESSOR, "0", MetricTags.PROCESSOR_TYPE, "SinkProcessor");
+        Map<String, String> second = Map.of(MetricTags.MEMBER, "b", MetricTags.ADDRESS, "second", MetricTags.EXECUTION, "live",
+                MetricTags.VERTEX, "sink", MetricTags.PROCESSOR, "1", MetricTags.PROCESSOR_TYPE, "SinkProcessor");
+        var starts = List.of(Measurement.of(start, 100, 500, first), Measurement.of(start, 110, 500, second));
+        var records = List.of(Measurement.of(rows, 10, 500, first));
+        var payload = List.of(Measurement.of(bytes, 90, 500, second));
+        var receipts = List.of(Measurement.of(received, 10, 500, first), Measurement.of(received, 0, 500, second));
+        var members = List.of(Measurement.of(memberStart, 1, 500, first), Measurement.of(memberStart, 1, 500, second));
+        var complete = Map.of(start, starts, rows, records, bytes, payload, received, receipts, memberStart, members);
+
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(complete), "live", participants))
+                .isEqualTo(Instant.ofEpochMilli(100));
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(complete), "previous", participants)).isNull();
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(Map.of(start, List.of(starts.getFirst()),
+                received, receipts, memberStart, members)), "live", participants))
+                .as("a writer still has no start").isNull();
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(Map.of(start, List.of(starts.getFirst()),
+                received, List.of(receipts.getFirst()), memberStart, List.of(members.getFirst()))), "live", participants))
+                .as("another participating member has no snapshot").isNull();
+        assertThat(Engine.outboundZeroAt(JobMetrics.of(Map.of(start, starts, received, receipts, memberStart, members,
+                rows, List.of(Measurement.of(rows, 10, 499, first)))), "live", participants)).isNull();
     }
 
     @Test
