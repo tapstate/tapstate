@@ -64,6 +64,9 @@ final class JetDeliveryGauge implements DeliveryGauge {
     private final Map<String, JobStatistic> reachedByTable = new HashMap<>();
     private final Map<String, JobStatistic> durationParts = new HashMap<>();
     private final Map<String, JobStatistic> waitingByName = new HashMap<>();
+    static final String OLDEST_PENDING_CDC = "cdcOldestPendingWriteEventTime";
+    private volatile long oldestPendingCdc;
+
     static final String CDC_COUNT = "cdcDeliveryCount";
     static final String CDC_TOTAL_MILLIS = "cdcDeliveryTotalMillis";
     private final AtomicReference<CdcSnapshot> cdcDelivery = new AtomicReference<>();
@@ -113,12 +116,18 @@ final class JetDeliveryGauge implements DeliveryGauge {
         cdcDelivery.set(new CdcSnapshot(current.startMillis(), totals));
     }
 
+    @Override
+    public void oldestPendingCdc(long eventMillis) {
+        oldestPendingCdc = eventMillis;
+    }
+
     void collectCdcDelivery(MetricDescriptor descriptor, MetricsCollectionContext context) {
         // The collector can run on another thread. Read the start and both totals together.
         CdcSnapshot snapshot = cdcDelivery.get();
         if (snapshot != null) {
             descriptor.withTag(MetricTags.USER, "true");
             context.collect(descriptor, SINCE_METRIC, ProbeLevel.INFO, ProbeUnit.MS, snapshot.startMillis());
+            context.collect(descriptor, OLDEST_PENDING_CDC, ProbeLevel.INFO, ProbeUnit.MS, oldestPendingCdc);
             context.collect(descriptor, CDC_COUNT, ProbeLevel.INFO, ProbeUnit.COUNT, snapshot.totals().count());
             context.collect(descriptor, CDC_TOTAL_MILLIS, ProbeLevel.INFO, ProbeUnit.MS, snapshot.totals().totalMillis());
         }

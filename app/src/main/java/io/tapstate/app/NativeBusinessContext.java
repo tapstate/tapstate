@@ -898,7 +898,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster, HazelcastProperties hz,
                 ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,
                 ScopedSinkStateProvider resourceAlerts, ProcessObservationWriter observationWrites, PeriodicObservations periodicObservations,
-                PipelineConvergences pipelineConvergences, CloudRuntimeSettings cloud, PipelineConnectorExecutions connectorExecutions) {
+                PipelineConvergences pipelineConvergences, CloudRuntimeSettings cloud, PipelineConnectorExecutions connectorExecutions,
+                NativePipelineRunProgressPublisher runProgress) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             HazelcastOperatorReadiness.bindTerminalRead(member,
                     original -> !actuator.hasPendingSubmission(original.pipelineId()), owner.memberStorage::requireNode);
@@ -941,7 +942,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
-                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> {
+                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports, runProgress), pass -> {
                                 if (admission instanceof ClusterRebuildAdmission rebuildAdmission) {
                                     rebuildAdmission.observeScope(pass.scope(), () -> owner.pipelineLogWindow(pass.scope().pipelineId()));
                                 }
@@ -958,7 +959,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         try (var ignored = ownership.enterPass(intent.scope())) {
                                             rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
                                         }
-                                    }), observationSampling, observationWrites, stopped), periodicObservations, pipelineConvergences);
+                                    }), observationSampling, observationWrites, stopped), periodicObservations, pipelineConvergences)
+                    .withRunProgress(runProgress);
         }
         @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {
@@ -966,6 +968,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.configuration.intents(), owner.configuration.preparations(), engine, ownership, owner.active::get,
                     owner.original.cache()::pipelineStates,
                     new NativePipelineLifecycleState(engine, plans, ExecutionAuthorization.of(member)::observedAuthorization, owner.active::get));
+        }
+        @Bean io.tapstate.control.core.PipelineRunProgressQuery nativePipelineRunProgressQuery(NativeBusinessContext owner) {
+            return new NativePipelineRunProgressQuery(owner.original.preparation().businessScope(),
+                    owner.configuration.intents(), owner.configuration.preparations(), owner.active::get, owner.original.cache());
+        }
+        @Bean(destroyMethod = "close") NativePipelineRunProgressPublisher pipelineRunProgressPublisher(
+                NativeBusinessContext owner, HazelcastInstance member, Engine engine) {
+            return new NativePipelineRunProgressPublisher(owner.original.cache(), owner.original.preparation().businessScope(),
+                    owner.configuration.intents(), owner.memberStorage::requireNode, member, engine);
         }
         @Bean(initMethod = "start", destroyMethod = "")
         RetiredPipelinePayloadCleanup retiredPipelinePayloadCleanup(NativeBusinessContext owner, NodeSessionLease node) {

@@ -1,5 +1,6 @@
 package io.tapstate.control.restapi;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
@@ -20,11 +21,13 @@ record PipelineList(List<Item> items) {
     }
 
     record Item(String id, String name, String description, String mode, Long revision, Instant updatedAt,
-            String contentHash, boolean hasArtifact, Status status) {
+            String contentHash, boolean hasArtifact, Status status,
+            @JsonInclude(JsonInclude.Include.NON_NULL)
+            PipelineCatalogItem.SyncLag syncLag) {
 
         static Item of(PipelineCatalogItem item, MessageCatalog catalog, Locale locale) {
             return new Item(item.id(), item.name(), item.description(), item.mode(), item.revision(), item.updatedAt(),
-                    item.contentHash(), item.hasArtifact(), Status.of(item.status(), catalog, locale));
+                    item.contentHash(), item.hasArtifact(), Status.of(item.status(), catalog, locale), item.syncLag());
         }
     }
 
