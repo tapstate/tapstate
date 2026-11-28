@@ -6,9 +6,11 @@ import io.tapstate.control.restapi.StorageEntryStatus;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.*;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.*;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
@@ -150,14 +152,12 @@ class OnPremInstallationCompletionTest {
         }
     }
 
-    private static final class InlineExecutor extends java.util.concurrent.AbstractExecutorService {
-        private boolean closed;
-        @Override public void shutdown() { closed = true; }
-        @Override public List<Runnable> shutdownNow() { closed = true; return List.of(); }
-        @Override public boolean isShutdown() { return closed; }
-        @Override public boolean isTerminated() { return closed; }
-        @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
-        @Override public void execute(Runnable task) { if (closed) throw new java.util.concurrent.RejectedExecutionException(); task.run(); }
+    private static final class InlineExecutor extends java.util.concurrent.ScheduledThreadPoolExecutor {
+        InlineExecutor() { super(1); }
+        @Override public void execute(Runnable task) {
+            if (isShutdown()) throw new java.util.concurrent.RejectedExecutionException();
+            task.run();
+        }
     }
 
     private static final class EntryBridge implements AutoCloseable {
@@ -511,6 +511,251 @@ class OnPremInstallationCompletionTest {
             verify(f.configuration, never()).prepareInitialValidationSchema(any(), any(), any());
         }
     }
+    @Test void retainedInstallationCompletesWhenItsPublishedOwnerBecomesAvailable() {
+        try (var f = new Fixture(directory.resolve("retained-owner-readiness"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            assertThat(f.completions).hasValue(0);
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
+            verify(f.business, never()).awaitAvailability();
+            verify(f.business, never()).close();
+
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            f.root.loadExisting(ignored -> { throw new AssertionError("retained owner was replaced"); });
+            assertThat(f.completions).hasValue(1);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @Test void retainedInstallationRetriesWhenAdmissionDropsDuringCompletion() {
+        try (var f = new Fixture(directory.resolve("retained-owner-admission-drop"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var observeAdmission = new AtomicBoolean();
+            var admissionChecks = new AtomicInteger();
+            var stable = new AtomicBoolean();
+            when(f.business.available()).thenAnswer(ignored ->
+                    observeAdmission.get() && (stable.get() || admissionChecks.incrementAndGet() == 1));
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            observeAdmission.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(admissionChecks.get()).isGreaterThanOrEqualTo(2));
+            assertThat(f.completions).hasValue(0);
+
+            stable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @Test void retainedInstallationRetriesItsOriginalOwnerAfterTransientCacheFailure() {
+        try (var f = new Fixture(directory.resolve("retained-owner-cache-outage"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var cacheReachable = new AtomicBoolean(true);
+            var refusedReads = new AtomicInteger();
+            var scope = f.preparation.businessScope();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            when(f.cache.loadBusinessScope(scope)).thenAnswer(ignored -> {
+                if (!cacheReachable.get()) {
+                    refusedReads.incrementAndGet();
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "test CACHE outage"), null);
+                }
+                return scope;
+            });
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            cacheReachable.set(false);
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(refusedReads.get()).isPositive());
+            assertThat(f.completions).hasValue(0);
+
+            cacheReachable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void retainedInstallationRetriesAfterTransientAuthenticationStoreFailure(boolean configurationPublication) {
+        try (var f = new Fixture(directory.resolve("retained-owner-auth-outage-" + configurationPublication))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var reachable = new AtomicBoolean(true);
+            var refusedReads = new AtomicInteger();
+            Runnable requireStore = () -> {
+                if (!reachable.get()) {
+                    refusedReads.incrementAndGet();
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "test authentication outage"), null);
+                }
+            };
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            if (configurationPublication) {
+                doAnswer(ignored -> { requireStore.run(); return null; })
+                        .when(f.configuration).requireAuthenticationPublished(eq(f.preparation), any(MongoReadBudget.class));
+            } else {
+                var scope = f.preparation.authScope();
+                when(f.cache.loadAuthScope(eq(scope), any(MongoReadBudget.class)))
+                        .thenAnswer(ignored -> { requireStore.run(); return scope; });
+            }
+
+            f.root.loadExisting(ignored -> f.business);
+            reachable.set(false);
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(refusedReads.get()).isPositive());
+            assertThat(f.completions).hasValue(0);
+
+            reachable.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @Test void retainedInstallationRetriesAfterAnotherProcessReleasesItsMutationLock() throws Exception {
+        try (var f = new Fixture(directory.resolve("retained-owner-mutation-lock"))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var lockWaitRefused = new AtomicBoolean();
+            var lockWaitAttempts = new AtomicInteger();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            doAnswer(invocation -> {
+                if (available.get()) lockWaitAttempts.incrementAndGet();
+                try {
+                    return invocation.callRealMethod();
+                } catch (TapstateException refused) {
+                    if (refused.code() == ControlError.BOOTSTRAP_FORBIDDEN) lockWaitRefused.set(true);
+                    throw refused;
+                }
+            }).when(f.files).locked(any());
+            f.root.loadExisting(ignored -> f.business);
+
+            Path output = directory.resolve("retained-owner-mutation-lock.log");
+            var blocker = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx64m", "-cp", System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                    InstallationRuntimeProbe.class.getName(), f.files.directory().toString(), "mutation")
+                    .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+            try {
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(10)).untilAsserted(() -> {
+                    assertThat(blocker.isAlive()).as("mutation probe diagnostics: %s", Files.readString(output)).isTrue();
+                    assertThat(Files.readAllLines(output)).contains("MUTATION_HELD");
+                });
+                available.set(true);
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(25))
+                        .untilAsserted(() -> assertThat(lockWaitRefused).isTrue());
+                org.awaitility.Awaitility.await().during(java.time.Duration.ofMillis(800))
+                        .atMost(java.time.Duration.ofSeconds(1))
+                        .untilAsserted(() -> assertThat(lockWaitAttempts).hasValue(1));
+                assertThat(f.completions).hasValue(0);
+            } finally {
+                blocker.getOutputStream().close();
+                if (!blocker.waitFor(5, TimeUnit.SECONDS)) {
+                    blocker.destroyForcibly().waitFor(5, TimeUnit.SECONDS);
+                }
+            }
+            assertThat(blocker.exitValue()).isZero();
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(f.completions).hasValue(1));
+            assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"binding", "setup-phase"})
+    void retainedInstallationStopsObservationWhenItsStoredOwnerIsRefused(String reason) {
+        try (var f = new Fixture(directory.resolve("retained-owner-refused-" + reason))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var available = new AtomicBoolean();
+            var reject = new AtomicBoolean();
+            var refusedChecks = new AtomicInteger();
+            when(f.business.available()).thenAnswer(ignored -> available.get());
+            if (reason.equals("binding")) {
+                when(f.bindings.load()).thenAnswer(ignored -> {
+                    if (!reject.get()) return Optional.of(f.binding);
+                    refusedChecks.incrementAndGet();
+                    return Optional.empty();
+                });
+            } else {
+                when(f.states.load()).thenAnswer(ignored -> {
+                    var setupPhase = f.phase.get();
+                    if (reject.get()) {
+                        refusedChecks.incrementAndGet();
+                        setupPhase = StorageSetupStateStore.Phase.STORAGE_BOUND;
+                    }
+                    return new StorageSetupStateStore.Status(f.currentScope.get(), setupPhase, 1);
+                });
+            }
+
+            f.root.loadExisting(ignored -> f.business);
+            reject.set(true);
+            available.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .untilAsserted(() -> assertThat(refusedChecks).hasValue(1));
+            org.awaitility.Awaitility.await().during(java.time.Duration.ofSeconds(1))
+                    .atMost(java.time.Duration.ofSeconds(2))
+                    .untilAsserted(() -> assertThat(refusedChecks).hasValue(1));
+            assertThat(f.completions).hasValue(0);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"binding", "setup-phase"})
+    void retainedInstallationStopsWatchingARefusedOwnerBeforeAdmission(String reason) {
+        try (var f = new Fixture(directory.resolve("retained-owner-unadmitted-" + reason))) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var reject = new AtomicBoolean();
+            var durableChecks = new AtomicInteger();
+            var admissionChecks = new AtomicInteger();
+            when(f.business.available()).thenAnswer(ignored -> {
+                admissionChecks.incrementAndGet();
+                return false;
+            });
+            when(f.configuration.storageSetupView(any(MongoReadBudget.class))).thenAnswer(ignored -> {
+                var phase = f.phase.get();
+                var binding = Optional.of(f.binding);
+                if (reject.get()) {
+                    durableChecks.incrementAndGet();
+                    if (reason.equals("binding")) binding = Optional.empty();
+                    else phase = StorageSetupStateStore.Phase.STORAGE_BOUND;
+                }
+                var current = new StorageSetupStateStore.Status(f.currentScope.get(), phase, 1);
+                return new StorageSetupStateStore.View(current, binding, Optional.of(f.preparation));
+            });
+
+            f.root.loadExisting(ignored -> f.business);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+            reject.set(true);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(10))
+                    .untilAsserted(() -> assertThat(durableChecks).hasValue(1));
+
+            int finalAdmissionChecks = admissionChecks.get();
+            org.awaitility.Awaitility.await().during(java.time.Duration.ofSeconds(1))
+                    .atMost(java.time.Duration.ofSeconds(2))
+                    .untilAsserted(() -> assertThat(admissionChecks).hasValue(finalAdmissionChecks));
+            assertThat(f.completions).hasValue(0);
+            assertThat(f.root.runtime().business()).containsSame(f.business);
+        }
+    }
+
     @Test void retainedCompletionKeepsReadyBusinessWithoutRepeatingCatalogAdmission() {
         try (var f = new Fixture(directory.resolve("retained-catalog"))) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);

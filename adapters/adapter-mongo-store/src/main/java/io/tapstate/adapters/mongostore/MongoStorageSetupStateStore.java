@@ -36,6 +36,15 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
     @Override public Status load() { return transaction(this::load); }
     @Override public View loadView() { return transaction(this::view); }
 
+    View loadView(MongoReadBudget budget) {
+        return budget.transaction(client, session -> {
+            active.run();
+            var result = view(bindings.readForStorageLifecycle(session, budget));
+            active.run();
+            return result;
+        });
+    }
+
     @Override public void requireCurrent(StorageSetupScope expected, Purpose purpose) {
         requireCurrentView(expected, purpose);
     }
@@ -68,7 +77,9 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
         return view(session).status();
     }
     private View view(ClientSession session) {
-        var facts = bindings.readForStorageLifecycle(session);
+        return view(bindings.readForStorageLifecycle(session));
+    }
+    private View view(MongoStorageBindingStore.TransactionFacts facts) {
         var binding = facts.loaded().map(MongoStorageBindingStore.Loaded::binding);
         Document row = facts.setup();
         try {
