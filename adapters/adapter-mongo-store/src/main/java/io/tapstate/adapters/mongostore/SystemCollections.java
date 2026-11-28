@@ -241,6 +241,7 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.channel", "_id.epoch", "_id.ordinal"), false, "direct_batches_channel_order")),
     CACHE_PIPELINE_STATE("pipeline_state", Database.CACHE, MongoCachePipelineStateStore.class, Strategy.MIGRATED, 1),
     CACHE_PIPELINE_OBSERVATION("pipeline_observation", Database.CACHE, MongoCachePipelineObservationStore.class, Strategy.MIGRATED, 1),
+    CACHE_PIPELINE_RUN_PROGRESS("pipeline_run_progress", Database.CACHE, MongoCachePipelineRunProgressStore.class, Strategy.MIGRATED, 1),
     CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoCacheSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
