@@ -77,6 +77,7 @@ class NativeIdlePipelineCostIT {
             try(var raw=MongoClients.create(storage.configurationUri());
                     var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
                         .properties(exerciseChildEdits ? Map.<String,Object>of("tapstate.cluster.profile", "SINGLE",
+                                "tapstate.cluster.workload-claim-renew-interval", "1s",
                                 "tapstate.cluster.node-session-ttl", "2s", "tapstate.cluster.node-session-renew-interval", "500ms") : Map.<String,Object>of()).run(
                         "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR",
                         "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.hz.member-port=0",

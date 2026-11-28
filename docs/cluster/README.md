@@ -94,10 +94,20 @@ The defaults are deliberately two separate clocks:
 |---|---:|---|
 | `tapstate.hz.heartbeat-interval` | `5s` | How often a member sends a liveness heartbeat. |
 | `tapstate.hz.maximum-no-heartbeat` | `30s` | How long membership waits before declaring a member lost. |
-| `tapstate.cluster.node-session-renew-interval` | `10s` | How often a stable node renews its reservation. |
-| `tapstate.cluster.node-session-ttl` | `30s` | How long the reservation remains valid without renewal. A member whose renewals go unanswered this long leaves the cluster, even if the store never answers. |
-| `tapstate.cluster.workload-claim-renew-interval` | `10s` | How often a business owner renews its claim. |
-| `tapstate.cluster.workload-claim-ttl` | `30s` | How long a business claim remains valid without renewal. |
+| `tapstate.cluster.node-session-renew-interval` | `10s` | Renewal interval for a timed node reservation. Startup requires this value to be shorter than `node-session-ttl`, including in single-node OP. |
+| `tapstate.cluster.node-session-ttl` | `30s` | Validity of a timed node reservation. A member leaves when its unrenewed reservation expires, even if the store never answers. In single-node OP this value caps the lifetime of a cached write authorization proof. |
+| `tapstate.cluster.workload-claim-renew-interval` | `10s` | Renewal interval for an independent workload claim. In single-node OP this value sets the write authorization cache window, and the background refresh is scheduled at half that window. |
+| `tapstate.cluster.workload-claim-ttl` | `30s` | Validity of an independent workload claim. Its renewal interval must be shorter than this value. |
+
+In single-node OP, a cached write authorization proof is valid for at most the shorter of
+`node-session-ttl` and `workload-claim-renew-interval`. If you shorten `node-session-ttl`, also
+check `workload-claim-renew-interval` so the scheduled refresh leaves time to complete before
+the proof expires. Changing `node-session-renew-interval` only satisfies the node-session
+startup check in this mode. For example, a `2s` node-session TTL with the default `10s`
+workload claim renew interval leaves a proof valid for at most `2s` and schedules its refresh
+after `5s`, which can cause the Pipeline's write acknowledgement to be refused. Setting the
+workload claim renew interval to `1s` gives a `1s` authorization window and schedules refresh
+after `500ms`.
 
 The maximum no-heartbeat duration must be longer than the heartbeat interval. Recovery waits for
 both topology loss detection and the relevant workload lease boundary; it is not an instantaneous
