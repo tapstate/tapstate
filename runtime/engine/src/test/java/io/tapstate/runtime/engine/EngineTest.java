@@ -25,6 +25,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
+import io.tapstate.spi.store.IoError;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -295,6 +296,51 @@ class EngineTest {
     }
 
     @Test
+    void lostRunKeepsItsEarlierFailureWhenShutdownAlsoInterruptsTheStore() {
+        var engine = new Engine(member);
+        var identity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        var job = engine.submitRun("orders", failingSinkDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), identity);
+        awaitStatus(member.getJet().getJob("orders"), JobStatus.FAILED);
+        var record = JobFailureRegistry.of(member).existing("orders", job.jobId(), identity);
+        var earlier = record.get().orElseThrow();
+        assertThat(earlier).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(TestWriteFailed.CODE));
+        MemberOutOfMemory.watch(member);
+
+        OutOfMemoryOnAMemberThread.raise(member);
+        var interruption = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "MongoInterruptedException"), null);
+        record.record(interruption);
+
+        assertThat(engine.failureOfLostRun("orders", identity)).containsSame(earlier);
+        assertThat(record.get()).containsSame(interruption);
+        assertThat(engine.failureOfLostRun("unrelated", identity)).isEmpty();
+        assertThat(engine.failureOfLostRun("orders", new TestRunIdentity("cache-a", 1, "boot-a", 1, 2))).isEmpty();
+    }
+
+    @Test
+    void lostRunDoesNotTreatAnEarlierInterruptionOrADifferentStoreFailureAsShutdownNoise() {
+        var engine = new Engine(member);
+        var identity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        var job = engine.submitRun("orders", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), identity);
+        var record = JobFailureRegistry.of(member).existing("orders", job.jobId(), identity);
+        var earlier = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "MongoInterruptedException"), null);
+        record.record(earlier);
+        MemberOutOfMemory.watch(member);
+
+        OutOfMemoryOnAMemberThread.raise(member);
+        assertThat(engine.failureOfLostRun("orders", identity)).containsSame(earlier);
+
+        var unavailable = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "MongoTimeoutException"), null);
+        record.record(unavailable);
+        assertThat(engine.failureOfLostRun("orders", identity)).containsSame(unavailable);
+    }
+
+    @Test
     void a_member_its_out_of_memory_handling_is_still_shutting_down_already_reads_as_lost()
             throws InterruptedException {
         // Partway through its shutdown a member stops answering, and the shutdown then waits for every job on it
@@ -361,11 +407,15 @@ class EngineTest {
         Engine engine = new Engine(member);
         engine.submit("orders-pipe", foreverDag());
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        var identity = new TestRunIdentity("cache-a", 1, "boot-a", 1, 1);
+        engine.submitRun("scoped-orders", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), identity);
         MemberOutOfMemory.watch(member);
 
         member.shutdown();
 
         assertThat(engine.isLost()).isFalse();
+        assertThat(engine.failureOfLostRun("scoped-orders", identity)).isEmpty();
         assertThatCode(() -> engine.refuseIfLost("orders-pipe")).doesNotThrowAnyException();
         assertThatThrownBy(() -> engine.failureOf("orders-pipe"))
                 .isInstanceOf(HazelcastInstanceNotActiveException.class);

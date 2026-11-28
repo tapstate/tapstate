@@ -4,9 +4,16 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.internal.util.executor.HazelcastManagedThread;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ExecutionFailureRecorder;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SrsStoreViews;
 import io.tapstate.testsupport.DockerGate;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -15,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -28,6 +36,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A server whose engine has been shut down for want of memory stops passing its health check, and stops
@@ -96,6 +105,16 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
     @Test
     void theHealthCheckFailsAndThePipelineReadsFailedForWantOfMemory(
             @TempDir Path source, @TempDir Path target, @TempDir Path jars) {
+        assertOutOfMemoryStatus(source, target, jars, false);
+    }
+
+    @Test
+    void aStoreReadInterruptedDuringOutOfMemoryShutdownDoesNotHideTheLoss(
+            @TempDir Path source, @TempDir Path target, @TempDir Path jars) {
+        assertOutOfMemoryStatus(source, target, jars, true);
+    }
+
+    private static void assertOutOfMemoryStatus(Path source, Path target, Path jars, boolean interruptRead) {
         FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,amount\n1,12\n");
 
         Set<HazelcastInstance> runningBefore = Hazelcast.getAllHazelcastInstances();
@@ -133,11 +152,13 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
             assertThat(runningMembers())
                     .as("this server's member is the only one running in this JVM when the heap runs out")
                     .containsExactly(engine);
+            Runnable interruptedRead = interruptRead ? recordInterruptedReadFor(engine, storage) : () -> {};
             runOutOfMemoryOnAnEngineThread();
             Await.until("the engine's own out-of-memory handling to shut its member down; nothing after this "
                             + "measures anything while the member is still up",
                     () -> !isRunning(engine),
                     () -> "the member is still running");
+            interruptedRead.run();
 
             String credential = control.credential();
             Await.until("the server to stop passing its health check, and to stop reporting the pipeline as "
@@ -149,10 +170,39 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
                             + "; why " + get(server.baseUrl(), "/api/pipelines/" + PIPELINE + "/explain", credential));
 
             Answer failed = status(server.baseUrl(), credential);
+            assertThat(healthCheck(server.baseUrl()).answer()).startsWith("HTTP 503 ");
             assertThat(failureMessageIn(failed))
                     .as("and the status names what took the engine down: %s", failed)
                     .containsIgnoringCase("memory");
         }
+    }
+
+    private static Runnable recordInterruptedReadFor(HazelcastInstance engine, PreparedNativeStore storage) {
+        var job = engine.getJet().getJob(PIPELINE);
+        assertThat(job).isNotNull();
+        Serializable identity = job.getConfig().getArgument(ExecutionFailureRecorder.EXECUTION_IDENTITY_ARGUMENT);
+        assertThat(identity).as("the active pipeline has an execution identity").isNotNull();
+        var registry = (ExecutionFailureRecorder) engine.getUserContext().get(ExecutionFailureRecorder.USER_CONTEXT_KEY);
+        var record = registry.forExecution(PIPELINE, job.getId(), identity);
+        var stores = (SrsStoreViews) engine.getUserContext().get(SrsStoreViews.USER_CONTEXT_KEY);
+        var settings = new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5));
+        CacheBusinessScope scope;
+        try (var configuration = MongoConfigurationDomain.open(settings, storage.clusterId())) {
+            var original = configuration.intents().loadForActuation(PIPELINE).orElseThrow().scope();
+            scope = new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation());
+        }
+        assertThat(stores.supportsAdmittedCaptureStartup()).isTrue();
+        assertThat(stores.withCaptureStartup(scope, () -> true)).isTrue();
+        // Use the original job's callback and the adapter's sanitized diagnostic. The real race depends on
+        // which Mongo read the stopped member interrupts, so make the callback deterministic.
+        return () -> {
+            record.accept(new TapstateException(IoError.STORE_UNAVAILABLE,
+                    Map.of("detail", "MongoInterruptedException"), null));
+            assertThatThrownBy(() -> stores.withCaptureStartup(scope, () -> {
+                throw new AssertionError("the stopped member must not enter the store operation");
+            })).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        };
     }
 
     /**

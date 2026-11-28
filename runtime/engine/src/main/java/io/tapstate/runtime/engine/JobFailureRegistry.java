@@ -5,6 +5,8 @@ import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import io.tapstate.core.common.FailureFact;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.Objects;
@@ -167,7 +169,7 @@ public final class JobFailureRegistry {
         }
     }
 
-    /** Reads only a slot attached while the concrete job was proved; never resolves or reattaches it. */
+    /** Reads the cause for loss reporting only from a slot attached while the concrete job was proved. */
     Optional<RetainedFailure> retainedRunFailure(String pipelineId, Serializable identity) {
         Slots slots = failures.get(pipelineId);
         return slots == null ? Optional.empty() : slots.retained(identity);
@@ -262,14 +264,13 @@ public final class JobFailureRegistry {
             this.registry = registry; this.pipelineId = pipelineId; this.slot = slot;
         }
         public void record(Throwable failure) {
-            if (slot != null) slot.capture(failure);
-            else if (registry != null) registry.record(pipelineId, failure);
+            if (registry != null) record(new FailureFact(failure));
         }
         public void record(Throwable failure, Map<String, Object> diagnostic) {
             record(new FailureFact(failure, diagnostic));
         }
         public void record(FailureFact fact) {
-            if (slot != null) slot.capture(fact);
+            if (slot != null) slot.captureScoped(fact, registry.member);
             else if (registry != null) registry.record(pipelineId, fact);
         }
         Optional<FailureFact> fact() {
@@ -311,6 +312,7 @@ public final class JobFailureRegistry {
         final long jobId;
         final Serializable identity;
         private FailureFact failure;
+        private FailureFact failureForLoss;
         private boolean retired;
         Slot(String pipelineId, long jobId, Serializable identity) {
             this.pipelineId = pipelineId; this.jobId = jobId; this.identity = identity;
@@ -320,12 +322,26 @@ public final class JobFailureRegistry {
         }
         synchronized Optional<RetainedFailure> retained(Serializable expectedIdentity) {
             return !retired && jobId != 0 && identity != null && identity.equals(expectedIdentity)
-                    ? Optional.of(new RetainedFailure(failure == null ? null : failure.cause(), failure == null ? Map.of() : failure.diagnostic())) : Optional.empty();
+                    ? Optional.of(new RetainedFailure(failureForLoss == null ? null : failureForLoss.cause(),
+                            failureForLoss == null ? Map.of() : failureForLoss.diagnostic()))
+                    : Optional.empty();
         }
-        synchronized void capture(Throwable cause) { capture(new FailureFact(cause)); }
+        synchronized void captureScoped(FailureFact next, HazelcastInstance member) {
+            if (retired) return;
+            failure = Objects.requireNonNull(next, "failure");
+            // The store intentionally drops driver causes. Its exact sanitized interruption detail is
+            // secondary for loss reporting only if this same member was already stopping over an OOM
+            // when the job recorded it. Keep the last other cause for this job.
+            if (!(next.cause() instanceof TapstateException coded
+                    && coded.code() == IoError.STORE_UNAVAILABLE
+                    && "MongoInterruptedException".equals(coded.args().get("detail"))
+                    && MemberOutOfMemory.of(member).isPresent())) {
+                failureForLoss = next;
+            }
+        }
         synchronized void capture(FailureFact next) { if (!retired) failure = Objects.requireNonNull(next, "failure"); }
         synchronized Optional<FailureFact> fact() { return retired ? Optional.empty() : Optional.ofNullable(failure); }
         synchronized Optional<Throwable> get() { return fact().map(FailureFact::cause); }
-        synchronized void retire() { retired = true; failure = null; }
+        synchronized void retire() { retired = true; failure = null; failureForLoss = null; }
     }
 }

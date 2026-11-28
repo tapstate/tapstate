@@ -53,10 +53,13 @@ class NativePipelineStatusDiagnosticsTest {
     @Test void anExactCurrentRunCanReportItsLossWithoutWritingAnything() {
         assertThat(diagnostics.failure("orders", PipelineState.RUNNING)).hasValueSatisfying(
                 failure -> assertThat(failure.code()).isEqualTo(EngineError.OUT_OF_MEMORY.code()));
-        verify(owner).reportingExecution(SCOPE); verifyNoMoreInteractions(owner);
-        verify(states, never()).create(anyString(), anyString(), any());
-        verify(states, never()).compareAndSwap(anyString(), anyLong(), anyString(), any());
-        verify(states, never()).delete(anyString());
+        verify(owner).reportingExecution(SCOPE);
+        verify(proof).execution();
+        verify(proof).current();
+        verify(intents, times(2)).loadForActuation("orders");
+        verify(preparations, times(2)).read("orders");
+        verify(states, times(2)).read("orders");
+        verifyNoMoreInteractions(owner, proof, intents, preparations, states);
     }
     @Test void aStaleRunningObservationCannotFailAnAlreadyCompletedCheckpoint() {
         when(states.read("orders")).thenReturn(Optional.of(checkpoint(PipelineState.COMPLETED)));
@@ -79,6 +82,11 @@ class NativePipelineStatusDiagnosticsTest {
                 new TapstateException(EngineError.OUT_OF_MEMORY, Map.of("pipeline", "orders"), null)));
         when(proof.current()).thenReturn(false);
         assertThat(diagnostics.failure("orders", PipelineState.RUNNING)).isEmpty();
+    }
+    @Test void missingOwnershipProofCannotDiagnoseThePipeline() {
+        when(owner.reportingExecution(SCOPE)).thenReturn(Optional.empty());
+        assertThat(diagnostics.failure("orders", PipelineState.RUNNING)).isEmpty();
+        verify(engine, never()).failureOfLostRun(anyString(), any());
     }
     @Test void aRetiredOwnerAndNonActiveObservedStatesCannotDiagnoseAnotherRun() {
         active.set(false); assertThat(diagnostics.failure("orders", PipelineState.RUNNING)).isEmpty();
