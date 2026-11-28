@@ -233,7 +233,9 @@ retain the request and summary from each command. Check the keys and values prod
 Check live warm-up and window counts and final readback,
 and backlog source history, zero snapshot rows on resume, confirmed writes and
 final readback. Review `measurement_status` independently from execution `status`.
-Live Copy may report `insufficient-event-correlation`. For fixed backlog Copy and
+Copy and Map live cases can collect source and target callbacks with
+`--endpoint-latency-probe`. Cases without complete correlation report
+`insufficient-event-correlation`. For fixed backlog Copy and
 Union, the formal workflow enables `--backlog-completion-probe`. To reproduce
 the measurement, use that flag with the matching formal recipe and retain
 `source-backlog.tsv`, its `.ack` file, and `result.json`. The probe matches each

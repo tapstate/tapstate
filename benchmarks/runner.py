@@ -467,7 +467,7 @@ def main():
     execute.add_argument("--output", type=Path, required=True)
     execute.add_argument("--offline", action="store_true")
     execute.add_argument("--endpoint-latency-probe", action="store_true",
-                         help="Observe source events and target confirmations on supported Copy live cases.")
+                         help="Observe source events and target confirmations on supported Copy and Map live cases.")
     execute.add_argument("--backlog-completion-probe", action="store_true",
                          help="Observe source tails and final acknowledgements on Copy and Union fixed backlogs.")
     execute.add_argument("--stop-at-epoch-seconds", type=positive,

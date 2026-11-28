@@ -21,9 +21,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import org.bson.Document;
 
-/** Reconciles the one-input, one-output Copy witness with independent MongoDB change history. */
+/** Reconciles a one-input, one-output witness with independent MongoDB change history. */
 final class BenchmarkLatencyProbe implements AutoCloseable {
     static final String PROTOCOL = "mongo-copy-pdk-ack-v1";
+    static final String MAP_PROTOCOL = "mongo-map-pdk-ack-v1";
     private static final long CLOCK_ALLOWANCE_MILLIS = 100;
     private final Path source;
     private final MongoDatabase mongo;

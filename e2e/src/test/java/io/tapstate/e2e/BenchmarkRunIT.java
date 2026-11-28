@@ -280,9 +280,10 @@ class BenchmarkRunIT {
         String sourceName = namespace + "_src";
         String targetName = namespace + "_tgt";
         Path seeds = Files.createDirectory(folder.resolve("runtime-input"));
+        boolean mapLatency = text(definition, "id").equals("map.live.basic.standard");
         boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && text(definition, "mode").equals("live-latency")
-                && text(definition, "spec").equals("specs/copy-basic.json") && operators == null;
+                && (mapLatency || text(definition, "spec").equals("specs/copy-basic.json") && operators == null);
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && List.of("copy.backlog.fixed-iud.standard", "union.backlog.basic.standard")
                         .contains(text(definition, "id"));
@@ -295,8 +296,9 @@ class BenchmarkRunIT {
             byte[] original = Files.readAllBytes(artifact);
             Files.write(connector, backlogProbe ? ObservedMongoConnectorJar.buildBacklogProbe(original, witness, delegate)
                     : ObservedMongoConnectorJar.buildLatencyProbe(original, witness, delegate));
+            String latencyProtocol = mapLatency ? BenchmarkLatencyProbe.MAP_PROTOCOL : BenchmarkLatencyProbe.PROTOCOL;
             evidence.result.put(backlogProbe ? "backlog_probe" : "latency_probe",
-                    Map.of("protocol", backlogProbe ? BenchmarkBacklogProbe.PROTOCOL : BenchmarkLatencyProbe.PROTOCOL,
+                    Map.of("protocol", backlogProbe ? BenchmarkBacklogProbe.PROTOCOL : latencyProtocol,
                     "original_connector_sha256", digest(artifact), "probe_connector_sha256", digest(connector),
                     "source_file", witness.getFileName().toString(), "ack_file", witness.getFileName() + ".ack"));
         } else {
@@ -395,7 +397,8 @@ class BenchmarkRunIT {
                         evidence.phase("startup", startup);
                         try {
                             if (operators != null) {
-                                operatorRun(entry, prepared, control, sourceDb, targetDb, operators, evidence, hot, backlogProbe);
+                                operatorRun(entry, prepared, control, sourceDb, targetDb, operators, evidence, hot,
+                                        backlogProbe, latencyProbe);
                             } else {
                                 if (snapshot) {
                                     mongoSnapshot(entry, control, evidence);
@@ -663,24 +666,30 @@ class BenchmarkRunIT {
             evidence.result.put("target_settled_before_drain", acknowledged);
             settleExpected(entry, control, observedWarm[0] + measured);
             evidence.phase("ack_wait", drain);
-            var trial = entry.getDocument("case").getDocument("workload_spec").getDocument("measurements")
-                    .getDocument("live-latency").getDocument("trial");
-            var threshold = trial.getDocument("p99");
-            int minimumP99 = number(threshold, "minimum_valid_samples");
-            var smoke = trial.getDocument("smoke");
-            int minimumP95 = Math.multiplyExact(number(smoke, "events_per_second"), number(smoke, "measurement_seconds"));
-            double coverage = threshold.getNumber("minimum_confirmation_coverage_percent").doubleValue() / 100;
-            var latency = latencyProbe == null
-                    ? LiveLatencyEligibility.assess(Math.toIntExact(measured), List.of(), false, minimumP95, minimumP99, coverage)
-                    : latencyReading(latencyProbe, result, minimumP95, minimumP99, coverage,
-                            Duration.ofSeconds(number(trial.getDocument("candidate"), "max_drain_seconds")), evidence);
-            evidence.result.put("live_latency", latency);
-            evidence.result.put("measurement_status", latency.status().equals("eligible")
-                    ? "endpoint-latency-observed" : "insufficient-event-correlation");
+            recordLiveLatency(entry, result, evidence, latencyProbe);
             evidence.result.put("diagnostic_delivery", "The aggregate histogram includes events outside the measured window.");
             evidence.result.put("window_source_events", measured);
             evidence.result.put("window_settled_delta", settled(control) - observedWarm[0]);
         }
+    }
+
+    private static void recordLiveLatency(BsonDocument entry, MongoWorkloadGenerator.Live run, Evidence evidence,
+            BenchmarkLatencyProbe probe) {
+        var trial = entry.getDocument("case").getDocument("workload_spec").getDocument("measurements")
+                .getDocument("live-latency").getDocument("trial");
+        var threshold = trial.getDocument("p99");
+        int minimumP99 = number(threshold, "minimum_valid_samples");
+        var smoke = trial.getDocument("smoke");
+        int minimumP95 = Math.multiplyExact(number(smoke, "events_per_second"), number(smoke, "measurement_seconds"));
+        double coverage = threshold.getNumber("minimum_confirmation_coverage_percent").doubleValue() / 100;
+        var latency = probe == null
+                ? LiveLatencyEligibility.assess(run.measured().streams().get(RECORDS).observed().total(),
+                        List.of(), false, minimumP95, minimumP99, coverage)
+                : latencyReading(probe, run, minimumP95, minimumP99, coverage,
+                        Duration.ofSeconds(number(trial.getDocument("candidate"), "max_drain_seconds")), evidence);
+        evidence.result.put("live_latency", latency);
+        evidence.result.put("measurement_status", latency.status().equals("eligible")
+                ? "endpoint-latency-observed" : "insufficient-event-correlation");
     }
 
     private static LiveLatencyEligibility.Reading latencyReading(BenchmarkLatencyProbe probe,
@@ -765,7 +774,7 @@ class BenchmarkRunIT {
 
     private static void operatorRun(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
-            MongoWorkloadGenerator.HotKeys hot, BenchmarkBacklogProbe backlogProbe) {
+            MongoWorkloadGenerator.HotKeys hot, BenchmarkBacklogProbe backlogProbe, BenchmarkLatencyProbe latencyProbe) {
         boolean lifecycle = operators.scenario.equals("join-lifecycle-release");
         String mode = lifecycle ? "live-latency" : text(entry.getDocument("case"), "mode");
         evidence.stage = "initial-state";
@@ -820,7 +829,7 @@ class BenchmarkRunIT {
         if (mode.equals("backlog-throughput")) {
             operatorBacklog(entry, prepared, control, source, target, operators, evidence, anchor, mix, backlogProbe);
         } else {
-            operatorLive(entry, prepared, control, source, target, operators, evidence, mix, hot);
+            operatorLive(entry, prepared, control, source, target, operators, evidence, mix, hot, latencyProbe);
         }
     }
 
@@ -842,7 +851,7 @@ class BenchmarkRunIT {
                 waitFor(entry, "Join resumed", () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
                 recordLifecycleResume(control, operators, observations.getLast(), previousPositions);
             }
-            operatorLive(entry, prepared, control, source, target, operators, evidence, null, null);
+            operatorLive(entry, prepared, control, source, target, operators, evidence, null, null, null);
             var warmup = evidence.result.get("warmup");
             var measurement = evidence.result.get("source_window");
             evidence.window("stop");
@@ -1018,7 +1027,7 @@ class BenchmarkRunIT {
 
     private static void operatorLive(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
-            WorkloadRecipe.Mix mix, MongoWorkloadGenerator.HotKeys hot) {
+            WorkloadRecipe.Mix mix, MongoWorkloadGenerator.HotKeys hot, BenchmarkLatencyProbe latencyProbe) {
         evidence.stage = "live";
         int rate = number(entry, "rate");
         int warmup = number(entry, "warmup_seconds");
@@ -1028,6 +1037,10 @@ class BenchmarkRunIT {
         var warmRows = new LinkedHashMap<String, BsonDocument>();
         long[] warmOutput = new long[1];
         evidence.window("warmup");
+        if (latencyProbe != null) {
+            evidence.result.put("latency_probe_error", "Probe window or drain did not complete");
+            latencyProbe.start();
+        }
         var windowSize = new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
                 Duration.ofSeconds(measurement));
         java.util.function.Consumer<MongoWorkloadGenerator.PhaseReport> afterWarmup = verifiedWarmup -> {
@@ -1039,6 +1052,7 @@ class BenchmarkRunIT {
             warmRows.putAll(expected);
             warm.putAll(expectedInputs);
             warmOutput[0] = settled(control);
+            if (latencyProbe != null) latencyProbe.awaitScoringBoundary();
             evidence.window("measurement");
         };
         Runnable afterWrites = () -> evidence.window("drain");
@@ -1063,6 +1077,7 @@ class BenchmarkRunIT {
         evidence.result.put("measurement_status", "insufficient-event-correlation");
         evidence.window("readback");
         verifyOperator(operators, target, expected, evidence);
+        if (latencyProbe != null) recordLiveLatency(entry, run, evidence, latencyProbe);
         if (operators.scenario.equals("join-steady-state")) {
             var factRows = source.getCollection("facts").countDocuments();
             var dimensionRows = source.getCollection("dimensions").countDocuments();
