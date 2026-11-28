@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.PendingCdcWrite;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestOrigin;
@@ -782,6 +783,23 @@ public final class Engine {
         return job == null ? null : cdcDeliveryIn(job.getMetrics());
     }
 
+    /** An empty sink supplies no evidence about source capture progress. */
+    static PendingCdcWrite pendingCdcWriteIn(JobMetrics metrics, Instant now) {
+        PendingCdcWrite oldest = null;
+        for (Measurement measurement : metrics.get(JetDeliveryGauge.OLDEST_PENDING_CDC)) {
+            long eventMillis = measurement.value();
+            long sampleMillis = measurement.timestamp();
+            Instant at = Instant.ofEpochMilli(sampleMillis);
+            if (eventMillis <= 0 || eventMillis > sampleMillis || !PendingCdcWrite.isCurrent(at, now)) continue;
+            long age = sampleMillis - eventMillis;
+            if (oldest == null || age > oldest.ageMillis()
+                    || (age == oldest.ageMillis() && at.isAfter(oldest.observedAt()))) {
+                oldest = new PendingCdcWrite(age, at);
+            }
+        }
+        return oldest;
+    }
+
     static CdcDeliveryTotals cdcDeliveryIn(JobMetrics metrics) {
         var counts = metrics.get(JetDeliveryGauge.CDC_COUNT);
         var totals = metrics.get(JetDeliveryGauge.CDC_TOTAL_MILLIS);
@@ -977,7 +995,7 @@ public final class Engine {
         if (start.isEmpty()) return DeliveryReading.NONE;
         return new DeliveryReading(deliveredRowsIn(collected), settledBytesIn(collected),
                 highestIn(collected, JetDeliveryGauge::reachedTableOf), Instant.ofEpochMilli(start.getAsLong()),
-                settledDurationsIn(collected), cdcDeliveryIn(collected));
+                settledDurationsIn(collected), cdcDeliveryIn(collected), pendingCdcWriteIn(collected, Instant.now()));
     }
 
     private static OptionalLong countingSinceIn(JobMetrics collected) {

@@ -93,6 +93,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.cdc.delivery.count",
                         "tapstate.pipeline.cdc.delivery.total_millis",
+                        "tapstate.pipeline.cdc.pending_write.age",
                         "tapstate.pipeline.process.duration",
                         "tapstate.pipeline.snapshot.rows",
                         "tapstate.pipeline.snapshot.rows.current_run",
@@ -510,6 +511,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                 .containsExactlyInAnyOrder(
                         "tapstate.pipeline.aggregate.group.rows.largest",
                         "tapstate.pipeline.lag",
+                        "tapstate.pipeline.cdc.pending_write.age",
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
