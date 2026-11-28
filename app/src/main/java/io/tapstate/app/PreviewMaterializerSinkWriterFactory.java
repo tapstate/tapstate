@@ -83,10 +83,13 @@ final class PreviewMaterializerSinkWriterFactory implements SupplierEx<SinkWrite
             }
             try {
                 long written = 0;
+                long acknowledgedRows = 0;
                 for (Envelope event : records) {
                     if (event.op() == Op.DDL) {
                         continue;
                     }
+                    // A preview consumes rows without a materializable payload as no-ops.
+                    acknowledgedRows++;
                     if (mode == WriteMode.APPEND) {
                         Map<String, Object> payload = event.after() == null ? event.before() : event.after();
                         if (payload == null) {
@@ -147,7 +150,7 @@ final class PreviewMaterializerSinkWriterFactory implements SupplierEx<SinkWrite
                     putBounded(nextKey, document, oldBytes, newBytes);
                     written++;
                 }
-                return CompletableFuture.completedFuture(new WriteResult(written));
+                return CompletableFuture.completedFuture(new WriteResult(written, acknowledgedRows));
             } catch (RuntimeException failure) {
                 return CompletableFuture.failedFuture(failure);
             }

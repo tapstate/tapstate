@@ -54,13 +54,17 @@ final class MongoStructureFailureScope {
     }
 
     static <T> T inspectOnFailure(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
+        return observe(client, budget, true, operation);
+    }
+
+    static <T> T observe(MongoClient client, MongoReadBudget budget, boolean inspectOnFailure, Supplier<T> operation) {
         var previous = CURRENT.get();
         var scope = new MongoStructureFailureScope(client, budget, previous);
         CURRENT.set(scope);
         try { return operation.get(); }
         catch (RuntimeException original) {
             CURRENT.remove();
-            if (original == scope.translated) throw scope.diagnose(original);
+            if (inspectOnFailure && original == scope.translated) throw scope.diagnose(original);
             throw original;
         } finally { if (previous == null) CURRENT.remove(); else CURRENT.set(previous); }
     }

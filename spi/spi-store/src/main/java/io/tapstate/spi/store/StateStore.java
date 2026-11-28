@@ -55,6 +55,16 @@ public interface StateStore {
         throw new UnsupportedOperationException("atomic workload-fenced checkpoint transitions are not implemented");
     }
 
+    /** Scoped CACHE readers can carry the private field in the same physical read. */
+    interface MetricReader {
+        Optional<ResumeMetrics.Checkpoint> readForMetrics(String pipelineId);
+    }
+
+    default CasOutcome transitionMetrics(String id, long epoch, String next, Instant at,
+            ResumeMetrics.Transition transition) {
+        throw new UnsupportedOperationException("metric transitions require a scoped checkpoint");
+    }
+
     /** Records one bounded recovery attempt under the original live checkpoint fence. */
     default CasOutcome recordLeaseRecovery(String pipelineId, CheckpointDoc expected,
             CheckpointDoc.LeaseRecovery recovery, Instant at) {
