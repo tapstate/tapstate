@@ -22,6 +22,7 @@ import java.time.Instant;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -69,6 +70,21 @@ class BenchmarkLatencyProbeTest {
     }
 
     @Test
+    void countsExpectedFilteredOutputsStillMissingAtDrainAndRefusesWritesForExcludedKeys() {
+        var confirmed = new Event(0, 2, 2_000);
+        var missing = new Event(0, 4, 2_000);
+        var source = observed(confirmed, INSERT, missing);
+        var measured = window(source);
+        Predicate<Event> filter = event -> BenchmarkOperatorOracle.evenKey(event.key());
+        var ack = new Confirmation(confirmed, 2_150);
+        var result = BenchmarkLatencyProbe.correlate(source, List.of(ack), null, measured, 2_000, 3_000, 3_500, filter);
+        assertEquals(2, result.expected());
+        assertEquals(List.of(new LiveLatencyEligibility.Sample("0", 150_000_000)), result.samples());
+        assertThrows(IllegalArgumentException.class, () -> BenchmarkLatencyProbe.correlate(source,
+                List.of(ack, new Confirmation(INSERT, 2_150)), null, measured, 2_000, 3_000, 3_500, filter));
+    }
+
+    @Test
     void scoresSourceHistoryAcrossFixtureClockBoundaries(@TempDir Path directory) throws Exception {
         var warm = new Event(0, 1, 1_000);
         var first = new Event(0, 2, 1_000);
@@ -85,7 +101,7 @@ class BenchmarkLatencyProbeTest {
                     case "runCommand" -> new Document("localTime", new Date());
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
-        try (var probe = new BenchmarkLatencyProbe(witness, mongo)) {
+        try (var probe = new BenchmarkLatencyProbe(witness, mongo, false)) {
             probe.start();
             var result = probe.finish(live, "records", 2, 100, 1, Duration.ofSeconds(2));
             assertNull(result.reason());

@@ -233,8 +233,10 @@ retain the request and summary from each command. Check the keys and values prod
 Check live warm-up and window counts and final readback,
 and backlog source history, zero snapshot rows on resume, confirmed writes and
 final readback. Review `measurement_status` independently from execution `status`.
-Copy, Map and JS live cases can collect source and target callbacks with
-`--endpoint-latency-probe`. Cases without complete correlation report
+Copy, Map, JS and Filter live cases can collect source and target callbacks
+with `--endpoint-latency-probe`. Filter records intentionally excluded source
+events separately. Confirmation coverage uses all retained events.
+Cases without complete correlation report
 `insufficient-event-correlation`. For fixed backlog Copy, Map, JS, Filter
 and Union, the formal workflow enables `--backlog-completion-probe`. To reproduce
 the measurement, use that flag with the matching formal recipe and retain

@@ -19,21 +19,25 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Predicate;
 import org.bson.Document;
 
-/** Reconciles a one-input, one-output witness with independent MongoDB change history. */
+/** Reconciles source events and their required target acknowledgements with independent MongoDB history. */
 final class BenchmarkLatencyProbe implements AutoCloseable {
     static final String PROTOCOL = "mongo-copy-pdk-ack-v1";
     static final String MAP_PROTOCOL = "mongo-map-pdk-ack-v1";
     static final String JS_PROTOCOL = "mongo-js-pdk-ack-v1";
+    static final String FILTER_PROTOCOL = "mongo-filter-pdk-ack-v1";
     private static final long CLOCK_ALLOWANCE_MILLIS = 100;
     private final Path source;
     private final MongoDatabase mongo;
+    private final boolean filtered;
     private boolean initialClock;
 
-    BenchmarkLatencyProbe(Path source, MongoDatabase mongo) {
+    BenchmarkLatencyProbe(Path source, MongoDatabase mongo, boolean filtered) {
         this.source = source;
         this.mongo = mongo;
+        this.filtered = filtered;
     }
 
     void start() {
@@ -65,7 +69,8 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
         }
     }
 
-    record Result(LiveLatencyEligibility.Reading reading, String reason, Long startEpochMillis, Long endExclusiveEpochMillis) {}
+    record Result(LiveLatencyEligibility.Reading reading, String reason, Long startEpochMillis,
+                  Long endExclusiveEpochMillis, Integer excludedEvents) {}
 
     Result finish(Live live, String stream, int minimumP95, int minimumP99, double coverage, Duration drain) {
         var measured = live.measured().streams().get(stream);
@@ -84,8 +89,11 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
             long end = live.measured().writesFinishedAt().plus(drain).toEpochMilli();
             List<Confirmation> observed = read(source, false);
             List<Confirmation> confirmed = read(path(".ack"), true);
-            List<LiveLatencyEligibility.Sample> samples = correlate(observed, confirmed, warmup, measured, start, finish, end);
-            return new Result(LiveLatencyEligibility.assess(expected, samples, true, minimumP95, minimumP99, coverage), null, start, finish);
+            var correlation = correlate(observed, confirmed, warmup, measured, start, finish, end,
+                    event -> !filtered || BenchmarkOperatorOracle.evenKey(event.key()));
+            var reading = LiveLatencyEligibility.assess(correlation.expected(), correlation.samples(),
+                    true, minimumP95, minimumP99, coverage);
+            return new Result(reading, null, start, finish, filtered ? expected - correlation.expected() : null);
         } catch (IOException | IllegalArgumentException unavailable) {
             return insufficient(expected, minimumP95, coverage, unavailable.getMessage());
         }
@@ -104,7 +112,7 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
     }
 
     private static Result insufficient(int expected, int minimum, double coverage, String reason) {
-        return new Result(LiveLatencyEligibility.assess(expected, List.of(), false, minimum, coverage), reason, null, null);
+        return new Result(LiveLatencyEligibility.assess(expected, List.of(), false, minimum, coverage), reason, null, null, null);
     }
 
     record Event(int operation, long key, long epochMillis) {}
@@ -131,6 +139,14 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
 
     static List<LiveLatencyEligibility.Sample> correlate(List<Confirmation> source, List<Confirmation> target,
             StreamReport warmup, StreamReport measured, long scoringStart, long scoringEnd, long drainEnd) {
+        return correlate(source, target, warmup, measured, scoringStart, scoringEnd, drainEnd, event -> true).samples();
+    }
+
+    record Correlation(List<LiveLatencyEligibility.Sample> samples, int expected) {}
+
+    static Correlation correlate(List<Confirmation> source, List<Confirmation> target,
+            StreamReport warmup, StreamReport measured, long scoringStart, long scoringEnd, long drainEnd,
+            Predicate<Event> expectsWrite) {
         int warmEvents = warmup == null ? 0 : warmup.observed().total();
         int scoredEvents = measured.observed().total();
         if (source.size() != warmEvents + scoredEvents
@@ -158,20 +174,26 @@ final class BenchmarkLatencyProbe implements AutoCloseable {
             if (!distinct.contains(event) || acknowledgements.putIfAbsent(event, targetAck.ackMillis()) != null) {
                 throw new IllegalArgumentException("A target acknowledgement has no unique source event");
             }
+            if (!expectsWrite.test(event)) {
+                throw new IllegalArgumentException("A filtered source event produced a target acknowledgement");
+            }
             if (targetAck.ackMillis() < event.epochMillis()) {
                 throw new IllegalArgumentException("A target acknowledgement preceded its source timestamp");
             }
         }
         var samples = new ArrayList<LiveLatencyEligibility.Sample>();
+        int expected = 0;
         for (int index = warmEvents; index < source.size(); index++) {
             Event event = source.get(index).event();
+            if (!expectsWrite.test(event)) continue;
+            expected++;
             Long ack = acknowledgements.get(event);
             if (ack != null && ack <= drainEnd) {
                 samples.add(new LiveLatencyEligibility.Sample(Integer.toString(index),
                         TimeUnit.MILLISECONDS.toNanos(ack - event.epochMillis())));
             }
         }
-        return samples;
+        return new Correlation(samples, expected);
     }
 
     static String digest(List<Confirmation> events) {

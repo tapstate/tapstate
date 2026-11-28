@@ -283,9 +283,11 @@ class BenchmarkRunIT {
         String caseId = text(definition, "id");
         boolean mapLatency = caseId.equals("map.live.basic.standard");
         boolean jsLatency = caseId.equals("js.live.basic.standard");
+        boolean filteredLatency = caseId.equals("filter.live.basic.standard");
         boolean latencyProbe = evidence.request.getBoolean("endpoint_latency_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && text(definition, "mode").equals("live-latency")
-                && (mapLatency || jsLatency || text(definition, "spec").equals("specs/copy-basic.json") && operators == null);
+                && (mapLatency || jsLatency || filteredLatency
+                        || text(definition, "spec").equals("specs/copy-basic.json") && operators == null);
         boolean filteredBacklog = caseId.equals("filter.backlog.basic.standard");
         boolean backlogProbe = evidence.request.getBoolean("backlog_completion_probe", org.bson.BsonBoolean.FALSE).getValue()
                 && (filteredBacklog || List.of("copy.backlog.fixed-iud.standard",
@@ -331,6 +333,7 @@ class BenchmarkRunIT {
             String latencyProtocol = switch (caseId) {
                 case "map.live.basic.standard" -> BenchmarkLatencyProbe.MAP_PROTOCOL;
                 case "js.live.basic.standard" -> BenchmarkLatencyProbe.JS_PROTOCOL;
+                case "filter.live.basic.standard" -> BenchmarkLatencyProbe.FILTER_PROTOCOL;
                 default -> BenchmarkLatencyProbe.PROTOCOL;
             };
             evidence.result.put(backlogProbe ? "backlog_probe" : "latency_probe",
@@ -352,7 +355,7 @@ class BenchmarkRunIT {
             try (var client = MongoClients.create(sourceUri)) {
                 var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
                 var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
-                try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb) : null;
+                try (var latency = latencyProbe ? new BenchmarkLatencyProbe(witness, sourceDb, filteredLatency) : null;
                         var backlog = backlogProbe ? new BenchmarkBacklogProbe(witness, filteredBacklog) : null;
                         var snapshot = snapshotProbe ? new BenchmarkSnapshotProbe(witness, filteredSnapshot) : null) {
                     runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
@@ -763,6 +766,9 @@ class BenchmarkRunIT {
         if (measured.startEpochMillis() != null) {
             evidence.result.put("latency_source_window_start_epoch_ms", measured.startEpochMillis());
             evidence.result.put("latency_source_window_end_exclusive_epoch_ms", measured.endExclusiveEpochMillis());
+        }
+        if (measured.excludedEvents() != null) {
+            evidence.result.put("latency_filtered_source_events", measured.excludedEvents());
         }
         evidence.result.remove("latency_probe_error");
         if (measured.reason() != null) evidence.result.put("latency_probe_error", measured.reason());
