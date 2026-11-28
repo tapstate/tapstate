@@ -918,8 +918,12 @@ final class ConvergenceDriver implements AutoCloseable {
         if (sampler == null) return null;
         var sample = RateSampler.sampleOf(reading.observation(), reading.startupEvidence());
         if (sample == null) return null;
-        return new ProcessObservationWriter.History(sample,
-                remaining -> sampler.offerPrepared(sample, pass.scope(), pass.rateHistory(remaining)));
+        // The last confirmed reading cannot be sampled again after this execution stops.
+        if (reading.observation().state() == PipelineState.STOPPED && reading.startupEvidence() != null) {
+            return new ProcessObservationWriter.History(sample, remaining -> pass.rateHistory(remaining).append(sample));
+        }
+        return new ProcessObservationWriter.History(sample, remaining ->
+                sampler.offerPrepared(sample, pass.scope(), pass.rateHistory(remaining)));
     }
 
     void stopForShutdown() { passes.stop(); }
@@ -984,7 +988,10 @@ final class ConvergenceDriver implements AutoCloseable {
                 sampler.offer(reading.observation(), pass.scope(), pass.rateHistory());
             } else {
                 var sample = RateSampler.sampleOf(reading.observation(), reading.startupEvidence());
-                if (sample != null) sampler.offerPrepared(sample, pass.scope(), pass.rateHistory());
+                if (sample != null) {
+                    if (reading.observation().state() == PipelineState.STOPPED) pass.rateHistory().append(sample);
+                    else sampler.offerPrepared(sample, pass.scope(), pass.rateHistory());
+                }
             }
         } catch (RuntimeException unsampled) {
             LOG.warn("Could not sample the history of pipeline {}", reading.observation().pipelineId(), unsampled);
