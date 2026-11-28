@@ -53,6 +53,43 @@ class ActionsRunTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matching input"):
             actions_run.selection("group", group="copy", case_ids="map.live.basic.standard")
 
+    def test_scheduled_pause_excludes_the_case_but_manual_dispatch_can_select_it(self):
+        now = "2026-11-28T08:00:00+00:00"
+        attempt = {"run_id": 111, "attempt": 1}
+        run = {"id": 111, "run_attempt": 1, "created_at": now, "run_started_at": now}
+        upstream = {"id": 10, "name": "Nightly Test", "event": "schedule", "run_attempt": 1,
+                    "head_branch": "main", "head_repository": {"id": 1}, "created_at": now,
+                    "updated_at": now, "html_url": "https://github.com/example/runs/10"}
+        scheduled = {"action": "completed", "repository": {"id": 1, "default_branch": "main"},
+                     "workflow_run": upstream}
+        paused, normal = "join.snapshot.basic.small", "copy.snapshot.basic.small"
+        issue = "https://github.com/example/repo/issues/123"
+        cases = [{"id": name, "case_version": 1} for name in (paused, normal)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = root / "pauses.json"
+            runner.write_json(registry, {f"{paused}@1": {"issue": issue, "reason": "Snapshot timeout"}})
+            args = Namespace(output=root / "scheduled", workloads=root / "workloads", estimates=root / "estimates")
+            with patch.object(actions_run, "SCHEDULED_PAUSES", registry, create=True), \
+                    patch.object(actions_run.catalog, "build_catalog", return_value={"cases": cases}), \
+                    patch.object(actions_run.time, "time", return_value=actions_run.timestamp(now).timestamp()), \
+                    patch.object(actions_run.baseline, "pin", return_value={"status": "unavailable"}), \
+                    patch.object(actions_run.subprocess, "run", return_value=Namespace(returncode=1)) as allocate:
+                actions_run.prepare(args, "workflow_run", scheduled, attempt, run)
+                command = allocate.call_args.args[0]
+                self.assertIn(f"{normal}@1", command)
+                self.assertNotIn(f"{paused}@1", command)
+                record = json.loads((args.output / "run.json").read_text())
+                self.assertEqual([{"id": paused, "version": 1, "issue": issue, "reason": "Snapshot timeout"}],
+                                 record["paused_cases"])
+
+                args.output = root / "manual"
+                inputs = {"mode": "ids", "case_ids": f"{paused}@1"}
+                actions_run.prepare(args, "workflow_dispatch", {"inputs": inputs}, attempt, run)
+                self.assertIn(f"{paused}@1", allocate.call_args.args[0])
+                record = json.loads((args.output / "run.json").read_text())
+                self.assertNotIn("paused_cases", record)
+
     def test_preparation_reports_missing_work_and_emits_no_matrix(self):
         now = datetime.fromisoformat("2026-11-21T15:00:00+00:00")
         run = {"id": 111, "run_attempt": 1, "created_at": now.isoformat(), "run_started_at": now.isoformat()}
@@ -407,7 +444,9 @@ class ActionsRunTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             attempt = {"run_id": 111, "attempt": 1}
-            runner.write_json(root / "run.json", {"github_attempt": attempt, "scope": "all"})
+            pause = {"id": "paused", "version": 1, "issue": "https://github.com/example/repo/issues/123",
+                     "reason": "Snapshot timeout"}
+            runner.write_json(root / "run.json", {"github_attempt": attempt, "scope": "all", "paused_cases": [pause]})
             selected = [{"id": case, "version": 1, "repeats": 3, "profile": "standard"} for case in ("first", "second")]
             runner.write_json(root / "manifest.json", {
                 "identity": {"code_sha": "candidate"}, "github_attempt": attempt, "environment": "hosted",
@@ -417,6 +456,9 @@ class ActionsRunTest(unittest.TestCase):
             result = actions_report.collect(root, root, attempt, {"prepare": "failure", "measure": "skipped"})
             self.assertEqual({"not-run": 2}, result["case_counts"])
             self.assertEqual({"not-run": 6}, result["repeat_counts"])
+            self.assertEqual([pause], result["paused_cases"])
+            self.assertIn("`paused@1`", actions_report.summary(result, "example/repo"))
+            self.assertIn(pause["issue"], actions_report.summary(result, "example/repo"))
             self.assertEqual("missing formal workload", result["results"][0]["reason"])
             self.assertEqual("allocation incomplete", result["results"][-1]["reason"])
             active, _ = notifications.signals({"status": "reported", "report": result})

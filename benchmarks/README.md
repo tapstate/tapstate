@@ -145,8 +145,10 @@ when mutations sample existing keys without replacement. Lifecycle repeats
 retain three cycles with shorter scoring windows and matching idle observations.
 
 The report artifact `performance-report-<attempt>` includes `report.json` and
-`report.md`. The input and batch artifact names also carry the attempt. Reproduce
-a result with its case version, tested SHA, workload, and environment profile.
+`report.md`. The input and batch artifact names also carry the attempt. Versioned entries in
+`cases/scheduled-pauses.json` are reported separately and omitted from scheduled
+selection. Use manual dispatch with the exact case ID and version to rerun one.
+Reproduce a result with its case version, tested SHA, workload, and environment profile.
 Use **Run workflow** to start a new run for a repeat measurement. **Re-run all
 jobs** can remove the first run's artifacts before the workflow rejects the new
 attempt. If the first report upload succeeded and the report is gone after a

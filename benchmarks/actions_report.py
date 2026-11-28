@@ -135,6 +135,8 @@ def collect(inputs, artifacts, attempt, job_results, *, jobs=(), artifact_index=
                   "case_verdicts": verdict.case_verdicts(unmeasured, None)}
     result["github_attempt"] = attempt
     result["workflow"] = run
+    if paused := run.get("paused_cases"):
+        result["paused_cases"] = paused
     result["job_results"] = job_results
     result["artifact_names"] = accepted_artifacts
     result["batch_evidence"] = batch_evidence
@@ -276,6 +278,9 @@ def summary(result, repository):
         f"- Manifest digest {cell(result.get('manifest_sha256'))}",
         f"- Cases selected {len(result['selected_ids'])}",
     ]
+    for pause in result.get("paused_cases", []):
+        lines.append(f"- Scheduled pause `{pause['id']}@{pause['version']}` · "
+                     f"[Issue]({pause['issue']}) · {cell(pause['reason'])}")
     for key, label in (("version", "Baseline version"), ("sha256", "Baseline SHA-256"),
                        ("baseline_commit", "Baseline commit"), ("release_record_commit", "Release record commit"),
                        ("code_sha", "Baseline candidate"), ("environment", "Baseline environment")):

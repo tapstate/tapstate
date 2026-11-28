@@ -1,0 +1,10 @@
+{
+  "join.snapshot.basic.small@1": {
+    "issue": "https://github.com/tapstate/tapstate/issues/1352",
+    "reason": "Join snapshot times out during initial landing"
+  },
+  "join.snapshot.basic.standard@1": {
+    "issue": "https://github.com/tapstate/tapstate/issues/1352",
+    "reason": "Join snapshot times out during initial landing"
+  }
+}

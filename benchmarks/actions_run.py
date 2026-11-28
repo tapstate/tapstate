@@ -25,6 +25,7 @@ MEASUREMENT_RESERVE_SECONDS = CONTROL_RESERVE_SECONDS + TEARDOWN_RESERVE_SECONDS
 BUILD_RESERVE_SECONDS = 600
 DEFAULT_BATCH_SECONDS = 5 * 60 * 60
 DEFAULT_SLOTS = 8
+SCHEDULED_PAUSES = Path(__file__).with_name("cases") / "scheduled-pauses.json"
 
 
 def selection(mode, group="", filters="", case_ids=""):
@@ -39,6 +40,21 @@ def selection(mode, group="", filters="", case_ids=""):
         return ["--where", f"group={value}"]
     flag = "--where" if mode == "filter" else "--id"
     return [argument for item in re.split(r"[\s,]+", value) for argument in (flag, item)]
+
+
+def scheduled_selection():
+    pauses = catalog.read_json(SCHEDULED_PAUSES)
+    if not pauses:
+        return [], []
+    cases = catalog.build_catalog()["cases"]
+    paused = runner.select(cases, list(pauses), [], "all")
+    paused_ids = {case["id"] for case in paused}
+    selected_refs = [f"{case['id']}@{case['case_version']}" for case in cases if case["id"] not in paused_ids]
+    if not selected_refs:
+        raise ValueError("The scheduled pause list leaves no cases to run")
+    records = [{"id": case["id"], "version": case["case_version"],
+                **pauses[f"{case['id']}@{case['case_version']}"]} for case in paused]
+    return selection("ids", case_ids=",".join(selected_refs)), records
 
 
 def eligible_event(event_name, event, attempt):
@@ -128,6 +144,10 @@ def prepare(args, event_name, event, attempt, run):
     run_record = {"github_attempt": attempt, "scope": scope, "timing": timing}
     runner.write_json(output / "run.json", run_record)
     flags = selection(scope, inputs.get("group", ""), inputs.get("filters", ""), inputs.get("case_ids", ""))
+    if upstream is not None:
+        flags, paused = scheduled_selection()
+        if paused:
+            run_record["paused_cases"] = paused
     receipt = baseline.pin(output, RUNNER_PROFILE, inputs.get("baseline_version"))
     runner.write_json(output / "baseline-receipt.json", receipt)
     runner.write_json(output / "run.json", {**run_record, "baseline_receipt_sha256": catalog.digest(receipt)})
