@@ -60,6 +60,7 @@ public enum CardinalityBudget {
             Fold.ADDED),
     CDC_DELIVERY_COUNT(CdcDeliveryTotals.COUNT_METRIC, null, 1, Fold.ADDED),
     CDC_DELIVERY_TOTAL_MILLIS(CdcDeliveryTotals.TOTAL_MILLIS_METRIC, null, 1, Fold.ADDED),
+    CDC_PENDING_WRITE_AGE(PendingCdcWrite.METRIC, null, 1, Fold.HIGHEST),
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
     SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
