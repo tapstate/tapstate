@@ -35,8 +35,14 @@ public sealed interface CaptureStart
     /**
      * Resume at {@code position}: the stream delivers the changes after it. The position came from a
      * previous run of this same source — a snapshot's seam, or a position that run had reached.
+     * A pending initial cutoff still applies when a timestamp-start run stopped before settling
+     * its first qualifying batch.
      */
-    record Resume(SourcePosition position) implements CaptureStart {
+    record Resume(SourcePosition position, Instant pendingStartAt) implements CaptureStart {
+
+        public Resume(SourcePosition position) {
+            this(position, null);
+        }
 
         public Resume {
             Objects.requireNonNull(position, "position");

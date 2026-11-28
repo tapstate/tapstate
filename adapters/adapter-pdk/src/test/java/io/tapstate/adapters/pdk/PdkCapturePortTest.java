@@ -1,6 +1,8 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.adapters.pdk.fixture.CdcStartBoundarySource;
 import io.tapstate.adapters.pdk.fixture.StopAwaitingReadSource;
+import io.tapstate.core.common.FailureFact;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -599,6 +601,91 @@ class PdkCapturePortTest {
     // ---- cdc drive: streamRead -> decodeChange ---------------------------------------------------
 
     // ---- where the tail is told to begin ----------------------------------------------------------
+
+    @Test
+    void anInstantStartSkipsEarlyBatchesThenDeliversTheRestInSourceOrder() throws Exception {
+        List<List<Envelope>> batches = new CopyOnWriteArrayList<>();
+        CountDownLatch delivered = new CountDownLatch(2);
+        try (var port = startBoundaryPort();
+                var subscription = port.cdc(config("t1"), CaptureStart.at(Instant.ofEpochMilli(20)), (events, offset) -> {
+                    assertThat(offset).isPresent();
+                    batches.add(events);
+                    delivered.countDown();
+                })) {
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(batches).satisfiesExactly(
+                    batch -> assertThat(batch).extracting(row -> row.after().get("id")).containsExactly(3L, 4L),
+                    batch -> assertThat(batch).extracting(row -> row.after().get("id")).containsExactly(5L));
+        }
+    }
+
+    @Test
+    void aMissingTimeWhileSeekingTheStartPreventsDeliveryAfterTheConnectorRetries() throws Exception {
+        BlockingQueue<FailureFact> failures = new LinkedBlockingQueue<>();
+        List<Envelope> delivered = new CopyOnWriteArrayList<>();
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> offset) {
+                delivered.addAll(events);
+            }
+
+            @Override
+            public void onFailure(FailureFact fact) {
+                failures.add(fact);
+            }
+        };
+        var config = new CaptureConfig("demo", Map.of("retry_failed_delivery", true), List.of("t1"));
+        try (var port = startBoundaryPort();
+                var subscription = port.cdc(config, CaptureStart.at(Instant.ofEpochMilli(21)), listener)) {
+            FailureFact failure = failures.poll(5, TimeUnit.SECONDS);
+            assertThat(failure).isNotNull();
+            assertThat(failure.publicFailure().code()).isEqualTo(ConnectorError.PROJECTION_FAILED.code());
+            assertThat(failure.cause()).isInstanceOfSatisfying(TapstateException.class, error ->
+                    assertThat(error.args()).containsEntry("connector", "demo")
+                            .hasEntrySatisfying("detail", detail -> assertThat(detail.toString())
+                                    .contains("neither referenceTime nor time", "1970-01-01T00:00:00.021Z")));
+            assertThat(delivered).isEmpty();
+        }
+    }
+
+    @Test
+    void aNewSubscriptionResumesByPositionAfterAnInstantStartIsInterrupted() throws Exception {
+        List<Envelope> delivered = new CopyOnWriteArrayList<>();
+        CountDownLatch resumed = new CountDownLatch(3);
+        var initial = new SourcePosition(ConnectorOffsetCodec.toToken("demo", 21L));
+        BlockingQueue<FailureFact> failures = new LinkedBlockingQueue<>();
+        try (var port = startBoundaryPort()) {
+            try (var subscription = port.cdc(config("t1"), CaptureStart.at(Instant.ofEpochMilli(21)),
+                    new CaptureListener() {
+                        @Override
+                        public void onBatch(List<Envelope> events, Optional<SourcePosition> offset) {
+                            delivered.addAll(events);
+                        }
+
+                        @Override
+                        public void onFailure(FailureFact fact) {
+                            failures.add(fact);
+                        }
+                    })) {
+                assertThat(failures.poll(5, TimeUnit.SECONDS)).isNotNull();
+                assertThat(delivered).isEmpty();
+            }
+            try (var subscription = port.cdc(config("t1"), CaptureStart.resume(initial), (events, offset) -> {
+                delivered.addAll(events);
+                resumed.countDown();
+            })) {
+                assertThat(resumed.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(delivered).extracting(row -> row.after().get("id"))
+                        .containsExactly(1L, 2L, 3L, 4L, 5L);
+            }
+        }
+    }
+
+    private static PdkCapturePort startBoundaryPort() throws Exception {
+        Class<CdcStartBoundarySource> fixture = CdcStartBoundarySource.class;
+        Path classes = Path.of(fixture.getProtectionDomain().getCodeSource().getLocation().toURI());
+        return new PdkCapturePort(provisioner(classes, fixture.getName(), null));
+    }
 
     /**
      * The mark the echoing source stamps on the first row it emits: what it was asked to resolve, and so
