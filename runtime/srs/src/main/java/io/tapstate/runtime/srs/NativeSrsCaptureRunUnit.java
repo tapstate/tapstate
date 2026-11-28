@@ -230,7 +230,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         Runnable fixed=guard(requireActive);fixed.run();var window=Objects.requireNonNull(opened.current(),"opened capture");
         var writer=new DirectCaptureWriter(opened,window.captureFence(),window.pipelineFence(),channels,row -> {
             fixed.run();handoff.accept(row);fixed.run();
-        },capacity,fixed);
+        },capacity,fixed,handoff::changesReady);
         Runnable ending=() -> {writer.close();writer.stopSources();closePortOpening(port,opened.context().captureId());};pendingCloses.put(ending,requireActive);
         var health=new CaptureHealth();Subscription source=null;CaptureRun provisional=null;
         try {
@@ -269,7 +269,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                 var saved=current.resumeToken();if(saved==null || current.cursor().sinkAcked()==null)throw new TapstateException(IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",opened.context().channelId()),null);
                 var writer=new DirectCaptureWriter(current,window.captureFence(),window.pipelineFence(),channels,row -> {
                     fixed.run();handoff.accept(row);fixed.run();
-                },capacity,fixed);
+                },capacity,fixed,handoff::changesReady);
                 Runnable ending=() -> {writer.close();writer.stopSources();closePortOpening(port,current.context().captureId());};pendingCloses.put(ending,requireActive);
                 Subscription source=null;
                 try {
