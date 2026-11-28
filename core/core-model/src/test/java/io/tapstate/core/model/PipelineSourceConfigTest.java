@@ -11,7 +11,7 @@ class PipelineSourceConfigTest {
             Map.of("host", "shared", "preImage", true), SourceMode.CDC,
             List.of(TableRef.literal("orders")), new Srs("shared", null, null, null, null), null);
 
-    @Test void localFalseAndResetToInheritanceDoNotMutateSharedSource() {
+    @Test void resolvingAuthoredValuesDoesNotMutateTheSource() {
         var local = pipeline(Map.of("preImage", false));
         assertThat(PipelineSourceConfig.settings(local, source)).containsEntry("host", "shared").containsEntry("preImage", false);
         assertThat(source.config()).containsEntry("preImage", true);
@@ -20,16 +20,18 @@ class PipelineSourceConfigTest {
                 .isInstanceOf(UnsupportedOperationException.class);
     }
 
-    @Test void redundantOverridesRetainLegacyKeyAndChangedSettingsAreIsolated() {
-        var inherited = pipeline(Map.of());
-        var redundant = pipeline(Map.of("preImage", true));
+    @Test void evenAnExplicitValueEqualToTheSourceSettingHasItsOwnCaptureIdentity() {
+        var unconfigured = pipeline(Map.of());
+        var explicit = pipeline(Map.of("preImage", true));
         var overridden = pipeline(Map.of("preImage", false));
         String legacy = SourceCaptureIdentity.resolve(source.connector(), source.config(), source.srs().key());
-        assertThat(PipelineSourceConfig.chain(inherited, source)).isEqualTo(legacy);
-        assertThat(PipelineSourceConfig.chain(redundant, source)).isEqualTo(legacy);
-        assertThat(PipelineSourceConfig.settings(redundant, source)).isSameAs(source.config());
+        assertThat(PipelineSourceConfig.chain(unconfigured, source)).isEqualTo(legacy);
+        assertThat(PipelineSourceConfig.chain(explicit, source)).isNotEqualTo(legacy);
+        assertThat(PipelineSourceConfig.overrides(explicit, source)).containsEntry("preImage", true);
         assertThat(PipelineSourceConfig.chain(overridden, source)).isNotEqualTo(legacy);
-        assertThat(PipelineSourceConfig.physical(overridden, source)).isNotEqualTo(PipelineSourceConfig.physical(inherited, source));
+        assertThat(PipelineSourceConfig.physical(overridden, source)).isNotEqualTo(PipelineSourceConfig.physical(unconfigured, source));
+        assertThat(SourceCaptureIdentity.resolve(source.connector(), source.config(), null, Map.of("preImage", true)))
+                .isNotEqualTo(SourceCaptureIdentity.resolve(source.connector(), source.config(), null));
     }
 
     private PipelineResource pipeline(Map<String, Object> config) {

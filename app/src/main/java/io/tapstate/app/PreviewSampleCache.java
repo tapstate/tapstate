@@ -158,6 +158,7 @@ final class PreviewSampleCache {
         identity.put("connectorId", request.connectorId());
         identity.put("connectorIdentity", connectorIdentity);
         identity.put("settings", request.settings());
+        identity.put("nodeConfig", request.nodeConfig());
         identity.put("table", Map.of(
                 "name", request.table().name(),
                 "fields", request.table().fields().stream()

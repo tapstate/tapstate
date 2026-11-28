@@ -3,7 +3,6 @@ package io.tapstate.core.model;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Objects;
 
 /** Resolves one Pipeline's effective connector settings without changing the shared Source. */
 public final class PipelineSourceConfig {
@@ -35,21 +34,14 @@ public final class PipelineSourceConfig {
                 settings, source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
     }
 
-    /** Local values that change the connector's effective configuration. */
+    /** Authored node values, including values that happen to equal a connection setting. */
     public static Map<String, Object> overrides(PipelineResource pipeline, SourceResource source) {
         return overrides(pipeline.sourceReference(source.id()), source);
     }
 
     public static Map<String, Object> overrides(SourceRef reference, SourceResource source) {
         if (!reference.id().equals(source.id())) throw new IllegalArgumentException("Source binding mismatch");
-        if (reference.nodeConfig().isEmpty()) return Map.of();
-        var result = new LinkedHashMap<String, Object>();
-        reference.nodeConfig().forEach((name, value) -> {
-            if (!source.config().containsKey(name) || !Objects.equals(source.config().get(name), value)) {
-                result.put(name, value);
-            }
-        });
-        return Collections.unmodifiableMap(result);
+        return reference.nodeConfig();
     }
 
     /** Explicit local false and null values take precedence just as any other authored value does. */

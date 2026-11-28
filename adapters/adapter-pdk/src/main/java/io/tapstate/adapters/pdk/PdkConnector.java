@@ -148,16 +148,24 @@ final class PdkConnector implements AutoCloseable {
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
                              ConnectorNoteScopes noteScopes, PipelineNode.Purpose purpose) {
-        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false);
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false, null);
+    }
+
+    /** Opens a Pipeline read with an independent set of node values, even when that set is empty. */
+    static PdkConnector openPipelineSource(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+            Map<String, Object> nodeSettings, PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
+            ConnectorNoteScopes noteScopes) {
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, PipelineNode.Purpose.CAPTURE,
+                false, java.util.Objects.requireNonNull(nodeSettings, "nodeSettings"));
     }
 
     static PdkConnector openDefaultTest(String connectorId, ConnectorRef ref, Map<String,Object> settings) {
-        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true);
+        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true, null);
     }
 
     private static PdkConnector open(String connectorId, ConnectorRef ref, Map<String,Object> settings,
             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes, ConnectorNoteScopes noteScopes,
-            PipelineNode.Purpose purpose, boolean strictDefaultTest) {
+            PipelineNode.Purpose purpose, boolean strictDefaultTest, Map<String, Object> nodeSettings) {
         java.util.Objects.requireNonNull(purpose, "purpose");
         if (notes != null && purpose != PipelineNode.Purpose.CAPTURE) {
             throw new IllegalArgumentException("shared notes require capture purpose");
@@ -236,6 +244,24 @@ final class PdkConnector implements AutoCloseable {
         boolean opened = false;
         ConnectorTrustMaterial material = null;
         try {
+            Map<String, Object> pipelineNodeValues = null;
+            if (nodeSettings != null) {
+                var forms = ref.spec() != null && JsonReader.parse(ref.spec()) instanceof Map<?, ?> root
+                        ? root : Map.of();
+                var declaredNodes = ConnectorForm.NODE.itemsIn(forms);
+                var declaredConnection = ConnectorForm.CONNECTION.itemsIn(forms);
+                var connection = new LinkedHashMap<>(effectiveSettings);
+                var selected = new LinkedHashMap<String, Object>();
+                declaredNodes.forEach((name, item) -> {
+                    if (!declaredConnection.containsKey(name)) connection.remove(name);
+                    if (nodeSettings.containsKey(name)) selected.put(name, nodeSettings.get(name));
+                    else if (item.containsKey("default")) selected.put(name, item.get("default"));
+                });
+                pipelineNodeValues = ConfigTypeCoercion.coerce(connectorId, ref.spec(), selected);
+                // Some PDK connectors load their node parameters from the connection bean as well.
+                connection.putAll(pipelineNodeValues);
+                effectiveSettings = connection;
+            }
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
             effectiveSettings = material.settings();
             driveGuard.run();
@@ -277,7 +303,8 @@ final class PdkConnector implements AutoCloseable {
             specification.setDataTypesMap(dataTypesFrom(ref.spec()));
             Map<String, Object> config = ConfigTypeCoercion.coerce(connectorId, ref.spec(), effectiveSettings);
             TapConnectorContext context = new TapConnectorContext(
-                    specification, DataMap.create(config), nodeConfigFrom(ref.spec(), config),
+                    specification, DataMap.create(config), pipelineNodeValues == null
+                            ? nodeConfigFrom(ref.spec(), config) : DataMap.create(pipelineNodeValues),
                     new ConnectorLog(connectorId, pipelineId, logGeneration));
             // A connector reaches what it keeps for itself through the context's state maps during init,
             // discovery and the drive; the context leaves them null, so give it live ones or the first

@@ -23,12 +23,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PipelineSourceNodeSettingsIT {
 
     private static final String SOURCE = "shared_orders";
-    private static final String OVERRIDDEN = "orders_override";
-    private static final String INHERITED = "orders_inherit";
+    private static final String EXPLICIT = "orders_explicit";
+    private static final String UNCONFIGURED = "orders_unconfigured";
     private static final Duration TIMEOUT = Duration.ofSeconds(90);
 
     @Test
-    void aPublishedPipelineOverridesItsSourceWithoutChangingTheOtherCapture(@TempDir Path directory) throws Exception {
+    void onlyTheNodeWithAnExplicitValueFailsEvenWhenTheSourceHasTheSameValue(@TempDir Path directory) throws Exception {
         Path input = Files.createDirectory(directory.resolve("input"));
         Path healthyOutput = Files.createDirectory(directory.resolve("healthy"));
         Path failingOutput = Files.createDirectory(directory.resolve("failing"));
@@ -55,49 +55,49 @@ class PipelineSourceNodeSettingsIT {
             control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", input.toString()));
             String originalSource = control.contentHash(SOURCE);
 
-            control.createPipelineDraft(OVERRIDDEN, draft(OVERRIDDEN, "healthy", Map.of()));
-            String endpoint = "/api/pipelines/" + OVERRIDDEN;
-            Map<String, Object> overrides = Map.of("orders", Map.of("fail_cdc", false));
-            control.sourceRequest("PUT", endpoint + "/draft", draft(OVERRIDDEN, "healthy", overrides), "\"1\"", 200);
-            Map<?, ?> reopened = (Map<?, ?>) control.pipelineDraft(OVERRIDDEN).orElseThrow().get("wizard");
+            control.createPipelineDraft(EXPLICIT, draft(EXPLICIT, "failing", Map.of()));
+            String endpoint = "/api/pipelines/" + EXPLICIT;
+            Map<String, Object> overrides = Map.of("orders", Map.of("fail_cdc", true));
+            control.sourceRequest("PUT", endpoint + "/draft", draft(EXPLICIT, "failing", overrides), "\"1\"", 200);
+            Map<?, ?> reopened = (Map<?, ?>) control.pipelineDraft(EXPLICIT).orElseThrow().get("wizard");
             assertThat(reopened.get("sourceNodeConfigs")).isEqualTo(overrides);
             control.sourceRequest("POST", endpoint + "/draft:publish", Map.of("revision", 2), null, 200);
             Map<?, ?> projected = (Map<?, ?>) JsonReader.parse(
                     control.sourceRequest("GET", endpoint, null, null, 200).body());
             Map<?, ?> source = (Map<?, ?>) ((List<?>) projected.get("sources")).getFirst();
-            assertThat(source.get("nodeConfig")).isEqualTo(Map.of("fail_cdc", false));
+            assertThat(source.get("nodeConfig")).isEqualTo(Map.of("fail_cdc", true));
 
-            control.createPipelineDraft(INHERITED, draft(INHERITED, "failing", Map.of()));
-            control.sourceRequest("POST", "/api/pipelines/" + INHERITED + "/draft:publish",
+            control.createPipelineDraft(UNCONFIGURED, draft(UNCONFIGURED, "healthy", Map.of()));
+            control.sourceRequest("POST", "/api/pipelines/" + UNCONFIGURED + "/draft:publish",
                     Map.of("revision", 1), null, 200);
-            control.lifecycle(OVERRIDDEN, LifecycleVerb.START);
-            Await.until("the Pipeline with a false override to settle", TIMEOUT,
-                    () -> control.state(OVERRIDDEN).filter(state -> state == PipelineState.RUNNING
+            control.lifecycle(UNCONFIGURED, LifecycleVerb.START);
+            Await.until("the Pipeline with no node setting to settle", TIMEOUT,
+                    () -> control.state(UNCONFIGURED).filter(state -> state == PipelineState.RUNNING
                             || state == PipelineState.FAILED).isPresent(),
-                    () -> control.pipelineStatus(OVERRIDDEN).toString());
-            assertThat(control.state(OVERRIDDEN)).contains(PipelineState.RUNNING);
-            control.lifecycle(INHERITED, LifecycleVerb.START);
-            awaitState(control, INHERITED, PipelineState.FAILED);
+                    () -> control.pipelineStatus(UNCONFIGURED).toString());
+            assertThat(control.state(UNCONFIGURED)).contains(PipelineState.RUNNING);
+            control.lifecycle(EXPLICIT, LifecycleVerb.START);
+            awaitState(control, EXPLICIT, PipelineState.FAILED);
 
             FileEndpoints.replaceTable(orders, "id,seq\n1,10\n2,20\n");
             EndpointAddress target = EndpointAddress.uri(healthyOutput.toString());
-            Await.until("the healthy capture to keep delivering after the inherited capture fails", TIMEOUT,
+            Await.until("the unconfigured capture to keep delivering after the explicit capture fails", TIMEOUT,
                     () -> files.fetch(target, "orders", Map.of("id", 2L)).isPresent(),
-                    () -> control.pipelineStatus(OVERRIDDEN).toString());
-            control.stop(OVERRIDDEN, false);
-            awaitState(control, OVERRIDDEN, PipelineState.STOPPED);
-            String previousArtifact = control.contentHash(OVERRIDDEN);
-            control.sourceRequest("PUT", endpoint + "/draft", draft(OVERRIDDEN, "healthy", Map.of()), "\"2\"", 200);
+                    () -> control.pipelineStatus(UNCONFIGURED).toString());
+            control.stop(EXPLICIT, false);
+            awaitState(control, EXPLICIT, PipelineState.STOPPED);
+            String previousArtifact = control.contentHash(EXPLICIT);
+            control.sourceRequest("PUT", endpoint + "/draft", draft(EXPLICIT, "failing", Map.of()), "\"2\"", 200);
             control.sourceRequest("POST", endpoint + "/draft:publish",
                     Map.of("revision", 3, "artifactHash", previousArtifact), null, 200);
-            assertThat(control.artifact(OVERRIDDEN).orElseThrow().canonicalForm()).doesNotContain("nodeConfig");
+            assertThat(control.artifact(EXPLICIT).orElseThrow().canonicalForm()).doesNotContain("nodeConfig");
             assertThat(control.contentHash(SOURCE)).isEqualTo(originalSource);
             assertThat(((Map<?, ?>) control.source(SOURCE).get("config")).get("fail_cdc")).isEqualTo(true);
         }
     }
 
     @Test
-    void nodesOfOnePipelineOpenSeparateCapturesAndRestoreOneOverride(@TempDir Path directory) throws Exception {
+    void nodesOfOnePipelineOpenSeparateCapturesAndClearOneNodeSetting(@TempDir Path directory) throws Exception {
         Path input = Files.createDirectory(directory.resolve("input"));
         Path output = Files.createDirectory(directory.resolve("output"));
         FileEndpoints.replaceTable(input.resolve("orders.csv"), "id,seq\n1,10\n");
@@ -213,7 +213,7 @@ class PipelineSourceNodeSettingsIT {
     }
 
     private static void clearForUpdatedSelection(ControlPlane control, PreparedNativeStore storage, String pipeline) {
-        // The inherited capture has a different input selection. Prepare the new definition for a full load.
+        // The revised node configuration has a different capture selection.
         try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
                 storage.configurationUri(), null, Duration.ofSeconds(5)))) {
             long original = configuration.pipelineStates().read(pipeline).orElseThrow().stateGeneration();

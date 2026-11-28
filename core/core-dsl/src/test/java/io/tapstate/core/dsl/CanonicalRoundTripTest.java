@@ -289,9 +289,9 @@ class CanonicalRoundTripTest {
         assertThat(reference.nodeConfig()).containsEntry("preImage", false);
         String canonical = writer.write(pipeline);
         assertThat(writer.write(parser.parse(canonical))).isEqualTo(canonical);
-        var inherit = parser.parse(raw.replace(", nodeConfig: { preImage: false }", ""));
+        var unconfigured = parser.parse(raw.replace(", nodeConfig: { preImage: false }", ""));
         assertThat(io.tapstate.core.model.canonical.AssemblyIdentity.of(pipeline))
-                .isNotEqualTo(io.tapstate.core.model.canonical.AssemblyIdentity.of(inherit));
+                .isNotEqualTo(io.tapstate.core.model.canonical.AssemblyIdentity.of(unconfigured));
     }
 
     @Test

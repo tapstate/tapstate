@@ -28,7 +28,7 @@ class PipelineRecoveryInspectorTest {
     private final PipelineRecoveryInspector inspector;
     private SourceModel actualModel;
     private int probes;
-    private final List<SourceResource> probedSources = new ArrayList<>();
+    private final List<io.tapstate.spi.store.ConnectionConfig> probedSources = new ArrayList<>();
     PipelineRecoveryInspectorTest() {
         when(configuration.cacheRecoveries()).thenReturn(recoveries);when(configuration.preparations()).thenReturn(preparations);
         when(configuration.bindings()).thenReturn(bindings);when(configuration.intents()).thenReturn(intents);
@@ -143,8 +143,10 @@ class PipelineRecoveryInspectorTest {
                 .thenReturn(Optional.of(ConnectorNoteOrigin.capture("mysql", hashes.get("mysql"), effective)));
         stopped();
         var result = inspector.inspect(AUTH, SELECT);
-        assertThat(probedSources).singleElement().satisfies(probed ->
-                assertThat(probed.config()).containsEntry("preImage", false).containsEntry("host", "source.invalid"));
+        assertThat(probedSources).singleElement().satisfies(probed -> {
+            assertThat(probed.settings()).containsEntry("host", "source.invalid").doesNotContainKey("preImage");
+            assertThat(probed.nodeConfig()).containsEntry("preImage", false);
+        });
         assertThat(result.privateContexts().get("pdk.state.flow.capture.src").config()).isEqualTo(effective);
         assertThat(result.inputs().sourceHashes()).containsEntry("src", CanonicalHash.of(source));
         assertThat(result.inputs().pipelineHash()).isEqualTo(CanonicalHash.of(pipeline));

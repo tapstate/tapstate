@@ -11,5 +11,10 @@ record PreviewSourceTable(
         String connectorId,
         Map<String, Object> settings,
         TableSchema schema,
-        SourceTable model) {
+        SourceTable model,
+        Map<String, Object> nodeConfig) {
+    PreviewSourceTable(String sourceKey, String sourceId, String connectorId, Map<String, Object> settings,
+            TableSchema schema, SourceTable model) {
+        this(sourceKey, sourceId, connectorId, settings, schema, model, Map.of());
+    }
 }

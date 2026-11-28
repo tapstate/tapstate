@@ -34,15 +34,15 @@ final class PipelineRecoveryInspector {
     private final StorePort store;
     private final ConnectorProvisioner connectors;
     private final BiFunction<String,String,ConnectorCapabilities> capabilities;
-    private final BiFunction<SourceResource,String,SourceModel> liveModels;
+    private final BiFunction<ConnectionConfig,String,SourceModel> liveModels;
     private final Runnable active;
 
     PipelineRecoveryInspector(MongoConfigurationDomain configuration,StorePort store,ConnectorProvisioner connectors,Runnable active) {
         this(configuration,store,connectors,new PdkCapabilityDeriver(connectors)::derive,
-                (source,hash) -> new PdkSchemaDiscoverer(id -> connectors.resolve(id,hash)).discoverStructure(new ConnectionConfig(source.id(),source.connector(),source.config())),active);
+                (source,hash) -> new PdkSchemaDiscoverer(id -> connectors.resolve(id,hash)).discoverPipelineStructure(source),active);
     }
     PipelineRecoveryInspector(MongoConfigurationDomain configuration,StorePort store,ConnectorProvisioner connectors,
-            BiFunction<String,String,ConnectorCapabilities> capabilities,BiFunction<SourceResource,String,SourceModel> liveModels,Runnable active) {
+            BiFunction<String,String,ConnectorCapabilities> capabilities,BiFunction<ConnectionConfig,String,SourceModel> liveModels,Runnable active) {
         this.configuration=Objects.requireNonNull(configuration);this.store=Objects.requireNonNull(store);
         this.connectors=Objects.requireNonNull(connectors);this.capabilities=Objects.requireNonNull(capabilities);this.liveModels=Objects.requireNonNull(liveModels);this.active=Objects.requireNonNull(active);
     }
@@ -104,7 +104,8 @@ final class PipelineRecoveryInspector {
                 modelHashes.put(source.id()+"."+table,PdkSinkPreparations.modelHash(target));
             }
             if(probeSources) {
-                active.run();var live=liveModels.apply(PipelineSourceConfig.effective(ref, source),artifacts.get(source.connector()));active.run();
+                var connection = new ConnectionConfig(source.id(), source.connector(), source.config(), ref.nodeConfig());
+                active.run();var live=liveModels.apply(connection,artifacts.get(source.connector()));active.run();
                 if(live==null || !selected.equals(Set.copyOf(PipelineTableSelection.resolve(pipeline,ref,source,live))))throw staleModel(source);
                 var actual=new TargetModelResolver(store,snapshot,ignored -> live).resolveAll(source.id());
                 for(String table:selected)if(actual.get(table)==null || !PdkSinkPreparations.modelHash(actual.get(table)).equals(modelHashes.get(source.id()+"."+table)))

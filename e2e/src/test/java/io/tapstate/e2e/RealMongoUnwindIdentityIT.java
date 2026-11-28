@@ -82,7 +82,7 @@ class RealMongoUnwindIdentityIT {
                             version: tapstate/v1
                             kind: pipeline
                             id: %s
-                            source: src_orders
+                            source: { id: src_orders, nodeConfig: { preImage: true } }
                             settings: { read_mode: snapshot_and_cdc }
                             transforms:
                               - id: expanded

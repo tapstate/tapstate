@@ -56,7 +56,7 @@ class PipelineLogLifetimeIT {
 
             var resources = new LinkedHashMap<String, String>();
             resources.put("old.tap.yml", source("probe_src_old", oldSource, ", require_password: true", true));
-            resources.put("new.tap.yml", source("probe_src_new", newSource, ", fail_cdc: true", true));
+            resources.put("new.tap.yml", source("probe_src_new", newSource, "", true));
             resources.put("target.tap.yml", source("probe_target", target, "", false));
             resources.put("pipeline.tap.yml", pipeline(PIPELINE, "probe_src_old"));
             control.apply(resources);
@@ -166,7 +166,8 @@ class PipelineLogLifetimeIT {
                   from: orders
                   sync:
                     - source: probe_target
-                """.formatted(id, source);
+                """.formatted(id, source.equals("probe_src_new")
+                        ? "{ id: probe_src_new, nodeConfig: { fail_cdc: true } }" : source);
     }
 
     private static void require(boolean ok, String reason) {

@@ -531,7 +531,7 @@ final class PreviewSelectionPlanner {
             SourceTable model = source.model();
             BoundedSnapshotQueryRequest request = new BoundedSnapshotQueryRequest(
                     source.sourceId(), source.connectorId(), source.settings(), source.schema(),
-                    model.primaryKey(), selection, List.of(), limit, remainingBytes, deadline);
+                    model.primaryKey(), selection, List.of(), limit, remainingBytes, deadline, source.nodeConfig());
             sourceReads++;
             String connectorIdentity = queries.cacheIdentity(request);
             BoundedSnapshotQueryResult result = sampleCache.get(

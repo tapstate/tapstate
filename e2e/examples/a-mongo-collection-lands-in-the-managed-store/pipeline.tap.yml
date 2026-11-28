@@ -1,7 +1,7 @@
 version: tapstate/v1
 kind: pipeline
 id: breadth_crossing
-source: src_store
+source: { id: src_store, nodeConfig: { preImage: true } }
 settings: { read_mode: snapshot_and_cdc }
 view:
   id: order_state

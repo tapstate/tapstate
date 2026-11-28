@@ -6,7 +6,7 @@
 # job running over a ring gone quiet: the job's own status never reflects the death. Only the capture
 # reporting its failure up to the runtime turns a dead tail into a FAILED state and an error count.
 #
-# The failure is deliberate: the source carries fail_cdc, a setting the connector declares for one node
+# The failure is deliberate: the pipeline input carries fail_cdc, a setting the connector declares for one node
 # use and reads only from the node config the host supplies. If that setting does not cross the host boundary,
 # the stream lives and this example times out waiting for FAILED. When it does cross, the change stream starts
 # and then throws. The tail reports that failure up through the capture listener's error channel, the

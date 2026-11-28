@@ -581,8 +581,9 @@ final class StoreBackedDagSource implements DagSource {
             }
             List<FieldSchema> fields = table.fields().stream()
                     .map(field -> new FieldSchema(field.name(), field.dataType())).toList();
+            var capture = vertex.resolution().config();
             selected.add(new PreviewSourceTable(entry.getKey(), source.id(), source.connector(),
-                    vertex.resolution().config().settings(), new TableSchema(table.name(), fields), table));
+                    capture.settings(), new TableSchema(table.name(), fields), table, capture.nodeConfig()));
         }
         return List.copyOf(selected);
     }

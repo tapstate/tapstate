@@ -50,7 +50,8 @@ class AConnectorsNodeParametersReachItTest {
                 },
                 "node": {
                   "properties": {
-                    "preImage4Sink": {"type": "boolean", "x-component": "Switch"}
+                    "preImage4Sink": {"type": "boolean", "x-component": "Switch"},
+                    "batchSize": {"type": "integer", "default": 100}
                   }
                 }
               }
@@ -88,6 +89,26 @@ class AConnectorsNodeParametersReachItTest {
             assertThat(connector.context().getNodeConfig()).doesNotContainKey("uri");
             assertThat(connector.context().getConnectionConfig())
                     .containsEntry("uri", "mongodb://localhost:27017/orders");
+        }
+    }
+
+    @Test
+    void aPipelineReadsOnlyItsOwnNodeSettingsAndDeclaredDefaults(@TempDir Path dir) {
+        ConnectorRef ref = new ConnectorRef(
+                List.of(Synthetic.discoverableSource(dir)), "synthetic.Discoverable", "2.0.8", null, SPEC);
+        var settings = Map.<String, Object>of("uri", "mongodb://host/db", "preImage4Sink", true, "batchSize", 999);
+
+        try (PdkConnector connector = PdkConnector.openPipelineSource(
+                "demo", ref, settings, Map.of(), null, null, null, null)) {
+            assertThat(connector.context().getNodeConfig()).containsEntry("batchSize", 100L)
+                    .doesNotContainKey("preImage4Sink");
+            assertThat(connector.context().getConnectionConfig()).containsEntry("uri", "mongodb://host/db")
+                    .containsEntry("batchSize", 100L).doesNotContainKey("preImage4Sink");
+        }
+        try (PdkConnector connector = PdkConnector.openPipelineSource(
+                "demo", ref, settings, Map.of("preImage4Sink", false), null, null, null, null)) {
+            assertThat(connector.context().getNodeConfig()).containsEntry("preImage4Sink", false);
+            assertThat(connector.context().getConnectionConfig()).containsEntry("preImage4Sink", false);
         }
     }
 

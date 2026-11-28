@@ -13,15 +13,16 @@ public final class SourceCaptureIdentity {
     public static String resolve(String connector,Map<String,Object> settings,String key) {
         return key != null && !key.isBlank() ? "mck-"+key : physical(connector,settings);
     }
-    /** A local node setting can qualify a keyed chain without changing its shared Source's key. */
+    /** Node settings participate independently of the connection settings. */
     public static String resolve(String connector, Map<String, Object> settings, String key,
             Map<String, Object> nodeConfig) {
-        if (nodeConfig == null || nodeConfig.isEmpty() || key == null || key.isBlank()) {
+        if (nodeConfig == null || nodeConfig.isEmpty()) {
             return resolve(connector, settings, key);
         }
         var input = new StringBuilder();
-        token(input, key);
+        token(input, key == null || key.isBlank() ? "" : key);
         token(input, physical(connector, settings));
+        value(input, nodeConfig);
         return "mcn-" + CanonicalHash.ofText(input.toString());
     }
     public static String sharedCapture(String chainId) {
