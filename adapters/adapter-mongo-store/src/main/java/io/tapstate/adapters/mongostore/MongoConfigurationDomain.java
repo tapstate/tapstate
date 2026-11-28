@@ -1486,6 +1486,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     public io.tapstate.spi.store.StorageSetupStateStore setupStates() {
+        return storageSetupStateStore();
+    }
+
+    public io.tapstate.spi.store.StorageSetupStateStore.View storageSetupView(MongoReadBudget budget) {
+        return storageSetupStateStore().loadView(Objects.requireNonNull(budget));
+    }
+
+    private MongoStorageSetupStateStore storageSetupStateStore() {
         requireOpen();
         return new MongoStorageSetupStateStore(connection.client(), connection.database(), bindings, this::requireOpen);
     }
