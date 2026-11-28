@@ -62,6 +62,7 @@ class ControlOperationsTest {
                         "pipeline.get",
                         "pipeline.layout.get",
                         "pipeline.layout.update",
+                        "pipeline.id-availability",
                         "pipeline.create",
                         "pipeline.update",
                         "pipeline-draft.list",
@@ -254,13 +255,14 @@ class ControlOperationsTest {
 
     @Test
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
-        // The cluster context and Cloud-session provider selection are REST-only. The reveal
-        // reservation stays unpublished until its dedicated authorizer exists.
+        // Console-only operations stay out of CLI. The reveal reservation stays unpublished
+        // until its dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(89);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"state-store.connection-uri".equals(op.id())
                 && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())
+                && !"pipeline.id-availability".equals(op.id())
                 && !"pipeline.run-progress".equals(op.id())
                 && !"ai-provider.select".equals(op.id()) && !op.id().startsWith("retry-settings.")
                 && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")
@@ -274,6 +276,10 @@ class ControlOperationsTest {
                 .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
         assertThat(registry.resolve("ai-provider.select").exposure())
                 .containsEntry(Frontend.REST, Maturity.CURRENT).containsOnlyKeys(Frontend.REST);
+        var availability = registry.resolve("pipeline.id-availability");
+        assertThat(availability.exposure()).containsExactlyEntriesOf(Map.of(Frontend.REST, Maturity.CURRENT));
+        assertThat(availability.scope()).isEqualTo(Scope.WRITE);
+        assertThat(availability.audited()).isFalse();
         assertThat(registry.resolve("retry-settings.get").scope()).isEqualTo(Scope.ADMIN);
         assertThat(registry.resolve("retry-settings.replace").scope()).isEqualTo(Scope.ADMIN);
         assertThat(registry.resolve("retry-settings.replace").audited()).isTrue();
@@ -337,7 +343,8 @@ class ControlOperationsTest {
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
                         "pipeline.preview",
-                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog", "pipeline.delete", "pipeline.run-progress");
+                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog", "pipeline.delete",
+                        "pipeline.id-availability", "pipeline.run-progress");
     }
 
     /**
